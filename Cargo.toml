@@ -1,0 +1,92 @@
+[workspace]
+members = [
+    "hal",
+    # The ARM image. The ONLY bin target for thumbv7em, and the only crate that
+    # may hold a #[global_allocator] or the vector table.
+    "firmware",
+    "vendor/frostsnap/frostsnap_core",
+    "vendor/frostsnap/frostsnap_comms",
+    "vendor/frostsnap/frostsnap_embedded",
+    "vendor/frostsnap/frost_backup",
+    "vendor/frostsnap/macros",
+]
+resolver = "2"
+
+[workspace.dependencies]
+# --- vendored frostsnap crates (upstream 0bbc18be) -------------------------
+# default-features = false throughout: the upstream defaults enable
+# `coordinator`, which pulls rusqlite/std and cannot build for a bare-metal
+# target.
+frostsnap_core = { path = "vendor/frostsnap/frostsnap_core", default-features = false }
+frostsnap_comms = { path = "vendor/frostsnap/frostsnap_comms", default-features = false }
+frostsnap_embedded = { path = "vendor/frostsnap/frostsnap_embedded", default-features = false }
+frostsnap_macros = { path = "vendor/frostsnap/macros", default-features = false }
+frost_backup = { path = "vendor/frostsnap/frost_backup", features = [
+    "bincode",
+], default-features = false }
+
+# --- crypto ----------------------------------------------------------------
+# Versions match upstream frostsnap so the vendored sources compile unchanged.
+secp256kfun = { version = "0.12", default-features = false }
+schnorr_fun = { version = "0.13", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+rand_core = { version = "0.6", default-features = false }
+rand_chacha = { version = "0.3", default-features = false }
+
+# --- serialization ---------------------------------------------------------
+bincode = { version = "2.0.1", features = [
+    "serde",
+    "alloc",
+    "derive",
+], default-features = false }
+serde = { version = "1", features = ["derive", "alloc"], default-features = false }
+
+# --- bitcoin ---------------------------------------------------------------
+# 326KB of flash and 47 usages across 4 files (incl. sighash). Retained for
+# now; see PLAN.md §9.2.
+#
+# `alloc` is explicit here. Upstream frostsnap gets it transitively via other
+# workspace members enabling `std`; this workspace has no std member, so
+# without it hex-conservative fails to compile (144 errors).
+# Pinned to =0.32.8, the version upstream frostsnap resolves.
+bitcoin = { version = "=0.32.8", features = ["serde", "secp-lowmemory"], default-features = false }
+
+# bitcoin 0.32.8 has no `alloc` feature — only `std`, which we cannot use. Its
+# hex dependency (hex-conservative) therefore gets neither `std` nor `alloc`
+# and fails to compile (144 errors). Enabling it here is what upstream gets
+# transitively from workspace members that do enable `std`.
+hex-conservative = { version = "0.2.2", features = [
+    "alloc",
+], default-features = false }
+
+# --- embedded --------------------------------------------------------------
+embedded-storage = "0.3.1"
+
+# --- cold-snap's own crates ------------------------------------------------
+coldsnap_hal = { path = "hal", default-features = false }
+
+# Unused on-device, but referenced by vendored manifests' optional/dev deps.
+proptest = "=1.6.0"
+rsa = { version = "0.9" }
+rand = "0.8"
+tracing = { version = "0.1", default-features = false }
+rusqlite = { version = "0.31.0", features = ["bundled"] }
+
+[profile.dev]
+opt-level = "s"
+
+[profile.release]
+codegen-units = 1
+debug = 0
+debug-assertions = false
+incremental = false
+lto = "fat"
+opt-level = "s"
+overflow-checks = false
+# No unwinder on a bare-metal target. Note the consequence: every panic and
+# every failed `assert_eq!` becomes a halt. See PLAN.md §6.2 — a panic handler
+# that reaches `NVIC_SystemReset` is mandatory before running on real hardware.
+# NOT DFU: production units are RDP=2, where the bootloader's own `enter_dfu()`
+# returns EPERM (`dispatch.c:417-418`), so DFU is hardware-impossible rather than
+# policy-blocked. DFU survives only as a late fallback on an RDP!=2 dev unit.
+panic = "abort"

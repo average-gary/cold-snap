@@ -1,0 +1,271 @@
+use crate::device::KeyPurpose;
+use crate::nonce_stream::CoordNonceStreamState;
+use crate::{
+    AccessStructureId, AccessStructureRef, CheckedSignTask, CoordShareDecryptionContrib, Gist,
+    KeygenId, MasterAppkey, SessionHash, ShareImage, SignSessionId, SignTaskError, Vec,
+};
+use crate::{DeviceId, EnterPhysicalId, Kind, WireSignTask};
+use alloc::{
+    boxed::Box,
+    collections::{BTreeMap, BTreeSet},
+    string::String,
+};
+use frostsnap_macros::Kind;
+use schnorr_fun::binonce;
+use schnorr_fun::frost::SharedKey;
+use schnorr_fun::frost::{chilldkg::certpedpop, ShareIndex};
+use schnorr_fun::fun::prelude::*;
+use schnorr_fun::fun::Point;
+use schnorr_fun::Signature;
+use sha2::digest::Update;
+use sha2::Digest;
+
+pub mod keygen;
+pub mod screen_verify;
+pub mod signing;
+pub use keygen::Keygen;
+
+#[derive(Clone, Debug)]
+#[must_use]
+pub enum DeviceSend {
+    ToUser(Box<crate::device::DeviceToUserMessage>),
+    ToCoordinator(Box<DeviceToCoordinatorMessage>),
+}
+
+#[derive(Clone, Debug, bincode::Encode, bincode::Decode, Kind)]
+pub enum CoordinatorToDeviceMessage {
+    KeyGen(keygen::Keygen),
+    #[delegate_kind]
+    Signing(signing::CoordinatorSigning),
+    #[delegate_kind]
+    Restoration(CoordinatorRestoration),
+    #[delegate_kind]
+    ScreenVerify(screen_verify::ScreenVerify),
+}
+
+#[derive(Clone, Debug, bincode::Encode, bincode::Decode, Kind)]
+pub enum CoordinatorRestoration {
+    EnterPhysicalBackup {
+        enter_physical_id: EnterPhysicalId,
+    },
+    SavePhysicalBackup {
+        share_image: ShareImage,
+        key_name: String,
+        purpose: KeyPurpose,
+        threshold: u16,
+    },
+    /// Consolidate the saved secret share backup into a properly encrypted backup.
+    Consolidate(Box<ConsolidateBackup>),
+    DisplayBackup {
+        /// Redundant: derivable from `root_shared_key` via
+        /// `AccessStructureRef::from_root_shared_key`. Coordinators must still
+        /// set it correctly — devices ignore it but the field is wire-visible
+        /// and kept for backwards compatibility.
+        access_structure_ref: AccessStructureRef,
+        coord_share_decryption_contrib: CoordShareDecryptionContrib,
+        share_index: ShareIndex,
+        root_shared_key: SharedKey,
+    },
+    RequestHeldShares,
+    SavePhysicalBackup2(Box<HeldShare2>),
+    CheckBackup {
+        coord_share_decryption_contrib: CoordShareDecryptionContrib,
+        share_index: ShareIndex,
+        root_shared_key: SharedKey,
+    },
+}
+
+#[derive(Clone, Debug, bincode::Encode, bincode::Decode, PartialEq)]
+pub struct ConsolidateBackup {
+    pub share_index: ShareIndex,
+    pub root_shared_key: SharedKey,
+    pub key_name: String,
+    pub purpose: KeyPurpose,
+}
+
+#[derive(Clone, Debug, bincode::Encode, bincode::Decode, PartialEq)]
+pub struct GroupSignReq<ST = WireSignTask> {
+    pub parties: BTreeSet<ShareIndex>,
+    pub agg_nonces: Vec<binonce::Nonce<Zero>>,
+    pub sign_task: ST,
+    pub access_structure_id: AccessStructureId,
+}
+
+impl<ST> GroupSignReq<ST> {
+    pub fn n_signatures(&self) -> usize {
+        self.agg_nonces.len()
+    }
+}
+
+impl GroupSignReq<WireSignTask> {
+    pub fn check(
+        self,
+        rootkey: Point,
+        purpose: KeyPurpose,
+    ) -> Result<GroupSignReq<CheckedSignTask>, SignTaskError> {
+        let master_appkey = MasterAppkey::derive_from_rootkey(rootkey);
+        let sign_task = self.sign_task.check(master_appkey, purpose)?;
+
+        // A `GroupSignReq<CheckedSignTask>` must carry exactly one agg_nonce per
+        // sign_item. `device.rs` indexes `agg_nonces[i]` for each sign_item, so
+        // without this the coordinator can panic the device by sending fewer.
+        let n_sign_items = sign_task.n_sign_items();
+        if self.agg_nonces.len() != n_sign_items {
+            return Err(SignTaskError::WrongNumberOfNonces {
+                got: self.agg_nonces.len(),
+                expected: n_sign_items,
+            });
+        }
+
+        Ok(GroupSignReq {
+            parties: self.parties,
+            agg_nonces: self.agg_nonces,
+            sign_task,
+            access_structure_id: self.access_structure_id,
+        })
+    }
+
+    pub fn session_id(&self) -> SignSessionId {
+        let bytes = bincode::encode_to_vec(self, bincode::config::standard()).unwrap();
+        SignSessionId(sha2::Sha256::new().chain(bytes).finalize().into())
+    }
+}
+
+impl Gist for CoordinatorToDeviceMessage {
+    fn gist(&self) -> String {
+        crate::Kind::kind(self).into()
+    }
+}
+
+#[derive(Clone, Debug, bincode::Encode, bincode::Decode, Kind)]
+pub enum DeviceToCoordinatorMessage {
+    KeyGen(keygen::DeviceKeygen),
+    #[delegate_kind]
+    Signing(signing::DeviceSigning),
+    #[delegate_kind]
+    Restoration(DeviceRestoration),
+}
+
+#[derive(Clone, Debug, bincode::Encode, bincode::Decode, Kind)]
+pub enum DeviceRestoration {
+    PhysicalEntered(EnteredPhysicalBackup),
+    PhysicalSaved(ShareImage),
+    FinishedConsolidation {
+        access_structure_ref: AccessStructureRef,
+        share_index: ShareIndex,
+    },
+    HeldShares(Vec<HeldShare>),
+    HeldShares2(Vec<HeldShare2>),
+}
+
+#[derive(Clone, Debug, bincode::Encode, bincode::Decode, PartialEq)]
+pub struct HeldShare {
+    pub access_structure_ref: Option<AccessStructureRef>,
+    pub share_image: ShareImage,
+    pub threshold: u16,
+    pub key_name: String,
+    pub purpose: KeyPurpose,
+}
+
+#[derive(Clone, Debug, bincode::Encode, bincode::Decode, PartialEq)]
+pub struct HeldShare2 {
+    pub access_structure_ref: Option<AccessStructureRef>,
+    pub share_image: ShareImage,
+    pub threshold: Option<u16>,
+    pub key_name: Option<String>,
+    pub purpose: Option<KeyPurpose>,
+    pub needs_consolidation: bool,
+}
+
+impl From<HeldShare> for HeldShare2 {
+    fn from(legacy: HeldShare) -> Self {
+        HeldShare2 {
+            access_structure_ref: legacy.access_structure_ref,
+            share_image: legacy.share_image,
+            threshold: Some(legacy.threshold),
+            key_name: Some(legacy.key_name),
+            purpose: Some(legacy.purpose),
+            needs_consolidation: legacy.access_structure_ref.is_none(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, bincode::Encode, bincode::Decode, PartialEq)]
+pub struct KeyGenResponse {
+    pub keygen_id: KeygenId,
+    pub input: Box<certpedpop::KeygenInput>,
+}
+
+impl Gist for DeviceToCoordinatorMessage {
+    fn gist(&self) -> String {
+        Kind::kind(self).into()
+    }
+}
+
+#[derive(Clone, Copy, Debug, bincode::Encode, bincode::Decode, PartialEq)]
+pub struct EnteredPhysicalBackup {
+    pub enter_physical_id: EnterPhysicalId,
+    pub share_image: ShareImage,
+}
+
+#[derive(Clone, Debug, Copy, bincode::Encode, bincode::Decode, PartialEq)]
+/// An encoded signature that can pass ffi boundries easily
+pub struct EncodedSignature(pub [u8; 64]);
+
+impl EncodedSignature {
+    pub fn new(signature: Signature) -> Self {
+        Self(signature.to_bytes())
+    }
+
+    pub fn into_decoded(self) -> Option<Signature> {
+        Signature::from_bytes(self.0)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum TaskKind {
+    KeyGen,
+    Sign,
+    DisplayBackup,
+    VerifyAddress,
+    CheckBackup,
+}
+
+#[derive(Debug, Clone, bincode::Encode, bincode::Decode, PartialEq)]
+pub struct RequestSign {
+    /// Common public parts of the signing request
+    pub group_sign_req: GroupSignReq,
+    /// Private part of the signing request that only the device should be able to access
+    pub device_sign_req: DeviceSignReq,
+}
+
+#[derive(Debug, Clone, bincode::Encode, bincode::Decode, PartialEq)]
+pub struct DeviceSignReq {
+    /// Not secret but device specific. No one needs to know this other than device.
+    pub nonces: CoordNonceStreamState,
+    /// the rootkey - semi secret. Should not be posted publicly. Only the device should receive this.
+    pub rootkey: Point,
+    /// The share decryption contribution from the coordinator.
+    pub coord_share_decryption_contrib: CoordShareDecryptionContrib,
+}
+
+#[derive(Clone, Debug, bincode::Encode, bincode::Decode)]
+pub struct KeyGenAck {
+    pub ack_session_hash: SessionHash,
+    pub keygen_id: KeygenId,
+}
+
+impl IntoIterator for KeyGenAck {
+    type Item = DeviceSend;
+    type IntoIter = core::iter::Once<DeviceSend>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        core::iter::once(DeviceSend::ToCoordinator(Box::new(self.into())))
+    }
+}
+
+impl From<KeyGenAck> for DeviceToCoordinatorMessage {
+    fn from(value: KeyGenAck) -> Self {
+        DeviceToCoordinatorMessage::KeyGen(keygen::DeviceKeygen::Ack(value))
+    }
+}

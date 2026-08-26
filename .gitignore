@@ -1,0 +1,12 @@
+# Build artifacts. NOTE the trailing slash and no leading slash: this must match
+# `hostcheck/target` too, which is its own cargo workspace (one graph cannot hold
+# both coldsnap_hal and upstream frostsnap_coordinator -- see vendor/README.md).
+# A leading-slash `/target` matched only the root and let 1.6G through.
+target/
+
+# Local machine state, not project configuration.
+.claude/settings.local.json
+
+**/*.rs.bk
+*.pdb
+.DS_Store

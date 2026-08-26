@@ -1,0 +1,193 @@
+[package]
+name = "coldsnap_hal"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+# "2-source", not 3: SE1's RNG is fed our own STM32 TRNG (`ae.c:1332`) and SE2's
+# `se2_read_rng` returns a static page (`se2.c:1341-1343`). See PLAN.md §5.1 and
+# `rng::ENTROPY_SOURCE_COUNT`.
+description = "Bare-metal STM32L4S5 substrate for cold-snap: FLASH_FS NorFlash, fail-closed 2-source RngCore, Coldcard bootloader callgate, panic->reset handler."
+
+# Dependency justification (PLAN.md §1: every added crate is flash AND another
+# author to trust). Six deps, all already resolved in the device graph for
+# frostsnap_core, so the marginal flash cost of this crate is its own code only.
+#
+#   frostsnap_comms   REQUIRED by `comms`, and the point of the module is that
+#                     it is NOT reimplemented: the magic-byte handshake, the
+#                     bincode config and the `ReceiveSerial` frame layout must
+#                     stay byte-identical with a coordinator we do not control,
+#                     and a second implementation of a wire format is a second
+#                     thing to keep in sync. `default-features = false` keeps
+#                     the `coordinator` feature (which pulls `std`, `rsa` and
+#                     `sha2`) out of the device build; the workspace default was
+#                     locally changed from `["coordinator"]` for this reason --
+#                     see vendor/README.md.
+#   bincode           REQUIRED by `comms` for `encode_into_slice` /
+#                     `decode_from_slice`. Both are alloc-free at the API level,
+#                     which is what lets the size bound be enforced by a
+#                     fixed-size buffer instead of by a length comparison.
+#                     Already in the device graph via frostsnap_comms.
+#   embedded-storage  REQUIRED. `NorFlash`/`ReadNorFlash` are the traits
+#                     `frostsnap_embedded` is generic over
+#                     (nor_flash_log.rs:2, partition.rs:3). Not optional: it is
+#                     the interface, not an implementation detail.
+#   rand_core         REQUIRED. `RngCore`/`CryptoRng` is what frostsnap_core
+#                     takes at 28 `&mut impl rand_core::RngCore` bounds.
+#   sha2              REQUIRED by the entropy mixer transcript (rng.rs
+#                     `mix_sources`). Already in the device graph via
+#                     frostsnap_core, so 0 marginal bytes.
+#   rand_chacha       REQUIRED. `Entropy` wraps `ChaCha20Rng` so that
+#                     `fill_bytes` is infallible BY CONSTRUCTION and touches no
+#                     hardware -- the whole fail-closed design rests on this
+#                     (see rng.rs docs). Already in the device graph.
+#
+# DELIBERATELY NOT TAKEN:
+#   cortex-m     Only wanted for `interrupt::free`, `asm::{dsb,isb,nop}` and
+#                `SCB::sys_reset` -- each is one `core::arch::asm!` line, and we
+#                need raw `asm!` for the callgate `blx` regardless. Taking it
+#                would add a crate and a `critical-section` dependency to gain
+#                nothing we do not already have to write.
+#   cortex-m-rt  Actively WRONG here. It owns the reset vector, the vector
+#                table and `memory.x`; on Mk4 the PCROP bootloader owns reset
+#                (mk4-bootloader/startup.S:87-95) and hands control to a fixed
+#                entry, and the layout is dictated by
+#                stm32/COLDCARD_MK4/layout.ld. cold-snap supplies its own
+#                minimal entry + linker script instead.
+#   stm32l4xx-hal / stm32l4 (svd2rust)  Thousands of unused registers, and it
+#                would fight the bootloader over peripheral ownership
+#                (UART4/I2C2, see rng.rs blockers). Raw volatile access to the
+#                ~8 registers we touch is smaller and auditable.
+
+[features]
+# The `#[panic_handler]` itself. On by default, and additionally gated on
+# `target_os = "none"` in lib.rs so a host `cargo test` can never collide with
+# std's handler. Turn OFF only if some other crate in the final binary supplies
+# the handler -- the RTC panic/RNG-fault counters in `panic` stay available
+# either way, because PLAN.md §6.3 requires normal firmware code to clear the
+# counter once the event loop is proven healthy.
+default = ["panic-handler"]
+panic-handler = []
+
+# `flash::fake::FakeFlash`, a RAM-backed NorFlash at StmFlash's EXACT geometry
+# (WRITE_SIZE = 8 / ERASE_SIZE = 4096). OFF by default: it needs `alloc`, which
+# the device build deliberately has no allocator for, and shipping a fake flash
+# in firmware is how a test double ends up holding nonces.
+#
+# Enabled for this crate's own integration tests through the dev-dependency
+# self-reference below -- `cfg(test)` does not reach `tests/`, which compiles
+# against the lib as an ordinary dependency.
+fake-flash = []
+
+# The entropy TEST SEAM: `rng::mix_sources`, `rng::Entropy::from_proven_seed`
+# and `rng::ProvenSeed::expose`. OFF by default, for exactly the reason
+# `fake-flash` is off by default.
+#
+# `mix_sources` takes three `&[u8]`. It requires three byte arrays that pass
+# `check_source` -- NOT three hardware draws. So while it is unconditionally
+# public, any downstream crate can mint a `ProvenSeed` from hardcoded constants
+# and get a full `RngCore + CryptoRng` `Entropy` with zero hardware reads, zero
+# callgate entries and zero singletons taken. That is the libngu defect of
+# PLAN.md §1 reproduced -- not as an `#ifdef` ladder, but as an unconditionally
+# public constructor -- and it compiled for the DEVICE target.
+#
+# The rng module's docs used to present "there is no `cfg` or feature in this
+# module" as a virtue. That reasoning was inverted: the *absence* of a gate is
+# what leaves the seam in shipped firmware. What must never be gated is the
+# refusal path (`check_source`, the three source legs, `Sources`/`Entropy::boot`)
+# -- those stay `cfg`-free. What must be gated is the seam that BYPASSES them.
+#
+# `Entropy::boot` does not go through the gated seam: it calls a private inner
+# mixer, so the device path is unaffected by this feature either way.
+#
+# Enabled for this crate's own integration tests through the dev-dependency
+# self-reference below -- `cfg(test)` does not reach `tests/`, which compiles
+# against the lib as an ordinary dependency.
+test-seam = []
+
+# `examples/heap_profile.rs` only. NOT a device feature and NOT a bypass: it adds
+# nothing to the library, it turns on `frostsnap_core/coordinator` (std + tracing
+# + rusqlite) so the profiler can drive a REAL `FrostCoordinator` instead of
+# hand-rolled messages. Off by default so the ordinary test graph never sees it.
+heap-profile = ["frostsnap_core/coordinator"]
+
+[dependencies]
+bincode = { workspace = true }
+embedded-storage = { workspace = true }
+frostsnap_comms = { workspace = true }
+rand_core = { workspace = true }
+rand_chacha = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+# Self-reference so `tests/` sees `flash::fake`. The integration test's whole
+# job is proving the real frostsnap stack composes with this HAL, so it needs a
+# NorFlash at the shipped geometry.
+coldsnap_hal = { path = ".", features = ["fake-flash", "test-seam"] }
+# The real thing, not a mock: `AbSlot`/`FlashPartition`/`NonceAbSlot` over
+# `FakeFlash`, and `frostsnap_core`'s `&mut impl RngCore` sites over `Entropy`.
+frostsnap_embedded = { workspace = true, features = ["std"] }
+frostsnap_core = { workspace = true }
+rand_core = { workspace = true }
+bincode = { workspace = true }
+schnorr_fun = { workspace = true, features = ["alloc", "bincode"] }
+# Property tests for `comms::Link::poll` -- the one surface a coordinator fully
+# controls, including the chunk boundaries, which the USB stack picks and we
+# never do. Pinned to the exact version `frostsnap_core` already locks, so this
+# adds no new crate to the graph; and a dev-dependency cannot reach firmware.
+proptest = "=1.6.0"
+# MEASUREMENT ONLY, and a dev-dependency deliberately: `examples/heap_lifo.rs`
+# `LIFO_MODE=lll` drives the real workload through it to answer whether it fits
+# `heap::HEAP_BYTES`. It is NOT a dependency of the library and there is no
+# `#[global_allocator]` anywhere in `hal/src` -- when it ships it ships registered
+# in the bin crate. `default-features = false` drops `use_spin`/`spinning_top`, so
+# this adds exactly one crate and it is the one under review.
+linked_list_allocator = { version = "0.10.6", default-features = false }
+
+# The harness's device side USED TO LIVE HERE. It is now
+# `firmware/examples/stub.rs`, because it drives `coldsnap_firmware`'s session
+# dispatch -- the same code the ARM image contains -- and a `hal` example cannot
+# depend on the firmware crate. The built artifact path is unchanged: cargo puts
+# every workspace member's examples in one flat
+# `target/<triple>/debug/examples/` directory, so `hostcheck`'s `DEFAULT_STUB`
+# did not move.
+
+# The heap profiler (see `examples/heap_profile.rs`). Host-only, and gated on its
+# OWN feature rather than on `test-seam`, because it is the only target here that
+# needs a real `FrostCoordinator` -- i.e. `frostsnap_core/coordinator`, which
+# drags in std + tracing + rusqlite. Putting that on the plain dev-dependency
+# would push a C SQLite build into `cargo test -p coldsnap_hal`; gating it here
+# keeps the 261-test command's graph exactly as it was.
+#
+# It compiled without this gate only by accident: `cargo build` at the workspace
+# root unifies features with `frostsnap_core`'s own dev-dependency on
+# `frostsnap_comms[coordinator]`, so the feature happened to be on. `cargo test
+# -p coldsnap_hal` selects one package, does not, and the example failed to
+# build -- MEASURED, not guessed. `required-features` makes it skip instead.
+[[example]]
+name = "heap_profile"
+required-features = ["heap-profile"]
+
+# `examples/heap_lifo.rs`: the same real workload under a LIFO-rollback bump
+# allocator instead of a tracking one, to answer whether that allocator shape
+# survives `FrostSigner`'s allocation pattern. Same gate and same reason.
+[[example]]
+name = "heap_lifo"
+required-features = ["heap-profile"]
+
+# `examples/ui_render.rs`: composes every `ui` screen and every page of the
+# paginated ones, and dumps each framebuffer as ASCII art plus a 1-bit BMP, so
+# the layouts are reviewable with no hardware and no display.
+#
+# NO `required-features`, deliberately, and that is not an oversight: `ui.rs` is
+# unconditional (no `cfg`, no feature) precisely so that screen composition is
+# host-testable, and giving its renderer a feature gate would imply the module
+# needs one. This target needs `std` for `fs`/`println!` only, which every
+# `examples/` target here already assumes -- `cargo build --release` for
+# thumbv7em builds lib and bin targets, not examples, so the ARM image never
+# sees it. Run it with `--target aarch64-apple-darwin`.
+#
+# It also carries `assert!`s (page counts, `Confirm` structurally last, refusals
+# actually refusing), so it fails loudly rather than printing a wrong catalogue.
+[[example]]
+name = "ui_render"

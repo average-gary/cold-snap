@@ -1,0 +1,152 @@
+####################################################################
+# coldsnap_firmware — the ARM image. THE ENTRY POINT LIVES HERE.
+#
+# This crate exists so there is something to link. At this commit it is a STUB:
+# a vector table with the two words the bootloader actually reads
+# (`mk4-bootloader/startup.S:102-112`) and an entry that loops forever. The real
+# bring-up sequence (VTOR, CPACR, .bss/.data, heap, singletons, event loop) is
+# PLAN.md's amended step list and is filled in by the entry agent in `entry.rs`.
+#
+# `cortex-m-rt` is deliberately absent — see the "DELIBERATELY NOT TAKEN" block
+# in `hal/Cargo.toml`: it owns the reset vector and `memory.x`, and on Mk4 the
+# PCROP bootloader owns reset and `layout.ld` dictates the layout.
+#
+# The `#[global_allocator]` will be registered HERE, in the bin crate, never in
+# the HAL (`hal/src/heap.rs` is constants only). `alloc.rs` is its stub.
+#
+# The linker script is wired in via `-C link-arg=-Tfirmware/link.x` in the repo
+# root's `.cargo/config.toml`, under `[target.thumbv7em-none-eabihf]` only, so
+# host builds are untouched.
+####################################################################
+[package]
+name = "coldsnap_firmware"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "cold-snap firmware image for Coldcard Mk4 (STM32L4S5): vector table, entry, allocator registration."
+
+[dependencies]
+# `path`, NOT `workspace = true`: the workspace entry pins
+# `default-features = false`, and a member cannot turn defaults back on through
+# inheritance (cargo warns and ignores it — and the release gate requires zero
+# warnings). `panic-handler` is named explicitly because it is what supplies the
+# image's single `#[panic_handler]` (`hal/src/panic.rs`, additionally gated on
+# `target_os = "none"`). Do not add a second one here.
+coldsnap_hal = { path = "../hal", features = ["panic-handler"] }
+# Pinned EXACTLY: upstream cannot build its own tests for a 32-bit target
+# (`src/test.rs:168`), so any bump re-owes the 32-bit Miri run. `default-features
+# = false` drops `use_spin`/`spinning_top` -- see `src/alloc.rs` for why a
+# spinlock is the wrong answer under PRIMASK=1.
+linked_list_allocator = { version = "=0.10.6", default-features = false }
+
+# `src/lib.rs` — the session logic, compiled into this image AND driven on the
+# host. Every one of these except `frostsnap_embedded` is ALREADY in the device
+# graph as a normal dependency of `coldsnap_hal` (via `frostsnap_comms`), so
+# naming them here adds no crate and no version to the ARM image. Checked with
+# `cargo tree --target thumbv7em-none-eabihf -p coldsnap_firmware -e normal,features`.
+#
+# `frostsnap_embedded` IS new to the device graph: it is the flash-partition and
+# A/B-slot layer the nonce slots are built on, and it belongs to the device
+# rather than to the hardware abstraction. `default-features = false` via the
+# workspace entry — the HAL's DEV-dependency on it enables `std`, and this one
+# must not.
+frostsnap_core = { workspace = true }
+frostsnap_comms = { workspace = true }
+frostsnap_embedded = { workspace = true }
+# Reach the curve through `frostsnap_core::schnorr_fun`, so no direct
+# `schnorr_fun`/`secp256kfun` entry can drift to a second version.
+sha2 = { workspace = true }
+rand_core = { workspace = true }
+embedded-storage = { workspace = true }
+
+[dev-dependencies]
+# The seam and the fake flash reach the lib's HOST tests only. A DEV-dependency
+# is by definition absent from `cargo build --release`, and resolver = "2" does
+# not unify dev features into a non-dev build — the same self-referencing shape
+# `hal/Cargo.toml` has carried all project. Do NOT add a `test-seam` feature to
+# this package: a feature on the device crate is a new way to type the bypass
+# into a release build.
+coldsnap_hal = { path = "../hal", features = ["fake-flash", "test-seam"] }
+
+# `examples/checkfw.rs` only: the ECDSA verify the Mk4 bootloader does at
+# `verify.c:232`. NOT a new package — 0.29.1 is already in `Cargo.lock` as a
+# normal dependency of `bitcoin =0.32.8` (decision 4), so this adds a feature
+# (`alloc`, for `Secp256k1::verification_only`) and nothing else. Reaching it
+# through `bitcoin::secp256k1` is not possible: the workspace pin is
+# `default-features = false`, so there is no context type to verify with.
+# A DEV-dependency, so `cargo build --release` for thumbv7em never sees it and
+# the image size is unchanged (re-measured: 282,080 B).
+secp256k1 = { version = "0.29", default-features = false, features = ["alloc"] }
+
+# `src/lib.rs`'s tests only: building a `TransactionTemplate` from RAW WIRE VALUES
+# (the shape a coordinator controls, which the builder API cannot express) needs
+# `ScriptBuf`/`OutPoint`/`Txid`, and `frostsnap_core` uses `bitcoin` everywhere but
+# does not re-export it. NOT a new package -- `bitcoin =0.32.8` is already a
+# NON-OPTIONAL dependency of `frostsnap_core` (decision 4) and this is the same
+# workspace pin, so the dev graph gains a name and nothing else. A DEV-dependency,
+# so `cargo build --release` for thumbv7em never sees it and the image is unchanged.
+bitcoin = { workspace = true }
+
+# `examples/stub.rs`: the `hostcheck` harness's device side, moved here from
+# `hal/examples/` so it drives THIS crate's `Session` dispatch -- the same code
+# the ARM image contains -- over `FakeFlash` at the shipped geometry, instead of
+# `FrostSigner::new_random` + `MemoryNonceSlot`. An EXAMPLE, so `cargo build
+# --release` for thumbv7em never sees it (it builds lib and bin targets only),
+# and it needs `std` for fds and `eprintln!`.
+#
+# `required-features` names the DEP feature, `coldsnap_hal/test-seam`, because
+# this package deliberately has no features of its own -- a feature on the device
+# crate would be a new way to type the bypass into a release build. The
+# dev-dependency above is what grants it; this line makes an unsatisfied build
+# fail loudly instead of silently producing a seam-less stub. Always name
+# `--example stub` explicitly: `--examples` with the requirement unmet is a
+# silent no-op.
+[[example]]
+name = "stub"
+required-features = ["coldsnap_hal/test-seam"]
+
+# `examples/heap_session.rs`: the heap budget in `coldsnap_hal::heap`, re-measured
+# against the SHIPPED construction (`Session::open` + `NonceAbSlot` over
+# `FakeFlash`) instead of `hal/examples/heap_profile.rs`'s `FrostSigner::new_random`
+# + `MemoryNonceSlot`. Same `linked_list_allocator =0.10.6` the image registers, in
+# an arena of exactly `heap::HEAP_BYTES`.
+#
+# ZERO new dependency lines, deliberately. It needs a real `FrostCoordinator`, i.e.
+# `frostsnap_core/coordinator` (std + tracing + BUNDLED rusqlite, a C SQLite build).
+# `frostsnap_core` is a workspace member, so that feature is switched on from the
+# command line and never in a manifest:
+#
+#   cargo run --release --target aarch64-apple-darwin -p coldsnap_firmware \
+#       --features frostsnap_core/coordinator --example heap_session
+#
+# Naming it in `required-features` is what keeps the gates untouched: `cargo test -p
+# coldsnap_firmware` has `test-seam` (from the dev-dependency) but NOT `coordinator`,
+# so this example is SKIPPED there and the 27-test command's dependency graph is
+# exactly what it was -- no rusqlite, no C SQLite build. `coldsnap_hal`'s own
+# `heap-profile` feature does NOT work here: it enables `frostsnap_core/coordinator`
+# through hal's DEV-dependency edge, which resolver = "2" applies only when building
+# hal's own dev targets, so the firmware graph never saw it (MEASURED: E0432,
+# `could not find coordinator in frostsnap_core`). A feature on THIS package would
+# have been the other route and is forbidden above.
+[[example]]
+name = "heap_session"
+required-features = ["coldsnap_hal/test-seam", "frostsnap_core/coordinator"]
+
+# `examples/simulator.rs`: the §4.2 screens, on a terminal, one keypress at a time.
+# Every pixel comes from `coldsnap_hal::ui` and every sign-approval page set from
+# `coldsnap_firmware::sign_consent`, so a layout or refusal bug shows up as itself
+# rather than as a mock that looks fine. ZERO new dependency lines: the frames are
+# printed with half-block chars from `core`, the fixtures use the `bitcoin` and
+# `coldsnap_hal` dev-dependencies already above, and the input is `std::io::stdin`
+# lines (line-buffered on purpose, so `printf '3\n8\n1\nq\n' | ...` scripts it).
+#
+# `test-seam` for the same reason `stub` needs it: a `ProvenSeed` has no other
+# constructor, and `Session::open` here is the SHIPPED construction over
+# `FakeFlash`. It deliberately does NOT ask for `frostsnap_core/coordinator` (which
+# `heap_session` above needs and which drags a C SQLite build): with no
+# coordinator there is no real `KeyGenPhase3`, so the two consent screens' t-of-n
+# and code are fixtures and the program says so on entry. `hostcheck` + `stub` is
+# what drives the real state machine over the wire; this drives the glass.
+[[example]]
+name = "simulator"
+required-features = ["coldsnap_hal/test-seam"]

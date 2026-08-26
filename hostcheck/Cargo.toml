@@ -1,0 +1,46 @@
+####################################################################
+# hostcheck — the phase-4 Tier-3 coordinator side.
+#
+# ITS OWN WORKSPACE, DELIBERATELY. This is not tidiness, it is the only thing
+# that works: a single cargo graph cannot hold both `coldsnap_hal` (which pulls
+# cold-snap's vendored frostsnap crates) and upstream `frostsnap_coordinator`
+# (which pulls the frostsnap checkout's own copies). `cargo generate-lockfile`
+# refuses outright —
+#
+#   package collision in the lockfile: packages frost_backup v0.1.0
+#   (cold-snap/vendor/frostsnap/frost_backup) and frost_backup v0.1.0
+#   (frostsnap/frost_backup) are different
+#
+# so the separation is enforced by cargo rather than by discipline. The root
+# workspace lists its 6 members explicitly with no globs, so this directory is
+# invisible to it.
+#
+# NOTHING HERE MAY EVER path-dep `coldsnap_hal` OR ANYTHING UNDER ../vendor/.
+# That is what keeps this 130-crate std graph — bundled SQLite compiled from C,
+# ring, tokio, rustls, three bdk_* crates, nusb — out of
+# `cargo build --release` for thumbv7em. Do not "tidy" this into the root
+# workspace members list; it will not resolve.
+#
+# Requires a sibling checkout at ../../frostsnap (upstream, read-only).
+####################################################################
+[package]
+name = "hostcheck"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# The REAL coordinator, unmodified, from the sibling checkout. Verified to have a
+# zero-line diff across 0bbc18be..bbce45d, so this is the same code cold-snap's
+# vendored crates were read against.
+frostsnap_coordinator = { path = "../../frostsnap/frostsnap_coordinator" }
+# Not a direct dependency: `frostsnap_coordinator` re-exports the serialport
+# crate (`pub use serialport;`), so taking it from there makes two versions of it
+# impossible by construction.
+anyhow = "1"
+# Already in this lockfile (frostsnap_core pulls it), so naming it directly adds
+# no crate to the graph. Wanted for one thing only: a FIXED-SEED rng, so a keygen
+# failure replays byte for byte instead of being a new random run each time.
+rand_chacha = "0.3.1"
+
+[workspace]

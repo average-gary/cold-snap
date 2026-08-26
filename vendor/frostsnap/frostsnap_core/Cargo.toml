@@ -1,0 +1,49 @@
+[package]
+name = "frostsnap_core"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+rand_core = { version = "0.6", default-features = false }
+# cold-snap: dropped upstream's "libsecp_compat_0_29" (decision 3). It only added
+# `From` impls converting secp256kfun types to/from C libsecp256k1 types; the four
+# call sites now do the same byte serialize/reparse explicitly. secp256kfun's own
+# arithmetic was always pure Rust (its sole backend is the vendored k256), so this
+# does not change any crypto — but it does remove secp256kfun as a parent of the C
+# crate. NOTE: C libsecp256k1 REMAINS in the graph via bitcoin 0.32.8, which
+# declares secp256k1 non-optionally, so a C cross-compiler is still required.
+schnorr_fun = { workspace = true, features = ["bincode", "serde","alloc", "share_backup", "vrf_cert_keygen"] }
+rand_chacha = { workspace = true }
+frostsnap_macros = { workspace = true }
+frost_backup = { workspace = true, default-features = false }
+sha2.workspace = true
+chacha20 = { version = "0.9", default-features = false }
+cipher = { version = "0.4", features = [ "rand_core" ], default-features = false }
+chacha20poly1305 = { version = "0.10", default-features = false }
+serde = { workspace = true }
+bitcoin = { workspace = true }
+bincode = { workspace = true }
+# cold-snap addition: forces hex-conservative/alloc on. bitcoin 0.32.8 exposes
+# no `alloc` feature, so without this its hex dependency compiles with neither
+# std nor alloc and fails. Not used directly by this crate's source.
+hex-conservative = { workspace = true }
+serde_json = { version = "1", optional = true }
+tracing = { workspace = true, optional = true }
+rusqlite = { workspace = true, optional = true }
+
+[dev-dependencies]
+rand = "0.8"
+frostsnap_comms = { workspace = true, features = ["coordinator"] }
+proptest-state-machine = "0.3"
+proptest = "=1.6.0"
+
+[features]
+std = ["tracing?/std", "schnorr_fun/std"]
+coordinator = ["std", "tracing", "rusqlite"]
+# cold-snap: upstream default is ["coordinator", "serde_json"], which pulls
+# std/rusqlite and cannot build for thumbv7em-none-eabihf. Default is empty
+# here so a bare `cargo build` targets the device. Host-side tooling must ask
+# for `coordinator` explicitly.
+default = []

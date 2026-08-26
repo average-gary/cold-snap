@@ -1,0 +1,52 @@
+[package]
+name = "frost_backup"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+schnorr_fun = { workspace = true, features = ["alloc"] }
+sha2 = { workspace = true, default-features = false }
+rand_core = { workspace = true }
+
+# optional
+rand = { workspace = true, optional = true }
+clap = { version = "4", optional = true, features = ["derive"] }
+bitcoin = { workspace = true, optional = true }
+bincode = { workspace = true, optional = true }
+miniscript = { version = "12.3", optional = true }
+
+[features]
+cli = [
+    "clap",
+    "std",
+    "rand",
+    "bitcoin",
+    "miniscript",
+]
+
+std = [
+    "schnorr_fun/std",
+    "sha2/std",
+    "bitcoin?/std",
+]
+
+# cold-snap: upstream default is ["cli"], which pulls clap/std/miniscript.
+# Default to the device-buildable feature set.
+default = ["bincode"]
+
+bincode = [
+    "dep:bincode",
+    "schnorr_fun/bincode"
+]
+
+[[bin]]
+name = "frost_backup"
+required-features = ["cli"]
+
+# cold-snap: upstream dev-deps dropped. They pull frostsnap_coordinator
+# (rusqlite/std) and miniscript, neither of which is vendored or buildable for
+# thumbv7em-none-eabihf. Upstream's own tests run in the frostsnap repo.
+[dev-dependencies]
+proptest = { workspace = true }
+secp256kfun = { workspace = true, features = ["proptest"] }
+rand = { workspace = true }

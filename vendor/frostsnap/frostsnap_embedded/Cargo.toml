@@ -1,0 +1,19 @@
+[package]
+name = "frostsnap_embedded"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bincode.workspace = true
+embedded-storage.workspace = true
+frostsnap_comms.workspace = true
+frostsnap_core.workspace = true
+rand_core.workspace = true
+
+[dev-dependencies]
+proptest = {  version = "1.6", features = ["std"] }
+
+[features]
+# cold-snap: upstream default is ["std"]; this crate runs on-device.
+default = []
+std = []

@@ -1,0 +1,32 @@
+[build]
+target = "thumbv7em-none-eabihf"
+
+# secp256k1-sys runs cc-rs, which looks for arm-none-eabi-gcc by default. clang
+# cross-compiles without a separate ARM toolchain install.
+#
+# This is required for as long as rust-bitcoin is retained (decision 4): bitcoin
+# 0.32.8 declares its `secp256k1` dependency NON-optionally, so secp256k1-sys and
+# cc-rs stay in the graph no matter what. Dropping schnorr_fun's
+# libsecp_compat_0_29 (done — PLAN.md §2.2) did NOT remove them; verified by
+# pointing CC at a nonexistent path afterwards, which still fails inside cc-rs.
+# Only dropping `bitcoin` itself removes the C toolchain requirement.
+[target.thumbv7em-none-eabihf]
+rustflags = [
+    # Cortex-M4F with single-precision FPU, matching Coldcard's stm32 port.
+    "-C", "target-cpu=cortex-m4",
+
+    # The firmware link script (memory map + containment ASSERTs). Under THIS
+    # target block only, so `--target aarch64-apple-darwin` host tests and
+    # `hostcheck` (which overrides `build.target` in its own nearer config) never
+    # see it. The path is resolved by the linker relative to cargo's invocation
+    # directory, which for every gate command is the workspace root.
+    #
+    # It reaches every ARM link, but only the `coldsnap_firmware` bin actually
+    # links for ARM: rlibs are not linked, and hal's examples/tests are host-only.
+    "-C", "link-arg=-Tfirmware/link.x",
+]
+
+[env]
+CC_thumbv7em_none_eabihf = "/opt/homebrew/opt/llvm/bin/clang"
+AR_thumbv7em_none_eabihf = "/opt/homebrew/opt/llvm/bin/llvm-ar"
+CFLAGS_thumbv7em_none_eabihf = "--target=thumbv7em-none-eabihf -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard -ffreestanding -Os"

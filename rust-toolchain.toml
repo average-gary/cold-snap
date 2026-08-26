@@ -1,0 +1,7 @@
+[toolchain]
+# Matches upstream frostsnap's pin so vendored sources build identically.
+channel = "1.88.0"
+components = ["rust-src", "rustfmt", "clippy"]
+# Coldcard Mk4: STM32L4S5, Cortex-M4F. The hard-float ABI is required —
+# ports/stm32 builds with -mfpu=fpv4-sp-d16 -mfloat-abi=hard.
+targets = ["thumbv7em-none-eabihf"]

@@ -1,0 +1,903 @@
+mod common;
+use common::*;
+use proptest::{
+    array,
+    prelude::*,
+    sample,
+    test_runner::{Config, RngAlgorithm, TestRng},
+};
+use std::collections::{BTreeMap, BTreeSet};
+
+use frostsnap_core::{
+    bitcoin_transaction::{LocalSpk, TransactionTemplate},
+    coordinator::{
+        BeginKeygen, CoordinatorToUserKeyGenMessage, CoordinatorToUserMessage,
+        CoordinatorToUserSigningMessage,
+    },
+    device::{DeviceToUserMessage, KeyGenPhase3, KeyPurpose, SignPhase1},
+    message::{self, DeviceSend, DeviceToCoordinatorMessage},
+    tweak::BitcoinBip32Path,
+    AccessStructureRef, DeviceId, KeygenId, SignSessionId, WireSignTask,
+};
+use proptest_state_machine::{
+    prop_state_machine, strategy::ReferenceStateMachine, StateMachineTest,
+};
+
+#[derive(Clone, Debug)]
+struct RefState {
+    run_start: Run,
+    pending_keygens: BTreeMap<KeygenId, RefKeygen>,
+    finished_keygens: Vec<RefFinishedKey>,
+    sign_sessions: Vec<RefSignSession>,
+    device_nonce_streams: BTreeMap<DeviceId, Vec<RefNonceStream>>,
+    n_nonce_slots: usize,
+    n_desired_nonce_streams_coord: usize,
+    nonce_batch_size: u32,
+}
+
+impl RefState {
+    pub fn n_devices(&self) -> usize {
+        self.run_start.devices.len()
+    }
+
+    fn is_stream_locked(&self, device_id: DeviceId, stream_id: usize) -> bool {
+        self.sign_sessions.iter().any(|session| {
+            !session.canceled && session.device_streams.get(&device_id) == Some(&stream_id)
+        })
+    }
+
+    fn get_device_stream_for_signing_session(
+        &mut self,
+        session: &RefSignSession,
+        device_id: &DeviceId,
+    ) -> &mut RefNonceStream {
+        let stream_id = session.device_streams[device_id];
+        &mut self.device_nonce_streams.get_mut(device_id).unwrap()[stream_id]
+    }
+
+    fn find_available_stream(&self, device_id: DeviceId, n_inputs: usize) -> Option<usize> {
+        self.device_nonce_streams
+            .get(&device_id)?
+            .iter()
+            .enumerate()
+            .find(|(stream_id, stream)| {
+                !self.is_stream_locked(device_id, *stream_id) && stream.nonces_available >= n_inputs
+            })
+            .map(|(stream_id, _)| stream_id)
+    }
+
+    fn max_available_nonces_for_device(&self, device_id: DeviceId) -> usize {
+        self.device_nonce_streams
+            .get(&device_id)
+            .and_then(|streams| {
+                streams
+                    .iter()
+                    .enumerate()
+                    .filter(|(stream_id, _)| !self.is_stream_locked(device_id, *stream_id))
+                    .map(|(_, stream)| stream.nonces_available)
+                    .max()
+            })
+            .unwrap_or(0)
+    }
+
+    fn cancel_session_and_consume_nonces(&mut self, session_idx: usize) {
+        let session = &mut self.sign_sessions[session_idx];
+        session.canceled = true;
+        let session = session.clone();
+
+        let devices_to_consume: Vec<_> = session
+            .sent_req_to
+            .difference(&session.got_sigs_from)
+            .cloned()
+            .collect();
+        for device_id in devices_to_consume {
+            let stream = self.get_device_stream_for_signing_session(&session, &device_id);
+            stream.nonces_available = stream.nonces_available.saturating_sub(session.n_inputs);
+        }
+    }
+
+    pub fn available_signing_devices(&self) -> BTreeSet<DeviceId> {
+        // A device is available if it has at least one unlocked stream with at least 1 nonce
+        self.device_nonce_streams
+            .iter()
+            .filter(|(device_id, streams)| {
+                streams.iter().enumerate().any(|(stream_id, stream)| {
+                    !self.is_stream_locked(**device_id, stream_id) && stream.nonces_available > 0
+                })
+            })
+            .map(|(device_id, _)| *device_id)
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RefSignSession {
+    key_index: usize,
+    devices: BTreeSet<DeviceId>,
+    n_inputs: usize,
+    device_streams: BTreeMap<DeviceId, usize>, // DeviceId -> stream_id
+    got_sigs_from: BTreeSet<DeviceId>,
+    sent_req_to: BTreeSet<DeviceId>,
+    canceled: bool,
+}
+
+impl RefSignSession {
+    pub fn finished(&self) -> bool {
+        self.devices == self.got_sigs_from
+    }
+
+    pub fn active(&self) -> bool {
+        !self.finished() && !self.canceled
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RefKeygen {
+    do_keygen: BeginKeygen,
+    devices_confirmed: BTreeSet<DeviceId>,
+}
+
+#[derive(Clone, Debug)]
+struct RefFinishedKey {
+    do_keygen: BeginKeygen,
+    deleted: bool,
+}
+
+#[derive(Clone, Debug)]
+struct RefNonceStream {
+    nonces_available: usize,
+}
+
+#[derive(Clone, Debug)]
+enum Transition {
+    CStartKeygen(BeginKeygen),
+    DKeygenAck {
+        device_id: DeviceId,
+        keygen_id: KeygenId,
+    },
+    CKeygenConfirm {
+        keygen_id: KeygenId,
+    },
+    CNonceReplenish {
+        device_id: DeviceId,
+    },
+    CStartSign {
+        key_index: usize,
+        devices: BTreeSet<DeviceId>,
+        n_inputs: usize,
+    },
+    CSendSignRequest {
+        session_index: usize,
+        device_id: DeviceId,
+    },
+    CCancelSignSession {
+        session_index: usize,
+    },
+    DAckSignRequest {
+        session_index: usize,
+        device_id: DeviceId,
+    },
+    CDeleteKey {
+        key_index: usize,
+    },
+}
+
+impl ReferenceStateMachine for RefState {
+    type State = RefState;
+
+    type Transition = Transition;
+
+    fn init_state() -> BoxedStrategy<Self::State> {
+        (1u16..8, 1usize..10, 1usize..4)
+            .prop_map(
+                move |(n_devices, n_nonce_slots, n_desired_nonce_streams_coord)| {
+                    let mut rng = TestRng::deterministic_rng(RngAlgorithm::ChaCha);
+                    let nonce_batch_size = 4u32; // Small batch size for testing
+                    let run = Run::generate_with_nonce_slots_and_batch_size(
+                        n_devices.into(),
+                        &mut rng,
+                        n_nonce_slots,
+                        nonce_batch_size,
+                    );
+
+                    RefState {
+                        run_start: run,
+                        pending_keygens: Default::default(),
+                        finished_keygens: Default::default(),
+                        sign_sessions: Default::default(),
+                        device_nonce_streams: Default::default(), // Start with no streams, CNonceReplenish will add them
+                        n_nonce_slots,
+                        n_desired_nonce_streams_coord,
+                        nonce_batch_size,
+                    }
+                },
+            )
+            .boxed()
+    }
+
+    fn transitions(state: &Self::State) -> BoxedStrategy<Self::Transition> {
+        let mut trans = vec![];
+
+        {
+            let possible_devices = sample::select(state.run_start.device_vec());
+            let devices_and_threshold =
+                proptest::collection::btree_set(possible_devices, 1..=state.n_devices())
+                    .prop_flat_map(|devices| (Just(devices.clone()), 1..=devices.len()));
+            let name = proptest::string::string_regex("[A-Z][a-z][a-z]")
+                .unwrap()
+                .no_shrink();
+            let keygen_id = array::uniform::<_, 16>(0..=u8::MAX)/* testing colliding keygen ids is not of interest */ .no_shrink();
+
+            let keygen_trans = (keygen_id, devices_and_threshold, name)
+                .prop_map(move |(keygen_id, (devices, threshold), key_name)| {
+                    Transition::CStartKeygen(BeginKeygen::new_with_id(
+                        devices.into_iter().collect(),
+                        threshold as u16,
+                        key_name,
+                        KeyPurpose::Bitcoin(bitcoin::Network::Regtest),
+                        KeygenId::from_bytes(keygen_id),
+                    ))
+                })
+                .boxed();
+
+            trans.push((1, keygen_trans));
+        }
+
+        for (&keygen_id, keygen) in &state.pending_keygens {
+            let candidates = keygen
+                .do_keygen
+                .devices_in_order
+                .iter()
+                .filter(|device_id| !keygen.devices_confirmed.contains(device_id))
+                .cloned()
+                .collect::<Vec<_>>();
+
+            if candidates.is_empty() {
+                trans.push((10, Just(Transition::CKeygenConfirm { keygen_id }).boxed()));
+            } else {
+                let device_ack = sample::select(candidates)
+                    .prop_map(move |device_id| Transition::DKeygenAck {
+                        keygen_id,
+                        device_id,
+                    })
+                    .boxed();
+
+                trans.push((10, device_ack));
+            }
+        }
+
+        let nonce_req = sample::select(state.run_start.device_vec())
+            .prop_map(|device_id| Transition::CNonceReplenish { device_id })
+            .boxed();
+
+        trans.push((3, nonce_req));
+
+        // sign request
+        {
+            let candidate_keys = state
+                .finished_keygens
+                .iter()
+                .cloned()
+                .enumerate()
+                .filter_map(|(key_index, key)| {
+                    let available = key
+                        .do_keygen
+                        .devices()
+                        .intersection(&state.available_signing_devices())
+                        .cloned()
+                        .map(|device_id| {
+                            (device_id, state.max_available_nonces_for_device(device_id))
+                        })
+                        .collect::<Vec<_>>();
+
+                    if available.len() > key.do_keygen.threshold as usize {
+                        Some((key_index, key, available))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            if !candidate_keys.is_empty() {
+                let start_sign = sample::select(candidate_keys)
+                    .prop_flat_map(|(key_index, key, available_devices)| {
+                            let sample = sample::select(available_devices);
+                            let signing_set = proptest::collection::btree_set(
+                                sample,
+                                key.do_keygen.threshold as usize,
+                            );
+
+                            signing_set
+                            .prop_flat_map(move |devices| {
+                                // Calculate minimum available nonces across selected devices
+                                let min_available_nonces = devices
+                                    .iter()
+                                    .map(|(_, nonces_available)| *nonces_available)
+                                    .min()
+                                    .unwrap_or(0);
+
+                                assert!(min_available_nonces > 0, "devices_with_nonces filter should ensure all devices have available nonces");
+
+                                let devices: BTreeSet<DeviceId> = devices.into_iter().map(|(device_id, _)| device_id).collect();
+
+                                // Generate n_inputs between 1 and min available
+                                (1..=min_available_nonces)
+                                    .prop_map(move |n_inputs| {
+                                        Some(Transition::CStartSign {
+                                            key_index,
+                                            devices: devices.clone(),
+                                            n_inputs,
+                                        })
+                                    })
+                                    .boxed()
+                            }
+)
+                                .boxed()
+                        }
+)
+                    .prop_filter_map("filter out None transitions", |x| x)
+                    .boxed();
+
+                trans.push((2, start_sign));
+            }
+        }
+
+        let unfinished_sesssions = state
+            .sign_sessions
+            .iter()
+            .filter(|session| !session.active())
+            .enumerate();
+
+        for (index, session) in unfinished_sesssions {
+            // coord send sign request
+            {
+                let candidates = session
+                    .devices
+                    .iter()
+                    // NOTE: We allow re-sending sign requests to device we've already sent it to but haven't got it from yet.
+                    .filter(|id| !session.got_sigs_from.contains(id))
+                    .copied()
+                    .collect::<Vec<_>>();
+                if !candidates.is_empty() {
+                    let next_to_ask = sample::select(candidates);
+                    let sign_req = next_to_ask
+                        .prop_map(move |device_id| Transition::CSendSignRequest {
+                            session_index: index,
+                            device_id,
+                        })
+                        .boxed();
+                    trans.push((10, sign_req));
+                }
+            }
+
+            // device ack sign request
+            {
+                let candidates = session.sent_req_to.clone().into_iter().collect::<Vec<_>>();
+                if !candidates.is_empty() {
+                    let selected = sample::select(candidates);
+                    let ack_sign = selected
+                        .prop_map(move |device_id| Transition::DAckSignRequest {
+                            session_index: index,
+                            device_id,
+                        })
+                        .boxed();
+                    trans.push((10, ack_sign));
+                }
+            }
+        }
+
+        // Coordinator cancel
+        if !state.sign_sessions.is_empty() {
+            let cancel_session = sample::select((0..state.sign_sessions.len()).collect::<Vec<_>>())
+                .prop_map(|session_index| Transition::CCancelSignSession { session_index })
+                .boxed();
+
+            trans.push((1, cancel_session));
+        }
+
+        if !state.finished_keygens.is_empty() {
+            let deletion_candidate =
+                sample::select((0..state.finished_keygens.len()).collect::<Vec<_>>());
+            let to_delete = deletion_candidate
+                .prop_map(|key_index| Transition::CDeleteKey { key_index })
+                .boxed();
+            trans.push((1, to_delete));
+        }
+
+        proptest::strategy::Union::new_weighted(trans).boxed()
+    }
+
+    fn preconditions(state: &Self::State, transition: &Self::Transition) -> bool {
+        match transition {
+            Transition::CStartKeygen(do_key_gen) => {
+                !state.pending_keygens.contains_key(&do_key_gen.keygen_id)
+                    && state
+                        .run_start
+                        .device_set()
+                        .is_superset(&do_key_gen.devices())
+            }
+            Transition::DKeygenAck {
+                device_id,
+                keygen_id,
+            } => match state.pending_keygens.get(keygen_id) {
+                Some(keygen_state) => {
+                    keygen_state.do_keygen.devices_in_order.contains(device_id)
+                        && !keygen_state.devices_confirmed.contains(device_id)
+                }
+                None => false,
+            },
+            Transition::CKeygenConfirm { keygen_id } => {
+                match state.pending_keygens.get(keygen_id) {
+                    Some(keygen_state) => {
+                        keygen_state.devices_confirmed.len()
+                            == keygen_state.do_keygen.devices_in_order.len()
+                    }
+                    None => false,
+                }
+            }
+            Transition::CNonceReplenish { device_id } => {
+                state.run_start.device_set().contains(device_id)
+            }
+            Transition::CStartSign {
+                key_index,
+                devices,
+                n_inputs,
+            } => match state.finished_keygens.get(*key_index) {
+                Some(keygen)
+                    if !keygen.deleted
+                        && keygen.do_keygen.devices().is_superset(devices)
+                        && state.available_signing_devices().is_superset(devices) =>
+                {
+                    // Check that all devices have enough nonces available for n_inputs
+                    devices.iter().all(|device_id| {
+                        state.max_available_nonces_for_device(*device_id) >= *n_inputs
+                    })
+                }
+                _ => false,
+            },
+            Transition::CSendSignRequest {
+                session_index,
+                device_id,
+            } => match state.sign_sessions.get(*session_index) {
+                Some(session) => {
+                    session.devices.contains(device_id)
+                        && session.key_index < state.finished_keygens.len()
+                        && !state.finished_keygens[session.key_index].deleted
+                        && !session.canceled
+                }
+                None => false,
+            },
+            Transition::CCancelSignSession { session_index } => {
+                match state.sign_sessions.get(*session_index) {
+                    Some(session) => {
+                        session.key_index < state.finished_keygens.len()
+                            && !state.finished_keygens[session.key_index].deleted
+                            && !session.canceled
+                    }
+                    None => false,
+                }
+            }
+            Transition::DAckSignRequest {
+                session_index,
+                device_id,
+            } => match state.sign_sessions.get(*session_index) {
+                Some(session) => {
+                    session.sent_req_to.contains(device_id)
+                        && session.key_index < state.finished_keygens.len()
+                        && !state.finished_keygens[session.key_index].deleted
+                        && !session.got_sigs_from.contains(device_id)
+                        && !session.canceled
+                }
+                None => false,
+            },
+            &Transition::CDeleteKey { key_index } => key_index < state.finished_keygens.len(),
+        }
+    }
+
+    fn apply(mut state: Self::State, transition: &Self::Transition) -> Self::State {
+        match transition.clone() {
+            Transition::CStartKeygen(do_keygen) => {
+                state.pending_keygens.insert(
+                    do_keygen.keygen_id,
+                    RefKeygen {
+                        do_keygen,
+                        devices_confirmed: Default::default(),
+                    },
+                );
+            }
+            Transition::DKeygenAck {
+                keygen_id,
+                device_id,
+            } => {
+                if let Some(state) = state.pending_keygens.get_mut(&keygen_id) {
+                    state.devices_confirmed.insert(device_id);
+                }
+            }
+            Transition::CKeygenConfirm { keygen_id } => {
+                if let Some(keygen) = state.pending_keygens.remove(&keygen_id) {
+                    state.finished_keygens.push(RefFinishedKey {
+                        do_keygen: keygen.do_keygen,
+                        deleted: false,
+                    });
+                }
+            }
+            Transition::CNonceReplenish { device_id } => {
+                // Initialize or replenish nonce streams for this device
+                let streams = state
+                    .device_nonce_streams
+                    .entry(device_id)
+                    .or_insert_with(|| {
+                        // Create n_nonce_slots streams for this device
+                        (0..state.n_nonce_slots)
+                            .map(|_| RefNonceStream {
+                                nonces_available: 0,
+                            })
+                            .collect()
+                    });
+
+                // Replenish up to n_desired_nonce_streams_coord streams
+                // The coordinator requests this many streams to be replenished
+                let streams_to_replenish =
+                    streams.iter_mut().take(state.n_desired_nonce_streams_coord);
+                for stream in streams_to_replenish {
+                    stream.nonces_available = state.nonce_batch_size as usize;
+                }
+            }
+            Transition::CStartSign {
+                key_index,
+                devices,
+                n_inputs,
+            } => {
+                // Assign streams to each device (locking them)
+                let mut device_streams = BTreeMap::new();
+                for device in &devices {
+                    // Find the first available stream for this device
+                    let stream_id = state
+                        .find_available_stream(*device, n_inputs)
+                        .expect("state transition should be valid");
+                    device_streams.insert(*device, stream_id);
+                }
+
+                state.sign_sessions.push(RefSignSession {
+                    key_index,
+                    devices,
+                    n_inputs,
+                    device_streams,
+                    got_sigs_from: Default::default(),
+                    sent_req_to: Default::default(),
+                    canceled: false,
+                })
+            }
+            Transition::CSendSignRequest {
+                session_index,
+                device_id,
+            } => {
+                let session = state.sign_sessions.get_mut(session_index).unwrap();
+                session.sent_req_to.insert(device_id);
+                // Nonces aren't consumed here - they're only consumed if session is canceled
+            }
+            Transition::CCancelSignSession { session_index } => {
+                state.cancel_session_and_consume_nonces(session_index);
+            }
+            Transition::DAckSignRequest {
+                session_index,
+                device_id,
+            } => {
+                let session = &mut state.sign_sessions[session_index];
+                session.got_sigs_from.insert(device_id);
+                let session = session.clone();
+                let nonce_batch_size = state.nonce_batch_size as usize;
+
+                // Replenish nonces after signing (device sends back replenishment)
+                let stream = state.get_device_stream_for_signing_session(&session, &device_id);
+                stream.nonces_available = nonce_batch_size;
+            }
+            Transition::CDeleteKey { key_index } => {
+                let sessions_to_cancel: Vec<_> = state
+                    .sign_sessions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, session)| session.key_index == key_index)
+                    .map(|(idx, _)| idx)
+                    .collect();
+
+                for session_idx in sessions_to_cancel {
+                    state.cancel_session_and_consume_nonces(session_idx);
+                }
+                state.finished_keygens[key_index].deleted = true;
+            }
+        }
+
+        state
+    }
+}
+
+/// This tests that all valid transitions can occur without panicking. This has marginal benefit for
+/// security but tests any state transition the user should be able to make happen while using the system.
+struct HappyPathTest {
+    run: Run,
+    rng: TestRng,
+    env: ProptestEnv,
+    finished_keygens: Vec<AccessStructureRef>,
+    sign_sessions: Vec<SignSessionId>,
+}
+
+#[derive(Default, Debug)]
+pub struct ProptestEnv {
+    device_keygen_acks: BTreeMap<KeygenId, BTreeMap<DeviceId, KeyGenPhase3>>,
+    sign_reqs: BTreeMap<SignSessionId, BTreeMap<DeviceId, SignPhase1>>,
+    coordinator_keygen_acks: BTreeSet<KeygenId>,
+    finished_signatures: BTreeSet<SignSessionId>,
+}
+
+impl Env for ProptestEnv {
+    fn user_react_to_coordinator(
+        &mut self,
+        _run: &mut Run,
+        message: CoordinatorToUserMessage,
+        _rng: &mut impl RngCore,
+    ) {
+        match message {
+            CoordinatorToUserMessage::KeyGen {
+                keygen_id,
+                inner:
+                    CoordinatorToUserKeyGenMessage::KeyGenAck {
+                        all_acks_received: true,
+                        ..
+                    },
+            } => {
+                self.coordinator_keygen_acks.insert(keygen_id);
+            }
+            CoordinatorToUserMessage::Signing(signing_update) => match signing_update {
+                CoordinatorToUserSigningMessage::GotShare { .. } => { /* ignore for now */ }
+                CoordinatorToUserSigningMessage::Signed { session_id, .. } => {
+                    self.finished_signatures.insert(session_id);
+                }
+            },
+            _ => { /* nothing needs doing */ }
+        }
+    }
+
+    fn user_react_to_device(
+        &mut self,
+        run: &mut Run,
+        from: DeviceId,
+        message: DeviceToUserMessage,
+        _rng: &mut impl RngCore,
+    ) {
+        use DeviceToUserMessage::*;
+        match message {
+            FinalizeKeyGen { .. } => {
+                // TODO: Do we need to keep track of keygen-finalized messages received by the user?
+                // TODO: Ignore for now.
+            }
+            CheckKeyGen { phase, .. } => {
+                let pending = self.device_keygen_acks.entry(phase.keygen_id).or_default();
+                pending.insert(from, *phase);
+            }
+            SignatureRequest { phase } => {
+                self.sign_reqs
+                    .entry(phase.session_id)
+                    .or_default()
+                    .insert(from, *phase);
+            }
+            Restoration(_msg) => {
+                // TODO: proptest restoration
+            }
+            VerifyAddress { .. } => {
+                // we dont actually confirm on the device
+            }
+            NonceJobs(mut batch) => {
+                // Run the batch to completion and send a single response
+                batch.run_until_finished(&mut TestDeviceKeyGen);
+                let segments = batch.into_segments();
+                let response =
+                    DeviceSend::ToCoordinator(Box::new(DeviceToCoordinatorMessage::Signing(
+                        message::signing::DeviceSigning::NonceResponse { segments },
+                    )));
+                run.extend_from_device(from, vec![response]);
+            }
+        }
+    }
+}
+
+impl StateMachineTest for HappyPathTest {
+    type SystemUnderTest = Self;
+
+    type Reference = RefState;
+
+    fn init_test(
+        ref_state: &<Self::Reference as ReferenceStateMachine>::State,
+    ) -> Self::SystemUnderTest {
+        let rng = TestRng::deterministic_rng(RngAlgorithm::ChaCha);
+        HappyPathTest {
+            run: ref_state.run_start.clone(),
+            rng,
+            env: ProptestEnv::default(),
+            finished_keygens: Default::default(),
+            sign_sessions: Default::default(),
+        }
+    }
+
+    fn apply(
+        mut state: Self::SystemUnderTest,
+        ref_state: &<Self::Reference as ReferenceStateMachine>::State,
+        transition: <Self::Reference as ReferenceStateMachine>::Transition,
+    ) -> Self::SystemUnderTest {
+        let HappyPathTest {
+            run,
+            rng,
+            env,
+            finished_keygens,
+            sign_sessions,
+        } = &mut state;
+        match transition {
+            Transition::CStartKeygen(do_keygen) => {
+                use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
+                let mut seed = [0u8; 32];
+                rng.fill_bytes(&mut seed);
+                let mut coordinator_rng = ChaCha20Rng::from_seed(seed);
+                let do_keygen = run
+                    .coordinator
+                    .begin_keygen(do_keygen, &mut coordinator_rng)
+                    .unwrap();
+                run.extend(do_keygen);
+            }
+            Transition::DKeygenAck {
+                keygen_id,
+                device_id,
+            } => {
+                let pending = env.device_keygen_acks.get_mut(&keygen_id).unwrap();
+                let phase = pending.remove(&device_id).unwrap();
+                let ack = run
+                    .device(device_id)
+                    .keygen_ack(phase, &mut TestDeviceKeyGen, rng)
+                    .unwrap();
+                run.extend_from_device(device_id, ack);
+            }
+            Transition::CKeygenConfirm { keygen_id } => {
+                if env.coordinator_keygen_acks.remove(&keygen_id) {
+                    let send_finalize_keygen = run
+                        .coordinator
+                        .finalize_keygen(keygen_id, TEST_ENCRYPTION_KEY, rng)
+                        .unwrap();
+                    let access_structure_ref = send_finalize_keygen.access_structure_ref;
+                    run.extend(send_finalize_keygen);
+                    finished_keygens.push(access_structure_ref);
+                } else {
+                    panic!("CKeygenConfirm for non-existent keygen");
+                }
+            }
+            Transition::CNonceReplenish { device_id } => {
+                let messages = run.coordinator.maybe_request_nonce_replenishment(
+                    &BTreeSet::from([device_id]),
+                    ref_state.n_desired_nonce_streams_coord,
+                    rng,
+                );
+                run.extend(messages);
+            }
+            Transition::CStartSign {
+                key_index,
+                devices,
+                n_inputs,
+            } => {
+                let as_ref = finished_keygens[key_index];
+                let key_data = run.coordinator.get_frost_key(as_ref.key_id).unwrap();
+                let master_appkey = key_data.complete_key.master_appkey;
+
+                // Generate a bitcoin transaction with n_inputs
+                let mut tx_template = TransactionTemplate::new();
+
+                // Add n_inputs owned inputs with random amounts
+                let mut total_in = 0u64;
+                for i in 0..n_inputs {
+                    let amount = 100_000 + (rng.next_u64() % 900_000); // 100k to 1M sats
+                    total_in += amount;
+                    tx_template.push_imaginary_owned_input(
+                        LocalSpk {
+                            master_appkey,
+                            bip32_path: BitcoinBip32Path::external(i as u32),
+                        },
+                        bitcoin::Amount::from_sat(amount),
+                    );
+                }
+
+                // Add output with some fee
+                let fee = 10_000; // 10k sats fee
+                let change = total_in.saturating_sub(fee);
+                if change > 0 {
+                    tx_template.push_owned_output(
+                        bitcoin::Amount::from_sat(change),
+                        LocalSpk {
+                            master_appkey,
+                            bip32_path: BitcoinBip32Path::internal(0),
+                        },
+                    );
+                }
+
+                let task = WireSignTask::BitcoinTransaction(tx_template);
+                let session_id = run
+                    .coordinator
+                    .start_sign(as_ref, task, &devices, rng)
+                    .unwrap();
+                sign_sessions.push(session_id);
+            }
+            Transition::CSendSignRequest {
+                session_index,
+                device_id,
+            } => {
+                let session_id = sign_sessions[session_index];
+
+                let req =
+                    run.coordinator
+                        .request_device_sign(session_id, device_id, TEST_ENCRYPTION_KEY);
+                run.extend(req);
+            }
+            Transition::CCancelSignSession { session_index } => {
+                let session_id = sign_sessions[session_index];
+                run.coordinator.cancel_sign_session(session_id);
+            }
+            Transition::DAckSignRequest {
+                session_index,
+                device_id,
+            } => {
+                let session_id = sign_sessions[session_index];
+
+                let phase = env
+                    .sign_reqs
+                    .get_mut(&session_id)
+                    .unwrap()
+                    .remove(&device_id)
+                    .unwrap();
+                let sign_ack = run
+                    .device(device_id)
+                    .sign_ack(phase, &mut TestDeviceKeyGen)
+                    .unwrap();
+                run.extend_from_device(device_id, sign_ack);
+            }
+            Transition::CDeleteKey { key_index } => {
+                let as_ref = finished_keygens[key_index];
+                run.coordinator.delete_key(as_ref.key_id);
+            }
+        }
+
+        run.run_until_finished(env, rng).unwrap();
+        state
+    }
+
+    fn check_invariants(
+        state: &Self::SystemUnderTest,
+        ref_state: &<Self::Reference as ReferenceStateMachine>::State,
+    ) {
+        for (session_index, session) in ref_state.sign_sessions.iter().enumerate() {
+            if session.finished() {
+                let ssid = state.sign_sessions[session_index];
+                assert!(state.env.finished_signatures.contains(&ssid));
+            }
+        }
+    }
+}
+
+// Setup the state machine test using the `prop_state_machine!` macro
+prop_state_machine! {
+    #![proptest_config(Config {
+        // Enable verbose mode to make the state machine test print the
+        // transitions for each case.
+        verbose: 1,
+        cases: 512,
+        .. Config::default()
+    })]
+
+    #[test]
+    fn state_machine_happy(
+        // This is a macro's keyword - only `sequential` is currently supported.
+        sequential
+        // The number of transitions to be generated for each case. This can
+        // be a single numerical value or a range as in here.
+        15..30
+        // Macro's boilerplate to separate the following identifier.
+        =>
+        // The name of the type that implements `StateMachineTest`.
+        HappyPathTest
+    );
+}

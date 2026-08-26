@@ -1,0 +1,9 @@
+# Cargo searches parent directories for config, so without this the repo root's
+# `.cargo/config.toml` would set `build.target = thumbv7em-none-eabihf` here too
+# and try to cross-compile bundled SQLite and ring to bare metal. A nearer config
+# wins for scalar keys, so this overrides it.
+#
+# Hardcoding the host triple matches what the root config already does with the
+# Homebrew clang paths. Change both together on a non-arm64 machine.
+[build]
+target = "aarch64-apple-darwin"
