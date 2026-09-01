@@ -13,6 +13,13 @@
 # there. Its stdout is /dev/null under xterm (:974), so its banner, its startup
 # self-checks and one line per keypress go to $SCRATCH/child.log.
 #
+#   tools/sim-window.sh              scenes, as before: no device, nothing live
+#   tools/sim-window.sh --relay      the child relays a LIVE session's frames instead
+#   tools/sim-window.sh --self-test  8s windowless run, four assertions, no human
+#
+# --relay just exports COLDSNAP_GLASS_SOCKET (see below). The two compose: --self-test
+# --relay checks the child still exits on numpad EOF while it is waiting for a device.
+#
 # Snapshots (ctrl-Z) and movies (ctrl-E) land in $SCRATCH/sim, not in the Coldcard
 # repo, because simulator.py writes them relative to its cwd -- which is our
 # scratch dir. So `--segregate` is not needed and is not passed.
@@ -48,7 +55,36 @@ import sdl2, sdl2.ext, numpy, PIL
 EOF
 
 SELFTEST=0
-if [ "${1:-}" = "--self-test" ]; then SELFTEST=1; shift; fi
+RELAY="${COLDSNAP_GLASS_SOCKET:-}"
+while :; do
+    case "${1:-}" in
+    --self-test) SELFTEST=1; shift ;;
+    # RELAY MODE: hand the child a socket path and it stops being a scene player --
+    # frames come from a LIVE session in another process (hostcheck's stub, driven by a
+    # real coordinator) and keys go back to it. LIVE-GLASS-PLAN §3.
+    #
+    # A path, because an fd cannot get there: the coordinator side must hold the pty
+    # MASTER (FIONREAD on a darwin master always returns 0), a master has no name, and
+    # simulator.py spawns its child with a fixed pass_fds list. The path travels as an
+    # env var because simulator.py copies os.environ into the child (:851, :970), so
+    # THEIR TREE IS STILL NOT TOUCHED -- no patch, no argv splicing, nothing to restore.
+    #
+    # Default path lives in $SCRATCH, which this script clears on every run, so the
+    # stale-socket case the child refuses to bind cannot survive a restart.
+    --relay)
+        shift
+        case "${1:-}" in ''|-*) ;; *) RELAY="$1"; shift ;; esac
+        RELAY="${RELAY:-$SCRATCH/glass.sock}"
+        ;;
+    *) break ;;
+    esac
+done
+if [ -n "$RELAY" ]; then
+    export COLDSNAP_GLASS_SOCKET="$RELAY"
+    # Only ever a socket, never a regular file: the child BINDS this path, and a
+    # leftover from a killed window would make it refuse to start.
+    if [ -S "$RELAY" ]; then rm -f "$RELAY"; fi
+fi
 
 BIN="${COLDSNAP_SIM_BIN:-}"
 if [ -z "$BIN" ]; then
@@ -90,6 +126,10 @@ EOF
 chmod +x "$SCRATCH/bin/xterm"
 
 printf 'child stdout/stderr -> %s\n' "$SCRATCH/child.log"
+if [ -n "$RELAY" ]; then
+    printf 'RELAY MODE: the child holds no Session; it listens on %s\n' "$RELAY"
+    printf '            device side: COLDSNAP_GLASS_SOCKET=%s <coordinator harness>\n' "$RELAY"
+fi
 cd "$SCRATCH/sim"
 
 if [ "$SELFTEST" = 1 ]; then

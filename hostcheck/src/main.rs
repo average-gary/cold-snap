@@ -143,6 +143,55 @@
 //!    DOES NOT VERIFY: 1 sig(s) over "cold-snap M5" against master_appkey 03c5..`**,
 //!    exit 1 at **1.36 s**. Restored and `diff`ed clean.
 //!
+//!  M6 (LIVE GLASS -- the two new assertions and the timeout scale). THREE passes
+//!  now: `STUB_CHUNK=64`, `STUB_CHUNK=1`, then a DECLINE pass in which the stub's
+//!  scripted consent (`COLDSNAP_GLASS_KEYS=yx`) presses `x` at every signing
+//!  screen. The two signature passes are unchanged in what they assert AND in the
+//!  aggregate signature they produce (`sig = 81b118f3dcf2ac15..`, byte-identical
+//!  before and after), because the `glass=` report draws no randomness; the only
+//!  wire difference is 9 extra `Debug` frames, MEASURED as the stub's first write
+//!  growing 1,818 -> 2,286 B.
+//!
+//!  1. THE GLASS SHOWS THE COORDINATOR'S CODE. The stub renders the real
+//!     `CheckKeyGen` screen with the shipped `prompt_screen`, reads the four bytes
+//!     back out of the framebuffer with the shipped `ui::Frame::cell_2x`, and
+//!     reports them as `Debug{glass=<8 hex>}`; this process compares them against
+//!     its own session-hash prefix. This is PLAN.md §9 item 12's OPEN half --
+//!     screen-to-coordinator. The core-to-core half already existed, below.
+//!  2. A DECLINED PROMPT YIELDS NO SIGNATURE, both halves: 9/9 `declined=` on the
+//!     wire AND zero `GotShare` from the coordinator's own accounting.
+//!
+//!  All RUN at chunk 64, each file restored and `diff`ed byte-identical after:
+//!  - ONE NIBBLE of the RENDERED code corrupted (the stub overwrites the drawn 2x
+//!    glyph with an `f` after `prompt_screen` returns, i.e. the device verified the
+//!    right transcript and drew the wrong code): **`GLASS CODE MISMATCH: <id>
+//!    RENDERED f25f9b9b ... session hash starts d25f9b9b`**, exit 1. Note that
+//!    every other assertion in the run still passed, which is the point of having
+//!    this one.
+//!  - THE SCRIPT STOPS READING THE PIXELS (`advertised_key` hardcodes `1`, which is
+//!    still correct for the keygen screen and cannot be correct for a randomised
+//!    signing digit): stub dies `1 prompt(s) DECLINED but STUB_EXPECT_DECLINES=0`,
+//!    surfacing here as `stub exited 2`, exit 1. Same failure with NO source
+//!    mutation at all, via `COLDSNAP_GLASS_KEYS=y9`, `=y1` and `=y2` -- a
+//!    hardcoded key cannot pass, which is what makes the glass read structural
+//!    rather than decorative.
+//!  - CONSENT THEATRE (stub declines on the glass and hands over a share anyway):
+//!    **`A DECLINED PROMPT PRODUCED A SIGNATURE`**, exit 1, while the two signature
+//!    passes still pass -- so the decline pass discriminates rather than just being
+//!    fragile.
+//!  - Same mutation with the loop's guard disabled: the post-loop half catches it
+//!    independently, **`DECLINE IGNORED: 9/9 device(s) declined and yet 9 signature
+//!    share(s) arrived`**, exit 1.
+//!  - The DECLINE pass stops declining (`yx` -> `yy`): **`A DECLINED PROMPT
+//!    PRODUCED A SIGNATURE: 0/9 device(s) reported declining`**, exit 1 -- it
+//!    cannot silently degrade into a third signature pass.
+//!  - TIMEOUT SCALE. `COLDSNAP_TIMEOUT_SCALE` unset is `Duration * 1`: the default
+//!    run's assertions, counts and signature are unchanged, and with the
+//!    CheckKeyGen ack dropped the deadline still reads `DEADLINE (35s) in state
+//!    KeygenAwaitingAcks ... elapsed=35.000289625s`, matching M3's 35.0000 s
+//!    exactly. At `=2` the same mutation reads `DEADLINE (70s) ...
+//!    elapsed=70.000580875s`, and `=10` passes all three passes normally.
+//!
 //! Usage: `hostcheck [path-to-stub-binary]`. Build the stub FIRST and pass the
 //! artifact -- never `cargo run`: the child's stdout IS the wire, and one stray
 //! byte of cargo progress output desynchronises the magic scan permanently.
@@ -156,7 +205,7 @@ use std::os::fd::{AsFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -354,6 +403,72 @@ const WATCHDOG_SLACK: Duration = Duration::from_secs(2);
 /// knob to turn if a real device legitimately stops reading for seconds mid-sign.
 const WRITE_STALL_LIMIT: Duration = Duration::from_secs(5);
 
+/// Multiplies every cumulative budget in [`State::budget`] — and so the
+/// once-per-pass watchdog too, which is derived from the largest one
+/// (`COLDSNAP_TIMEOUT_SCALE`, default **1**).
+///
+/// Default 1 means `Duration * 1`, so the automated gate's 5 s / 35 s / 65 s bounds
+/// and every mutation measurement in the header above are bit-for-bit unchanged.
+/// The factor exists for the window: a human takes seconds per screen and there are
+/// two consent screens per device back to back, so no single honest budget covers
+/// both a human and two debug builds talking to each other. LIVE-GLASS-PLAN §10
+/// says exactly that — the gate does not survive "unchanged by a single line", and
+/// this is the line.
+///
+/// The stub inherits this variable (we spawn it) and scales its own 90 s watchdog
+/// by it, which is the load-bearing part: that watchdog's contract is being ~2.5x
+/// OUR bound, so scaling one side and not the other would put the stub in charge of
+/// killing a slow run and throw away the diagnosis.
+///
+/// NOT scaled, deliberately, and both are budgets in name only:
+///  - `PORT_TIMEOUT` — the read path's tick, not a deadline. Scaling it would make
+///    every failure up to `scale x 250 ms` late and buy nothing, because a slow
+///    human does not make the pty slow.
+///  - `WRITE_STALL_LIMIT` — a parked write needs the DEVICE to stop draining fd 0,
+///    and the stub drains from a dedicated thread (`spawn_reader`) that a prompt
+///    parked on a keypress cannot block. Thinking does not stall a write.
+///
+/// Read ONCE: `budget()` runs every 2 ms lap.
+fn timeout_scale() -> u32 {
+    static SCALE: OnceLock<u32> = OnceLock::new();
+    *SCALE.get_or_init(|| {
+        std::env::var("COLDSNAP_TIMEOUT_SCALE")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            // A 0 would make every budget instantly expired, i.e. a typo would
+            // look like a device fault.
+            .filter(|&n| n > 0)
+            .unwrap_or(1)
+    })
+}
+
+/// What a pass is trying to prove, because there are now two opposite things.
+///
+/// [`Expect::Decline`] is not "the run may fail": it is a pass with its own
+/// assertions, and a signature appearing during it is a FAILURE. LIVE-GLASS-PLAN
+/// §10 is explicit that a decline without an explicit expectation must fail the
+/// gate, so the expectation is a value the pass carries rather than a log line
+/// somebody reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Expect {
+    /// The default gate: 9 consents, a signature that verifies.
+    Signature,
+    /// Every device presses `x` at the signing screen. Keygen still completes (so
+    /// the glass assertion still runs), and then NOTHING may sign.
+    Decline,
+}
+
+/// How long the decline pass keeps reading after the last device has said no,
+/// before it will believe the absence of a signature share.
+///
+/// It does not need to be long and it is not a guess: a device's `declined=` Debug
+/// and a `SignatureShare` it wrongly produced anyway are pushed to the SAME
+/// `Outbox` and cross in the same write, so by the time this process has decoded
+/// the ninth decline a share is either already decoded or the next thing in the pty
+/// buffer. One second is ~500 laps of this loop. Scaled with everything else so a
+/// human-latency run does not shorten it relative to the rest.
+const DECLINE_GRACE: Duration = Duration::from_secs(1);
+
 /// Coordinator-side states. `NAMES` is the single source of truth for the
 /// spelling, because both the loop's own error and the watchdog thread (which
 /// has only an integer) print from it.
@@ -402,13 +517,16 @@ impl State {
     /// adds its own budget on top of the ones before it, so the handshake keeps
     /// M2's 5 s exactly and keygen's mutations keep dying at 35 s.
     fn budget(self) -> Duration {
-        match self {
+        let base = match self {
             State::WaitingForMagic | State::WaitingForAnnounces => HANDSHAKE_DEADLINE,
             State::NonceReplenish | State::SigningAwaitingShares => {
                 HANDSHAKE_DEADLINE + KEYGEN_DEADLINE + SIGN_DEADLINE
             }
             _ => HANDSHAKE_DEADLINE + KEYGEN_DEADLINE,
-        }
+        };
+        // Step 6. `* 1` by default, so every number above and every measurement in
+        // the header stands.
+        base * timeout_scale()
     }
 }
 
@@ -635,19 +753,38 @@ fn main() -> Result<()> {
     // provably reassembles across reads. So the realistic setting proves the
     // least, and keygen must pass at 1 as well -- that is the reassembly case for
     // frames an order of magnitude bigger than M1's 59-byte Announce.
+    if timeout_scale() != 1 {
+        eprintln!(
+            "hostcheck: COLDSNAP_TIMEOUT_SCALE={} -- every budget multiplied. This is NOT the \
+             automated gate's configuration; it exists so a human at the simulator window can \
+             take seconds per screen.",
+            timeout_scale()
+        );
+    }
+
     for chunk in [64usize, 1] {
         eprintln!("--- pass: STUB_CHUNK={chunk} ---");
-        one_pass(&stub, chunk, &t0).with_context(|| format!("pass STUB_CHUNK={chunk}"))?;
+        one_pass(&stub, chunk, &t0, Expect::Signature)
+            .with_context(|| format!("pass STUB_CHUNK={chunk}"))?;
     }
+    // THE DECLINE PASS. Same binary, same wire, same keygen; the only difference is
+    // that the scripted consent presses `x` at every signing screen. It asserts the
+    // half of consent the two passes above cannot: that saying no actually refuses.
+    // One chunk size is enough — this pass is about the consent decision, and
+    // reassembly is already proven at 1 by the pass above.
+    eprintln!("--- pass: DECLINE (every device presses x at the signing screen) ---");
+    one_pass(&stub, 64, &t0, Expect::Decline).context("pass DECLINE")?;
     println!(
         "M1+M2+M3+M5 PASS: real {THRESHOLD}-of-{N_DEVICES} keygen, nonce replenishment and a signature that \
          VERIFIES against the group key, across the pty at both chunk sizes, including the \
-         1-byte case that forces reassembly"
+         1-byte case that forces reassembly; the 4-byte code ON THE GLASS equals the \
+         coordinator's session hash on every device; and a declined signing prompt yields no \
+         signature at all"
     );
     Ok(())
 }
 
-fn one_pass(stub: &str, chunk: usize, t0: &Instant) -> Result<()> {
+fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()> {
     // (master, slave). The master has `port_name: None` and so cannot be
     // reopened by path -- handing it over as the child's stdio is the whole
     // reason this works cross-process.
@@ -661,9 +798,34 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant) -> Result<()> {
 
     let mut cmd = Command::new(stub);
     cmd.env("STUB_CHUNK", chunk.to_string())
+        // FAIL CLOSED on the stub's own side: 0 makes it die by name on the first
+        // unexpected decline instead of going quiet, and the decline pass below has
+        // to declare how many it wants. Set explicitly rather than left to the
+        // stub's default so an exported `STUB_EXPECT_DECLINES` in somebody's shell
+        // cannot loosen the signature passes.
+        .env("STUB_EXPECT_DECLINES", "0")
         .stdin(Stdio::from(wire_in))
         .stdout(Stdio::from(wire_out))
+        // Still INHERIT, and that is now a decision rather than a default: the
+        // glass assertion crosses the workspace boundary on the WIRE (a
+        // `DeviceSendBody::Debug{glass=...}` this loop intercepts), not on stderr,
+        // so nothing here needs to parse the child's diagnostics. `hostcheck`
+        // cannot depend on `coldsnap_firmware` — one cargo graph will not hold both
+        // `coldsnap_hal` and upstream `frostsnap_coordinator` — so only bytes may
+        // cross, and the existing `Debug` back-channel is already a bounded,
+        // intercepted, protocol-inert one. Piping stderr would have meant a second
+        // channel, a second parser and a reader thread to keep it from filling its
+        // pipe.
         .stderr(Stdio::inherit());
+    if expect == Expect::Decline {
+        // `y` at the keygen check (so assertion 1 still runs in this pass), `x` at
+        // every signing screen. `COLDSNAP_GLASS_KEYS` is deliberately NOT set for a
+        // signature pass: unset is the stub's default `yy`, which keeps the
+        // automated gate on the default path AND lets a human run e.g.
+        // `COLDSNAP_GLASS_KEYS=y9 cargo run` to watch a hardcoded-key script fail.
+        cmd.env("COLDSNAP_GLASS_KEYS", "yx")
+            .env("STUB_EXPECT_DECLINES", N_DEVICES.to_string());
+    }
     let mut child = cmd.spawn().with_context(|| format!("spawn {stub}"))?;
     // Drop the parent's copies of the master fds NOW, so the stub exiting gives
     // the slave a clean EOF instead of a port that stays open forever.
@@ -714,6 +876,17 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant) -> Result<()> {
     // can move the protocol along; they can only be compared at PASS.
     let mut device_hashes: std::collections::BTreeMap<DeviceId, String> = Default::default();
     let mut refused_erase: std::collections::BTreeSet<DeviceId> = Default::default();
+    // What each device's KEYGEN CHECK SCREEN actually rendered, read back out of
+    // the framebuffer on the device side by the shipping `ui::Frame::cell_2x` and
+    // sent as `glass=<8 hex>`. Compared at PASS against our own session hash's
+    // first four bytes — see the block by that name.
+    let mut device_glass: std::collections::BTreeMap<DeviceId, String> = Default::default();
+    // Devices that DECLINED the signing prompt. Arrives on the same intercepted
+    // `Debug` channel, because the protocol has no decline variant — that is a
+    // finding of this work, not a shortcut.
+    let mut declined: std::collections::BTreeSet<DeviceId> = Default::default();
+    // When the last device said no, i.e. when [`DECLINE_GRACE`] starts.
+    let mut all_declined_at: Option<Instant> = None;
     let mut lied = false;
     let mut keygen: Option<Keygen> = None;
     let mut sign = Sign::default();
@@ -946,6 +1119,28 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant) -> Result<()> {
                                     eprintln!("hostcheck: {from} says session_hash={value}");
                                     device_hashes.insert(from, value.to_string());
                                 }
+                                // ASSERTION 1's raw material: the 8 hex characters
+                                // the device's keygen-check SCREEN actually drew,
+                                // read back off the framebuffer over there. Not
+                                // trusted here — compared at PASS.
+                                Some(("glass", value)) => {
+                                    eprintln!(
+                                        "hostcheck: {from} says its GLASS shows {value}"
+                                    );
+                                    device_glass.insert(from, value.to_string());
+                                }
+                                // ASSERTION 2's raw material. The protocol has no
+                                // decline variant, so a "no" can only ever arrive
+                                // as this plus silence where a share would be —
+                                // which is why the pass checks BOTH halves.
+                                Some(("declined", what)) => {
+                                    eprintln!(
+                                        "hostcheck: {from} DECLINED {what} at the glass"
+                                    );
+                                    if what == "SignatureRequest" {
+                                        declined.insert(from);
+                                    }
+                                }
                                 Some(("refused", what)) => {
                                     eprintln!(
                                         "hostcheck: {from} REFUSED {what} (a frame our own \
@@ -1120,8 +1315,39 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant) -> Result<()> {
 
             // The coordinator has aggregated. Verification happens below, OUTSIDE
             // the loop, and the pass hinges on it -- not on getting here.
-            if sign.signatures.is_some() {
-                break Ok(());
+            match expect {
+                Expect::Signature => {
+                    if sign.signatures.is_some() {
+                        break Ok(());
+                    }
+                }
+                Expect::Decline => {
+                    // ASSERTION 2, and this is the sharp end of it: every device
+                    // said no and the coordinator aggregated anyway, which means
+                    // `x` did not refuse. Caught HERE rather than after the loop
+                    // because there is nothing left to wait for.
+                    if sign.signatures.is_some() {
+                        break Err(anyhow::anyhow!(
+                            "A DECLINED PROMPT PRODUCED A SIGNATURE: {}/{N_DEVICES} device(s) \
+                             reported declining the SignatureRequest and the coordinator still \
+                             aggregated from {} share(s) -- pressing `x` does not refuse",
+                            declined.len(),
+                            sign.got_shares.len()
+                        ));
+                    }
+                    // Everyone has said no. Keep reading for the grace period
+                    // before believing the absence of a share (see DECLINE_GRACE),
+                    // then this pass is done -- there is no point sitting out the
+                    // 65 s signing budget for a signature that must not come.
+                    if declined.len() == N_DEVICES
+                        && all_declined_at
+                            .get_or_insert_with(Instant::now)
+                            .elapsed()
+                            > DECLINE_GRACE * timeout_scale()
+                    {
+                        break Ok(());
+                    }
+                }
             }
             if sign.session_id.is_some() {
                 state = State::SigningAwaitingShares;
@@ -1216,6 +1442,45 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant) -> Result<()> {
                 }
             }
 
+            // ========= ASSERTION 1: THE GLASS SHOWS THE COORDINATOR'S CODE =========
+            // PLAN.md §9 item 12's OPEN half. The cross-check above is
+            // core-to-core: the hash the device COMPUTED against the one we
+            // computed. This is SCREEN-to-coordinator -- the four bytes
+            // `ui::keygen_check` actually RENDERED, read back out of the
+            // framebuffer by the shipping `ui::Frame::cell_2x` (the exact inverse
+            // of the `text_2x` that drew them, not a second implementation of the
+            // mapping) and reported as `glass=`.
+            //
+            // Why it is worth its own assertion when the hash already matches:
+            // those four bytes are the ENTIRE anti-MITM defence, because they are
+            // what a human reads aloud and compares between devices. A device that
+            // verified the right transcript and then drew the wrong code -- a
+            // truncation, a nibble swap, the wrong end of the hash, a 1x blit
+            // where a 2x one was meant -- passed every check above it.
+            //
+            // And it is not merely additional: with step 0's randomised confirm
+            // digit the scripted consent CANNOT press the right key without
+            // reading the same framebuffer, so a device that renders the wrong
+            // screen fails this pass whether or not anyone compares these bytes.
+            // This assertion names the failure; the gate would fail regardless.
+            let want_glass: String = want.chars().take(8).collect();
+            if device_glass.len() != N_DEVICES {
+                bail!(
+                    "only {}/{N_DEVICES} device(s) reported what is ON THE GLASS: \
+                     {device_glass:?}",
+                    device_glass.len()
+                );
+            }
+            for (id, got) in &device_glass {
+                if *got != want_glass {
+                    bail!(
+                        "GLASS CODE MISMATCH: {id} RENDERED {got} on the screen a human reads \
+                         aloud, but this coordinator's session hash starts {want_glass} -- the \
+                         device verified the right transcript and drew the wrong code"
+                    );
+                }
+            }
+
             // ================= THE FORGED DataErase WAS REFUSED =================
             if refused_erase.len() != N_DEVICES {
                 bail!(
@@ -1224,6 +1489,57 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant) -> Result<()> {
                      obeyed it or dropped it silently",
                     refused_erase.len()
                 );
+            }
+
+            // ============ ASSERTION 2: A DECLINED PROMPT YIELDS NO SIGNATURE ============
+            // Everything above still had to hold -- keygen completed, the hashes
+            // agreed, the glass matched, the forged erase was refused -- so the
+            // ONLY difference between this pass and the two before it is the key
+            // pressed at the signing screen. That is what makes it evidence about
+            // consent rather than about a broken run.
+            //
+            // BOTH halves, because a refusal has no protocol message and so each
+            // half alone is ambiguous: the `declined=` lines could be a device
+            // declining everything (which is why keygen had to complete first), and
+            // "no signature" alone is also what a dead device looks like.
+            if expect == Expect::Decline {
+                if declined.len() != N_DEVICES {
+                    bail!(
+                        "only {}/{N_DEVICES} device(s) reported declining the SignatureRequest \
+                         (declined: {declined:?}) -- a device that neither declined nor signed \
+                         dropped the prompt, which is not a refusal",
+                        declined.len()
+                    );
+                }
+                // The teeth. A device that declines on its screen and hands over a
+                // share anyway has performed consent theatre, and this is the only
+                // thing that catches it: shares are counted from the coordinator's
+                // own `GotShare`, not from anything the device says about itself.
+                if !sign.got_shares.is_empty() || sign.signatures.is_some() {
+                    bail!(
+                        "DECLINE IGNORED: {}/{N_DEVICES} device(s) declined and yet {} signature \
+                         share(s) arrived ({:?}), aggregated={} -- the screen said no and the \
+                         device signed",
+                        declined.len(),
+                        sign.got_shares.len(),
+                        sign.got_shares,
+                        sign.signatures.is_some()
+                    );
+                }
+                std::io::stderr().flush().ok();
+                eprintln!(
+                    "  pass ok: DECLINE -- keygen {} FINISHED in {:?} and the glass matched on \
+                     {}/{N_DEVICES} devices, then all {}/{N_DEVICES} device(s) pressed `x` at \
+                     the signing screen and NOT ONE signature share reached the coordinator\
+                     \n    so `x` genuinely refuses: the only thing that changed from the \
+                     passes above is the key pressed at the glass",
+                    kg.id,
+                    started.elapsed(),
+                    device_glass.len(),
+                    declined.len(),
+                );
+                reap(&mut child);
+                return Ok(());
             }
 
             // ===================== M5: THE SIGNATURE MUST VERIFY =====================
@@ -1279,6 +1595,9 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant) -> Result<()> {
                  reports matched our own access structure\
                  \n    session_hash AGREED device<->coordinator on {}/{N_DEVICES} devices \
                  (two processes, two copies of frostsnap_core)\
+                 \n    THE GLASS shows {want_glass} on {}/{N_DEVICES} devices -- the 4 bytes \
+                 `ui::keygen_check` RENDERED, read back with `Frame::cell_2x`, equal this \
+                 coordinator's session-hash prefix\
                  \n    forged DataErase REFUSED by {}/{N_DEVICES} devices, and they still signed\
                  \n    largest coordinator->device frame actually written: {} B \
                  (old FRAME_LIMIT was 2060, so this keygen was previously REFUSED)",
@@ -1293,6 +1612,7 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant) -> Result<()> {
                 sign.signers.len(),
                 held.len(),
                 device_hashes.len(),
+                device_glass.len(),
                 refused_erase.len(),
                 MAX_DOWN_B.load(Ordering::Relaxed),
             );

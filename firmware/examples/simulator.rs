@@ -62,12 +62,25 @@
 //! of drawing ASCII — see [`sim_fds`], [`push`] and [`gui`]. No SSD1306 is
 //! involved either way: the window is a decoder for the same 1,024 bytes the
 //! terminal front-end prints, and every "DOES NOT PROVE" line below still holds.
+//!
+//! RELAY front-end — the same window, but the frames are drawn by a LIVE session in
+//! another process instead of by the scene table here:
+//!   tools/sim-window.sh --relay
+//! With `COLDSNAP_GLASS_SOCKET` set this program builds and self-checks its scenes as
+//! usual and then never looks at them: it binds that path, and once a device dials in
+//! it relays 1,024-byte frames from the socket to the display fd and Mk4 keys from the
+//! numpad fd to the socket. It holds no `Session` and no state machine — see [`relay`]
+//! for why the socket is a PATH and not an fd, and which side listens. That is what
+//! finally puts a real coordinator's keygen-check code on the glass, since the third
+//! paragraph below is exactly the gap it closes.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufRead, Read, Write};
 use std::os::fd::FromRawFd;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::mpsc;
 
 use bitcoin::{Amount, Network, OutPoint, ScriptBuf, TxOut, WitnessProgram, WitnessVersion};
 use coldsnap_firmware::{sign_consent, DebugFlash, Fault, Outbox, Session};
@@ -172,6 +185,18 @@ fn art(f: &Frame) -> String {
 /// past it and renders a byte-rotated screen. Never wrap this fd in a `BufWriter`
 /// — an 8 KiB buffer would swallow eight frames and freeze the window.
 fn push(out: &mut impl Write, f: &Frame) -> std::io::Result<()> {
+    push_bytes(out, f.as_bytes())
+}
+
+/// [`push`] for a frame that arrived as bytes rather than as a [`Frame`] — the relay
+/// case, where the pixels were drawn in another process. Same single write, same
+/// warning; `Frame` has no byte constructor and does not need one, since nothing here
+/// looks at the pixels.
+///
+/// The caller must hand over exactly [`ui::FRAME_BYTES`]; [`relay`] guarantees that by
+/// reading a fixed-size buffer, and a short read there is a hard error rather than a
+/// short frame here.
+fn push_bytes(out: &mut impl Write, bytes: &[u8]) -> std::io::Result<()> {
     // A single `write`, NOT `write_all`, so a short write becomes OBSERVABLE instead
     // of being silently papered over.
     //
@@ -195,7 +220,6 @@ fn push(out: &mut impl Write, f: &Frame) -> std::io::Result<()> {
     // drains up to 1,024,000 bytes non-blocking on every SDL event-loop pass and we
     // write only on a state change, so the buffer should never approach full. If this
     // warning ever appears, that assumption was wrong.
-    let bytes = f.as_bytes();
     let n = out.write(bytes)?;
     if n != bytes.len() {
         eprintln!(
@@ -361,20 +385,24 @@ fn sim_fds() -> Option<[i32; 4]> {
     }
 }
 
-/// The window front-end. Same scenes, same `Frame`s, same [`apply_key`]; the only
-/// difference from the terminal loop is where the bytes go and where the keys come
-/// from.
-fn gui(scenes: &[Scene], [display, numpad, led, _data]: [i32; 4], refused: &str) {
-    // stdout is /dev/null under the launcher (`unix/simulator.py:974`), so the
-    // header and the self-check result go to stderr or nowhere.
-    eprintln!("{BANNER}");
-    eprintln!("Refusals confirmed by real code on startup: {refused}");
-    eprintln!("Display stream self-check passed: every frame one write of 1024 B.\n");
+/// The Mk4 membrane pad as raw bytes, and the whole key filter for both window
+/// front-ends. Anything else that arrives on the numpad fd is not a keypress: the
+/// all-up `b"\0"` a click delivers behind the key, and the `\n` of ctrl-M's 30x
+/// `b"y\n"` (`unix/simulator.py:1070`).
+///
+/// The all-up byte is DROPPED, not forwarded, and that is now correct by decision
+/// rather than by luck: the two screens that authorise a signature used to print
+/// `hold 1`, a gesture this keypad cannot produce (their numpad emits keydown and
+/// all-up only), and step 0 replaced it with a randomised `Press (n)` digit. With no
+/// hold to detect there is nothing downstream that wants to know a key came back up.
+const PAD_KEYS: &[u8] = b"0123456789xy";
 
-    // SAFETY: simulator.py created these pipes and cleared CLOEXEC for them via
-    // `pass_fds`; nothing else in this process has them.
-    let mut disp = unsafe { File::from_raw_fd(display) };
-    let mut pad = unsafe { File::from_raw_fd(numpad) };
+/// The two fds either window front-end needs, plus the one write that turns the
+/// window's genuine LED green.
+///
+/// SAFETY: simulator.py created these pipes and cleared CLOEXEC for them via
+/// `pass_fds`; nothing else in this process has them.
+fn window_fds([display, numpad, led, _data]: [i32; 4]) -> (File, File) {
     if led >= 0 {
         // `[mask, state]` (`unix/variant/machine.py:39`), the one write their child
         // also does (`unix/variant/ckcc.py:19`). Without it the window's genuine
@@ -382,6 +410,194 @@ fn gui(scenes: &[Scene], [display, numpad, led, _data]: [i32; 4], refused: &str)
         // the parent holds its own copy of the write end, so it sees no EOF.
         let _ = unsafe { File::from_raw_fd(led) }.write_all(&[0xff, 0x01]);
     }
+    unsafe { (File::from_raw_fd(display), File::from_raw_fd(numpad)) }
+}
+
+/// RELAY MODE — this process stops being a device and becomes a dumb terminal.
+///
+/// It holds no `Session`, no scenes and no state machine: frames come off an AF_UNIX
+/// socket and go to the display fd, keypresses come off the numpad fd and go to the
+/// socket. Every pixel was drawn by `coldsnap_hal::ui` in the OTHER process — the one
+/// hostcheck's real `frostsnap_coordinator` is talking to — so the glass finally shows
+/// a live session instead of a fixture. LIVE-GLASS-PLAN §3.
+///
+/// WHY A PATH AND NOT AN fd, which is the constraint the whole topology hangs off: the
+/// coordinator side must hold the pty MASTER (`FIONREAD` on a darwin master always
+/// returns 0 and `frostsnap_coordinator` calls exactly that ioctl), a master has no
+/// name, and `simulator.py` spawns us with a fixed `pass_fds` list, so no fd of theirs
+/// can cross into this process. A path can. `simulator.py` copies `os.environ` into the
+/// child (`:851`, `:970`), so `COLDSNAP_GLASS_SOCKET` reaches us without patching one
+/// byte of their tree — see [`relay_path`].
+///
+/// WE LISTEN, THE DEVICE DIALS IN. The window is the long-lived half and its launcher
+/// already owns a scratch directory to put the path in; the device process is spawned
+/// later by hostcheck and can retry. The reverse polarity would need a connect-retry
+/// loop here for a path that does not exist yet.
+///
+/// FRAME DISCIPLINE is the one thing a byte relay can still get wrong, so it is
+/// explicit: a socket read is not a frame boundary, so a fixed [`ui::FRAME_BYTES`]
+/// buffer is filled first and handed to [`push_bytes`] as ONE write. Streaming the
+/// socket straight into the fd (`io::copy`, or any `BufWriter`) would split frames at
+/// the reader's chunk size and trip the parent's `assert len(buf) == 1024`
+/// (`unix/simulator.py:461`), which kills the window with a Python traceback that says
+/// nothing about us.
+fn relay(path: &str, fds: [i32; 4]) {
+    let (mut disp, mut pad) = window_fds(fds);
+    eprintln!(
+        "RELAY MODE: this process is a byte relay, not a device. It holds no Session.\n\
+         Frames come from whoever connects to {path}; keys go back to them. The PIXELS\n\
+         are real -- drawn by coldsnap_hal::ui in that process -- and nothing else is:\n\
+         no SSD1306, no SPI, no keypad driver, no bootloader, no ARM image, no glass.\n\
+         Nothing in this process has touched hardware."
+    );
+
+    // Bind, or say why on stderr AND on the glass: in relay mode the window is the
+    // only thing a human is looking at, and stdout is /dev/null under the launcher.
+    let listener = match UnixListener::bind(path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!(
+                "relay: cannot bind '{path}' ({e}).\n\
+                 A stale socket file from a previous window is the usual cause -- \
+                 `rm {path}` -- or the directory does not exist. tools/sim-window.sh \
+                 --relay puts it in its own scratch dir, which it clears on every run."
+            );
+            let _ = push(&mut disp, &note_frame(&format!("RELAY: bind failed {e}")));
+            return;
+        }
+    };
+    let _ = push(&mut disp, &note_frame(&format!("relay: waiting for a device on {path}")));
+
+    // The numpad reader runs BEFORE `accept`, and that ordering is the point of the
+    // channel: while no device has dialled in the main thread is parked in `accept`
+    // and would never notice the parent dying, which is precisely the orphan
+    // `tools/sim-window.sh --self-test` check 4 exists to catch. This thread is the
+    // only reader of the numpad fd, so EOF is seen from the first second.
+    let (tx, rx) = mpsc::channel::<UnixStream>();
+    std::thread::spawn(move || {
+        let mut sock: Option<UnixStream> = None;
+        loop {
+            let mut buf = [0u8; 64];
+            let n = match pad.read(&mut buf) {
+                // The parent exited (ctrl-Q / window closed) and its numpad_w copy
+                // went with it. `exit` from this thread is deliberate: it is the whole
+                // quit path, and the main thread is blocked on a socket that may never
+                // speak again.
+                Ok(0) => {
+                    eprintln!("numpad EOF -- window closed. Nothing was signed, nothing was flashed.");
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("numpad read failed ({e}) -- exiting.");
+                    std::process::exit(1);
+                }
+                Ok(n) => n,
+            };
+            // One read can carry several bytes: a click delivers the key and the
+            // all-up `b"\0"` back to back, and ctrl-M writes 30x b"y\n" (`:1070`).
+            let pressed: Vec<u8> = buf[..n].iter().copied().filter(|k| PAD_KEYS.contains(k)).collect();
+            if pressed.is_empty() {
+                continue;
+            }
+            if sock.is_none() {
+                // First real key: block until there is somewhere to send it. A press
+                // before a device connects is meaningless, but queueing it beats
+                // eating it silently. `Err` = main gave up, so there never will be.
+                match rx.recv() {
+                    Ok(s) => sock = Some(s),
+                    Err(_) => return,
+                }
+            }
+            let sock = sock.as_mut().expect("just filled");
+            if let Err(e) = sock.write_all(&pressed) {
+                eprintln!("relay: key write failed ({e}) -- device gone, exiting.");
+                std::process::exit(1);
+            }
+            eprintln!("relay: key(s) {:?} -> device", String::from_utf8_lossy(&pressed));
+        }
+    });
+
+    let (mut sock, _) = match listener.accept() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("relay: accept failed ({e}) -- exiting.");
+            return;
+        }
+    };
+    eprintln!("relay: device connected on {path}. The glass is live.");
+    // ponytail: ONE device per window. When this connection ends the relay exits and
+    // the window goes dark until the launcher is re-run -- which matches §7 (one panel
+    // shows one of the nine signers) but does mean a two-pass hostcheck run needs two
+    // windows. Re-accepting in a loop is two lines HERE and a rework of the key thread,
+    // which holds a clone of THIS connection; do that only if someone actually wants
+    // one window across passes.
+    let keys = match sock.try_clone() {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("relay: cannot clone the socket ({e}) -- exiting.");
+            return;
+        }
+    };
+    let _ = tx.send(keys);
+
+    // socket -> display. One frame in, one 1,024-byte write out, forever.
+    let mut frame = [0u8; ui::FRAME_BYTES];
+    loop {
+        // The first byte separately, ONLY so that "the device exited" (every normal
+        // run) is distinguishable from "the device died mid-frame" (a real bug).
+        // `read_exact` collapses both into UnexpectedEof.
+        match sock.read(&mut frame[..1]) {
+            Ok(0) => {
+                eprintln!("relay: device closed the socket. Nothing was flashed.");
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("relay: socket read failed ({e}) -- exiting.");
+                return;
+            }
+        }
+        if let Err(e) = sock.read_exact(&mut frame[1..]) {
+            eprintln!(
+                "relay: PARTIAL FRAME ({e}) -- a frame is exactly {} bytes and the device \
+                 stopped mid-frame. NOT forwarding it: every later frame would be offset \
+                 by the remainder and every screen would render as garbage.",
+                ui::FRAME_BYTES
+            );
+            return;
+        }
+        if let Err(e) = push_bytes(&mut disp, &frame) {
+            // EPIPE: the parent is gone (it dies on its own length assert before it
+            // gets to `xterm.kill()`, so this is the other half of the no-orphan
+            // rule). Rust ignores SIGPIPE, so we have to notice.
+            eprintln!("display pipe closed ({e}) -- parent gone, exiting.");
+            return;
+        }
+    }
+}
+
+/// The relay socket path, or `None` for the scene front-ends.
+///
+/// An env var rather than an argv flag, having read both routes: `simulator.py` builds
+/// `cc_cmd` as `[...] + pass_fds + metal_args + scan_args + sys.argv[1:] + [socket_path]`
+/// (`:926`) and spawns it with `env=os.environ.copy()` (`:851`), so BOTH cross — but the
+/// env var costs one line and cannot be misparsed positionally, which is the failure
+/// [`sim_fds`] already has to warn about at length. Empty is treated as unset so a
+/// launcher can pass the variable through unconditionally.
+fn relay_path() -> Option<String> {
+    std::env::var("COLDSNAP_GLASS_SOCKET").ok().filter(|p| !p.is_empty())
+}
+
+/// The window front-end. Same scenes, same `Frame`s, same [`apply_key`]; the only
+/// difference from the terminal loop is where the bytes go and where the keys come
+/// from.
+fn gui(scenes: &[Scene], fds: [i32; 4], refused: &str) {
+    // stdout is /dev/null under the launcher (`unix/simulator.py:974`), so the
+    // header goes to stderr or nowhere.
+    eprintln!("{BANNER}");
+    eprintln!("Refusals confirmed by real code on startup: {refused}");
+
+    let (mut disp, mut pad) = window_fds(fds);
 
     let mut here: Option<usize> = None;
     let mut page = 0usize;
@@ -424,12 +640,11 @@ fn gui(scenes: &[Scene], [display, numpad, led, _data]: [i32; 4], refused: &str)
                 }
                 // One read can carry several bytes: a mouse click delivers the key
                 // and the all-up `b"\0"` back to back, and ctrl-M writes 30x b"y\n"
-                // (`:1070`). Anything not on the Mk4 pad -- `\0`, `\n` -- is not a
-                // keypress.
+                // (`:1070`). [`PAD_KEYS`] is the filter both front-ends use.
                 Ok(n) => keys.extend(
                     buf[..n]
                         .iter()
-                        .filter(|b| b"0123456789xy".contains(b))
+                        .filter(|b| PAD_KEYS.contains(b))
                         .map(|b| *b as char),
                 ),
             }
@@ -1077,10 +1292,19 @@ fn main() {
     // either way. See `check_display_stream` for what it does and does not cover.
     check_display_stream(&scenes);
 
-    // The window front-end, when simulator.py launched us and put its pipe fds on
-    // our argv. Everything above this line is identical for both.
+    // The window front-ends, when simulator.py launched us and put its pipe fds on our
+    // argv. Everything above this line is identical for all three -- and the scenes are
+    // still built and self-checked in relay mode, where they go unused, because that
+    // costs milliseconds and keeps ONE startup path.
     if let Some(fds) = sim_fds() {
-        gui(&scenes, fds, &refused.join(", "));
+        // stdout is /dev/null under the launcher (`unix/simulator.py:974`).
+        eprintln!("Display stream self-check passed: every frame one write of 1024 B.\n");
+        match relay_path() {
+            // A live coordinator session, drawn in another process. LIVE-GLASS-PLAN §3.
+            Some(path) => relay(&path, fds),
+            // Scenes, as before: no socket, no device, no install.
+            None => gui(&scenes, fds, &refused.join(", ")),
+        }
         return;
     }
 

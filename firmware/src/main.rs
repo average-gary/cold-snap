@@ -287,11 +287,18 @@ fn boot() -> ! {
     /// device saying no is something a user is entitled to see.
     ///
     /// Nothing here can be *confirmed*: there is no button driver, so the prompt
-    /// is the end of the road. See the module docs.
-    fn draw_prompt(panel: Option<&mut display::Panel>, prompt: &DeviceToUserMessage) {
+    /// is the end of the road. See the module docs. `confirm` is the randomised
+    /// digit the signing screens print — drawn per prompt by the caller from
+    /// `rng::Entropy` — and until a button driver exists nothing reads the key it
+    /// asks for, which is why the digit is passed in rather than remembered here.
+    fn draw_prompt(
+        panel: Option<&mut display::Panel>,
+        prompt: &DeviceToUserMessage,
+        confirm: ui::ConfirmDigit,
+    ) {
         let Some(panel) = panel else { return };
         let mut frame = ui::Frame::new();
-        if prompt_screen(&mut frame, prompt) == Ok(false) {
+        if prompt_screen(&mut frame, prompt, confirm) == Ok(false) {
             return;
         }
         let _ = panel.show(frame.as_bytes());
@@ -566,7 +573,13 @@ fn boot() -> ! {
                                 // the outbox after `poll` returns.
                                 Ok(prompts) => {
                                     for prompt in &prompts {
-                                        draw_prompt(panel.as_mut(), prompt);
+                                        // A fresh digit per prompt, from the
+                                        // same proven entropy the signer uses.
+                                        draw_prompt(
+                                            panel.as_mut(),
+                                            prompt,
+                                            ui::ConfirmDigit::draw(&mut entropy),
+                                        );
                                     }
                                 }
                                 // A policy refusal is worth a screen — it is the

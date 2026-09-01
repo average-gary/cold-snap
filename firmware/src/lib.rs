@@ -611,7 +611,17 @@ impl<'a, F: NorFlash + fmt::Debug> Session<'a, F> {
         // The `Frame` is 1,024 B on the stack of a function that already runs on
         // `boot`'s frame (548,268 B of runway, MEASURED), which is cheaper than
         // a second copy of the renderability rules.
-        match prompt_screen(&mut ui::Frame::new(), &prompt) {
+        // The digit drawn here is thrown away with the frame, and that is not a
+        // hole: `confirm` means "the human already read the screen and pressed
+        // the digit it showed", so the key check belongs to whoever held THAT
+        // frame — the caller, with the `ConfirmDigit` it drew and rendered. This
+        // call is the renderability gate only. Drawn from `rng` rather than
+        // hardcoded so no fixed digit exists anywhere for a script to find.
+        match prompt_screen(
+            &mut ui::Frame::new(),
+            &prompt,
+            ui::ConfirmDigit::draw(rng),
+        ) {
             Ok(true) => {}
             Ok(false) => return Err(Fault::NotConfirmable),
             Err(refusal) => return Err(Fault::Refused(refusal)),
@@ -762,7 +772,22 @@ pub fn sign_consent<T>(
 /// four remaining §4.2 screens (backup display, backup entry, the quiz, address
 /// verify) have no caller because every message that reaches them is refused in
 /// [`Session::recv`]; adding one would be a lie about what the device does.
-pub fn prompt_screen(frame: &mut ui::Frame, prompt: &DeviceToUserMessage) -> Result<bool, Refusal> {
+///
+/// `confirm` is the randomised digit the two **signing** screens print, drawn by
+/// the caller from its own RNG (on ARM `rng::Entropy`, never libngu — PLAN.md
+/// §1). One value flows from here into the legend, and the caller holds the same
+/// value to answer the keypress with
+/// [`ui::ConfirmDigit::accepts`](coldsnap_hal::ui::ConfirmDigit::accepts): the
+/// screen that DISPLAYS the digit and the logic that ACCEPTS it are the same
+/// `ConfirmDigit`, so they cannot disagree. `keygen_check` deliberately keeps its
+/// plain `1=match` — the stronger gesture belongs on the screens that authorise
+/// a signature, which was the pre-existing split and the only part of it that
+/// was wrong was that it asked for a *hold* the numpad cannot produce.
+pub fn prompt_screen(
+    frame: &mut ui::Frame,
+    prompt: &DeviceToUserMessage,
+    confirm: ui::ConfirmDigit,
+) -> Result<bool, Refusal> {
     let shown = match prompt {
         DeviceToUserMessage::CheckKeyGen { phase } => {
             let (threshold, parties) = phase.t_of_n();
@@ -784,7 +809,7 @@ pub fn prompt_screen(frame: &mut ui::Frame, prompt: &DeviceToUserMessage) -> Res
             // showing 64 characters of 4,000 while signing all 4,000 is a blind
             // signer. Until this was wired into `confirm`, such a request was
             // drawn as a refusal and then signed anyway.
-            SignTask::Test { message } => ui::sign_test_message(frame, message)
+            SignTask::Test { message } => ui::sign_test_message_confirm(frame, message, confirm)
                 .map(|()| true)
                 .map_err(|_| Refusal::Undisplayable),
             // Page 0 of the validated set. `sign_consent` — the same call
@@ -795,7 +820,15 @@ pub fn prompt_screen(frame: &mut ui::Frame, prompt: &DeviceToUserMessage) -> Res
             // and `SignPage::Confirm` is last: a human cannot reach consent
             // without stepping through every page, and nothing can step. The
             // cursor belongs with the input driver (phase 5), not here.
-            _ => match sign_consent(phase.sign_task(), |pages| pages.render(0, frame)) {
+            // `confirming` attaches the digit to the whole page set, so it is
+            // `SignPage::Confirm` — the page that authorises — that prints it,
+            // wherever a page cursor eventually lands. Page 0 is not that page,
+            // so a bitcoin request shows no confirm key YET; there is still no
+            // button driver to advance the cursor, and a legend on a page that
+            // cannot consent would be the same lie `hold 1` was.
+            _ => match sign_consent(phase.sign_task(), |pages| {
+                pages.confirming(confirm).render(0, frame)
+            }) {
                 Ok(Some(true)) => Ok(true),
                 // `render` says the page could not be drawn in full, or
                 // `sign_consent` says this is not a task with a page set at all

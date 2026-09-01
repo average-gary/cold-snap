@@ -563,6 +563,49 @@ impl Frame {
         }
         None
     }
+
+    /// Read back the character of the **2× glyph** whose top-left cell is
+    /// (`col`, `row`) — the exact inverse of [`Frame::text_2x`]. One glyph per
+    /// call, so a caller reading a run of them steps `col` by 2.
+    ///
+    /// Reconstructs the source byte from the even destination columns of both
+    /// byte-rows and then requires a byte-for-byte font-table match, so it is
+    /// `None` unless those pixels are exactly some glyph doubled — a
+    /// vertical-only double, an off-by-one row and a wrong glyph all fail,
+    /// where a "some pixels are set" check would pass. It samples the even
+    /// columns only; the horizontal duplication in the odd columns is asserted
+    /// separately, against the 1× glyph, by
+    /// `text_2x_doubles_in_both_axes_and_round_trips_through_the_font`.
+    ///
+    /// Public because the 2× keygen code is the whole anti-MITM defence and the
+    /// only thing that reads it is a human eye: a gate outside this crate has to
+    /// be able to assert that the four bytes on the *glass* are the
+    /// coordinator's, and re-deriving the doubling to do that would be a second
+    /// implementation of the same mapping to keep in sync. Like [`Frame::cell`],
+    /// firmware never calls it, so `--gc-sections` drops it from the ARM image;
+    /// it costs flash only once something on the device path reads a screen back.
+    pub fn cell_2x(&self, col: usize, row: usize) -> Option<u8> {
+        // A 2x glyph is two cells wide and two byte-rows tall. Anything smaller
+        // than that window cannot hold one, so there is nothing to read.
+        if col.saturating_add(2) > COLS || row.saturating_add(2) > ROWS {
+            return None;
+        }
+        let mut src = [0u8; CELL];
+        for (j, s) in src.iter_mut().enumerate() {
+            let dx = col * CELL + j * 2;
+            let lo = *self.0.get(row * WIDTH + dx)?;
+            let hi = *self.0.get((row + 1) * WIDTH + dx)?;
+            let mut b = 0u8;
+            for k in 0..4 {
+                b |= ((lo >> (2 * k)) & 1) << k;
+                b |= ((hi >> (2 * k)) & 1) << (k + 4);
+            }
+            *s = b;
+        }
+        // FONT_FIRST + index is the codepoint, as in `cell`.
+        let g = (0..96).find(|g| FONT.get(g * CELL..g * CELL + CELL) == Some(&src[..]))?;
+        Some(FONT_FIRST as u8 + g as u8)
+    }
 }
 
 /// A fixed-capacity ASCII scratch string: the "bounded text into a fixed-size
@@ -799,6 +842,90 @@ pub const FEE_UNVERIFIED_1: &str = "NOT VERIFIED BY";
 /// Second line of the fee provenance label.
 pub const FEE_UNVERIFIED_2: &str = "THIS DEVICE";
 
+/// The five keys a confirm digit may be drawn from — `0`, `5`, `7`, `8` and `9`
+/// are deliberately absent.
+///
+/// Copied verbatim from Coldcard's own highest-stakes approval
+/// (`shared/hsm_ux.py:58`, `confirm_char = '12346'[ngu.random.uniform(5)]`)
+/// rather than chosen here: it is their considered set for THIS keypad, and a
+/// substitution would be a worse-informed guess dressed as a decision.
+pub const CONFIRM_CHARSET: [u8; 5] = *b"12346";
+
+/// One randomised confirm digit: what a screen that authorises a signature
+/// prints, and the **only** key that may authorise it.
+///
+/// # Why the screens take this as data rather than taking an RNG
+///
+/// The digit is drawn by the caller and passed in, exactly as every other screen
+/// here takes `u64` sats and `&str` addresses. That keeps the screens
+/// deterministic under test — a rendered legend is a pure function of its
+/// arguments — and keeps this module free of RNG state, which is the property
+/// the module docs above rest on. [`ConfirmDigit::draw`] is the one function
+/// here that touches an RNG and it touches the *caller's*, through a
+/// `rand_core::RngCore` bound that is already a dependency of this crate
+/// (`crate::rng`): no hardware, no singleton, no register. Giving three screens
+/// an RNG parameter instead would make all three non-deterministic to test and
+/// buy nothing.
+///
+/// # Why a digit at all, and why it replaced a hold
+///
+/// The two signing screens used to print `hold 1`, a gesture **this hardware
+/// cannot produce**: the Mk4 numpad emits keydown and "all up" only
+/// (`shared/numpad.py`), and nothing in Coldcard's UX layer interprets a hold.
+/// A randomised digit is their own answer to the same problem, and it has a
+/// second property a fixed key does not: a script cannot hardcode it, so it can
+/// only be answered by reading the screen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ConfirmDigit(u8);
+
+impl ConfirmDigit {
+    /// Draw one from `rng`.
+    ///
+    /// On the device `rng` is [`crate::rng::Entropy`] — 2-source and fail-closed
+    /// — and **never** libngu, which PLAN.md §1 forbids outright. What is copied
+    /// from `hsm_ux.py` is the pattern, not the RNG.
+    ///
+    /// `% 5` rather than rejection sampling: `2^32 % 5 == 1`, so one digit is
+    /// favoured by 1 part in 858,993,459, which is undetectable in a one-in-five
+    /// press gate — and it keeps the draw a fixed-cost expression with no loop,
+    /// which is what a firmware path wants.
+    pub fn draw<R: rand_core::RngCore>(rng: &mut R) -> Self {
+        ConfirmDigit(CONFIRM_CHARSET[(rng.next_u32() % CONFIRM_CHARSET.len() as u32) as usize])
+    }
+
+    /// The digit as text for a legend. Always exactly one ASCII character.
+    pub fn as_str(&self) -> &str {
+        // Every byte of `CONFIRM_CHARSET` is ASCII and the field is private, so
+        // the fallback is unreachable by construction. It exists because a
+        // `unwrap` on a screen path would be a reachable panic, and on this
+        // device a reachable panic is permanent (README.md: installation at
+        // RDP=2 is one-way).
+        core::str::from_utf8(core::slice::from_ref(&self.0)).unwrap_or("?")
+    }
+
+    /// **FAIL CLOSED**: `true` for the exact digit and for nothing else.
+    ///
+    /// This is `hsm_ux.py:58`'s `self.refused = (ch != confirm_char)` read the
+    /// other way round, and the inversion is the whole mechanism: a wrong digit,
+    /// `x`, an unrelated key and a key that is not even on the pad are all
+    /// **refusals**, not ignored presses and not retries. Treating only `x` as
+    /// refusal is the way this gets subtly wrong, and it fails *open* — hence
+    /// [`anything_but_the_confirm_digit_is_a_refusal`](self).
+    pub fn accepts(&self, key: u8) -> bool {
+        key == self.0
+    }
+}
+
+/// `"Press (4)"` — the one place the confirm instruction is spelled, so the two
+/// signing screens cannot word it differently or print different digits.
+fn press_legend(confirm: ConfirmDigit) -> Buf<16> {
+    let mut b = Buf::<16>::new();
+    b.push_str("Press (")
+        .push_str(confirm.as_str())
+        .push_str(")");
+    b
+}
+
 /// One foreign recipient: amount and the full destination address.
 ///
 /// Change outputs never appear here — upstream filters them
@@ -853,8 +980,8 @@ pub enum SignPage<'a> {
         /// The fee, in satoshis.
         sats: u64,
     },
-    /// The final hold-to-confirm page. Always last, so reaching it requires
-    /// stepping through every prior page.
+    /// The final confirm page. Always last, so reaching it requires stepping
+    /// through every prior page.
     Confirm,
 }
 
@@ -870,6 +997,9 @@ pub enum SignPage<'a> {
 pub struct SignPages<'a> {
     recipients: &'a [Recipient<'a>],
     fee_sats: u64,
+    /// The digit [`SignPage::Confirm`] advertises, or `None` for "this page set
+    /// advertises no way to say yes". See [`SignPages::confirming`].
+    confirm: Option<ConfirmDigit>,
 }
 
 impl<'a> SignPages<'a> {
@@ -889,7 +1019,27 @@ impl<'a> SignPages<'a> {
         Ok(SignPages {
             recipients,
             fee_sats,
+            confirm: None,
         })
+    }
+
+    /// Attach the randomised digit [`SignPage::Confirm`] will print.
+    ///
+    /// A builder rather than a fourth argument to [`SignPages::new`] because the
+    /// page *set* is what a caller validates and the digit is what a caller
+    /// draws, and the two have different lifetimes: `new` refuses transactions,
+    /// this only decorates one it accepted.
+    ///
+    /// Without it the confirm page advertises no confirm key at all, and that is
+    /// the deliberate direction: a page set built by a fixture with no RNG
+    /// (`hal/examples/ui_render`, `firmware/examples/simulator`) must not print a
+    /// key that nothing is checking. The device path
+    /// (`coldsnap_firmware::prompt_screen`) always calls this.
+    pub fn confirming(self, confirm: ConfirmDigit) -> Self {
+        SignPages {
+            confirm: Some(confirm),
+            ..self
+        }
     }
 
     /// The recipients, in order. Same slice the pages are derived from.
@@ -1045,7 +1195,13 @@ impl<'a> SignPages<'a> {
             SignPage::Confirm => {
                 frame.text(0, 0, "Approve and");
                 frame.text(0, 1, "sign?");
-                frame.text(0, 4, "hold 1 to sign");
+                // The randomised digit, or NOTHING — never a fixed key. A page
+                // set with no digit attached is one nothing can consent to, so
+                // it must not invite a press.
+                if let Some(confirm) = self.confirm {
+                    frame.text(0, 4, press_legend(confirm).as_str());
+                    frame.text(0, 5, "to sign");
+                }
                 frame.text(0, 6, "x to cancel");
             }
         }
@@ -1189,7 +1345,33 @@ const MESSAGE_ROWS: usize = 4;
 /// by `comms::FRAME_LIMIT`), and showing 64 characters of 4,000 while signing all
 /// 4,000 is a blind signer. Truncation here would be a security bug, so it is a
 /// refusal.
+/// This form advertises **no confirm key**, so nothing drawn by it can be
+/// consented to. It is for callers with no RNG and nothing to authorise — the
+/// screen catalogues (`hal/examples/ui_render`, `firmware/examples/simulator`).
+/// The device path is [`sign_test_message_confirm`], reached through
+/// `coldsnap_firmware::prompt_screen`.
 pub fn sign_test_message(frame: &mut Frame, message: &str) -> Result<(), Unrenderable> {
+    test_message(frame, message, None)
+}
+
+/// Screen 4 with the randomised digit that will authorise the signature.
+///
+/// The digit printed here is the same value the caller must hand to
+/// [`ConfirmDigit::accepts`]: one drawn value, rendered and checked, so the
+/// legend and the acceptance cannot drift.
+pub fn sign_test_message_confirm(
+    frame: &mut Frame,
+    message: &str,
+    confirm: ConfirmDigit,
+) -> Result<(), Unrenderable> {
+    test_message(frame, message, Some(confirm))
+}
+
+fn test_message(
+    frame: &mut Frame,
+    message: &str,
+    confirm: Option<ConfirmDigit>,
+) -> Result<(), Unrenderable> {
     if !message.bytes().all(|b| b.is_ascii_graphic() || b == b' ') {
         return Err(Unrenderable::NotAscii);
     }
@@ -1202,7 +1384,17 @@ pub fn sign_test_message(frame: &mut Frame, message: &str) -> Result<(), Unrende
     if frame.wrap(2, MESSAGE_ROWS, message) != n {
         return Err(Unrenderable::TooLong);
     }
-    frame.text(0, 7, "hold 1  x=no");
+    match confirm {
+        Some(confirm) => {
+            let mut b = press_legend(confirm);
+            b.push_str(" x=no");
+            frame.text(0, 7, b.as_str());
+        }
+        // No digit, no yes key. `x` still cancels; that direction is always safe.
+        None => {
+            frame.text(0, 7, "x=no");
+        }
+    }
     Ok(())
 }
 
@@ -1513,39 +1705,15 @@ mod tests {
     use alloc::string::String;
     use alloc::vec::Vec;
 
-    /// Read a whole row back out of the pixels as text.
-    /// Decode a [`Frame::text_2x`] region back to characters, by INVERTING the
-    /// doubling and matching the reconstructed cell against `FONT`.
+    /// Decode a run of `len` [`Frame::text_2x`] glyphs back to characters.
     ///
-    /// Deliberately an exact inverse rather than a fuzzy check: it reconstructs the
-    /// source byte from the even destination columns of both byte-rows and then
-    /// requires a byte-for-byte font match, so it fails if the blit is wrong in any
-    /// bit — including a horizontal-only or vertical-only double, which a
-    /// "some pixels are set" assertion would pass.
+    /// The inverse itself is [`Frame::cell_2x`], now public — this is only the
+    /// string loop over it, so the round-trip proof below covers the shipping
+    /// function rather than a test-only copy of the mapping.
     fn text_2x_at(f: &Frame, col: usize, row: usize, len: usize) -> String {
-        let mut out = String::new();
-        for i in 0..len {
-            let x = col + i * 2;
-            let mut src = [0u8; CELL];
-            for (j, s) in src.iter_mut().enumerate() {
-                let dx = x * CELL + j * 2;
-                let lo = f.as_bytes()[row * WIDTH + dx];
-                let hi = f.as_bytes()[(row + 1) * WIDTH + dx];
-                let mut b = 0u8;
-                for k in 0..4 {
-                    b |= ((lo >> (2 * k)) & 1) << k;
-                    b |= ((hi >> (2 * k)) & 1) << (k + 4);
-                }
-                *s = b;
-            }
-            // Find which glyph this is. FONT_FIRST + index is the codepoint.
-            let found = (0..96).find(|g| FONT[g * CELL..(g + 1) * CELL] == src);
-            out.push(match found {
-                Some(g) => char::from_u32(FONT_FIRST + g as u32).unwrap_or('?'),
-                None => '?',
-            });
-        }
-        out
+        (0..len)
+            .map(|i| f.cell_2x(col + i * 2, row).map_or('?', char::from))
+            .collect()
     }
 
     fn row_text(f: &Frame, row: usize) -> String {
@@ -1998,6 +2166,32 @@ mod tests {
     }
 
     #[test]
+    fn cell_2x_reads_a_known_code_off_the_glass_and_is_none_where_no_glyph_is() {
+        // The public path an out-of-crate gate uses: read the 2x keygen code back
+        // out of the pixels one glyph at a time, no test helper involved.
+        let mut f = Frame::new();
+        keygen_check(&mut f, 2, 3, [0xab, 0xcd, 0xef, 0x01], "wallet");
+        let base = (COLS - 8) / 2;
+        let read: Vec<u8> = [2usize, 4]
+            .iter()
+            .flat_map(|row| (0..4).filter_map(|i| f.cell_2x(base + i * 2, *row)))
+            .collect();
+        assert_eq!(read, b"abcdef01", "code not readable off the glass");
+
+        // Blank pixels are not a glyph at 2x (the blank cell doubles to a blank
+        // cell, so ' ' is the one exception and it reads as ' ').
+        assert_eq!(f.cell_2x(0, 0), None, "1x text decoded as a 2x glyph");
+        let blank = Frame::new();
+        assert_eq!(blank.cell_2x(0, 0), Some(b' '), "blank is a doubled space");
+        // Out of bounds, and the two windows that are too small for a 2x glyph.
+        assert_eq!(f.cell_2x(COLS, 0), None, "read past the right edge");
+        assert_eq!(f.cell_2x(0, ROWS), None, "read past the bottom");
+        assert_eq!(f.cell_2x(COLS - 1, 0), None, "read a half-width glyph");
+        assert_eq!(f.cell_2x(0, ROWS - 1), None, "read a half-height glyph");
+        assert_eq!(f.cell_2x(usize::MAX, usize::MAX), None, "no overflow panic");
+    }
+
+    #[test]
     fn keygen_check_renders_the_code_and_the_compare_instruction() {
         let mut f = Frame::new();
         keygen_check(&mut f, 2, 3, [0xab, 0xcd, 0xef, 0x01], "wallet");
@@ -2079,6 +2273,170 @@ mod tests {
             sign_test_message(&mut f, "drain\u{202e}me"),
             Err(Unrenderable::NotAscii)
         );
+    }
+
+    // -- the randomised confirm digit (Coldcard `shared/hsm_ux.py:58`). The
+    //    hardware cannot produce a hold, so the two signing screens ask for a
+    //    digit instead; these are the tests that make it worth having.
+
+    /// A counter, not an RNG: `draw` must be a pure function of the bytes it is
+    /// handed, so a test can drive every branch of it. Being *worse* than the
+    /// hardware RNG is the point — a double that only ever returned one value
+    /// would hide a `draw` that ignores its argument.
+    struct Counter(u32);
+
+    impl rand_core::RngCore for Counter {
+        fn next_u32(&mut self) -> u32 {
+            let v = self.0;
+            self.0 = self.0.wrapping_add(1);
+            v
+        }
+        fn next_u64(&mut self) -> u64 {
+            self.next_u32() as u64
+        }
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            for b in dest {
+                *b = self.next_u32() as u8;
+            }
+        }
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
+            self.fill_bytes(dest);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_confirm_digit_is_drawn_from_coldcards_five_and_reaches_all_of_them() {
+        assert_eq!(&CONFIRM_CHARSET, b"12346", "charset is hsm_ux.py:58's, verbatim");
+        let mut rng = Counter(0);
+        let mut seen = Vec::new();
+        for _ in 0..50 {
+            let d = ConfirmDigit::draw(&mut rng);
+            let key = d.as_str().as_bytes()[0];
+            assert!(
+                CONFIRM_CHARSET.contains(&key),
+                "drew {:?}, which is not one of 12346",
+                d.as_str()
+            );
+            if !seen.contains(&key) {
+                seen.push(key);
+            }
+        }
+        // Every digit must be reachable: a `draw` that returns a constant (or
+        // ignores its RNG) is a fixed key a script could hardcode, which is the
+        // whole thing this replaces.
+        assert_eq!(seen.len(), CONFIRM_CHARSET.len(), "digits reached: {seen:?}");
+    }
+
+    /// FAIL CLOSED. `hsm_ux.py:58`'s `refused = (ch != confirm_char)`: anything
+    /// that is not the exact digit is a REFUSAL, never an ignored press and never
+    /// a retry. Treating only `x` as refusal is how this gets subtly wrong, and it
+    /// fails *open*, so that direction is asserted explicitly.
+    #[test]
+    fn anything_but_the_confirm_digit_is_a_refusal() {
+        for expect in CONFIRM_CHARSET {
+            let d = ConfirmDigit::draw(&mut Counter(
+                CONFIRM_CHARSET.iter().position(|c| *c == expect).unwrap() as u32,
+            ));
+            assert!(d.accepts(expect), "the drawn digit must confirm");
+            // A WRONG digit from the same charset — the near miss.
+            for other in CONFIRM_CHARSET.iter().filter(|c| **c != expect) {
+                assert!(
+                    !d.accepts(*other),
+                    "{} must refuse the wrong charset digit {}",
+                    expect as char,
+                    *other as char
+                );
+            }
+            // `x`, the advertised decline.
+            assert!(!d.accepts(b'x'), "x must refuse");
+            // Keys that are not in the charset at all, including the ones
+            // Coldcard deliberately left out, `y` (which two designs would have
+            // confirmed on), and the all-up byte.
+            for stray in [b'0', b'5', b'7', b'8', b'9', b'y', b'*', b'#', 0u8, 0xff] {
+                assert!(
+                    !d.accepts(stray),
+                    "{} must refuse stray key {stray:#04x}",
+                    expect as char
+                );
+            }
+        }
+    }
+
+    /// The screen shows the digit that will be accepted — the property the whole
+    /// mechanism rests on, because a script can only answer by reading the glass.
+    #[test]
+    fn the_signing_screens_print_the_digit_that_accepts() {
+        let rs = [Recipient {
+            address: "bc1qexampleaddress0000",
+            sats: 1_000,
+        }];
+        for seed in 0..CONFIRM_CHARSET.len() as u32 {
+            let d = ConfirmDigit::draw(&mut Counter(seed));
+
+            let pages = SignPages::new(&rs, 500).unwrap().confirming(d);
+            let mut f = Frame::new();
+            let last = pages.len() - 1;
+            assert_eq!(pages.page(last), Some(SignPage::Confirm));
+            assert!(pages.render(last, &mut f));
+            let shown = screen_text(&f);
+            assert!(
+                shown.contains(&format!("Press ({})", d.as_str())),
+                "confirm page must print the drawn digit, got:\n{shown}"
+            );
+
+            let mut f = Frame::new();
+            sign_test_message_confirm(&mut f, "frostsnap test", d).unwrap();
+            let shown = screen_text(&f);
+            assert!(
+                shown.contains(&format!("Press ({})", d.as_str())),
+                "test-message screen must print the drawn digit, got:\n{shown}"
+            );
+
+            // Read the digit back OUT OF THE PIXELS and require the code to
+            // accept exactly that. A screen that printed one digit while the
+            // logic accepted another would pass every other assertion here.
+            let row = row_text(&f, 7);
+            let printed = row
+                .as_bytes()
+                .iter()
+                .copied()
+                .find(|b| CONFIRM_CHARSET.contains(b))
+                .unwrap_or(0);
+            assert!(
+                d.accepts(printed),
+                "the digit on the glass ({}) is not the digit accepted ({})",
+                printed as char,
+                d.as_str()
+            );
+            // And no hold is asked for anywhere, on either screen: the numpad
+            // emits keydown and all-up only, so a hold legend is unhonourable.
+            assert!(!shown.contains("hold"), "hold gesture is unproducible: {shown}");
+        }
+    }
+
+    /// A caller that draws no digit gets a screen with NO way to say yes, rather
+    /// than one advertising a fixed key nothing checks. Fail-closed by default,
+    /// which is what lets the fixture catalogues keep their two-argument calls.
+    #[test]
+    fn a_signing_screen_with_no_digit_advertises_no_confirm_key() {
+        let rs = [Recipient {
+            address: "bc1qexampleaddress0000",
+            sats: 1_000,
+        }];
+        let pages = SignPages::new(&rs, 500).unwrap();
+        let mut f = Frame::new();
+        assert!(pages.render(pages.len() - 1, &mut f));
+        let shown = screen_text(&f);
+        assert!(shown.contains("x to cancel"), "cancel is always offered: {shown}");
+        assert!(!shown.contains("Press"), "no digit was drawn: {shown}");
+        assert!(!shown.contains("hold"), "and no hold either: {shown}");
+
+        let mut f = Frame::new();
+        sign_test_message(&mut f, "frostsnap test").unwrap();
+        let shown = screen_text(&f);
+        assert!(shown.contains("x=no"), "cancel is always offered: {shown}");
+        assert!(!shown.contains("Press") && !shown.contains("hold"), "{shown}");
     }
 
     const WORDS: [&str; BACKUP_WORDS] = [

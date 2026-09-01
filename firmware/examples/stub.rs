@@ -65,13 +65,20 @@
 //! host process has no flashed image to hash) — real function, fake input.
 //!
 //! WRITE-BLOCKING / DEADLOCK, read this before raising n. Every frame leaves here
-//! in 64-byte chunks (`STUB_CHUNK` overrides), and this loop does not read while
-//! it writes. MEASURED: an undrained pty blocks writes past ~1 KB. `CertifyPlease`
-//! is 2,179 B at 9-of-9 and a single-segment `NonceResponse` is 2,040 B, so the
-//! coordinator's own write bound is what carries this, not the frame sizes. It
-//! works because the traffic is one-directional at those points. What deadlocks is
-//! both sides writing >1 KB AT ONCE. Today no exchange does that. Fix when one
-//! does: read between chunks here instead of after the whole write.
+//! in 64-byte chunks (`STUB_CHUNK` overrides). MEASURED: an undrained pty blocks
+//! writes past ~1 KB. `CertifyPlease` is 2,179 B at 9-of-9 and a single-segment
+//! `NonceResponse` is 2,040 B, so the coordinator's own write bound is what carries
+//! this, not the frame sizes. It works because the traffic is one-directional at
+//! those points. What deadlocks is both sides writing >1 KB AT ONCE. Today no
+//! exchange does that.
+//!
+//! Our half of that hazard is now structurally gone rather than merely unexercised:
+//! `spawn_reader` drains fd 0 from its own thread, so the pty keeps emptying while
+//! the main loop is inside `write_chunked` (which sleeps 1 ms per chunk for the
+//! first 64) or inside a keygen. UNTESTED as a claim — no exchange writes >1 KB
+//! both ways, so nothing here demonstrates it; what IS demonstrated is the
+//! parked-progress property `spawn_reader` exists for. The coordinator's own write
+//! path stays bounded by its `WRITE_STALL_LIMIT`, which is its business, not ours.
 //!
 //! Run it via the harness, not by hand:
 //!   cargo build --target aarch64-apple-darwin -p coldsnap_firmware --example stub
@@ -81,14 +88,15 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 
-use coldsnap_firmware::{firmware_digest, DebugFlash, Fault, Outbox, Session};
+use coldsnap_firmware::{firmware_digest, prompt_screen, DebugFlash, Fault, Outbox, Session};
 use coldsnap_hal::comms::{decode_body, CoordinatorSendBody, Link, MAGIC_REPLY};
 use coldsnap_hal::flash::fake::FakeFlash;
 use coldsnap_hal::flash::ERASE_SIZE;
 use coldsnap_hal::rng::{mix_sources, Entropy, ProvenSeed, SE1_BYTES, SE2_BYTES, TRNG_BYTES};
-use coldsnap_hal::{identity, memmap};
+use coldsnap_hal::{identity, memmap, ui};
 use frostsnap_comms::{DeviceSendBody, ReceiveSerial, Upstream};
 use frostsnap_core::device::keys::KeyMutation;
 use frostsnap_core::device::{DeviceToUserMessage, Mutation};
@@ -128,6 +136,9 @@ static BYTES_READ: AtomicUsize = AtomicUsize::new(0);
 /// threaded through `drive` because `STATE` already is, and it is read only by
 /// `die` and the exit log.
 static SIG_ACKS: AtomicUsize = AtomicUsize::new(0);
+/// How many prompts the consent closure DECLINED. Global for the same reason
+/// `SIG_ACKS` is, and read by the main loop's fail-closed check.
+static DECLINES: AtomicUsize = AtomicUsize::new(0);
 
 /// LONGER than the harness's own budget on purpose, and that is load-bearing.
 /// `hostcheck` owns the budget and kills us itself; this watchdog only exists so
@@ -138,6 +149,11 @@ static SIG_ACKS: AtomicUsize = AtomicUsize::new(0);
 /// nine signers deep, and at `STUB_CHUNK=1` every byte of every frame costs a
 /// syscall. The harness's own budget is 35 s, so this is ~2.5x its bound —
 /// deliberately, so that when both fire it is the harness's message you read.
+///
+/// SCALED by [`timeout_scale`], and that is why it is not used raw: `hostcheck`
+/// scales its budgets by the same variable, so leaving this fixed would invert the
+/// ~2.5x relationship above the first time a human took ten seconds per screen —
+/// the stub would kill the run and the harness's diagnosis would never print.
 const DEADLINE: Duration = Duration::from_secs(90);
 
 /// The tier-2 test fingerprint (`frostsnap_core/tests/common/mod.rs`), NOT the
@@ -166,6 +182,55 @@ fn chunk_size() -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(64)
+}
+
+/// Multiplies this process's watchdog AND every budget in `hostcheck`
+/// (`COLDSNAP_TIMEOUT_SCALE`, default **1** — the automated gate is unchanged).
+///
+/// ONE factor, read by both processes, because they are one clock: `hostcheck`
+/// spawns us, so we inherit whatever it was given, and [`DEADLINE`]'s whole
+/// contract is being ~2.5x the harness's bound. It exists for the window, where a
+/// human takes seconds per screen and there are 18 consent prompts back to back;
+/// no fixed budget covers both that and two debug builds talking to each other
+/// (LIVE-GLASS-PLAN §10).
+///
+/// `filter(|&n| n > 0)`: a 0 would make the watchdog fire instantly, i.e. a typo
+/// would look like a device fault.
+fn timeout_scale() -> u32 {
+    std::env::var("COLDSNAP_TIMEOUT_SCALE")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(1)
+}
+
+/// The SCRIPTED KEY SOURCE: what to press at each of the two consent screens
+/// (`COLDSNAP_GLASS_KEYS`, default `yy`, i.e. exactly today's behaviour).
+///
+/// Two characters, `<CheckKeyGen><SignatureRequest>`:
+///  - `y` — press whatever the GLASS advertises, read back out of the rendered
+///    pixels by [`advertised_key`]. The ONLY way to answer a signing screen
+///    correctly, because step 0 made that digit random.
+///  - anything else — press THAT byte, whatever the screen says. `x` declines; `9`
+///    is a wrong digit (not in `ui::CONFIRM_CHARSET`, so it is *always* a
+///    refusal), which is how a hardcoded-key script is demonstrated to fail.
+///
+/// A missing character is `y`, so `COLDSNAP_GLASS_KEYS=y` also means "approve
+/// both".
+///
+/// KEYED BY PROMPT KIND, not positional, and that is deliberate: `N_DEVICES`
+/// devices produce 2xN interleaved prompts, so a positional list would encode the
+/// device count in an env var and start answering the wrong screen the moment n
+/// changed. There are exactly two consent screens, so two characters is the whole
+/// vocabulary.
+///
+/// LIVE-GLASS-PLAN §6 wrote this as `COLDSNAP_GLASS_KEYS=11`. That is no longer
+/// expressible and the reason is the point of the whole step: with a randomised
+/// digit there IS no fixed byte that authorises a signature. `y` is what "press
+/// the confirm key" has to mean now, and it can only be answered by reading the
+/// screen.
+fn glass_keys() -> String {
+    std::env::var("COLDSNAP_GLASS_KEYS").unwrap_or_else(|_| "yy".into())
 }
 
 /// WHEN the device throws away its keygen scratch state, i.e. where firmware
@@ -215,6 +280,246 @@ fn write_chunked(w: &mut impl Write, bytes: &[u8], chunk: usize) -> std::io::Res
         }
     }
     Ok(())
+}
+
+/// One fd-0 read. `Ok(bytes)` non-empty is wire traffic, `Ok(bytes)` EMPTY is EOF
+/// (`read` returning 0), `Err` is the read error the old inline `match` reported by
+/// name. It is an `io::Result` rather than a bespoke enum because `read` already
+/// models all three and `io::Error` is `Send`.
+type WireEv = std::io::Result<Vec<u8>>;
+
+/// fd 0 in its own thread, feeding ONE channel. The main loop then consumes it with
+/// a `recv_timeout`, which is the whole point.
+///
+/// WHY, and it is a deadlock rather than a tidiness argument. The old loop blocked
+/// in `read(fd 0)`, so the ONLY thing that could ever wake it was a byte from the
+/// coordinator. Any work the loop still owes that the coordinator is *waiting for*
+/// therefore never happens — the loop is parked on the wrong fd. The comment on the
+/// deferred-`hello` hazard further down describes exactly that shape ("the
+/// coordinator stops writing magic bytes the moment it reads our reply, so deferring
+/// to the next loop iteration would park us in `read()` waiting for a byte it will
+/// never send"), and MUTATION-VERIFIED: defer that write by one lap and a blocking
+/// consumer hangs the pass while a `recv_timeout` consumer still passes.
+///
+/// Live glass needs that property for a second reason: a prompt parked on a human
+/// keypress arrives on a channel that is not fd 0, and a loop blocked on fd 0 can
+/// never observe it. This step lands the threading alone, with no consent change and
+/// no key channel, so that a regression here is unambiguous.
+///
+/// Same shape as `hostcheck`'s own `spawn_writer` — one thread, one unbounded
+/// `mpsc` — deliberately, so this process has one concurrency model and not two.
+/// Unbounded is not sloppy here: the sender is the coordinator, whose traffic is
+/// already bounded by its own budgets, and a bounded queue would have to block the
+/// reader, which is the thing being removed.
+fn spawn_reader() -> Receiver<WireEv> {
+    let (tx, rx) = std::sync::mpsc::channel::<WireEv>();
+    std::thread::spawn(move || {
+        // 512 B and one allocation per read, exactly the old inline buffer's size.
+        // `Link` reassembles across reads, so read granularity was never load-bearing.
+        let mut wire_in = std::io::stdin().lock();
+        let mut buf = [0u8; 512];
+        loop {
+            let ev: WireEv = wire_in.read(&mut buf).map(|n| buf[..n].to_vec());
+            // Stop after EOF or an error: `read` on a closed fd returns `Ok(0)`
+            // forever, and looping on that would spin a core and flood the channel.
+            let last = !matches!(&ev, Ok(bytes) if !bytes.is_empty());
+            if tx.send(ev).is_err() || last {
+                return;
+            }
+        }
+    });
+    rx
+}
+
+/// How long the main loop waits for wire bytes before doing another lap.
+///
+/// It adds ZERO latency to the automated path: `recv_timeout` returns the instant a
+/// message lands, so this bounds only how long an IDLE loop sleeps. The numbers it
+/// has to stay clear of are all `hostcheck`'s, and it is three orders of magnitude
+/// under the smallest: `PORT_TIMEOUT` 250 ms, `WRITE_STALL_LIMIT` 5 s,
+/// `HANDSHAKE_DEADLINE` 5 s, then cumulative budgets of 35 s (handshake + keygen)
+/// and 65 s (+ signing), with a once-per-pass watchdog at 67 s
+/// (`65 s + WATCHDOG_SLACK`). 2 ms matches the coordinator's own poll lap, so
+/// neither side idles finer than the other. Step 6 scales the harness's budgets for
+/// human latency; nothing here needs scaling, because a longer park costs laps, not
+/// deadline.
+const WIRE_POLL: Duration = Duration::from_millis(2);
+
+/// How many prompts this run EXPECTS the consent closure to decline
+/// (`STUB_EXPECT_DECLINES`, default **0**).
+///
+/// FAIL CLOSED, and that default is the whole point. A refusal has NO protocol
+/// message (see [`decline`]), so all a decline can ever look like from outside is
+/// a `Debug{declined=...}` line plus silence where a signature share would have
+/// been — which is also exactly what a device that declines EVERYTHING looks
+/// like. Default 0 therefore makes any unexpected decline a nonzero exit, and a
+/// run that WANTS declines has to say how many (LIVE-GLASS-PLAN §10).
+fn expect_declines() -> usize {
+    std::env::var("STUB_EXPECT_DECLINES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+/// The consent seam, and the only one: ONE closure threaded through [`drive`],
+/// answering with **the key byte** a human would press after looking at `frame`.
+///
+/// WHY A KEY BYTE, when LIVE-GLASS-PLAN §4 drew this as
+/// `&mut dyn FnMut(&DeviceToUserMessage) -> bool`. Step 0 landed after that was
+/// written and made the digit that authorises a signature RANDOM
+/// (`ui::ConfirmDigit`, charset `12346`, copied from Coldcard's `hsm_ux.py:58`),
+/// so "did the user approve" is no longer answerable without the digit — and a
+/// closure that is TOLD the digit can approve without ever looking at the screen,
+/// which is the one shortcut this whole gate exists to forbid. So the closure is
+/// handed the rendered [`ui::Frame`] and nothing else: its only route to the digit
+/// is the pixels. That is what makes the glass assertion structural instead of
+/// additional.
+///
+/// The other half of the shape is that [`approved`] — not the closure — calls
+/// [`ui::ConfirmDigit::accepts`]. The fail-closed rule then lives at ONE place for
+/// all three closures that will exist (this stub's, the window's, the script's)
+/// rather than being re-implemented, and got subtly wrong, in each; and the
+/// window's closure needs no `ui` knowledge at all, just "write 1,024 bytes, read
+/// one back".
+type Consent<'a> = &'a mut dyn FnMut(&DeviceToUserMessage, &ui::Frame) -> u8;
+
+/// `"Press ("` — the fixed part of the legend `ui::press_legend` composes, and the
+/// anchor [`advertised_key`] finds the digit by.
+const PRESS: &[u8] = b"Press (";
+
+/// The key the LAST ROW of `frame` advertises as its yes: the digit inside
+/// `Press (n)`, or the `1` of `1=match`. `None` when the screen advertises no yes
+/// key at all — which is a screen nothing may consent to.
+///
+/// This reads the digit **off the pixels**, and it is the cheapest always-approve
+/// closure that can exist rather than an early down-payment on step 4: with a
+/// randomised digit there IS no fixed byte that authorises a signature, so any
+/// approving closure has to read the screen. `ui::Frame::cell` is the reverse
+/// glyph lookup that already ships (`hal/src/ui.rs`) and requires a byte-for-byte
+/// font match, so nothing here re-implements the font — an independent second
+/// copy of that mapping would be a second thing to keep in sync.
+///
+/// Both consent legends live on the last row and there are only two forms:
+/// `keygen_check` prints `1=match x=no`, `sign_test_message_confirm` prints
+/// `Press (n) x=no`.
+fn advertised_key(frame: &ui::Frame) -> Option<u8> {
+    let row: Vec<u8> = (0..ui::COLS)
+        .map(|col| frame.cell(col, ui::ROWS - 1).map_or(b' ', |(ch, _)| ch))
+        .collect();
+    if let Some(i) = row.windows(PRESS.len()).position(|w| w == PRESS) {
+        return row.get(i + PRESS.len()).copied();
+    }
+    // `<key>=<what it does>`, the plain-press legend.
+    if row.get(1) == Some(&b'=') {
+        return row.first().copied();
+    }
+    None
+}
+
+/// The four bytes the KEYGEN CHECK screen actually **drew**, read back off the
+/// glass as 8 lowercase hex characters. `None` if those pixels are not eight
+/// doubled font glyphs.
+///
+/// THE OPEN HALF OF PLAN.md §9 item 12. The session hash is already compared
+/// core-to-core across the two processes (`hostcheck` bails `SESSION HASH
+/// MISMATCH`); nothing until now asserted that the code on the SCREEN is that
+/// value. Those four bytes are the entire anti-MITM defence, because they are what
+/// a human reads aloud — a device that verified the right transcript and then drew
+/// the wrong code passed every existing check.
+///
+/// `ui::Frame::cell_2x` is the shipping inverse of `text_2x` (one glyph per call,
+/// `col` stepped by 2, byte-for-byte font match), so nothing here re-derives the
+/// doubling; `ui::keygen_check` draws the high half at `((COLS - 8) / 2, 2)` and
+/// the low half two rows down. `?` rather than `filter_map`, because a short read
+/// must be a FAILURE and not a shorter string that might still prefix-match.
+fn glass_code(frame: &ui::Frame) -> Option<String> {
+    let base = (ui::COLS - 8) / 2;
+    let mut code = String::new();
+    for row in [2usize, 4] {
+        for i in 0..4 {
+            code.push(frame.cell_2x(base + i * 2, row)? as char);
+        }
+    }
+    Some(code)
+}
+
+/// Render `prompt`, ask `consent` for a keypress, and decide. `true` means
+/// confirm it.
+///
+/// THE ONE PLACE A KEY BECOMES CONSENT. `Session::confirm` renders the screen
+/// again for its own renderability gate, with its own throwaway digit (documented
+/// at that call in `firmware/src/lib.rs`); THIS frame is the one the closure
+/// answers and this digit is the one printed on it, so the legend that is
+/// displayed and the value that is accepted are one `ConfirmDigit` and cannot
+/// drift.
+///
+/// It also REPORTS the keygen code off this same frame (`glass=`), which is why it
+/// takes the outbox. From THIS frame and not a re-render, deliberately: the four
+/// bytes `hostcheck` compares against its own session hash have to be the four
+/// bytes on the screen the consent below answered, or the assertion is about a
+/// picture nobody approved.
+fn approved(
+    prompt: &DeviceToUserMessage,
+    rng: &mut Entropy,
+    consent: Consent,
+    out: &mut Outbox,
+) -> bool {
+    let digit = ui::ConfirmDigit::draw(rng);
+    let mut frame = ui::Frame::new();
+    // `Ok(false)` (informational, no screen) and `Err` (this device cannot draw
+    // the request in full) are both prompts NO key may authorise. They are
+    // deliberately not called declines: `Session::confirm` fails closed on exactly
+    // these two — `NotConfirmable` and `Refused` — and names the failure itself,
+    // so it stays the authority and its diagnostics keep their existing wording.
+    if !matches!(prompt_screen(&mut frame, prompt, digit), Ok(true)) {
+        return true;
+    }
+    // ASSERTION 1, on the wire. `UNREADABLE` rather than skipping the report: a
+    // screen whose code cannot be read back is a screen whose code is not the
+    // coordinator's, and `hostcheck` must fail on it rather than on a missing map
+    // entry it could mistake for a device that never got there.
+    if matches!(prompt, DeviceToUserMessage::CheckKeyGen { .. }) {
+        let code = glass_code(&frame).unwrap_or_else(|| "UNREADABLE".into());
+        if let Err(e) = out.push(DeviceSendBody::Debug {
+            message: format!("glass={code}"),
+        }) {
+            die(2, &format!("Debug(glass) refused by framing: {e:?}"));
+        }
+    }
+    let key = consent(prompt, &frame);
+    match prompt {
+        // `keygen_check` advertises `1=match`, NOT a digit: the stronger gesture
+        // belongs on the screens that authorise a signature (`prompt_screen`'s
+        // doc). Accepting the digit here would accept a key the screen never
+        // showed.
+        DeviceToUserMessage::CheckKeyGen { .. } => key == b'1',
+        // FAIL CLOSED — `hsm_ux.py:58`'s `refused = (ch != confirm_char)`,
+        // inverted. Only the digit that is ON THE SCREEN signs; `x`, another
+        // charset digit and a key that is not on the pad are all refusals.
+        DeviceToUserMessage::SignatureRequest { .. } => digit.accepts(key),
+        // Not a consent prompt. Unreachable from the two call sites in `drive`,
+        // and a decline — which fails the run — if that ever stops being true.
+        _ => false,
+    }
+}
+
+/// The consent closure said no: `Session::confirm` is never called, and the only
+/// thing that can carry a "no" to the coordinator is the `Debug` back-channel a
+/// `Fault::Refused` already uses two dozen lines below.
+///
+/// The vendored protocol HAS no decline variant — that is a finding, not a detail
+/// — so the alternative to `Debug` is silence, and silence is indistinguishable
+/// from a dead device. `Outbox` caps `Debug` at 256 B on a UTF-8 boundary and
+/// `hostcheck` intercepts it before the `FrostCoordinator` state machine, so it
+/// cannot perturb the protocol.
+fn decline(id: DeviceId, what: &str, out: &mut Outbox) {
+    DECLINES.fetch_add(1, Ordering::Relaxed);
+    eprintln!("stub: {id} DECLINED {what} -- the protocol has no message for a no");
+    if let Err(e) = out.push(DeviceSendBody::Debug {
+        message: format!("declined={what}"),
+    }) {
+        die(2, &format!("Debug(declined) refused by framing: {e:?}"));
+    }
 }
 
 /// Lowercase hex, for the two values this stub reports to the coordinator over
@@ -326,20 +631,25 @@ fn synthetic_digest() -> frostsnap_comms::Sha256Digest {
 /// Feed one decoded coordinator body to one session, answer the prompts a human
 /// would answer, and record any share it staged.
 ///
-/// AUTO-ACK, and it is why the two consent prompts are NOT answered by the
+/// CONSENT, and it is why the two consent prompts are NOT answered by the
 /// dispatch: `Session::recv` returns `CheckKeyGen` and `SignatureRequest` and
 /// answers neither. `CheckKeyGen` is a human comparing the session hash against
 /// the coordinator's display, which is the defence against a coordinator that
 /// lies about who is in the access structure; `SignatureRequest` is a human
-/// reading the transaction. **A REAL DEVICE MUST NOT ACK EITHER ITSELF.** This
-/// stub has no display and acks both unconditionally, exactly as the vendored
-/// tier-2 harness does. It is a harness affordance, not a policy — and the fact
-/// that it lives HERE rather than in `firmware/src/lib.rs` is the load-bearing
-/// part.
+/// reading the transaction. **A REAL DEVICE MUST NOT ACK EITHER ITSELF.** That
+/// the answer lives HERE rather than in `firmware/src/lib.rs` is the load-bearing
+/// part, and it is now a `Consent` closure rather than an unconditional ack, so
+/// the same two `session.confirm` call sites serve this harness, a human at the
+/// simulator window and a scripted gate. By default the closure is the
+/// always-approve one — press whatever the glass advertises — so it remains a
+/// harness affordance and every existing measurement is unchanged;
+/// `COLDSNAP_GLASS_KEYS` scripts it (see [`glass_keys`]), which is how
+/// `hostcheck`'s DECLINE pass proves that `x` refuses.
 fn drive(
     session: &mut Session<'_, Flash>,
     body: CoordinatorSendBody,
     rng: &mut Entropy,
+    consent: Consent,
     wire: &mut Vec<u8>,
     saved: &mut BTreeMap<DeviceId, AccessStructureRef>,
 ) {
@@ -387,26 +697,36 @@ fn drive(
                 }) {
                     die(2, &format!("Debug(session_hash) refused by framing: {e:?}"));
                 }
-                eprintln!("stub: {id} CheckKeyGen -> auto-ack (a real device asks a human)");
                 let p = DeviceToUserMessage::CheckKeyGen { phase };
-                match session.confirm(p, rng, &mut out) {
-                    Ok(more) => prompts.extend(more),
-                    Err(e) => die(2, &format!("confirm(CheckKeyGen, {id}): {e:?}")),
-                }
-                if clear_tmp_mode() == "check" {
-                    eprintln!("stub: {id} clear_tmp_data() at CheckKeyGen -- WRONG ON PURPOSE");
-                    session.signer.clear_tmp_data();
+                if !approved(&p, rng, &mut *consent, &mut out) {
+                    decline(id, "CheckKeyGen", &mut out);
+                } else {
+                    eprintln!("stub: {id} CheckKeyGen -> auto-ack (a real device asks a human)");
+                    match session.confirm(p, rng, &mut out) {
+                        Ok(more) => prompts.extend(more),
+                        Err(e) => die(2, &format!("confirm(CheckKeyGen, {id}): {e:?}")),
+                    }
+                    if clear_tmp_mode() == "check" {
+                        eprintln!("stub: {id} clear_tmp_data() at CheckKeyGen -- WRONG ON PURPOSE");
+                        session.signer.clear_tmp_data();
+                    }
                 }
             }
             p @ DeviceToUserMessage::SignatureRequest { .. } => {
-                eprintln!("stub: {id} SignatureRequest -> auto-ack (a real device asks a human)");
-                match session.confirm(p, rng, &mut out) {
-                    Ok(more) => {
-                        SIG_ACKS.fetch_add(1, Ordering::Relaxed);
-                        STATE.fetch_max(6, Ordering::Relaxed);
-                        prompts.extend(more);
+                if !approved(&p, rng, &mut *consent, &mut out) {
+                    decline(id, "SignatureRequest", &mut out);
+                } else {
+                    eprintln!(
+                        "stub: {id} SignatureRequest -> auto-ack (a real device asks a human)"
+                    );
+                    match session.confirm(p, rng, &mut out) {
+                        Ok(more) => {
+                            SIG_ACKS.fetch_add(1, Ordering::Relaxed);
+                            STATE.fetch_max(6, Ordering::Relaxed);
+                            prompts.extend(more);
+                        }
+                        Err(e) => die(2, &format!("confirm(SignatureRequest, {id}): {e:?}")),
                     }
-                    Err(e) => die(2, &format!("confirm(SignatureRequest, {id}): {e:?}")),
                 }
             }
             DeviceToUserMessage::FinalizeKeyGen { key_name } => {
@@ -457,7 +777,7 @@ fn drive(
 
 fn main() {
     std::thread::spawn(|| {
-        std::thread::sleep(DEADLINE);
+        std::thread::sleep(DEADLINE * timeout_scale());
         die(3, "watchdog fired: no progress within the deadline");
     });
 
@@ -471,51 +791,102 @@ fn main() {
     let mut saved: BTreeMap<DeviceId, AccessStructureRef> = BTreeMap::new();
     let mut announced_save = false;
 
+    // THE SCRIPTED GATE'S CONSENT, and the default is the automated gate's: press
+    // whatever the SCREEN advertises.
+    //
+    // Not `|_| true`, because with a randomised digit there is no fixed byte that
+    // authorises a signature — `advertised_key` reads it back out of the rendered
+    // pixels, which is the only channel a closure has. `y` is still an
+    // unconditional yes and still a harness affordance: it never says no, it just
+    // cannot say yes without having read the screen correctly. A device that
+    // rendered the wrong legend would make this press the wrong key and get a
+    // refusal, which fails the run — so the glass assertion is a PRECONDITION of
+    // passing, not an extra check bolted on.
+    //
+    // The digit is never derived from the RNG, the seed, or the `ConfirmDigit` the
+    // caller holds. `COLDSNAP_GLASS_KEYS` can only ask for a LITERAL key, which is
+    // exactly the hardcoded-script case, and a literal cannot match a randomised
+    // digit reliably (`9` never can).
+    let keys = glass_keys();
+    eprintln!(
+        "stub: consent keys = {keys:?} (y = press what the glass advertises; anything else is \
+         that literal key, whatever the screen says)"
+    );
+    let mut consent = |prompt: &DeviceToUserMessage, frame: &ui::Frame| -> u8 {
+        let scripted = match prompt {
+            DeviceToUserMessage::CheckKeyGen { .. } => keys.as_bytes().first(),
+            _ => keys.as_bytes().get(1),
+        };
+        match scripted.copied().unwrap_or(b'y') {
+            b'y' => match advertised_key(frame) {
+                Some(key) => key,
+                // FAIL CLOSED: a screen advertising no yes key gets `x`, which is a
+                // decline, which fails the run unless it was declared.
+                None => {
+                    eprintln!("stub: the glass advertises NO confirm key -- declining");
+                    b'x'
+                }
+            },
+            key => key,
+        }
+    };
+
     let mut link = Link::new();
-    let mut wire_in = std::io::stdin().lock();
+    let wire_rx = spawn_reader();
     let mut wire_out = std::io::stdout().lock();
-    let mut buf = [0u8; 512];
     let chunk = chunk_size();
 
     loop {
-        // Read every iteration: an undrained pty blocks writes past ~1 KB, and
-        // while unlinked `Link::poll` is silent, so reading is the only way
-        // anything ever happens.
-        let n = match wire_in.read(&mut buf) {
+        // fd 0 is drained by `spawn_reader`, never by this loop: an undrained pty
+        // blocks writes past ~1 KB, while unlinked `Link::poll` is silent so wire
+        // bytes are still the only thing that advances the protocol, and a loop
+        // that BLOCKS for them cannot service anything else (see `spawn_reader`).
+        let bytes = match wire_rx.recv_timeout(WIRE_POLL) {
             // EOF is the ending for a HAND run: `hostcheck` kills us instead
             // (`reap()`), so in a harness run neither of these arms is reached and
             // our exit status is not what the pass hinges on. Kept, and kept
             // asymmetric, because it is the only contract a hand run has: EOF
             // after a successful save is success, EOF before one is a failure, and
             // it must stay that way or a stub killed early would look clean.
-            Ok(0) if saved.len() == N_DEVICES => {
-                eprintln!(
-                    "stub: PASS -- coordinator closed the wire after verifying \
-                     {N_DEVICES}/{N_DEVICES} held shares and {} signature share(s), all from \
-                     sessions REBUILT FROM FLASH after the restart",
-                    SIG_ACKS.load(Ordering::Relaxed)
-                );
-                return;
+            Ok(Ok(bytes)) if bytes.is_empty() => {
+                if saved.len() == N_DEVICES {
+                    eprintln!(
+                        "stub: PASS -- coordinator closed the wire after verifying \
+                         {N_DEVICES}/{N_DEVICES} held shares and {} signature share(s), all from \
+                         sessions REBUILT FROM FLASH after the restart",
+                        SIG_ACKS.load(Ordering::Relaxed)
+                    );
+                    return;
+                }
+                die(
+                    2,
+                    &format!(
+                        "wire EOF with only {}/{N_DEVICES} share(s) saved -- the coordinator gave \
+                         up first",
+                        saved.len()
+                    ),
+                )
             }
-            Ok(0) => die(
-                2,
-                &format!(
-                    "wire EOF with only {}/{N_DEVICES} share(s) saved -- the coordinator gave \
-                     up first",
-                    saved.len()
-                ),
-            ),
-            Ok(n) => n,
-            Err(e) => die(2, &format!("read(fd 0): {e}")),
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(e)) => die(2, &format!("read(fd 0): {e}")),
+            // No wire bytes this lap. Nothing else can have changed either --
+            // `saved`, `coordinator_acked` and `wire` are all downstream of a
+            // decoded body -- so skipping the rest is EXACTLY what the old blocking
+            // read did, minus the block. Once a prompt can park (step 2) this arm is
+            // where it gets serviced.
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => {
+                die(2, "the fd-0 reader thread vanished without an EOF or an error")
+            }
         };
-        BYTES_READ.fetch_add(n, Ordering::Relaxed);
+        BYTES_READ.fetch_add(bytes.len(), Ordering::Relaxed);
 
         // The "just linked" edge is observed HERE, from outside, on purpose:
         // `Link` exposes `is_linked()` but no edge, and this file is specified to
         // need zero `hal/src/` changes.
         let was_linked = link.is_linked();
         let mut wire: Vec<u8> = Vec::new();
-        let poll = link.poll::<ReceiveSerial<Upstream>, _>(&buf[..n], |frame| match frame {
+        let poll = link.poll::<ReceiveSerial<Upstream>, _>(&bytes, |frame| match frame {
             ReceiveSerial::Message(msg) => {
                 let mut dest = msg.target_destinations;
                 let targets: Vec<DeviceId> =
@@ -539,7 +910,14 @@ fn main() {
                         for id in targets {
                             let session =
                                 sessions.get_mut(&id).expect("id came from `sessions`");
-                            drive(session, body.clone(), &mut rng, &mut wire, &mut saved);
+                            drive(
+                                session,
+                                body.clone(),
+                                &mut rng,
+                                &mut consent,
+                                &mut wire,
+                                &mut saved,
+                            );
                         }
                     }
                     // Over the inner limit, not valid bincode, or one of the two
@@ -643,6 +1021,23 @@ fn main() {
                 die(2, &format!("write(fd 1): {e}"));
             }
             eprintln!("stub: sent {bytes} B");
+        }
+
+        // FAIL CLOSED on a decline, and checked AFTER the write so the
+        // `declined=` line is on the wire before we go. A decline is a pass only
+        // if the run asked for one: otherwise a bug that declined every prompt
+        // would look like a quiet, clean — and completely signature-free — run,
+        // which is the failure mode LIVE-GLASS-PLAN §10 names.
+        let declined = DECLINES.load(Ordering::Relaxed);
+        if declined > expect_declines() {
+            die(
+                2,
+                &format!(
+                    "{declined} prompt(s) DECLINED but STUB_EXPECT_DECLINES={} -- a declined \
+                     prompt is a FAILURE unless the run declares it",
+                    expect_declines()
+                ),
+            );
         }
 
         if saved.len() == N_DEVICES && !announced_save {

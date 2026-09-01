@@ -33,9 +33,17 @@ flash -- and mid-run it drops every signer and rebuilds them from those flash by
 so the coordinator finishes the keygen and the signature with devices whose
 `DeviceId` was read back out of flash. What this does **not** cover
 is *consent*: the stub auto-acks `SignatureRequest`, so the approval policy — the
-only thing between a coordinator and a signature — has never been exercised, and the
-keygen session hash is never compared device↔coordinator. Both are phase-5 UI work
-(PLAN.md §8 phase 4, §9 item 12).
+only thing between a coordinator and a signature — has never been exercised on the
+gate path.
+
+The session hash **is** compared, and this paragraph claimed otherwise until
+2026-08-27: `hostcheck/src/main.rs:1188-1217` checks every device's computed hash
+against the coordinator's across two OS processes and two *different builds* of
+`frostsnap_core`, and bails on a mismatch by name. What is still open is one level up
+and easy to conflate with it — the comparison is **core-to-core, not
+screen-to-coordinator**. Nothing asserts that the four bytes `ui::keygen_check`
+actually draws are the coordinator's, and those four bytes are what a human compares.
+See PLAN.md §8 phase 4 and §9 item 12.
 
 **This firmware requires a global allocator, and does not register one.** A library
 must not — registering one would silently override the future `main`'s choice. The
@@ -154,7 +162,7 @@ cargo test --target $T -p frostsnap_macros                              #   7
 cargo test --target $T -p frostsnap_embedded --features std             #  17  (15 without std)
 cargo test --target $T -p frostsnap_comms    --features coordinator     #  10
 cargo test --target $T -p frostsnap_core     --features coordinator     #  63
-cargo test --target $T -p coldsnap_hal --features fake-flash,test-seam   # 214
+cargo test --target $T -p coldsnap_hal --features fake-flash,test-seam   # 219
 cargo test --target $T -p coldsnap_firmware                              #  36  (22 lib + 14 bin)
 cargo test --target $T -p frost_backup --lib --test proptest \
   --test specification_tests --test recovery_tests --test error_handling \
@@ -286,7 +294,7 @@ Current state against Mk4's 1,425,408-byte `FLASH_TEXT`
 
 **Those are rlib sums with LTO off, i.e. upper bounds, and the gap to a real
 linked image is now measured and it is large.** `firmware/` links, and
-`target/thumbv7em-none-eabihf/release/coldsnap_firmware` is **297,064 B = 20.84%**
+`target/thumbv7em-none-eabihf/release/coldsnap_firmware` is **298,148 B = 20.92%**
 flash-resident (`.vector_table` 64 + `.text` 257,272 + `.rodata` 24,712 + `.data`
 32, from `llvm-objdump -h`), measured 2026-08-25 with a real `FrostSigner` linked.
 That is **3.1× smaller** than the

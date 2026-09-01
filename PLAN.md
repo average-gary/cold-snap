@@ -937,7 +937,7 @@ Each phase ends at a testable artifact. No hardware until Phase 5.
 | 1b | Close the residual test gaps | odd-y/`lift_x` assertion; device-path vector; clippy at `bitcoin_transaction.rs:524` | tests fail on mutating `tweak.rs:342` | ⬜ pending — see DECISIONS.md residual gaps |
 | 2 | STM32 HAL substrate | `NorFlash` for STM32 flash, **2-source** `RngCore` (§5.1 — not three), **panic → `NVIC_SystemReset`** (§6.2), plus removal of the §6.3 panic sites | host tests; handler disassembly; **§8.1 defect register empty** | 🟡 **written, all 12 review defects fixed, host-verified; hardware claims unverified** — see **§8.1**. Device build links; clippy and rustdoc clean; **204 tests** and **857,125 B = 60.1%** at the gate (now 268 / 860,898 with phase 3 and 4 on top). What remains is §8.1 items 3–5 — the real `DBANK`, `.ramfunc`, ECC/NMI — all bench work. Every on-silicon claim is still an assumption (§9); nothing has run on hardware. |
 | 3 | Transport | USB CDC carrying `frostsnap_comms` framing, within the **4,096 B** ceiling (§7, raised from 2,060 — DECISIONS.md 7) | coordinator handshake | 🟡 **written and host-verified; no enumeration has been attempted.** `hal/src/comms.rs` (framing, +18 tests) and `hal/src/usb.rs` (OTG_FS device mode + CDC-ACM, +31 tests, **23/23 mutations caught**) — see **§8.2**. The bound is structural, not a comparison: the accumulator *is* `[u8; FRAME_LIMIT]`, and it costs 2 × that in SRAM. The gate is **not** met **on silicon**, which is what it means here — a real unmodified coordinator *has* handshaked with this framing on the host over a pty (§9 item 6, phase 4's row below); what has never happened is enumeration on the device. §7's census is what raised the bound: at 2,060 the transport refused a real `SignatureShare`, a real 11-input `RequestSign`, 9-of-9 keygen and a 14-share `HeldShares2`; at 4,096 it refuses none of them, and the **three device-side construction caps remain UNIMPLEMENTED** phase-4 work. |
-| 4 | Protocol on host | keygen + sign, Tier 2 simulator first, then Tier 3 stub `Serial` against real `frostsnap_coordinator` | end-to-end on host | 🟡 **gate MET on host 2026-08-18; not signed off.** `hostcheck/` + `firmware/examples/stub.rs` complete a **9-of-9 keygen, nonce replenishment and a signature that VERIFIES** (`Schnorr::verify_only()` against the coordinator's own derived x-only key) over a pty in two processes, against an **unmodified** sibling `frostsnap_coordinator`, at both `STUB_CHUNK=64` and `=1`. The two §7 size crossovers are **closed** by decision 7 (`FRAME_LIMIT` 2,060 → 4,096), validated on the wire: largest coordinator→device frame actually written is **2,179 B**, above the old bound, so this keygen was previously refused. Tier 1 268 tests green. **What the gate does NOT cover, and why phase 4 is not signed off:** the stub auto-acks `SignatureRequest`, so the *approval policy* — the actual security property — is untested; the keygen session hash is never compared device↔coordinator, which is the defence against a lying coordinator; restoration, backup consolidation, physical-backup entry and naming flows have never been driven at all; the three device-side caps (§7) are unimplemented; the allocator is sized and chosen but not registered (§9 item 7); and nothing has run on silicon.
+| 4 | Protocol on host | keygen + sign, Tier 2 simulator first, then Tier 3 stub `Serial` against real `frostsnap_coordinator` | end-to-end on host | 🟡 **gate MET on host 2026-08-18; not signed off.** `hostcheck/` + `firmware/examples/stub.rs` complete a **9-of-9 keygen, nonce replenishment and a signature that VERIFIES** (`Schnorr::verify_only()` against the coordinator's own derived x-only key) over a pty in two processes, against an **unmodified** sibling `frostsnap_coordinator`, at both `STUB_CHUNK=64` and `=1`. The two §7 size crossovers are **closed** by decision 7 (`FRAME_LIMIT` 2,060 → 4,096), validated on the wire: largest coordinator→device frame actually written is **2,179 B**, above the old bound, so this keygen was previously refused. Tier 1 268 tests green. **What the gate does NOT cover, and why phase 4 is not signed off:** the stub auto-acks `SignatureRequest`, so the *approval policy* — the actual security property — is untested; the keygen session hash **is** now compared device↔coordinator across two processes and two builds of `frostsnap_core` (`hostcheck/src/main.rs:1188-1217`, added after this row was written), but only CORE-to-CORE — nothing yet asserts the four bytes the *screen* renders are the coordinator's, which is the half a human actually compares; restoration, backup consolidation, physical-backup entry and naming flows have never been driven at all; the three device-side caps (§7) are unimplemented; the allocator is sized and chosen but not registered (§9 item 7); and nothing has run on silicon.
 | 5 | Mono UI | **8 screens** (§4.2), mono `DrawTarget`, ~850 LOC ported from `frostsnap_widgets` | manual, on hardware | ⬜ pending — largest single item. Note it inherits §8.1 defect 12: the sign-approval screen is the first caller of `user_prompt()`, whose `None` must be a **refusal**, not a rendering fallback. |
 | 6 | Callgate integration | SE1/SE2 identity, PIN, rate limiting; ABI already determined (§5, DECISIONS.md decision 2) | hardware | ⬜ pending |
 | 7 | Nonce durability | read-back-verified writes as `Result` not `assert!`, power-loss testing | fault injection | ⬜ pending — `TestNorFlash` does **not** model power loss (§7) |
@@ -1440,14 +1440,47 @@ catalogued on the device side, sitting on the host side of the same protocol.
     `bring_up` does a full core reset, which is the right default, but that is an
     argument from first principles and not a measurement.
 
-12. **The two security properties phase 4 did not test.** The harness proves the
-    wire and the crypto agree; it does not touch **consent**. `firmware/examples/stub.rs`
-    **auto-acks `SignatureRequest`**, so the approval policy — the only thing between
-    a coordinator and a signature — has never been exercised, and the keygen
-    **session hash is never compared device↔coordinator**, which is the defence
-    against a lying coordinator. Both are phase-5 UI work; neither is fixed by more
-    harness. This is why phase 4's gate is recorded as *met but not signed off* in
-    §8, and it is the reason that row should not be read as "signing is verified".
+12. **The consent gap. HALF OF THIS ITEM IS CLOSED and the text below was stale
+    until 2026-08-27** — it claimed the session hash is never compared
+    device↔coordinator, and that has not been true since the gap-closing pass:
+    `hostcheck/src/main.rs:1188-1217` compares **every** device's computed session
+    hash against the coordinator's, requires all `N_DEVICES` to have reported, and
+    bails with `SESSION HASH MISMATCH: {id} computed {got}, the coordinator computed
+    {want}`. It is a genuine cross-check — two OS processes and two *different builds*
+    of `frostsnap_core` (upstream via `frostsnap_coordinator` on one side, vendored in
+    the stub on the other) — and it is ours by name rather than relying on upstream's
+    internal `recv_device_message` refusal, which a re-vendor could silently drop.
+
+    **What remains open is narrower and worth stating precisely: the hash is compared
+    CORE-to-CORE, not SCREEN-to-coordinator.** Nothing asserts that the 4-byte code
+    `ui::keygen_check` actually *renders* is the code the coordinator computed. A
+    device that verified the right transcript and then drew the wrong four bytes would
+    pass everything above, and the human comparison is the whole anti-MITM defence.
+    **CLOSED 2026-08-31.** `firmware/examples/stub.rs::glass_code()` reads the four
+    rendered bytes back off the *same* `ui::Frame` the consent answered, using the
+    promoted `ui::Frame::cell_2x` (not a second implementation of the mapping), and
+    reports them on the existing wire as a `Debug` line. `hostcheck/src/main.rs:1477`
+    compares them against its own session-hash prefix, requires all 9 devices to have
+    reported, and bails `GLASS CODE MISMATCH: <id> RENDERED <x> on the screen a human
+    reads aloud, but this coordinator's session hash starts <y>`. Measured:
+    `THE GLASS shows d25f9b9b on 9/9 devices`, the same value from two OS processes and
+    two different builds of `frostsnap_core`.
+
+    The assertion is **structural, not additional**, and that is the part worth
+    understanding: the confirm digit is randomised, so a script cannot answer a signing
+    prompt without first reading the digit out of the framebuffer. Verified with no
+    source change — `COLDSNAP_GLASS_KEYS=y9` (a hardcoded key) and `=11` both exit 1,
+    while the pixel-reading path exits 0. A device that renders the wrong prompt fails
+    automatically because the script presses the wrong key and is refused.
+
+    Still open, unchanged: `firmware/examples/stub.rs` **auto-acks
+    `SignatureRequest`**, so the approval policy — the only thing between a
+    coordinator and a signature — has never been exercised on the gate path. And note
+    a constraint found while designing the fix: **the vendored protocol has no
+    "decline" message**, so a refusal is expressible only as *not confirming* plus a
+    `Debug` back-channel line. This is why phase 4's gate is recorded as *met but not
+    signed off* in §8, and it is the reason that row should not be read as "signing is
+    verified".
     Restoration, backup, consolidation and naming flows have never been driven by any
     harness in this tree either.
 
@@ -1481,6 +1514,25 @@ catalogued on the device side, sitting on the host side of the same protocol.
     silicon at a bench. It is only resolvable by phase-5 UI, and the fix is **not** to
     bring USB up early to obtain a channel — that trades the security property for a
     diagnostic. First screen phase 5 should draw.
+
+21. **The randomised confirm digit is drawn and rendered on the device path but never
+    EVALUATED there, because no keypad driver exists.** `firmware/src/main.rs:581` draws
+    a fresh `ui::ConfirmDigit` per prompt and renders it, and `firmware/src/lib.rs:780-789`
+    documents that the render and the accept share one `ConfirmDigit` so they cannot
+    disagree — but `ConfirmDigit::accepts` has **no caller anywhere in `firmware/src`**.
+    `boot()` has no button input, so nothing on the device evaluates a keypress. The
+    fail-closed rule therefore lives in two places today: the type in `hal`
+    (`accepts` compares against a *private* field only `draw` can fill, so no
+    cross-crate caller can forge a digit) and the only consumer,
+    `firmware/examples/stub.rs::approved`.
+
+    So do not read "fail-closed confirm digit" as "the device enforces it" — **on silicon
+    the digit is currently a legend with no enforcement.** It becomes real when a keypad
+    driver lands, which is phase-5 work alongside `display.rs`. Both call sites say this
+    in comments. Pinned meanwhile by `ui::tests::anything_but_the_confirm_digit_is_a_refusal`
+    (every non-digit key refuses, including all four *other* charset digits — the near
+    miss a sloppy implementation gets wrong) and
+    `ui::tests::the_signing_screens_print_the_digit_that_accepts`.
 
 20. **CLOSED 2026-08-25, and it was a permanent-brick path: the declared envelope
     n <= 12 existed only in prose.** No code anywhere refused a larger group —
@@ -1594,7 +1646,7 @@ catalogued on the device side, sitting on the host side of the same protocol.
 | Rust toolchain | 1.88.0 (upstream pin) + `thumbv7em-none-eabihf` |
 | C cross-compiler | clang 21 (`/opt/homebrew/opt/llvm/bin/clang`) — still required, decision 4 |
 | Decisions record | [DECISIONS.md](DECISIONS.md), dated 2026-08-12 |
-| Flash, as built | 860,898 B = **60.4%** of `FLASH_TEXT`, re-measured in a clean target dir 2026-08-19 (844,229 at phase 0; +5,101 panic sites, +253 for §8.1 defects 10–12, **+15,873 `coldsnap_hal` rlib** — of which +3,461 is phase 3's `comms.rs` + `usb.rs` — less −4,482 instantiations that moved between rlibs; all with LTO off, so upper bounds). **This row read 893,099 B = 62.7% until 2026-08-19**, on the strength of a +32,513 B growth attributed to `comms::decode_body`; that does not reproduce clean and is retracted — see README "Flash budget". The live `./target` glob measures 1,311,110 B = 92.0% from 131 rlibs against a clean 48, which is the artefact to suspect first.  **The linked image is measured, and the rlib sum above overestimates it by ~2.9×:** `firmware/` links at **297,064 B = 20.84%** of `FLASH_TEXT` (`llvm-objdump -h`, 2026-08-25: `.vector_table` 64 + `.text` 270,472 + `.rodata` 26,496 + `.data` 32), because LTO plus `--gc-sections` keeps only what is reachable. `llvm-nm` finds **210** frostsnap/secp/schnorr/bitcoin symbols and **12** `coldsnap_hal::ui` symbols. The trajectory, each step a real caller appearing rather than a code addition: 11,604 B when `boot()` polled USB but touched no `comms` · 94,304 B with `Link::poll` + `decode_body` · 99,684 B with `identity` · 101,416 B once the identity-hold screen gave `ui`/`display` a caller · 282,080 B once a real `FrostSigner` was constructed and dispatched to · **297,064 B** once the remaining §4.2 consent screens got honest callers. This is no longer a floor in the earlier sense — the FROST workload and the consent screens are both genuinely linked — but it is still not the ceiling: the undriven restoration, backup, consolidation and naming flows are refused rather than implemented (§9), so their code is absent. Read the rlib rows for the MARGINAL cost of a change, never as a prediction of image size. |
+| Flash, as built | 860,898 B = **60.4%** of `FLASH_TEXT`, re-measured in a clean target dir 2026-08-19 (844,229 at phase 0; +5,101 panic sites, +253 for §8.1 defects 10–12, **+15,873 `coldsnap_hal` rlib** — of which +3,461 is phase 3's `comms.rs` + `usb.rs` — less −4,482 instantiations that moved between rlibs; all with LTO off, so upper bounds). **This row read 893,099 B = 62.7% until 2026-08-19**, on the strength of a +32,513 B growth attributed to `comms::decode_body`; that does not reproduce clean and is retracted — see README "Flash budget". The live `./target` glob measures 1,311,110 B = 92.0% from 131 rlibs against a clean 48, which is the artefact to suspect first.  **The linked image is measured, and the rlib sum above overestimates it by ~2.9×:** `firmware/` links at **298,148 B = 20.92%** of `FLASH_TEXT` (`llvm-objdump -h`, 2026-08-25: `.vector_table` 64 + `.text` 270,472 + `.rodata` 26,496 + `.data` 32), because LTO plus `--gc-sections` keeps only what is reachable. `llvm-nm` finds **210** frostsnap/secp/schnorr/bitcoin symbols and **12** `coldsnap_hal::ui` symbols. The trajectory, each step a real caller appearing rather than a code addition: 11,604 B when `boot()` polled USB but touched no `comms` · 94,304 B with `Link::poll` + `decode_body` · 99,684 B with `identity` · 101,416 B once the identity-hold screen gave `ui`/`display` a caller · 282,080 B once a real `FrostSigner` was constructed and dispatched to · **297,064 B** once the remaining §4.2 consent screens got honest callers. This is no longer a floor in the earlier sense — the FROST workload and the consent screens are both genuinely linked — but it is still not the ceiling: the undriven restoration, backup, consolidation and naming flows are refused rather than implemented (§9), so their code is absent. Read the rlib rows for the MARGINAL cost of a change, never as a prediction of image size. |
 | Host tests passing | **366** (357 before the gap-closing pass; 355 before the signing pipeline; 344 on 2026-08-25 before `FrostSigner`; the firmware gate is now a SUM of two `test result` lines, 11 lib + 14 bin; 341 on 2026-08-24, +40 for `ui.rs`; 268 until 2026-08-24, which never counted `coldsnap_firmware`'s 14; +19 for `identity`; 204 at the phase-2 gate, 253 at the end of phase 3, 261 before §9 item 7(c)'s three outer-leg tests, 264 before the three inner-leg `decode_body` tests, 267 before the pin on the vendored `MAX_MESSAGE_ALLOC_SIZE`; `frostsnap_core` no longer needs an allowlist, `frost_backup` still does — §7) |
 
 Vendored crates live in `vendor/frostsnap/` with upstream commit recorded in
