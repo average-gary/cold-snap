@@ -162,8 +162,8 @@ cargo test --target $T -p frostsnap_macros                              #   7
 cargo test --target $T -p frostsnap_embedded --features std             #  17  (15 without std)
 cargo test --target $T -p frostsnap_comms    --features coordinator     #  10
 cargo test --target $T -p frostsnap_core     --features coordinator     #  63
-cargo test --target $T -p coldsnap_hal --features fake-flash,test-seam   # 219
-cargo test --target $T -p coldsnap_firmware                              #  36  (22 lib + 14 bin)
+cargo test --target $T -p coldsnap_hal --features fake-flash,test-seam   # 267
+cargo test --target $T -p coldsnap_firmware                              #  91  (22 lib + 14 bin)
 cargo test --target $T -p frost_backup --lib --test proptest \
   --test specification_tests --test recovery_tests --test error_handling \
   --test checksum_statistics                                            #  19
@@ -223,6 +223,41 @@ whole image, not just against our own output.
 or intra-doc links into the test double and the entropy seam dangle, and `cargo doc -p
 frostsnap_core --features coordinator` needs `--target $T` for the same
 `build.target` reason the tests do.
+
+Both of those run for the HOST, so neither ever sees the 169
+`cfg(target_arch = "arm")` blocks (measured 2026-09-08; the count moves, the gate
+does not care — it is a whole-target compile). These two do (PLAN.md §9 item 22). They are the
+cheapest gates in the project — measured 2026-09-08: **8.2 s** from a genuinely empty
+`CARGO_TARGET_DIR`, **2.5 s** after touching `hal/` or `firmware/`, **0.21 s** warm —
+because clippy only emits metadata, so it never pays codegen or LTO:
+
+```sh
+cargo clippy --release --target thumbv7em-none-eabihf \
+  -p coldsnap_hal -p coldsnap_firmware 2>&1 | grep -cE "hal/src|firmware/src"   # 0
+cargo doc --release --target thumbv7em-none-eabihf -p coldsnap_hal \
+  --features fake-flash,test-seam --no-deps 2>&1 | grep -cE "^warning"          # 0
+```
+
+Three things about those lines, each of which cost a run to learn:
+
+- **No `--all-targets`.** Dev-dependencies (proptest → getrandom) have no
+  `thumbv7em` support: 298 errors, mostly `can't find crate for std`. The library
+  and binary targets are what matter here anyway.
+- The `doc` line **needs** `--features fake-flash,test-seam`, for the same dangling
+  intra-doc links as the host line above. Without them you get 6 spurious
+  `unresolved link to fake::FakeFlash` — a feature artifact, not a device finding.
+- No `--lib` is needed and no allocator problem arises. Clippy stops at
+  `--emit=metadata`, so `main.rs`'s `#![no_main]`, the vector table, the absent
+  `#[global_allocator]` and `.cargo/config.toml`'s `-Tfirmware/link.x` never reach
+  a linker. Cargo prints one status line per package, so you may see
+  `Compiling coldsnap_firmware` (its build script) and no second `Checking` line;
+  the bin **is** checked — a planted defect is what proves that, not the log.
+
+`cargo build --release` already catches *rustc*-level lints in `cfg`-arm code (a
+planted `[0u8; 4][9]` there fails it on `unconditional_panic`, deny-by-default).
+What it does not catch is anything clippy-only, which is the hole these two close.
+Neither runs the code: there is no `thumbv7em` runner in this tree, so those blocks
+are now LINTED and still never EXECUTED.
 
 Note `coldsnap_hal` needs `--features fake-flash,test-seam` for its `tests/`
 directory; both are off by default so a test double or an entropy bypass can never
@@ -294,7 +329,7 @@ Current state against Mk4's 1,425,408-byte `FLASH_TEXT`
 
 **Those are rlib sums with LTO off, i.e. upper bounds, and the gap to a real
 linked image is now measured and it is large.** `firmware/` links, and
-`target/thumbv7em-none-eabihf/release/coldsnap_firmware` is **298,148 B = 20.92%**
+`target/thumbv7em-none-eabihf/release/coldsnap_firmware` is **362,288 B = 25.42%**
 flash-resident (`.vector_table` 64 + `.text` 257,272 + `.rodata` 24,712 + `.data`
 32, from `llvm-objdump -h`), measured 2026-08-25 with a real `FrostSigner` linked.
 That is **3.1× smaller** than the

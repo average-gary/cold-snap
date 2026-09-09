@@ -930,12 +930,18 @@ fn ui_scenes() -> Vec<Scene> {
     ]);
 
     // -- screen 5: 25 words, page by page ---------------------------------
+    //
+    // The RNG is not optional on these two screens: every row with a word on it is
+    // covered by `Frame::mark_sensitive` (`shared/display.py:201-205`), so the
+    // ragged right margin below is the defence and not decoration. A real
+    // `Entropy`, from the same deterministic seam the rest of this file uses.
+    let mut noise = entropy(0x5e);
     match ui::BackupPages::new(3, &WORDS) {
         Ok(b) => scenes.push(Scene::shown(
             "5 backup display: share index + 7 word pages",
             "8 pages: the share-index page is not optional, a backup without it is \
-             unrestorable",
-            (0..b.len()).map(|i| frame(|f| { b.render(i, f); })).collect(),
+             unrestorable. Word rows are noised per scanline (mark_sensitive)",
+            (0..b.len()).map(|i| frame(|f| { b.render(i, f, &mut noise); })).collect(),
         )),
         Err(e) => scenes.push(Scene::refused("5 backup display", "25 good words", format!("{e:?}"))),
     }
@@ -944,7 +950,7 @@ fn ui_scenes() -> Vec<Scene> {
         Ok(b) => scenes.push(Scene::shown(
             "5b backup display, 24 words: EXPECTED A REFUSAL",
             "a word list that is not 25 long must be refused",
-            (0..b.len()).map(|i| frame(|f| { b.render(i, f); })).collect(),
+            (0..b.len()).map(|i| frame(|f| { b.render(i, f, &mut noise); })).collect(),
         )),
         Err(e) => scenes.push(Scene::refused(
             "5b backup display: 24 words -> REFUSAL",
@@ -963,7 +969,7 @@ fn ui_scenes() -> Vec<Scene> {
                 partial: if i == 0 { "1" } else { "ab" },
             };
             frame(|f| {
-                e.render(i, f);
+                e.render(i, f, &mut noise);
             })
         })
         .collect();

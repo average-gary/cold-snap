@@ -322,6 +322,7 @@ dependencies = [
  "bitcoin",
  "coldsnap_hal",
  "embedded-storage",
+ "frost_backup",
  "frostsnap_comms",
  "frostsnap_core",
  "frostsnap_embedded",

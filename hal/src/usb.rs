@@ -1172,11 +1172,37 @@ mod offset {
     pub const EP_STRIDE: usize = 0x20;
     /// `PCGCCTL`.
     pub const PCGCCTL: usize = 0xe00;
-    /// Base of the FIFO access windows.
-    pub const FIFO: usize = 0x1000;
-    /// Stride between endpoint FIFO windows.
-    pub const FIFO_STRIDE: usize = 0x1000;
 }
+
+/// Base of the FIFO access windows (`stm32l4s5xx.h:1494`).
+///
+/// Host-visible, unlike the rest of the register offsets in the ARM-only `offset`
+/// module: [`fifo_window`] is host-tested and needs them, and that is the point —
+/// keeping these two behind `cfg(target_arch = "arm")` is exactly what made the FIFO
+/// address computation unreachable by every gate. See [`fifo_window`].
+pub const FIFO: usize = 0x1000;
+/// Stride between endpoint FIFO windows (`stm32l4s5xx.h:1495`). See [`FIFO`].
+pub const FIFO_STRIDE: usize = 0x1000;
+
+/// Address of endpoint `ep`'s transmit FIFO window.
+///
+/// `OTG_FS_BASE + 0x1000 + (ep & 0x0f) * 0x1000` (`stm32l4s5xx.h:1494-1495`). The
+/// mask is what keeps the address inside the peripheral for ANY `ep`, rather than
+/// relying on every caller to pass one of 0, `EP_DATA` or `EP_NOTIFY`.
+///
+/// Extracted from `write_fifo_word` on 2026-09-08 because inline, inside a
+/// `cfg(target_arch = "arm")` block, it was **unreachable by every gate** — PLAN.md
+/// §9 item 22 measured that deleting the `& 0x0f` left all 265 hal tests, 81 firmware
+/// tests, host clippy, `cargo build --release` and both device-target clippy gates
+/// green, while putting an `unsafe write_volatile` outside the OTG_FS window.
+///
+/// A pure fn is host-testable, and `fifo_window_stays_inside_the_peripheral_for_any_ep`
+/// walks all 256 values of `ep`. Checking the address beats grepping for the mask.
+#[must_use]
+pub const fn fifo_window(ep: u8) -> usize {
+    OTG_FS_BASE + FIFO + (ep as usize & 0x0f) * FIFO_STRIDE
+}
+
 
 #[cfg(target_arch = "arm")]
 use offset::*;
@@ -1347,7 +1373,7 @@ impl OtgPort for Mmio {
         // (`stm32l4s5xx.h:1494-1495`). `ep` here is always 0, `EP_DATA` or
         // `EP_NOTIFY`, all < 4, so the address is inside the peripheral. The
         // masking makes that a property of the code rather than of every caller.
-        let window = OTG_FS_BASE + FIFO + (ep as usize & 0x0f) * FIFO_STRIDE;
+        let window = fifo_window(ep);
         unsafe { core::ptr::write_volatile(window as *mut u32, word) }
     }
 
@@ -1847,6 +1873,30 @@ fn configure_pins() {
 
 #[cfg(test)]
 mod tests {
+
+    /// The FIFO window stays inside the peripheral for EVERY `ep`, not just the
+    /// three callers pass.
+    ///
+    /// This exists because deleting the `& 0x0f` in `fifo_window` was MEASURED to
+    /// pass all six gates (PLAN.md §9 item 22) while putting an `unsafe
+    /// write_volatile` outside the OTG_FS window. It was unreachable as an inline
+    /// expression in a `cfg(target_arch = "arm")` block; as a pure fn it is this.
+    #[test]
+    fn fifo_window_stays_inside_the_peripheral_for_any_ep() {
+        // OTG_FS occupies 0x5000_0000..0x5004_0000 (256 KiB, `stm32l4s5xx.h`).
+        const OTG_FS_END: usize = OTG_FS_BASE + 0x0004_0000;
+        for ep in 0u8..=255 {
+            let w = fifo_window(ep);
+            assert!(
+                w >= OTG_FS_BASE + FIFO && w + 4 <= OTG_FS_END,
+                "ep {ep} maps to {w:#x}, outside the OTG_FS window"
+            );
+        }
+        // And the mask is what does it: ep and ep|0x10 must land identically.
+        for ep in 0u8..16 {
+            assert_eq!(fifo_window(ep), fifo_window(ep | 0x10), "mask dropped for {ep}");
+        }
+    }
     extern crate alloc;
     extern crate std;
 

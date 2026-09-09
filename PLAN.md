@@ -1515,6 +1515,197 @@ catalogued on the device side, sitting on the host side of the same protocol.
     bring USB up early to obtain a channel — that trades the security property for a
     diagnostic. First screen phase 5 should draw.
 
+24. **CLOSED 2026-09-03 — the three absent features, and one of them was a blind
+    signer I had called fail-closed.**
+
+    *Durable share storage.* `firmware/src/store.rs` persists the keygen triple as one
+    512-byte fixed-shape record in a **vendored `AbSlot`** at `memmap::FS_SHARE_OFFSET` —
+    no new store and no `NorFlashLog` patch, because the vendored A/B slot works on
+    8-byte-programmed flash where the log does not. The checksum occupies the final
+    doubleword, so a tear anywhere leaves the tail at `0xff` and `load` answers `Damaged`
+    rather than a half-share — the same commit-word-last property `identity.rs` uses.
+    Verified by mutation: tampering one body byte is caught by the checksum, so reload
+    genuinely reads flash rather than replaying a constant (the stability-vs-durability
+    trap that bit the identity test).
+
+    *Persist-before-ack, enforced not merely ordered.* `persist_staged` sits at the TOP of
+    `Session::run`, above the loop that pushes to the outbox, so no coordinator-bound
+    message can precede it. I ran both mutations myself — deleting the call, and moving it
+    below the drain — and each fails
+    `a_share_that_cannot_be_written_is_never_acked`. The property being defended: an ack
+    this device cannot back leaves a threshold silently short, discovered only when
+    someone tries to spend.
+
+    *The page cursor — and my error.* I reported page 0 of a bitcoin transaction as
+    "unapprovable, correctly fail-closed" because no confirm digit is rendered on it.
+    **That was wrong.** `confirming(confirm)` attached the digit to the whole page SET
+    while `render(0, ...)` drew a page that never printed it, and `answer` still compared
+    a keypress against that drawn digit — so a **1-in-5 blind guess signed a transaction
+    whose fee and recipients had never been displayed.** Unapprovable by an honest user
+    reading the screen; approvable by luck. The cursor is now an *argument* rather than
+    state (so `confirm` re-renders the exact page the human read), the digit lives in the
+    same `is_last` branch the consent check tests, and the footer reads `pg 4/67 (9)next`.
+    Pinned by `only_the_last_page_of_a_transaction_advertises_the_key_that_signs`,
+    `the_consent_gate_uses_the_page_it_was_given_and_demands_the_last_one` and
+    `the_page_0_funnel_reports_a_paged_transaction_as_unanswerable`.
+
+    *`SetName`.* Sent, and committed at `FinalizeKeyGen`; consent belongs at the commit,
+    not the per-keystroke preview. The name is NOT a core `Mutation`, so it gets its own
+    record in the share store. The false comment claiming `NeedName` registers a device is
+    gone. **Still blocked upstream:** the shipped Flutter row renders the name field only
+    when the device digest equals the app's bundled digest
+    (`wallet_create.dart:662-704`), which cold-snap's never will — so this is exercised by
+    `hostcheck`, not by the released app.
+
+    A process note worth keeping: a temporary probe an agent left behind
+    (`/// TEMPORARY VERIFICATION PROBE — remove.`) had never executed because the file did
+    not compile, and it failed on first run against a record it was over-reaching past by
+    8 bytes. The correctly-scoped test beside it passes. **A test that has never run is
+    not evidence**, and a green report from an agent whose gates never compiled the file
+    is worth nothing — check the counts, not the claim.
+
+22. **152 `cfg(target_arch = "arm")` blocks were invisible to every LINT in this project.
+    Now they are linted; they are still never executed.** Measured 2026-09-02:
+    keypad 8, display 8, usb 85, flash 20, panic 13, rng 6, callgate 5,
+    firmware/src/main.rs 7. Every test, clippy and rustdoc command here runs
+    `--target aarch64-apple-darwin`, so none of that code was ever compiled under a lint.
+
+    **The original wording of this item overstated the hole, and correcting it is worth
+    more than repeating it.** `cargo build --release` does compile those blocks, and it
+    is not silent: it enforces every *rustc*-level lint in them, including the
+    deny-by-default ones. A probe planting `let _ = [0u8; 4][9];` inside `keypad.rs`
+    `scan_once`'s `cfg`-arm block failed that gate outright — exit 101,
+    `error: this operation will panic at runtime`, `#[deny(unconditional_panic)] on by
+    default` — while host tests stayed at 261 and host clippy at 0. So rustc was already
+    looking. The hole was **clippy and rustdoc only**, and that is the whole of what the
+    two new gate lines close.
+
+    This was found the expensive way. `hal/src/keypad.rs` shuffles its row scan order per
+    scan from `Entropy` — the Tempest defence, so EM emissions cannot reveal which key
+    was pressed. `shuffle_rows` is thoroughly host-tested as a function, but its only
+    call site is inside a `cfg`-arm block, and replacing `let order = shuffle_rows(rng)`
+    with a fixed `[0, 1, 2, 3]` left **all 237 hal tests green and the ARM release build
+    clean**. A security property was preserved by review alone.
+
+    Closed for the keypad by `the_scan_order_is_actually_shuffled_at_the_only_call_site`,
+    which reads its own source with `include_str!` and asserts the call site textually
+    (both the removal AND a hardcoded order alongside a still-present call are caught —
+    verified by mutation). A fake GPIO was rejected as the alternative: a test double
+    more permissive than the hardware is worse than no test, which is the same reason
+    `fake-flash` is off by default.
+
+    **WHAT IS NOW ENFORCED for all of them**, added 2026-09-08 and listed in README's
+    "Test" section: `cargo clippy --release --target thumbv7em-none-eabihf -p coldsnap_hal
+    -p coldsnap_firmware` (0 hits in `hal/src`/`firmware/src`) and the same
+    `--target thumbv7em-none-eabihf` for `cargo doc`. It works with no tricks — no
+    `--lib`, no feature juggling, no allocator problem, because clippy stops at
+    `--emit=metadata` and nothing reaches the linker. **`--all-targets` must NOT be in
+    the gate**: dev-dependencies (proptest → getrandom) have no `thumbv7em` support and
+    it fails with 298 errors. Cost, measured not estimated: 8 s cold, 2.4 s incremental,
+    0.22 s warm — the cheapest gate here.
+
+    **The 152 is a snapshot, not a bound, and it has already moved:** a recount on
+    2026-09-08 finds **169** (usb 85, flash 20, panic 13, callgate 11, firmware/src/main.rs
+    10, keypad 8, display 8, rng 6, firmware/src/entry.rs 4, firmware/src/lib.rs 2,
+    hal/src/lib.rs 1, ui.rs 1 — the first recount of this listed only 164 because it
+    missed `entry.rs` and `hal/src/lib.rs` entirely). Do not chase the
+    number — the gate is a whole-target compile, so it covers however many there are.
+
+    The gate bites where the four existing ones do not, proven by mutation:
+    `ROW_SETTLE_SPINS as u32 + 0` in the same `cfg`-arm block left host tests at 261,
+    host clippy at 0, and `cargo build --release` at **0 warnings and 0 errors**, while
+    the device clippy flagged it twice (`identity_op`, `unnecessary_cast`).
+
+    **What the 152 blocks actually contained: nothing.** At clippy's default level, from a
+    cold target dir, 0 findings in `hal/src` and `firmware/src` and 0 rustdoc warnings.
+    A deeper hunt — restriction and pedantic lints as a one-off survey, plus a
+    brace-matching grep of all 152 spans for `unwrap`/`expect`/`panic!`/`assert`/
+    `copy_from_slice`/variable indexing — found **no reachable panic and no unbounded
+    hardware spin**: every register poll is a `checked_sub` countdown returning an error
+    (`usb::wait_bits`, `usb::wait_ep_idle`, `display::write_byte`, `display::drain`,
+    `rng::read_one_word`, `flash`'s `while off < to`), and `panic::system_reset`'s
+    exit-less loop is decision 6 by design. All 19 `cfg(not(target_arch = "arm"))` blocks
+    are refusals, so the forbidden fail-open direction — a cfg on a refusal — does not
+    occur. The single real defect was a missing `SAFETY` comment on the `SPI1_CR1`/`CR2`
+    read in `display::PanelToken::open`, now written. That is a boring result and it is
+    the true one.
+
+    **The restriction lints are deliberately NOT in the gate**, and this is the judgement
+    call to not re-litigate. `-W clippy::cast_possible_truncation`,
+    `arithmetic_side_effects` and `indexing_slicing` produce 281 findings, 40 inside
+    `cfg`-arm spans, and **39 of those 40 are false on this target**: 37 are `usize → u32`
+    casts the lint itself describes as lossy only "on targets with 64-bit wide pointers"
+    (`target_pointer_width = "32"` here, so `usize` *is* `u32`), 8 are `chunks_exact(8)`
+    indexing that is total, 2 are a slice already bounded by `.min(4)` with a comment
+    saying so, and 16 are `const fn` register-address arithmetic on constants. A gate
+    whose only available response is `#[allow]` is a permanent hall pass, which is
+    exactly what this project forbids. Run them as a survey; keep them out of the list.
+
+    **STILL NOT CLOSED, and it is the larger half.** Linted is not executed. There is no
+    `thumbv7em` runner in this tree, so no assertion in any of those blocks has ever
+    evaluated — that needs QEMU or hardware and is a different piece of work. Nor does a
+    lint see a *deleted security property*: the keypad shuffle regression above would
+    still pass all six gates today if `shuffle_rows` were replaced by a call to some
+    other correctly-typed function. Source-level guards like
+    `the_scan_order_is_actually_shuffled_at_the_only_call_site` remain the only defence
+    for that class, and they exist for exactly one call site.
+
+    **BOTH OF THOSE ARE NOW PINNED, 2026-09-08.** Each was an inline expression inside
+    a `cfg`-arm block; each is now a pure `const fn` with a host test that checks the
+    VALUE rather than the spelling, which is strictly stronger than a source-text pin:
+      - `usb::fifo_window(ep)` — `OTG_FS_BASE + FIFO + (ep & 0x0f) * FIFO_STRIDE`, pinned
+        by `fifo_window_stays_inside_the_peripheral_for_any_ep`, which walks all 256 `ep`
+        values and separately asserts `ep` and `ep | 0x10` land identically (so the mask
+        itself is what is tested). Dropping the mask now fails with `ep 63 maps to
+        0x50040000, outside the OTG_FS window`. This required hoisting `FIFO` and
+        `FIFO_STRIDE` out of the ARM-only `offset` module: keeping register CONSTANTS
+        behind a cfg is what made the expression unreachable, and constants are numbers,
+        not code.
+      - `flash::pnb_bits(page)` — pinned by `pnb_bits_encodes_the_page_number_itself`
+        across the whole 8-bit field. `page << 4` now fails with `page 1 encoded as page
+        2`. Worth restating why the mask does not save it: the masked result is a VALID
+        field value naming the wrong page, so page 5 erases page 10 and the erase
+        reports success because it did erase a page.
+    The rule of thumb below still holds for everything not yet extracted, and the lesson
+    generalises: an expression worth guarding is an expression worth making a function.
+
+    **Two concrete mutations that pass all six gates**, measured 2026-09-08 during
+    adversarial verification of this item, recorded because "a lint cannot see a deleted
+    security property" is abstract and these are not. (a) Deleting the `& 0x0f` bound in
+    `usb::Mmio::write_fifo_word` (`usb.rs:1351`) — the mask the comment there calls "a
+    property of the code rather than of every caller" — puts an unsafe
+    `write_volatile` outside the OTG_FS window. (b) Changing `page << 3` to `page << 4`
+    in `StmFlash::erase`'s `FLASH_CR` `PNB` field (`flash.rs:1169`) erases the **wrong
+    page**. Both left 265 hal + 81 firmware tests green, host clippy 0, `cargo build
+    --release` at 0 warnings *and* 0 errors, and both new device gates at 0. What the
+    gate does catch, also by mutation: `apb2 & RCC_APB2ENR_SPI1EN == 0` → `== 1` in
+    `display::enable_clocks` (a flag test that can never be true, so `SPI1`'s clock is
+    never ungated) fails device clippy at exit 101 on deny-by-default
+    `clippy::bad_bit_mask`, while every other gate stays green. So the rule of thumb is:
+    the gate sees *malformed* register code and is blind to *plausible-but-wrong*
+    register code. Only a source pin or silicon closes the second half.
+
+23. **A near-miss worth recording because the cause was a plausible-looking source
+    citation.** The Mk4 keypad has TWO decode strings in the Coldcard tree and they are
+    exact reverses. `shared/mempad.py:19` is the authoritative electrical matrix map,
+    `DECODER = 'y0x987654321'`, indexed `(row * NUM_COLS) + col` (`:120`) and decoded at
+    `:152`. `unix/simulator.py:491` uses `'123456789x0y'[(row*3) + col]` — but that
+    `row`/`col` come from **screen pixel coordinates** (`(y - KEYPAD_TOP) //
+    KEYPAD_PITCH`), i.e. the photo's visual layout, NOT the matrix.
+
+    The pixel string was handed to the keypad agents as "the matrix map". Under it,
+    electrical index 2 — physically CANCEL — decodes to `'3'`, and `'3'` is in
+    `ui::CONFIRM_CHARSET = *b"12346"`. **Pressing CANCEL would have signed on one prompt
+    in five**, with the other four unapprovable. Caught during the build, not after.
+    Now guarded by a `const _: ()` assert (`keypad.rs:488`,
+    `DECODER[CANCEL_INDEX] == KEY_CANCEL`) so the wrong table is a BUILD FAILURE, plus
+    `the_decode_table_is_the_matrix_map_not_the_printed_layout`. Both verified by
+    mutation: substituting the pixel string fails `E0080` at compile time.
+
+    The lesson is about citations, not keypads: a file:line that exists and looks
+    authoritative can still be the wrong file. The simulator's string was real, cited,
+    and about pixels.
+
 21. **The randomised confirm digit is drawn and rendered on the device path but never
     EVALUATED there, because no keypad driver exists.** `firmware/src/main.rs:581` draws
     a fresh `ui::ConfirmDigit` per prompt and renders it, and `firmware/src/lib.rs:780-789`
@@ -1526,8 +1717,21 @@ catalogued on the device side, sitting on the host side of the same protocol.
     cross-crate caller can forge a digit) and the only consumer,
     `firmware/examples/stub.rs::approved`.
 
-    So do not read "fail-closed confirm digit" as "the device enforces it" — **on silicon
-    the digit is currently a legend with no enforcement.** It becomes real when a keypad
+    **CLOSED 2026-09-02.** `hal/src/keypad.rs` landed (the Mk4 4x3 membrane matrix, real
+    pins from `stm32/COLDCARD_MK4/pins.csv:74-80` — cols PB0-PB2, rows PD8-PD11) and
+    `firmware/src/main.rs:221` now calls `confirm.accepts(key)` inside `fn answer`,
+    reachable only from `keypad::Event::Down`. `Answer::Yes` is the sole route to
+    `session.confirm`. The `keypad::Event` match is exhaustive with no `_` arm, so a new
+    driver variant is a compile error rather than a silent default. Proven fail-closed
+    over all 256 byte values x all 5 digits (`only_the_rendered_digit_confirms`), plus
+    ghosting refused across all 4,096 scan patterns
+    (`simultaneous_contacts_are_refused_never_guessed`) and a dead pad refusing
+    (`a_missing_keypad_never_confirms`).
+
+    The original text is kept below because its warning still applies to any OTHER
+    mechanism of this shape. So do not read "fail-closed confirm digit" as "the device
+    enforces it" — **before this landed, on silicon the digit was a legend with no
+    enforcement.** It becomes real when a keypad
     driver lands, which is phase-5 work alongside `display.rs`. Both call sites say this
     in comments. Pinned meanwhile by `ui::tests::anything_but_the_confirm_digit_is_a_refusal`
     (every non-digit key refuses, including all four *other* charset digits — the near
@@ -1646,8 +1850,8 @@ catalogued on the device side, sitting on the host side of the same protocol.
 | Rust toolchain | 1.88.0 (upstream pin) + `thumbv7em-none-eabihf` |
 | C cross-compiler | clang 21 (`/opt/homebrew/opt/llvm/bin/clang`) — still required, decision 4 |
 | Decisions record | [DECISIONS.md](DECISIONS.md), dated 2026-08-12 |
-| Flash, as built | 860,898 B = **60.4%** of `FLASH_TEXT`, re-measured in a clean target dir 2026-08-19 (844,229 at phase 0; +5,101 panic sites, +253 for §8.1 defects 10–12, **+15,873 `coldsnap_hal` rlib** — of which +3,461 is phase 3's `comms.rs` + `usb.rs` — less −4,482 instantiations that moved between rlibs; all with LTO off, so upper bounds). **This row read 893,099 B = 62.7% until 2026-08-19**, on the strength of a +32,513 B growth attributed to `comms::decode_body`; that does not reproduce clean and is retracted — see README "Flash budget". The live `./target` glob measures 1,311,110 B = 92.0% from 131 rlibs against a clean 48, which is the artefact to suspect first.  **The linked image is measured, and the rlib sum above overestimates it by ~2.9×:** `firmware/` links at **298,148 B = 20.92%** of `FLASH_TEXT` (`llvm-objdump -h`, 2026-08-25: `.vector_table` 64 + `.text` 270,472 + `.rodata` 26,496 + `.data` 32), because LTO plus `--gc-sections` keeps only what is reachable. `llvm-nm` finds **210** frostsnap/secp/schnorr/bitcoin symbols and **12** `coldsnap_hal::ui` symbols. The trajectory, each step a real caller appearing rather than a code addition: 11,604 B when `boot()` polled USB but touched no `comms` · 94,304 B with `Link::poll` + `decode_body` · 99,684 B with `identity` · 101,416 B once the identity-hold screen gave `ui`/`display` a caller · 282,080 B once a real `FrostSigner` was constructed and dispatched to · **297,064 B** once the remaining §4.2 consent screens got honest callers. This is no longer a floor in the earlier sense — the FROST workload and the consent screens are both genuinely linked — but it is still not the ceiling: the undriven restoration, backup, consolidation and naming flows are refused rather than implemented (§9), so their code is absent. Read the rlib rows for the MARGINAL cost of a change, never as a prediction of image size. |
-| Host tests passing | **366** (357 before the gap-closing pass; 355 before the signing pipeline; 344 on 2026-08-25 before `FrostSigner`; the firmware gate is now a SUM of two `test result` lines, 11 lib + 14 bin; 341 on 2026-08-24, +40 for `ui.rs`; 268 until 2026-08-24, which never counted `coldsnap_firmware`'s 14; +19 for `identity`; 204 at the phase-2 gate, 253 at the end of phase 3, 261 before §9 item 7(c)'s three outer-leg tests, 264 before the three inner-leg `decode_body` tests, 267 before the pin on the vendored `MAX_MESSAGE_ALLOC_SIZE`; `frostsnap_core` no longer needs an allowlist, `frost_backup` still does — §7) |
+| Flash, as built | 860,898 B = **60.4%** of `FLASH_TEXT`, re-measured in a clean target dir 2026-08-19 (844,229 at phase 0; +5,101 panic sites, +253 for §8.1 defects 10–12, **+15,873 `coldsnap_hal` rlib** — of which +3,461 is phase 3's `comms.rs` + `usb.rs` — less −4,482 instantiations that moved between rlibs; all with LTO off, so upper bounds). **This row read 893,099 B = 62.7% until 2026-08-19**, on the strength of a +32,513 B growth attributed to `comms::decode_body`; that does not reproduce clean and is retracted — see README "Flash budget". The live `./target` glob measures 1,311,110 B = 92.0% from 131 rlibs against a clean 48, which is the artefact to suspect first.  **The linked image is measured, and the rlib sum above overestimates it by ~2.9×:** `firmware/` links at **362,288 B = 25.42%** of `FLASH_TEXT` (`llvm-objdump -h`, 2026-09-08: `.vector_table` 64 + `.text` 304,948 + `.rodata` 57,240 + `.data` 36), because LTO plus `--gc-sections` keeps only what is reachable. `llvm-nm` finds **267** frostsnap/secp/schnorr/bitcoin symbols and **17** `coldsnap_hal::ui` symbols. The trajectory, each step a real caller appearing rather than a code addition: 11,604 B when `boot()` polled USB but touched no `comms` · 94,304 B with `Link::poll` + `decode_body` · 99,684 B with `identity` · 101,416 B once the identity-hold screen gave `ui`/`display` a caller · 282,080 B once a real `FrostSigner` was constructed and dispatched to · 297,064 B once the remaining §4.2 consent screens got honest callers · 331,116 B with the keypad driver and real consent · **362,288 B** once `DisplayBackup`, `mark_sensitive` and the persistent share store landed. Still not the ceiling: `EnterPhysicalBackup`, `SavePhysicalBackup`, `SavePhysicalBackup2`, `Consolidate`, `CheckBackup` and the naming flows are refused rather than implemented (§9), so their code is absent — and a PIN would add the SE1 paths that are currently bound but gc-sectioned out. Read the rlib rows for the MARGINAL cost of a change, never as a prediction of image size. |
+| Host tests passing | **474** (357 before the gap-closing pass; 355 before the signing pipeline; 344 on 2026-08-25 before `FrostSigner`; the firmware gate is now a SUM of two `test result` lines, 11 lib + 14 bin; 341 on 2026-08-24, +40 for `ui.rs`; 268 until 2026-08-24, which never counted `coldsnap_firmware`'s 14; +19 for `identity`; 204 at the phase-2 gate, 253 at the end of phase 3, 261 before §9 item 7(c)'s three outer-leg tests, 264 before the three inner-leg `decode_body` tests, 267 before the pin on the vendored `MAX_MESSAGE_ALLOC_SIZE`; `frostsnap_core` no longer needs an allowlist, `frost_backup` still does — §7) |
 
 Vendored crates live in `vendor/frostsnap/` with upstream commit recorded in
 `vendor/README.md`, which also carries the local-modifications table. Changes are

@@ -274,6 +274,28 @@ pub const FLASH_CR_PER: u32 = 1 << 1;
 pub const FLASH_CR_MER1: u32 = 1 << 2;
 /// `FLASH_CR_PNB` — page number, bits 3..10 (`:8849-8850`).
 pub const FLASH_CR_PNB: u32 = 0xFF << 3;
+
+/// Encode a page number into the `FLASH_CR.PNB` field.
+///
+/// Extracted from `erase`'s inline expression on 2026-09-08 for one reason: as an
+/// expression inside a `cfg(target_arch = "arm")` block it was **unreachable by every
+/// gate in this project**, and PLAN.md §9 item 22 records the measurement — changing
+/// `page << 3` to `page << 4` there left all 265 hal tests, 81 firmware tests, host
+/// clippy, `cargo build --release` AND both new device-target clippy gates green.
+///
+/// The mask does not save it, which is what makes this worth a function. `page << 4`
+/// masked by `FLASH_CR_PNB` (`0xFF << 3`) still yields a **valid** field value — just
+/// the wrong page. Page 5 would erase page 10. In `FLASH_FS` that is the identity
+/// record, a share, or nonce state destroyed silently; the erase reports success
+/// because it *did* erase a page.
+///
+/// As a pure fn it is host-testable, which `pnb_bits_encodes_the_page_number_itself`
+/// does across the whole field range. That is strictly better than a source-text pin:
+/// it checks the value, not the spelling.
+#[must_use]
+pub const fn pnb_bits(page: u32) -> u32 {
+    (page << 3) & FLASH_CR_PNB
+}
 /// `FLASH_CR_BKER` — bank select for erase, bit 11 (`:8852`).
 pub const FLASH_CR_BKER: u32 = 1 << 11;
 /// `FLASH_CR_STRT` — start erase, bit 16 (`:8858`).
@@ -1165,8 +1187,10 @@ impl NorFlash for StmFlash {
                             cr &= !FLASH_CR_BKER;
                         }
                         // MODIFY_REG(CR, PNB, page << PNB_Pos) -- PNB is bits
-                        // 3..10 (`stm32l4s5xx.h:8849`).
-                        cr = (cr & !FLASH_CR_PNB) | ((page << 3) & FLASH_CR_PNB);
+                        // 3..10 (`stm32l4s5xx.h:8849`). Encoded by `pnb_bits`, a
+                        // pure fn, because inline here it was a blind spot: see
+                        // that function's docs.
+                        cr = (cr & !FLASH_CR_PNB) | pnb_bits(page);
                         core::ptr::write_volatile(FLASH_CR, cr);
                         core::ptr::write_volatile(FLASH_CR, cr | FLASH_CR_PER);
                         core::ptr::write_volatile(FLASH_CR, cr | FLASH_CR_PER | FLASH_CR_STRT);
@@ -1565,6 +1589,26 @@ pub mod fake {
 /// such mutation, so the name states which defect it holds closed.
 #[cfg(test)]
 mod tests {
+
+    /// `pnb_bits` encodes the page number ITSELF, not a shifted-by-one neighbour.
+    ///
+    /// MEASURED (PLAN.md §9 item 22): as an inline expression in a
+    /// `cfg(target_arch = "arm")` block, changing `page << 3` to `page << 4` passed
+    /// all six gates. The `& FLASH_CR_PNB` mask does not catch it — the result is a
+    /// VALID field value naming the wrong page, so page 5 erases page 10. In
+    /// `FLASH_FS` that is the identity record, a share, or nonce state destroyed,
+    /// and the erase reports success because it did erase a page.
+    #[test]
+    fn pnb_bits_encodes_the_page_number_itself() {
+        // PNB is 8 bits at position 3, so pages 0..=255 round-trip exactly.
+        for page in 0u32..=255 {
+            let bits = pnb_bits(page);
+            assert_eq!(bits & !FLASH_CR_PNB, 0, "page {page} set bits outside PNB");
+            assert_eq!(bits >> 3, page, "page {page} encoded as page {}", bits >> 3);
+        }
+        // The specific mutation, named: a shift of 4 doubles the page.
+        assert_ne!(pnb_bits(5), (5u32 << 4) & FLASH_CR_PNB, "shift-by-4 must differ");
+    }
     use super::*;
 
     /// Capacity of [`SimPort`]'s write log. A module-level const, not an

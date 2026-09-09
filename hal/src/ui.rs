@@ -1,5 +1,6 @@
-//! `ui` — the 1,024-byte `MONO_VLSB` framebuffer and the eight required screens
-//! (PLAN.md §4.2), composed from **plain data** and touching **no hardware**.
+//! `ui` — the 1,024-byte `MONO_VLSB` framebuffer, the eight required screens
+//! (PLAN.md §4.2) and the PIN prompt (PLAN.md §8 phase 6), composed from **plain
+//! data** and touching **no hardware**.
 //!
 //! # Why this module has no registers in it
 //!
@@ -101,6 +102,13 @@
 //!   instruction is not the anti-MITM check.
 //! - **The fee is coordinator-supplied.** [`fee_page`] draws
 //!   [`FEE_UNVERIFIED_1`] / [`FEE_UNVERIFIED_2`] on the same page as the number.
+//! - **A row with a seed word on it is noised.** §4.2's note on
+//!   `shared/display.py:284-285` is [`Frame::mark_sensitive`], a fresh
+//!   random-length run per scanline; [`BackupPages::render`] and
+//!   [`EntryPages::render`] take the RNG for it as a **required** argument, so
+//!   there is no un-noised way to put a share on the glass. Its one unclosed
+//!   edge — averaging over redraws — is documented on `mark_sensitive` itself
+//!   rather than left for a reader to discover.
 //!
 //! # What is deliberately not here
 //!
@@ -189,6 +197,38 @@ pub const MAX_RECIPIENTS: usize = 32;
 pub const BACKUP_WORDS: usize = 25;
 /// Backup words shown per page: 4 labelled rows plus a header row.
 pub const WORDS_PER_PAGE: usize = 4;
+
+/// Shortest noise run `Frame::mark_sensitive` draws, in pixels: upstream's
+/// `max(2, ...)` floor (`shared/display.py:203`). Never zero, so a secret row is
+/// never distinguishable from a noised one by having no ink at all.
+const SENSITIVE_MIN: usize = 2;
+/// Longest noise run, in pixels. Upstream draws `max(2, ckcc.rng() % 32)`, whose
+/// inclusive maximum is 31; `mark_sensitive` derives its modulus from this.
+const SENSITIVE_MAX: usize = 31;
+/// Cells the `NN: ` label on a noised row occupies: two digits from
+/// [`Buf::push_u8_pad2`] plus `": "`. Not the string that gets drawn — the rows
+/// are built from those two pushes — so
+/// `the_sensitive_row_budget_matches_the_label_actually_drawn` ties this number to
+/// them.
+const SENSITIVE_LABEL_CELLS: usize = "NN: ".len();
+/// Cells a noised row may spend on TEXT, and the width every such row is built
+/// at: the `NN: ` label plus one [`MAX_WORD_LEN`] word.
+const SENSITIVE_TEXT_CELLS: usize = SENSITIVE_LABEL_CELLS + MAX_WORD_LEN;
+
+/// The noise must not reach the word it is standing next to.
+///
+/// This is host-compiled on purpose. The property is geometric, so it would
+/// otherwise be the kind of security invariant that lives only in a
+/// `cfg(target_arch = "arm")` block and is checked by no gate (PLAN.md §9 item
+/// 22). `mark_sensitive` anchors each run at the last column, so the leftmost
+/// pixel it can touch is `WIDTH - SENSITIVE_MAX`; the text ends at
+/// `SENSITIVE_TEXT_CELLS * CELL`. 12 * 8 + 31 = 127 < 128 — one column of slack,
+/// which is why widening the label, [`MAX_WORD_LEN`] or the run length is a BUILD
+/// FAILURE and not a legibility bug reported from a bench.
+const _: () = assert!(
+    SENSITIVE_TEXT_CELLS * CELL + SENSITIVE_MAX < WIDTH,
+    "the sensitive-row noise would overlap the word it is drawn beside"
+);
 
 /// Absolute high-fee threshold in sats, from `sign_prompt.rs:30`. Strictly
 /// greater, and it short-circuits the relative test.
@@ -389,6 +429,74 @@ impl Frame {
         self.0
             .get((y / CELL) * WIDTH + x)
             .is_some_and(|b| b & (1u8 << (y % CELL)) != 0)
+    }
+
+    /// Fill the right margin of text row `row` with a **fresh random-length run
+    /// per scanline** — `shared/display.py:201-205`, and the side-channel defence
+    /// PLAN.md §4.2 requires the mono backup screen preserve.
+    ///
+    /// Upstream, for every scanline `y` of a secret row:
+    ///
+    /// ```text
+    /// wx = WIDTH - 4                      # avoid the scroll bar
+    /// ln = max(2, ckcc.rng() % 32)
+    /// dis.line(wx - ln, y, wx, y, 1)
+    /// ```
+    ///
+    /// One length per *pixel* row, 13 per 13 px text row — not one per text row.
+    /// This is the same thing at this module's geometry: [`CELL`] scanlines per
+    /// row, each a run of 2..=31 px ending at the last column. The 4 px upstream
+    /// reserves is for a scroll bar these screens do not draw, so the run ends at
+    /// `WIDTH - 1`.
+    ///
+    /// `shared/display.py:284-285` (`is_sensitive and len(ln) > 3 and ln[2] ==
+    /// ':'`) is only upstream's TRIGGER — it sniffs the text to pick which rows to
+    /// noise. It is not the defence, and preserving the `NN:` shape is not
+    /// implementing it. Here the choice of rows is structural instead: the callers
+    /// noise the rows they drew words on, so a row cannot lose its noise by having
+    /// its label reformatted.
+    ///
+    /// # What this defends, measured
+    ///
+    /// The channel is remote observation of the panel — power draw and EM emission
+    /// both scale with lit pixels per row, so the *ink* on a row is observable even
+    /// when the glyphs are not. A BIP39 word is 3..=8 letters, and over the in-tree
+    /// list (`frost_backup::bip39_words::BIP39_WORDS`, counted from the array
+    /// itself) the length histogram is `3:103 4:442 5:555 6:508 7:352 8:88` —
+    /// 2,048 — giving H(word) = 11.0000 bits and H(word | length) = 8.6645 bits:
+    /// **word length alone is 2.3355 bits**. `frost_backup`'s `to_word_indices`
+    /// packs the 256-bit scalar plus an 8-bit checksum into words 1..24
+    /// (24 × 11 = 264 bits), so reading every length leaks 24 × 2.3355 =
+    /// **56.1 bits — 264 down to 207.9**. 208 bits is infeasible on its own, but it
+    /// composes with any second partial leak, and an unlucky all-8-letter
+    /// transcript (the rarest bucket, 88 words) leaks 109 bits and leaves 155.
+    ///
+    /// # What it does NOT defend — unresolved, not papered over
+    ///
+    /// The run lengths are redrawn from `rng` on every render, and **a page turn is
+    /// a redraw**. An observer who watches a user page back and forth, or read the
+    /// backup twice, averages N independent noise draws away: the true per-row ink
+    /// re-emerges at roughly `sqrt(N)` fewer observations than a single-shot
+    /// estimate would need. Upstream has exactly the same property. This raises the
+    /// cost of the measurement; it does not close the channel, and nothing in this
+    /// module makes a claim stronger than that.
+    ///
+    /// Also out of scope, and deliberately: [`pin_words`] draws its two
+    /// anti-phishing words with [`Frame::text_2x`], where 8 characters is exactly
+    /// the panel — there is no margin left to noise. That screen is unprotected.
+    ///
+    /// A row past [`ROWS`] draws nothing, via [`Frame::set_pixel`]: never a panic
+    /// and never a wrap into another row, which is why `row * CELL` is
+    /// `saturating_mul` (release builds run `overflow-checks = false`).
+    pub fn mark_sensitive(&mut self, row: usize, rng: &mut impl rand_core::RngCore) {
+        let top = row.saturating_mul(CELL);
+        for y in top..top.saturating_add(CELL) {
+            // `max(2, rng() % 32)`, verbatim, as 2..=SENSITIVE_MAX.
+            let run = ((rng.next_u32() % (SENSITIVE_MAX as u32 + 1)) as usize).max(SENSITIVE_MIN);
+            for x in WIDTH.saturating_sub(run)..WIDTH {
+                self.set_pixel(x, y, true);
+            }
+        }
     }
 
     /// Draw `s` at cell (`col`, `row`), returning how many characters were drawn.
@@ -707,9 +815,16 @@ impl<const N: usize> Buf<N> {
         self
     }
 
-    /// Append `v` in decimal, zero-padded to two digits — the `NN:` shape
-    /// `shared/display.py:284-285` triggers `mark_sensitive` on, which PLAN.md
-    /// §4.2 requires the mono backup screen preserve.
+    /// Append `v` in decimal, zero-padded to two digits — the `NN:` row label the
+    /// backup screens number their words with, so that `07` and `17` are the same
+    /// width and a column of them is scannable by eye.
+    ///
+    /// It is also the shape `shared/display.py:284-285` sniffs (`ln[2] == ':'`) to
+    /// decide which rows to noise, but that is upstream's TRIGGER and **not** the
+    /// side-channel defence PLAN.md §4.2 asks for: the defence is the random-length
+    /// scanline noise, [`Frame::mark_sensitive`], and this module's callers select
+    /// the rows structurally rather than by re-sniffing the text. Padding here buys
+    /// alignment, and nothing else.
     pub fn push_u8_pad2(&mut self, v: u8) -> &mut Self {
         self.push(b'0' + (v / 10) % 10);
         self.push(b'0' + v % 10);
@@ -851,6 +966,89 @@ pub const FEE_UNVERIFIED_2: &str = "THIS DEVICE";
 /// substitution would be a worse-informed guess dressed as a decision.
 pub const CONFIRM_CHARSET: [u8; 5] = *b"12346";
 
+/// The key that advances one page of a multi-page approval, and the key that goes
+/// back one.
+///
+/// Not invented here: this is Coldcard's own story-screen map, `9` page-down and
+/// `7` page-up (`shared/ux.py:237-247`), and it is *why* [`CONFIRM_CHARSET`]
+/// omits `0`, `5`, `7`, `8` and `9` — those five are the scroll keys, so the key
+/// that turns a page can never be the key that signs. `hsm_ux.py:65` runs the
+/// randomised-digit approval with `strict_escape=True` for the same reason: the
+/// only exits are the digit and `x`, while the scroll keys keep scrolling.
+///
+/// They live here rather than in the firmware because [`SignPages::render`] draws
+/// their legend: a caller that compares against a different byte than the glass
+/// advertises is the desync this const exists to prevent. Both are on the Mk4 pad
+/// (`shared/mempad.py:19` `DECODER = 'y0x987654321'`) — the pad half of that
+/// claim is asserted in `hal::keypad`, which owns the decode table; this module
+/// is pure and cannot see it.
+pub const NEXT_KEY: u8 = b'9';
+/// Back one page. See [`NEXT_KEY`].
+pub const BACK_KEY: u8 = b'7';
+
+/// The advance legend, deliberately with **no `=`**: `firmware/examples/stub.rs`
+/// reads a screen's yes key off the last row and treats `<k>=<what>` as a
+/// plain-press consent legend, so `9=next` would make a page that cannot consent
+/// advertise a yes key. `(9)next` leaves that scraper at `None`, which is the
+/// truth about every page but the last.
+const NEXT_LEGEND: &str = " (9)next";
+
+/// The paging legend for the backup screens, in the same no-`=` form and for the
+/// same reason as [`NEXT_LEGEND`].
+///
+/// # These printed `5=next 8=back` until 2026-09-08, and 5 and 8 both mean NO
+///
+/// [`NEXT_KEY`] is `9` and [`BACK_KEY`] is `7`; `firmware/src/main.rs`'s `answer`
+/// routes `5` and `8` to `Answer::No`. So **a human following the printed
+/// instruction part-way through transcribing 25 words abandoned their own backup** —
+/// on the one screen whose entire purpose is to be copied down carefully.
+///
+/// It survived because the `const` assert below only checked [`NEXT_LEGEND`], which
+/// the sign-approval pages use; these two were bare string literals that nothing
+/// compared against [`NEXT_KEY`]. The assert now covers both, so the class is closed
+/// rather than the instance.
+const BACKUP_NEXT_LEGEND: &str = "(9)next";
+/// Paging back on the backup screens. See [`BACKUP_NEXT_LEGEND`].
+const BACKUP_BACK_LEGEND: &str = "(9)next (7)back";
+
+const _: () = {
+    // The legend must print the key the firmware compares against.
+    assert!(
+        NEXT_LEGEND.as_bytes()[2] == NEXT_KEY,
+        "the advance legend must name NEXT_KEY"
+    );
+    // The backup legends too. Omitting them is how `5=next 8=back` shipped on the
+    // screen a user transcribes, naming two keys that both mean No.
+    assert!(
+        BACKUP_NEXT_LEGEND.as_bytes()[1] == NEXT_KEY,
+        "the backup advance legend must name NEXT_KEY"
+    );
+    assert!(
+        BACKUP_BACK_LEGEND.as_bytes()[1] == NEXT_KEY,
+        "the backup paging legend must name NEXT_KEY"
+    );
+    assert!(
+        BACKUP_BACK_LEGEND.as_bytes()[9] == BACK_KEY,
+        "the backup paging legend must name BACK_KEY"
+    );
+    // And neither paging key may be drawable as a confirm digit: turning a page
+    // would then be indistinguishable from signing on one prompt in five. This is
+    // a build failure rather than a test because both sides are consts — the same
+    // rung `hal::keypad`'s CANCEL/decode-table assert already stands on.
+    let mut i = 0;
+    while i < CONFIRM_CHARSET.len() {
+        assert!(
+            CONFIRM_CHARSET[i] != NEXT_KEY,
+            "the advance key must not be able to confirm"
+        );
+        assert!(
+            CONFIRM_CHARSET[i] != BACK_KEY,
+            "the back key must not be able to confirm"
+        );
+        i += 1;
+    }
+};
+
 /// One randomised confirm digit: what a screen that authorises a signature
 /// prints, and the **only** key that may authorise it.
 ///
@@ -866,6 +1064,13 @@ pub const CONFIRM_CHARSET: [u8; 5] = *b"12346";
 /// (`crate::rng`): no hardware, no singleton, no register. Giving three screens
 /// an RNG parameter instead would make all three non-deterministic to test and
 /// buy nothing.
+///
+/// [`BackupPages::render`] and [`EntryPages::render`] *do* take an RNG, and that
+/// is not a contradiction: their randomness is not a value to be shown and then
+/// compared against a keypress, it is the [`Frame::mark_sensitive`] noise, which
+/// is only a defence if it is fresh on every scanline of every render. There is
+/// no "data" form of it to pass in. Nothing on those two screens is authorised by
+/// a key, so nothing there needs to stay comparable.
 ///
 /// # Why a digit at all, and why it replaced a hold
 ///
@@ -923,6 +1128,30 @@ fn press_legend(confirm: ConfirmDigit) -> Buf<16> {
     b.push_str("Press (")
         .push_str(confirm.as_str())
         .push_str(")");
+    b
+}
+
+/// The row every page of a paged approval puts its footer on — the last one.
+///
+/// Free on all six [`SignPage`] kinds, and the row a harness reads a screen's yes
+/// key off (`firmware/examples/stub.rs` `advertised_key`), so the confirm legend
+/// has to be here or the only executed end-to-end harness in the tree can never
+/// approve a signature.
+const FOOTER_ROW: usize = ROWS - 1;
+
+/// `"pg 4/67"` — which page of how many.
+///
+/// Load-bearing, not decoration: 32 recipients is 67 pages, and a screen that
+/// says nothing about position invites consenting on page 1 of 67 in the belief
+/// it is the whole transaction. Distinct from [`counter`]'s `#3 of 12`, which
+/// counts *recipients*; the two appear on the same screen and must not be
+/// confusable.
+fn page_of(index: usize, len: usize) -> Buf<16> {
+    let mut b = Buf::<16>::new();
+    b.push_str("pg ")
+        .push_u64(index.saturating_add(1) as u64)
+        .push_str("/")
+        .push_u64(len as u64);
     b
 }
 
@@ -1095,6 +1324,53 @@ impl<'a> SignPages<'a> {
         false
     }
 
+    /// Whether `index` is the last page — **the only page a signature may be
+    /// authorised on**, and the only page [`SignPages::render`] prints a confirm
+    /// digit on.
+    ///
+    /// Public because the caller that decides whether to accept a keypress and
+    /// the render that drew the glass must agree on this bit, and the way they
+    /// stay agreed is by asking the same function rather than each recomputing it.
+    ///
+    /// `index == len() - 1`, never `index + 1 == len()`: `overflow-checks = false`
+    /// in release, so `index + 1` wraps to 0 for `usize::MAX` and would call page
+    /// 0 the last page of a 1-page set. [`SignPages::len`] is provably at least 3,
+    /// so the subtraction cannot underflow.
+    pub fn is_last(&self, index: usize) -> bool {
+        index == self.len() - 1
+    }
+
+    /// Draw page `index`'s footer: where you are, and the one key that leaves.
+    ///
+    /// **The confirm digit is drawn here and nowhere else in a page set**, and
+    /// only when `index` is the last page. Before this, the digit rode on
+    /// [`SignPage::Confirm`] and was therefore only correct by the coincidence
+    /// that `Confirm` sorts last; now the page that prints it is the page the
+    /// consent check asks about ([`SignPages::is_last`]), so a caller cannot draw
+    /// a signable-looking screen for page 1 of 67.
+    ///
+    /// A page that is not last advertises the *advance* key, not a yes key. A last
+    /// page with no digit attached advertises nothing: fail-closed, per
+    /// [`SignPages::confirming`].
+    fn footer(&self, frame: &mut Frame, index: usize) {
+        match (self.is_last(index), self.confirm) {
+            (false, _) => {
+                let mut b = page_of(index, self.len());
+                b.push_str(NEXT_LEGEND);
+                frame.text(0, FOOTER_ROW, b.as_str());
+            }
+            // Byte-for-byte `sign_test_message_confirm`'s legend: the same words
+            // in the same place for the same gesture, and the form
+            // `advertised_key` can read.
+            (true, Some(confirm)) => {
+                let mut b = press_legend(confirm);
+                b.push_str(" x=no");
+                frame.text(0, FOOTER_ROW, b.as_str());
+            }
+            (true, None) => {}
+        }
+    }
+
     /// The page at `index`, or `None` past the end.
     pub fn page(&self, index: usize) -> Option<SignPage<'a>> {
         let n = self.recipients.len();
@@ -1144,6 +1420,11 @@ impl<'a> SignPages<'a> {
     /// `index` is past the end (frame untouched) or the page could not be drawn in
     /// full (frame holds [`refusal`]). A caller must only advance or accept
     /// consent when this returns `true`.
+    ///
+    /// Every page it draws ends with a footer on the last row: `pg 4/67 (9)next`
+    /// while pages remain, the `Press (n) x=no` legend on the last page only.
+    /// `true` therefore means "drawn in full" and **not** "consentable" — that
+    /// second question is [`SignPages::is_last`], and the caller has to ask it.
     pub fn render(&self, index: usize, frame: &mut Frame) -> bool {
         let Some(page) = self.page(index) else {
             return false;
@@ -1195,16 +1476,18 @@ impl<'a> SignPages<'a> {
             SignPage::Confirm => {
                 frame.text(0, 0, "Approve and");
                 frame.text(0, 1, "sign?");
-                // The randomised digit, or NOTHING — never a fixed key. A page
-                // set with no digit attached is one nothing can consent to, so
-                // it must not invite a press.
-                if let Some(confirm) = self.confirm {
-                    frame.text(0, 4, press_legend(confirm).as_str());
-                    frame.text(0, 5, "to sign");
-                }
+                // "You have read all of it" belongs on the page that authorises
+                // more than anywhere else, and the footer row is spent on the
+                // digit here, so it goes in the body. `index` is deliberately the
+                // outer one — the `Amount`/`Address` arms shadow that name with a
+                // *recipient* index, which is why the footer is drawn after the
+                // match and not inside it.
+                frame.text(0, 3, page_of(index, self.len()).as_str());
                 frame.text(0, 6, "x to cancel");
             }
         }
+        // The digit, or the advance key, or nothing — see `footer`.
+        self.footer(frame, index);
         true
     }
 }
@@ -1434,9 +1717,7 @@ impl<'a> BackupPages<'a> {
             return Err(Unrenderable::BadWordList);
         }
         for w in words {
-            if w.is_empty() || w.len() > 8 || !w.bytes().all(|b| b.is_ascii_lowercase()) {
-                return Err(Unrenderable::BadWordList);
-            }
+            check_word(w)?;
         }
         Ok(BackupPages { share_index, words })
     }
@@ -1470,11 +1751,36 @@ impl<'a> BackupPages<'a> {
 
     /// Compose page `index`. `false` past the end.
     ///
-    /// Word rows keep the two-digit-colon `NN:` shape, because
-    /// `shared/display.py:284-285` triggers Coldcard's `mark_sensitive`
-    /// side-channel defence on exactly that shape and PLAN.md §4.2 requires it be
-    /// preserved.
-    pub fn render(&self, index: usize, frame: &mut Frame) -> bool {
+    /// # Why `rng` is a parameter and not a second `render_noised` method
+    ///
+    /// Every word row drawn here is covered by [`Frame::mark_sensitive`], which
+    /// needs fresh randomness per scanline, so the RNG is threaded in. It is
+    /// **mandatory** rather than an opt-in variant because an opt-in fails OPEN:
+    /// the day some caller reaches for the plain method, the defence silently
+    /// vanishes and no test anywhere notices a missing decoration. A caller that
+    /// cannot produce an RNG cannot draw a share — which is the correct answer, not
+    /// an inconvenience. On the device this is [`crate::rng::Entropy`], 2-source
+    /// and fail-closed; the `rand_core::RngCore` bound keeps this module free of
+    /// hardware and of any global, exactly as [`ConfirmDigit::draw`] does.
+    ///
+    /// Consequence a test must expect: the frame is **not** a pure function of its
+    /// arguments any more. Two renders of the same page differ in the noise
+    /// columns, and only in those — see
+    /// `backup_word_rows_are_noised_and_the_words_stay_clear`.
+    ///
+    /// The share-index page carries no noise: an index in 1..=n is not the secret,
+    /// it is what makes the secret restorable, and upstream does not noise it
+    /// either (its trigger only fires on `NN:` word rows).
+    ///
+    /// Word rows are built at `SENSITIVE_TEXT_CELLS` (12), the width the geometry
+    /// assert reserves, so the noise and the words cannot overlap for any input
+    /// [`BackupPages::new`] accepts.
+    pub fn render(
+        &self,
+        index: usize,
+        frame: &mut Frame,
+        rng: &mut impl rand_core::RngCore,
+    ) -> bool {
         let Some(page) = self.page(index) else {
             return false;
         };
@@ -1486,7 +1792,7 @@ impl<'a> BackupPages<'a> {
                 let mut b = Buf::<16>::new();
                 b.push_str("#").push_u64(i as u64);
                 frame.text(0, 4, b.as_str());
-                frame.text(0, 7, "5=next");
+                frame.text(0, 7, BACKUP_NEXT_LEGEND);
             }
             BackupPage::Words { first, words } => {
                 let mut head = Buf::<16>::new();
@@ -1496,13 +1802,17 @@ impl<'a> BackupPages<'a> {
                     .push_u64((first + words.len() - 1) as u64);
                 frame.text(0, 0, head.as_str());
                 for (i, w) in words.iter().enumerate() {
-                    let mut b = Buf::<16>::new();
+                    let mut b = Buf::<SENSITIVE_TEXT_CELLS>::new();
                     b.push_u8_pad2((first + i) as u8)
                         .push_str(": ")
                         .push_str(w);
-                    frame.text(0, 2 + i, b.as_str());
+                    // Draw, then noise the same row. Structural, not text-sniffed:
+                    // this is a row we just put a word on, so it gets covered.
+                    let row = 2 + i;
+                    frame.text(0, row, b.as_str());
+                    frame.mark_sensitive(row, rng);
                 }
-                frame.text(0, 7, "5=next 8=back");
+                frame.text(0, 7, BACKUP_BACK_LEGEND);
             }
         }
         true
@@ -1596,7 +1906,25 @@ impl<'a> EntryPages<'a> {
     }
 
     /// Compose page `index`. `false` past the end.
-    pub fn render(&self, index: usize, frame: &mut Frame) -> bool {
+    ///
+    /// `rng` is mandatory for the same reason it is on [`BackupPages::render`], and
+    /// the threat is the same one: a share being typed back in is on the glass
+    /// exactly as much as a share being read out, so both word rows here — the
+    /// previous word and the one being typed — go through
+    /// [`Frame::mark_sensitive`]. The share-index page is not noised.
+    ///
+    /// Both word rows are built at `SENSITIVE_TEXT_CELLS` (12) so they cannot reach
+    /// the noise. That budget is `NN: ` plus [`MAX_WORD_LEN`], which means the
+    /// trailing `_` cursor is what gives way on a full 8-letter field — never a
+    /// letter. A field that has stopped accepting letters showing no cursor is
+    /// honest; a letter silently dropped from the word a user is transcribing would
+    /// not be.
+    pub fn render(
+        &self,
+        index: usize,
+        frame: &mut Frame,
+        rng: &mut impl rand_core::RngCore,
+    ) -> bool {
         let Some(page) = self.page(index) else {
             return false;
         };
@@ -1622,16 +1950,18 @@ impl<'a> EntryPages<'a> {
                     .push_u64(BACKUP_WORDS as u64);
                 frame.text(0, 0, head.as_str());
                 if let Some(p) = previous {
-                    let mut b = Buf::<16>::new();
+                    let mut b = Buf::<SENSITIVE_TEXT_CELLS>::new();
                     b.push_u8_pad2((number - 1) as u8).push_str(": ").push_str(p);
                     frame.text(0, 2, b.as_str());
+                    frame.mark_sensitive(2, rng);
                 }
-                let mut b = Buf::<16>::new();
+                let mut b = Buf::<SENSITIVE_TEXT_CELLS>::new();
                 b.push_u8_pad2(number as u8)
                     .push_str(": ")
                     .push_str(partial)
                     .push_str("_");
                 frame.text(0, 4, b.as_str());
+                frame.mark_sensitive(4, rng);
                 frame.text(0, 7, "1=ok x=del");
             }
         }
@@ -1695,6 +2025,350 @@ pub fn address_verify(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Screen 9 — PIN (PLAN.md §8 phase 6)
+// ---------------------------------------------------------------------------
+
+/// Longest PIN half this panel draws, and Coldcard's own maximum
+/// (`shared/login.py:14`).
+///
+/// `[` + six `*` + `]` is 8 characters, which at [`Frame::text_2x`] is *exactly*
+/// the 128 px panel — so the masked field can never truncate. A longer one is
+/// refused ([`Unrenderable::TooLong`]) rather than silently shortened, because a
+/// star count that stops growing is a feedback lie about what was typed.
+pub const MAX_PIN_PART_LEN: usize = 6;
+
+/// The longest word [`pin_words`] or [`BackupPages`] will draw.
+///
+/// 8 is both the longest BIP39 English word and exactly [`COLS`] at 2× — the
+/// const block below ties those two facts together so a wider word bound cannot
+/// be raised without noticing that it no longer fits the glass.
+pub const MAX_WORD_LEN: usize = 8;
+
+const _: () = {
+    assert!(
+        MAX_WORD_LEN * 2 == COLS,
+        "an 8-char word at 2x is exactly the panel"
+    );
+    // `[` + digits + `]`, at 2x, must fit too — this is what makes the masked
+    // field untruncatable rather than merely usually short enough.
+    assert!(
+        (MAX_PIN_PART_LEN + 2) * 2 <= COLS,
+        "the masked PIN field must fit the panel at 2x"
+    );
+};
+
+/// Cells the masked field occupies: the digits plus its two brackets.
+const FIELD_CELLS: usize = MAX_PIN_PART_LEN + 2;
+
+/// Shown the first time a PIN is set, when the words must be *recorded*.
+pub const PIN_WORDS_LEARN: &str = "Write these down";
+/// Shown at every login, when the words must be *recognised*.
+pub const PIN_WORDS_CHECK: &str = "Recognize these?";
+
+/// First line of the consequence label: what the attempts figure counts.
+pub const PIN_TRIES_1: &str = "wrong tries";
+/// Second line of the consequence label: what happens when it reaches zero.
+pub const PIN_TRIES_2: &str = "before erase";
+
+/// The one PIN footer. **No `=`**: `firmware/examples/stub.rs`'s `advertised_key`
+/// reads `<k>=<what>` on the last row as a plain-press consent legend, and a PIN
+/// screen authorises no transaction. Same dodge as [`NEXT_LEGEND`].
+const PIN_FOOTER: &str = "(y)ok (x)del";
+
+/// Which PIN is being asked for.
+///
+/// The titles live here rather than being passed as text because the
+/// set-versus-login distinction is load-bearing: a user who is *setting* a PIN
+/// must be told so, and `shared/login.py:54-55` makes the same split for the same
+/// reason. A `&str` title would let a caller word it wrongly; four variants
+/// cannot.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PinPrompt {
+    /// The first half, the one the anti-phishing words are derived from.
+    Prefix,
+    /// The second half. Spending an attempt happens after this one.
+    Suffix,
+    /// First-time set, first pass.
+    Set,
+    /// First-time set, confirmation pass.
+    Repeat,
+}
+
+impl PinPrompt {
+    /// The title row for this prompt. Always ≤ [`COLS`] characters.
+    pub fn title(&self) -> &'static str {
+        match self {
+            PinPrompt::Prefix => "Enter PIN prefix",
+            PinPrompt::Suffix => "Rest of your PIN",
+            PinPrompt::Set => "Set a new PIN",
+            PinPrompt::Repeat => "Repeat new PIN",
+        }
+    }
+}
+
+/// Which screen [`pin_entry`] actually drew.
+///
+/// Returned rather than documented because the accepted key differs on all three
+/// and the key handler lives above this seam: on [`PinScreen::Entry`] a digit
+/// extends the PIN, on [`PinScreen::LastTry`] only the drawn [`ConfirmDigit`] may
+/// submit, and on [`PinScreen::Bricked`] nothing may submit anything. A caller
+/// that matches this cannot forget the last-attempt case.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PinScreen {
+    /// Ordinary masked entry, two or more attempts left.
+    Entry,
+    /// One attempt left. The next wrong PIN destroys the key.
+    LastTry,
+    /// No attempts left: SE1 has already erased the secret.
+    Bricked,
+}
+
+/// The entry field: `[`, one character per digit typed, `]`.
+///
+/// `mask` false is the deliberate exception — see [`pin_entry`]'s last-attempt
+/// branch, the only caller that passes it.
+fn pin_field(typed: &str, mask: bool) -> Buf<FIELD_CELLS> {
+    let mut b = Buf::<FIELD_CELLS>::new();
+    b.push_str("[");
+    if mask {
+        for _ in typed.chars() {
+            b.push_str("*");
+        }
+    } else {
+        b.push_str(typed);
+    }
+    b.push_str("]");
+    b
+}
+
+/// Draw `s` at 2× if it fits the panel at 2×, else at 1× on the same row.
+///
+/// For the attempts figure, which comes straight out of SE1's attempt struct and
+/// is never recomputed here: `attempts_left` is 13 on healthy silicon and
+/// `num_fails` has a sentinel of 99 (`pins.c:478`), but a struct that reports
+/// nonsense must *look* like nonsense rather than being shortened into a
+/// plausible small number. 2× truncates at 8 characters, so anything longer drops
+/// to the ordinary [`Frame::text`] path every other screen already uses.
+fn big_number(frame: &mut Frame, row: usize, s: &str) {
+    if s.chars().count() * 2 <= COLS {
+        frame.text_2x(0, row, s);
+    } else {
+        frame.text(0, row, s);
+    }
+}
+
+/// Screen 9: PIN entry — masked field, and the attempts remaining at 2× beside
+/// it.
+///
+/// # Why the attempts figure is not optional
+///
+/// SE1 destroys the key at the limit and there is no reset and no recovery
+/// (`shared/login.py:181-189`). So this is not a status line: it is the only
+/// warning a user gets before an irreversible act, and it is drawn from
+/// `attempts_left` **as SE1 reported it**. Never subtract locally — release
+/// builds run `overflow-checks = false`, so a local `13 - fails` wraps to 255 and
+/// would print *255 tries left* on a unit one guess from death.
+///
+/// # Why the last attempt cannot be drawn as an ordinary screen
+///
+/// This function diverts on `attempts_left` itself rather than trusting the
+/// caller to notice. One attempt left draws a distinct screen that names the
+/// consequence, un-masks the typed PIN so a typo is catchable before the attempt
+/// is spent (`shared/login.py:200-208` does exactly this, and near the brick
+/// counter correctness beats secrecy), and gates the submit on `confirm` so
+/// neither a stuck key nor a script can spend it. Zero attempts is not a prompt
+/// at all — it draws [`pin_bricked`]. Both branches are structural: there is no
+/// argument a caller can pass to get an ordinary entry screen at one attempt.
+///
+/// `confirm` is used only by the last-attempt branch and ignored otherwise; it is
+/// taken unconditionally so that reaching that branch cannot require a caller to
+/// have prepared for it.
+///
+/// Refuses (`Unrenderable::TooLong`) a `typed` longer than [`MAX_PIN_PART_LEN`].
+pub fn pin_entry(
+    frame: &mut Frame,
+    prompt: PinPrompt,
+    typed: &str,
+    attempts_left: u64,
+    confirm: ConfirmDigit,
+) -> Result<PinScreen, Unrenderable> {
+    if typed.chars().count() > MAX_PIN_PART_LEN {
+        return Err(Unrenderable::TooLong);
+    }
+    if attempts_left == 0 {
+        pin_bricked(frame);
+        return Ok(PinScreen::Bricked);
+    }
+    if attempts_left == 1 {
+        pin_last_try(frame, typed, confirm);
+        return Ok(PinScreen::LastTry);
+    }
+    frame.clear();
+    frame.text(0, 0, prompt.title());
+    let field = pin_field(typed, true);
+    frame.text_2x(centred(field.len()), 1, field.as_str());
+    let mut left = Buf::<20>::new();
+    left.push_u64(attempts_left);
+    big_number(frame, 3, left.as_str());
+    frame.text(0, 5, PIN_TRIES_1);
+    frame.text(0, 6, PIN_TRIES_2);
+    frame.text(0, FOOTER_ROW, PIN_FOOTER);
+    Ok(PinScreen::Entry)
+}
+
+/// Column that centres `cells` 2× characters, saturating rather than wrapping.
+fn centred(cells: usize) -> usize {
+    COLS.saturating_sub(cells.saturating_mul(2)) / 2
+}
+
+/// The last-attempt screen. Private: reachable only through [`pin_entry`], which
+/// is what makes it unskippable.
+fn pin_last_try(frame: &mut Frame, typed: &str, confirm: ConfirmDigit) {
+    frame.clear();
+    frame.text_2x(0, 0, "LAST TRY");
+    frame.text(0, 2, "Wrong = the key");
+    frame.text(0, 3, "is erased. Check");
+    frame.text(0, 4, "your PIN below:");
+    let field = pin_field(typed, false);
+    frame.text_2x(centred(field.len()), 5, field.as_str());
+    frame.text(0, FOOTER_ROW, press_legend(confirm).as_str());
+}
+
+/// The screen after a rejected PIN: how many tries are left, at 2×, and what
+/// running out costs.
+///
+/// Both figures come from SE1's attempt struct verbatim — `num_fails` too, whose
+/// 99 is a sentinel rather than a count (`pins.c:478`), which is why neither is
+/// formatted as two digits.
+pub fn pin_wrong(frame: &mut Frame, attempts_left: u64, num_fails: u64) {
+    frame.clear();
+    frame.text(0, 0, "WRONG PIN");
+    let mut left = Buf::<20>::new();
+    left.push_u64(attempts_left);
+    big_number(frame, 1, left.as_str());
+    frame.text(0, 3, PIN_TRIES_1);
+    frame.text(0, 4, PIN_TRIES_2);
+    let mut fails = Buf::<24>::new();
+    fails.push_str("fails: ").push_u64(num_fails);
+    frame.text(0, 6, fails.as_str());
+    frame.text(0, FOOTER_ROW, "(x)retry");
+}
+
+/// The terminal screen for a unit SE1 has already killed.
+///
+/// Not [`refusal`] and not [`identity_fault`]: both of those describe a request
+/// this device declined, and this one describes a device that no longer holds a
+/// key. It advertises no key, because there is nothing left to answer.
+pub fn pin_bricked(frame: &mut Frame) {
+    frame.clear();
+    frame.text(0, 0, "PIN ATTEMPTS");
+    frame.text(0, 1, "EXHAUSTED");
+    frame.text(0, 3, "The secure chip");
+    frame.text(0, 4, "erased the key.");
+    frame.text(0, 5, "No reset and no");
+    frame.text(0, 6, "recovery.");
+    frame.text(0, FOOTER_ROW, "Will not start");
+}
+
+/// First-time set, the two entries differed. Says plainly that nothing was
+/// stored, because a user who believes a PIN was set is a user locked out of a
+/// unit that has no PIN.
+pub fn pin_mismatch(frame: &mut Frame) {
+    frame.clear();
+    frame.text(0, 0, "PINS DIFFER");
+    frame.text(0, 2, "The two entries");
+    frame.text(0, 3, "did not match.");
+    frame.text(0, 5, "No PIN was set.");
+    frame.text(0, FOOTER_ROW, "(x)again");
+}
+
+/// The screen that stands in for a countdown this silicon does not have.
+///
+/// `calc_delay_required` returns a hard 0 on the 608 (`pins.c:518-522`) — the
+/// rate limit *is* the KDF, ~1.4 s measured for the words alone (`pins.c:22`).
+/// The callgate blocks the core while it runs, so this cannot animate; a static
+/// screen that says so is the difference between a slow check and an apparent
+/// hang. It also tells the user not to cut power mid-KDF.
+pub fn pin_checking(frame: &mut Frame) {
+    frame.clear();
+    frame.text(0, 0, "Checking...");
+    frame.text(0, 2, "This takes a");
+    frame.text(0, 3, "few seconds.");
+    frame.text(0, 5, "Do not remove");
+    frame.text(0, 6, "power.");
+}
+
+/// The anti-phishing words: two words at 2×, derived above this seam.
+///
+/// The words are `&str`, never derived here — this module is pure (see the module
+/// header), it carries no wordlist, and `BackupPages` already takes its words the
+/// same way. `first_time` picks between recording them and recognising them; that
+/// distinction is the whole check (`shared/login.py:54-55`), so it is a `bool`
+/// rather than caller-supplied text.
+///
+/// Refuses (`Unrenderable::BadWordList`) anything that is not 1..=[`MAX_WORD_LEN`]
+/// lowercase ASCII, because a 2× word wider than that would be *truncated* by
+/// [`Frame::text_2x`] — and a silently shortened anti-phishing word is one a user
+/// cannot tell from the right one.
+pub fn pin_words(
+    frame: &mut Frame,
+    first_time: bool,
+    words: [&str; 2],
+) -> Result<(), Unrenderable> {
+    for w in words {
+        check_word(w)?;
+    }
+    frame.clear();
+    frame.text(
+        0,
+        0,
+        if first_time {
+            PIN_WORDS_LEARN
+        } else {
+            PIN_WORDS_CHECK
+        },
+    );
+    frame.text_2x(0, 2, words[0]);
+    frame.text_2x(0, 4, words[1]);
+    frame.text(0, FOOTER_ROW, "(y)ok (x)stop");
+    Ok(())
+}
+
+/// One BIP39-shaped word, or a refusal: 1..=[`MAX_WORD_LEN`] ASCII letters of a
+/// SINGLE case, either all-upper or all-lower.
+///
+/// One rule, two callers ([`BackupPages::new`] and [`pin_words`]), because two
+/// word-shape rules is one of them being wrong.
+///
+/// # This demanded lowercase until 2026-09-08, and that rejected every real word
+///
+/// The vendored list is UPPERCASE — `frost_backup::bip39_words::BIP39_WORDS` is
+/// `[&str; 2048]` beginning `"ABANDON", "ABILITY", "ABLE", ...` — so an
+/// `is_ascii_lowercase` gate made `BackupPages::new` return
+/// `Err(Unrenderable::BadWordList)` for **every share a keygen can produce**. The
+/// backup-display screen could not draw a real backup at all, and nothing caught it
+/// because `hal` has no `frost_backup` dependency: `ui` takes `&[&str]` and every
+/// test here supplied its own lowercase fixture, so the gate and the only real
+/// caller were never compared. That comparison now lives in `coldsnap_firmware`,
+/// which has both — see its `every_vendored_bip39_word_is_renderable`.
+///
+/// Mixed case is still refused, and deliberately: a backup a human transcribes must
+/// not vary in case between words, because a user copying "ABANDON" then "ability"
+/// will reasonably wonder which is significant. BIP39 recovery is case-insensitive,
+/// so the refusal costs nothing real and buys a consistent page.
+fn check_word(w: &str) -> Result<(), Unrenderable> {
+    if w.is_empty() || w.len() > MAX_WORD_LEN {
+        return Err(Unrenderable::BadWordList);
+    }
+    let all_upper = w.bytes().all(|b| b.is_ascii_uppercase());
+    let all_lower = w.bytes().all(|b| b.is_ascii_lowercase());
+    if !(all_upper || all_lower) {
+        return Err(Unrenderable::BadWordList);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     extern crate alloc;
@@ -1723,6 +2397,22 @@ mod tests {
                 Some((b, _)) => s.push(b as char),
                 None => s.push('\u{0}'),
             }
+        }
+        s.trim_end().into()
+    }
+
+    /// The TEXT half of a row `Frame::mark_sensitive` has covered: the cells the
+    /// geometry assert reserves for glyphs, decoded and right-trimmed.
+    ///
+    /// It stops short of the noise columns deliberately. Those bytes are random, so
+    /// they may reverse-look-up to a glyph, to nothing, or to something different
+    /// on the next seed — asserting on them would be asserting on the RNG. A text
+    /// cell that failed to decode still shows up, as a NUL that `trim_end` does not
+    /// remove.
+    fn noised_row_text(f: &Frame, row: usize) -> String {
+        let mut s = String::new();
+        for col in 0..SENSITIVE_TEXT_CELLS {
+            s.push(f.cell(col, row).map_or('\u{0}', |(b, _)| b as char));
         }
         s.trim_end().into()
     }
@@ -2104,6 +2794,134 @@ mod tests {
         }
     }
 
+    /// **THE PAGED-CONSENT INVARIANT, read off the pixels.** A confirm digit on a
+    /// page that cannot authorise is the same lie `hold 1` was: it invites a press
+    /// that signs while the glass shows "recipient 1 of 32" and no fee. This walks
+    /// every page of five page sets and requires the legend to appear on exactly
+    /// the page [`SignPages::is_last`] names.
+    #[test]
+    fn only_the_last_page_prints_a_confirm_digit() {
+        let d = ConfirmDigit::draw(&mut Counter(0));
+        let legend = format!("Press ({})", d.as_str());
+        for n in [0usize, 1, 2, 3, MAX_RECIPIENTS] {
+            for fee in [1u64, HIGH_FEE_SATS + 1] {
+                let v: Vec<(&str, u64)> = (0..n).map(|_| (ADDR, 1_000_000u64)).collect();
+                let r = recips(&v);
+                let p = SignPages::new(&r, fee).unwrap().confirming(d);
+                for i in 0..p.len() {
+                    let mut f = Frame::new();
+                    assert!(p.render(i, &mut f), "page {i} of {} must draw", p.len());
+                    let shown = screen_text(&f);
+                    // The LEGEND, not the digit byte: an amount page legitimately
+                    // renders the character '4' when the amount contains a 4, so a
+                    // byte-level assertion would fail for an honest reason.
+                    assert_eq!(
+                        shown.contains(&legend),
+                        p.is_last(i),
+                        "page {}/{} (n={n} fee={fee}) advertises the wrong thing:\n{shown}",
+                        i + 1,
+                        p.len()
+                    );
+                    assert!(!shown.contains("hold"), "unproducible gesture: {shown}");
+                }
+            }
+        }
+    }
+
+    /// 32 recipients is 67 pages. A page set that never says which page you are on
+    /// invites consenting on page 1 in the belief it is the whole transaction, so
+    /// the position is on every page — including the last, where it is the only
+    /// evidence that there is nothing further to read.
+    #[test]
+    fn every_page_says_where_it_is_in_the_set() {
+        let v: Vec<(&str, u64)> = (0..MAX_RECIPIENTS).map(|_| (ADDR, 1_000_000u64)).collect();
+        let r = recips(&v);
+        let p = SignPages::new(&r, HIGH_FEE_SATS + 1)
+            .unwrap()
+            .confirming(ConfirmDigit::draw(&mut Counter(0)));
+        assert_eq!(
+            p.len(),
+            2 * MAX_RECIPIENTS + 3,
+            "amount+address each, plus warning, fee, confirm"
+        );
+        for i in 0..p.len() {
+            let mut f = Frame::new();
+            assert!(p.render(i, &mut f));
+            let shown = screen_text(&f);
+            assert!(
+                shown.contains(&format!("pg {}/{}", i + 1, p.len())),
+                "page {} does not say where it is:\n{shown}",
+                i + 1
+            );
+        }
+    }
+
+    /// [`Frame::text`] truncates at [`COLS`] **silently**, and the widest footer
+    /// this device can produce is exactly `COLS` wide: `pg 66/67 (9)next`. One more
+    /// page and the advance legend would be cut off with nothing failing — so this
+    /// is the thing that fails. Raising [`MAX_RECIPIENTS`] means shortening the
+    /// footer, not deleting this test.
+    #[test]
+    fn the_widest_page_footer_still_fits_the_screen() {
+        let v: Vec<(&str, u64)> = (0..MAX_RECIPIENTS).map(|_| (ADDR, 1_000_000u64)).collect();
+        let r = recips(&v);
+        let p = SignPages::new(&r, HIGH_FEE_SATS + 1).unwrap();
+        let widest = p.len() - 2; // last page that still advertises "next"
+        assert!(
+            page_of(widest, p.len()).as_str().len() + NEXT_LEGEND.len() <= COLS,
+            "the footer would be truncated"
+        );
+        let mut f = Frame::new();
+        assert!(p.render(widest, &mut f));
+        let row = row_text(&f, ROWS - 1);
+        assert_eq!(row, format!("pg {}/{}{NEXT_LEGEND}", widest + 1, p.len()));
+        // No `=` on a page that cannot consent: `stub.rs` `advertised_key` reads
+        // `<k>=<what>` on this row as a yes key, so `9=next` would hand a harness a
+        // way to approve a transaction it has only seen one page of.
+        assert!(!row.contains('='), "non-consenting page advertises a yes key: {row}");
+    }
+
+    /// Every byte of a device name is coordinator-controlled: upstream's
+    /// `DeviceName` bounds 14 **chars** (up to 56 bytes) and its `Decode`
+    /// truncates rather than erroring (`fixed_string.rs:131-140`), so the column
+    /// bound has to hold here. Screen 1 is also the screen a human uses to tell
+    /// two cold-snaps apart at the moment one of them asks for a signature, which
+    /// is what makes a reorderable name a security property and not cosmetics.
+    #[test]
+    fn a_hostile_device_name_cannot_overrun_or_reorder_screen_one() {
+        let mut f = Frame::new();
+        // RTL override, zero-width joiner, combining acute — then 4 KiB of text.
+        let name = format!("a\u{202e}b\u{200d}c\u{301}{}", "Z".repeat(4096));
+        standby(&mut f, &name, "family", Some(3));
+        let row = row_text(&f, 0);
+        assert_eq!(
+            row.chars().count(),
+            COLS,
+            "the name filled its row and stopped: {row:?}"
+        );
+        let shown = screen_text(&f);
+        assert!(
+            shown.contains("family") && shown.contains("share #3"),
+            "a long name pushed the rest of screen 1 off:\n{shown}"
+        );
+        // ONE ROW, not "the rows the other fields happen to redraw afterwards": a
+        // name that wraps would spill over every row screen 1 leaves blank, and
+        // the two fields drawn after it would hide only two of them.
+        for r in [1usize, 3, 5, 6, 7] {
+            assert!(
+                row_text(&f, r).is_empty(),
+                "the name spilled onto row {r}:\n{shown}"
+            );
+        }
+        // Strictly left-to-right by codepoint into fixed cells: the first char
+        // drawn is the first char given, and each unmappable one is ONE visible
+        // missing-glyph cell (`chr(127)`) rather than a reordering directive.
+        assert!(
+            row.starts_with("a\u{7f}b\u{7f}c\u{7f}"),
+            "name was reordered or a control char vanished: {row:?}"
+        );
+    }
+
     // -- 4. keygen check: the anti-MITM screen.
 
     #[test]
@@ -2445,20 +3263,29 @@ mod tests {
         "acquire", "across", "act", "action", "actor", "actress", "actual", "adapt",
     ];
 
+    /// Every word, exactly once, in order, across the pages — the property that
+    /// makes the screen a *backup* rather than a partial one.
+    ///
+    /// This test used to be called `..._with_the_two_digit_colon_shape`, which named
+    /// the wrong thing as the point: the `NN:` shape is upstream's trigger predicate
+    /// (`display.py:284-285`), not the side-channel defence. That defence is
+    /// `Frame::mark_sensitive`, and it is pinned by
+    /// `backup_word_rows_are_noised_and_the_words_stay_clear` below. What is
+    /// load-bearing here is coverage: 25 words, in order, none dropped.
     #[test]
-    fn backup_pages_cover_all_25_words_with_the_two_digit_colon_shape() {
+    fn backup_pages_cover_every_word_exactly_once_in_order() {
         let p = BackupPages::new(9, &WORDS).unwrap();
         assert_eq!(p.len(), 1 + BACKUP_WORDS.div_ceil(WORDS_PER_PAGE));
         assert_eq!(p.page(0), Some(BackupPage::ShareIndex(9)));
         let mut seen: Vec<&str> = Vec::new();
         let mut f = Frame::new();
         for i in 1..p.len() {
-            assert!(p.render(i, &mut f));
+            assert!(p.render(i, &mut f, &mut Counter(i as u32)));
             let t = screen_text(&f);
             match p.page(i) {
                 Some(BackupPage::Words { first, words }) => {
                     for (k, w) in words.iter().enumerate() {
-                        // mark_sensitive (display.py:284-285) triggers on "NN:"
+                        // The label is alignment, nothing more; see push_u8_pad2.
                         let label = format!("{:02}: {}", first + k, w);
                         assert!(t.contains(&label), "page {i} missing {label:?}: {t}");
                         seen.push(w);
@@ -2509,9 +3336,177 @@ mod tests {
         );
         assert_eq!(e.page(BACKUP_WORDS + 1), None);
         let mut f = Frame::new();
-        assert!(e.render(3, &mut f));
+        assert!(e.render(3, &mut f, &mut Counter(0)));
         let t = screen_text(&f);
         assert!(t.contains("word 3 of 25") && t.contains("03: abo_"), "{t}");
+    }
+
+    // -- the seed-word side-channel defence: `Frame::mark_sensitive`, ported from
+    //    `shared/display.py:201-205`. The `NN:` label is NOT this; see
+    //    `push_u8_pad2`.
+
+    /// Every scanline of a noised row gets its own run, and the runs are not all
+    /// the same length. Both halves matter: one run per *text* row instead of one
+    /// per *pixel* row, or a fixed length, is a pattern that subtracts out.
+    #[test]
+    fn mark_sensitive_draws_a_fresh_run_on_every_scanline_of_the_row() {
+        let row = 3;
+        let mut f = Frame::new();
+        f.mark_sensitive(row, &mut Counter(0));
+
+        let mut lengths = Vec::new();
+        for y in 0..HEIGHT {
+            let lit: Vec<usize> = (0..WIDTH).filter(|x| f.pixel(*x, y)).collect();
+            if !(row * CELL..row * CELL + CELL).contains(&y) {
+                assert!(lit.is_empty(), "row {row} noise leaked onto scanline {y}");
+                continue;
+            }
+            let run = lit.len();
+            assert!(
+                (SENSITIVE_MIN..=SENSITIVE_MAX).contains(&run),
+                "scanline {y} run of {run} px is outside max(2, rng % 32)"
+            );
+            // Contiguous and right-anchored, exactly like `dis.line(wx-ln, y, wx, y)`.
+            assert_eq!(lit.last(), Some(&(WIDTH - 1)), "run must end at the last column");
+            assert_eq!(
+                lit,
+                (WIDTH - run..WIDTH).collect::<Vec<_>>(),
+                "scanline {y} run is not one contiguous line"
+            );
+            lengths.push(run);
+        }
+        assert_eq!(lengths.len(), CELL, "one run per scanline of the row");
+        assert!(
+            lengths.iter().any(|l| Some(l) != lengths.first()),
+            "every scanline drew {lengths:?} — a constant-length margin is not noise"
+        );
+        // A row off the panel draws nothing rather than wrapping or panicking.
+        let mut g = Frame::new();
+        g.mark_sensitive(ROWS, &mut Counter(0));
+        g.mark_sensitive(usize::MAX, &mut Counter(0));
+        assert!(g.as_bytes().iter().all(|b| *b == 0));
+    }
+
+    /// The whole point, end to end: every word row of a rendered backup page is
+    /// noised, the words themselves are still readable, the rows that are not
+    /// secret are untouched, and the noise actually comes from the RNG.
+    #[test]
+    fn backup_word_rows_are_noised_and_the_words_stay_clear() {
+        // The widest legal row: MAX_WORD_LEN letters, so the text ends exactly at
+        // the column the geometry assert reserves.
+        let widest = ["abstract"; BACKUP_WORDS];
+        let p = BackupPages::new(4, &widest).unwrap();
+        let mut f = Frame::new();
+        assert!(p.render(1, &mut f, &mut Counter(0)));
+
+        for row in 2..2 + WORDS_PER_PAGE {
+            // Readable: every text cell still reverse-looks-up to its glyph, which
+            // it cannot if a single noise pixel reached the word.
+            assert_eq!(
+                noised_row_text(&f, row),
+                format!("{:02}: abstract", row - 1),
+                "row {row}: the word must survive the noise beside it"
+            );
+            for y in row * CELL..row * CELL + CELL {
+                assert!(
+                    f.pixel(WIDTH - 1, y),
+                    "scanline {y} of word row {row} is not noised at all"
+                );
+                // The gutter: the const assert leaves exactly one column between
+                // the widest text and the longest run, so THIS column is blank on
+                // a noised row whichever side would have encroached.
+                assert!(
+                    !f.pixel(SENSITIVE_TEXT_CELLS * CELL, y),
+                    "row {row} scanline {y}: text and noise met at the gutter column"
+                );
+            }
+        }
+        // Not secret, and therefore not noised: the header and the paging legend
+        // both read back cleanly, which they could not if the noise were sprayed
+        // over the whole page.
+        assert_eq!(row_text(&f, 0), "words 1-4");
+        assert_eq!(row_text(&f, 7), BACKUP_BACK_LEGEND);
+        // Nor is the share-index page: an index is what makes a share restorable,
+        // it is not the share.
+        let mut g = Frame::new();
+        assert!(p.render(0, &mut g, &mut Counter(0)));
+        assert_eq!(row_text(&g, 2), "Share index:");
+        assert_eq!(row_text(&g, 4), "#4");
+
+        // The RNG is consumed, not ignored: a different stream is a different
+        // frame, and it differs ONLY right of the text.
+        let mut h = Frame::new();
+        assert!(p.render(1, &mut h, &mut Counter(0x5eed_1234)));
+        assert!(f != h, "render ignored its rng");
+        for y in 0..HEIGHT {
+            for x in 0..SENSITIVE_TEXT_CELLS * CELL {
+                assert_eq!(
+                    f.pixel(x, y),
+                    h.pixel(x, y),
+                    "the noise changed a text pixel at ({x},{y})"
+                );
+            }
+        }
+    }
+
+    /// The entry screen is the same secret on the same glass, so it is noised too —
+    /// including the row being typed, where the cursor is what gives way at a full
+    /// field rather than a letter.
+    #[test]
+    fn backup_entry_noises_both_word_rows_and_keeps_a_full_field_readable() {
+        let entered = ["abstract"; 4];
+        let e = EntryPages {
+            share_index: Some(7),
+            words: &entered,
+            partial: "abstract",
+        };
+        let mut f = Frame::new();
+        assert!(e.render(5, &mut f, &mut Counter(0)));
+        assert_eq!(row_text(&f, 0), "word 5 of 25");
+        assert_eq!(noised_row_text(&f, 2), "04: abstract", "previous word");
+        assert_eq!(
+            noised_row_text(&f, 4),
+            "05: abstract",
+            "a full field keeps all 8 letters; the cursor is what is dropped"
+        );
+        for row in [2, 4] {
+            for y in row * CELL..row * CELL + CELL {
+                assert!(f.pixel(WIDTH - 1, y), "entry row {row} scanline {y} not noised");
+                // `_` is 0xc0 in all eight of its columns, so a cursor drawn one
+                // cell too far right lights this gutter column and is caught here.
+                assert!(
+                    !f.pixel(SENSITIVE_TEXT_CELLS * CELL, y),
+                    "entry row {row} scanline {y}: text and noise met at the gutter"
+                );
+            }
+        }
+        assert_eq!(row_text(&f, 7), "1=ok x=del");
+        // A shorter field keeps its cursor.
+        let e = EntryPages { partial: "abs", ..e };
+        let mut g = Frame::new();
+        assert!(e.render(5, &mut g, &mut Counter(0)));
+        assert_eq!(noised_row_text(&g, 4), "05: abs_");
+        // The share-index page is not a word row.
+        let mut h = Frame::new();
+        assert!(e.render(0, &mut h, &mut Counter(0)));
+        assert_eq!(row_text(&h, 2), "share index:");
+    }
+
+    /// `SENSITIVE_LABEL_CELLS` is a hand-written 4 standing in for two pushes. Tie
+    /// it to the pushes, or the geometry assert is guarding a width nothing draws.
+    #[test]
+    fn the_sensitive_row_budget_matches_the_label_actually_drawn() {
+        let mut b = Buf::<SENSITIVE_TEXT_CELLS>::new();
+        b.push_u8_pad2(25).push_str(": ");
+        assert_eq!(b.len(), SENSITIVE_LABEL_CELLS, "the NN: label is 4 cells");
+        assert!(!b.truncated());
+        b.push_str("abstract");
+        assert_eq!(b.as_str(), "25: abstract");
+        assert!(
+            !b.truncated(),
+            "a MAX_WORD_LEN word must fit the noised-row budget in full"
+        );
+        assert_eq!(b.len() * CELL + SENSITIVE_MAX, WIDTH - 1, "one column of slack");
     }
 
     #[test]
@@ -2546,6 +3541,252 @@ mod tests {
         assert!(address_verify(&mut f, &"q".repeat(76), "m/0/4294967295", 0).is_ok());
     }
 
+    // -- 9. the PIN prompt. SE1 destroys the key at the limit, so unlike every
+    //       other screen here these stand between a user and an *irreversible*
+    //       act. Each of the four below fails if its guard is deleted.
+
+    /// The lowest-entropy confirm digit there is — `Counter(0)` always yields
+    /// `CONFIRM_CHARSET[0]`, which keeps the last-attempt footer assertable.
+    fn confirm() -> ConfirmDigit {
+        ConfirmDigit::draw(&mut Counter(0))
+    }
+
+    const PROMPTS: [PinPrompt; 4] = [
+        PinPrompt::Prefix,
+        PinPrompt::Suffix,
+        PinPrompt::Set,
+        PinPrompt::Repeat,
+    ];
+
+    #[test]
+    fn a_typed_pin_is_never_rendered_in_cleartext_on_the_entry_screen() {
+        // Stated as the property rather than as a layout detail: two different
+        // PINs of the same length must produce a byte-identical panel. That
+        // covers the whole frame, 2x band included, and no assertion about where
+        // the field sits can be weakened to let a digit through somewhere else.
+        for prompt in PROMPTS {
+            let (mut a, mut b) = (Frame::new(), Frame::new());
+            assert_eq!(
+                pin_entry(&mut a, prompt, "1234", 13, confirm()),
+                Ok(PinScreen::Entry)
+            );
+            pin_entry(&mut b, prompt, "9876", 13, confirm()).unwrap();
+            assert_eq!(
+                a.as_bytes(),
+                b.as_bytes(),
+                "{prompt:?}: the panel leaks which digits were typed"
+            );
+            assert!(
+                !screen_text(&a).contains('1'),
+                "{prompt:?}: a typed digit reached the 1x rows"
+            );
+        }
+        // Longer than the field can hold is a refusal, not a shortened star run:
+        // a count that stops growing is a lie about what was typed.
+        let mut f = Frame::new();
+        assert_eq!(
+            pin_entry(&mut f, PinPrompt::Prefix, "1234567", 13, confirm()),
+            Err(Unrenderable::TooLong)
+        );
+    }
+
+    #[test]
+    fn the_masked_field_shows_one_star_per_digit_so_a_press_is_visible() {
+        for n in 0..=MAX_PIN_PART_LEN {
+            let typed = "7".repeat(n);
+            let mut f = Frame::new();
+            pin_entry(&mut f, PinPrompt::Set, &typed, 13, confirm()).unwrap();
+            let want = format!("[{}]", "*".repeat(n));
+            let cells = want.chars().count();
+            assert_eq!(
+                text_2x_at(&f, centred(cells), 1, cells),
+                want,
+                "{n} digits typed"
+            );
+        }
+    }
+
+    #[test]
+    fn the_entry_screen_always_shows_the_attempts_remaining() {
+        for n in [2u64, 3, 12, 13, 99] {
+            let mut f = Frame::new();
+            assert_eq!(
+                pin_entry(&mut f, PinPrompt::Suffix, "12", n, confirm()),
+                Ok(PinScreen::Entry)
+            );
+            let mut want = Buf::<20>::new();
+            want.push_u64(n);
+            assert_eq!(
+                text_2x_at(&f, 0, 3, want.len()),
+                want.as_str(),
+                "{n} attempts left must be on the panel at 2x"
+            );
+            let s = screen_text(&f);
+            assert!(
+                s.contains(PIN_TRIES_1) && s.contains(PIN_TRIES_2),
+                "the figure needs its consequence: {s}"
+            );
+        }
+        // Same figure, same 2x treatment, on the screen a user actually reads it
+        // on — the one right after a rejected PIN.
+        let mut f = Frame::new();
+        pin_wrong(&mut f, 4, 9);
+        assert_eq!(text_2x_at(&f, 0, 1, 1), "4");
+        let s = screen_text(&f);
+        assert!(s.contains("WRONG PIN") && s.contains(PIN_TRIES_2), "{s}");
+        assert!(s.contains("fails: 9"), "{s}");
+        // 99 is `pins.c:478`'s sentinel, not a count: it must print in full.
+        pin_wrong(&mut f, 13, 99);
+        assert!(screen_text(&f).contains("fails: 99"));
+    }
+
+    #[test]
+    fn the_final_attempt_screen_is_not_an_ordinary_entry_screen() {
+        let c = confirm();
+        let mut f = Frame::new();
+        assert_eq!(
+            pin_entry(&mut f, PinPrompt::Suffix, "1234", 1, c),
+            Ok(PinScreen::LastTry)
+        );
+        assert_eq!(text_2x_at(&f, 0, 0, 8), "LAST TRY");
+        let s = screen_text(&f);
+        assert!(s.contains("erased"), "must name the consequence: {s}");
+        // Submit is the drawn confirm digit, not the ordinary key.
+        assert!(s.contains(press_legend(c).as_str()), "{s}");
+        assert!(!s.contains(PIN_FOOTER), "{s}");
+        // And here, deliberately, the PIN is in the clear so a typo is catchable
+        // before the attempt is spent (`shared/login.py:200-208`).
+        assert_eq!(text_2x_at(&f, centred(6), 5, 6), "[1234]");
+        // No argument produces an ordinary entry screen with one attempt left.
+        for prompt in PROMPTS {
+            for typed in ["", "1", "123456"] {
+                assert_eq!(
+                    pin_entry(&mut f, prompt, typed, 1, c),
+                    Ok(PinScreen::LastTry),
+                    "{prompt:?} {typed:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_unit_with_no_attempts_left_is_never_offered_an_entry_screen() {
+        let mut f = Frame::new();
+        assert_eq!(
+            pin_entry(&mut f, PinPrompt::Suffix, "1234", 0, confirm()),
+            Ok(PinScreen::Bricked)
+        );
+        let mut want = Frame::new();
+        pin_bricked(&mut want);
+        assert_eq!(f.as_bytes(), want.as_bytes(), "0 attempts is not a prompt");
+        let s = screen_text(&f);
+        assert!(s.contains("EXHAUSTED") && s.contains("No reset"), "{s}");
+        // Nothing to press: a dead unit must not advertise a key.
+        assert!(!s.contains("(y)") && !s.contains("(x)"), "{s}");
+    }
+
+    #[test]
+    fn an_over_long_anti_phishing_word_is_refused_not_truncated() {
+        let mut f = Frame::new();
+        // Exactly MAX_WORD_LEN is fine, and lands as exactly the full panel.
+        pin_words(&mut f, true, ["aaaaaaaa", "bbbbbbbb"]).unwrap();
+        assert_eq!(text_2x_at(&f, 0, 2, MAX_WORD_LEN), "aaaaaaaa");
+        assert_eq!(text_2x_at(&f, 0, 4, MAX_WORD_LEN), "bbbbbbbb");
+        // One over, empty, uppercase, spaced, digits: all refusals. A silently
+        // shortened word is one a user cannot tell from the right one.
+        for bad in ["abilities", "", "Ability", "abil ty", "ability9"] {
+            assert_eq!(
+                pin_words(&mut f, false, ["abandon", bad]),
+                Err(Unrenderable::BadWordList),
+                "{bad:?} in second position"
+            );
+            assert_eq!(
+                pin_words(&mut f, false, [bad, "abandon"]),
+                Err(Unrenderable::BadWordList),
+                "{bad:?} in first position"
+            );
+        }
+        // Same rule, same refusal, on the other caller of `check_word`.
+        let mut words = WORDS;
+        words[7] = "abilities";
+        assert_eq!(
+            BackupPages::new(1, &words).err(),
+            Some(Unrenderable::BadWordList)
+        );
+    }
+
+    #[test]
+    fn the_words_screen_says_record_them_the_first_time_and_recognise_them_after() {
+        assert_ne!(PIN_WORDS_LEARN, PIN_WORDS_CHECK);
+        let mut f = Frame::new();
+        pin_words(&mut f, true, ["abandon", "ability"]).unwrap();
+        assert!(screen_text(&f).contains(PIN_WORDS_LEARN));
+        pin_words(&mut f, false, ["abandon", "ability"]).unwrap();
+        assert!(screen_text(&f).contains(PIN_WORDS_CHECK));
+    }
+
+    #[test]
+    fn no_pin_screen_advertises_a_consent_key_to_the_stub_scraper() {
+        // `firmware/examples/stub.rs`'s `advertised_key` reads `<k>=<what>` on the
+        // last row as a plain-press yes key. No PIN screen authorises a
+        // signature, so none of them may match that shape — the same trap
+        // `NEXT_LEGEND` documents.
+        let c = confirm();
+        let mut f = Frame::new();
+        let mut footers = Vec::new();
+        pin_entry(&mut f, PinPrompt::Prefix, "12", 13, c).unwrap();
+        footers.push(("entry", row_text(&f, FOOTER_ROW)));
+        pin_entry(&mut f, PinPrompt::Suffix, "12", 1, c).unwrap();
+        footers.push(("last try", row_text(&f, FOOTER_ROW)));
+        pin_wrong(&mut f, 5, 8);
+        footers.push(("wrong", row_text(&f, FOOTER_ROW)));
+        pin_bricked(&mut f);
+        footers.push(("bricked", row_text(&f, FOOTER_ROW)));
+        pin_mismatch(&mut f);
+        footers.push(("mismatch", row_text(&f, FOOTER_ROW)));
+        pin_checking(&mut f);
+        footers.push(("checking", row_text(&f, FOOTER_ROW)));
+        pin_words(&mut f, true, ["abandon", "ability"]).unwrap();
+        footers.push(("words", row_text(&f, FOOTER_ROW)));
+        for (name, row) in footers {
+            assert_ne!(
+                row.as_bytes().get(1),
+                Some(&b'='),
+                "{name}: footer {row:?} reads to the scraper as a consent legend"
+            );
+        }
+    }
+
+    #[test]
+    fn every_pin_string_this_module_owns_fits_the_panel() {
+        let mut all = Vec::new();
+        for p in PROMPTS {
+            all.push(p.title());
+        }
+        all.extend([
+            PIN_WORDS_LEARN,
+            PIN_WORDS_CHECK,
+            PIN_TRIES_1,
+            PIN_TRIES_2,
+            PIN_FOOTER,
+        ]);
+        for s in all {
+            assert!(
+                s.chars().count() <= COLS,
+                "{s:?} is {} cols, panel is {COLS}",
+                s.chars().count()
+            );
+        }
+        // And the prose rows: nothing a PIN screen draws may be clipped, which on
+        // a 16-col grid means every rendered row is at most COLS and the
+        // right-hand column is the last thing on it.
+        let mut f = Frame::new();
+        pin_mismatch(&mut f);
+        assert!(screen_text(&f).lines().all(|l| l.chars().count() <= COLS));
+        pin_checking(&mut f);
+        assert!(screen_text(&f).lines().all(|l| l.chars().count() <= COLS));
+    }
+
     /// The artefact: every page of every screen, as ASCII art. Not a snapshot —
     /// it is how a human judges the layouts with nothing flashed.
     ///
@@ -2577,8 +3818,11 @@ mod tests {
         show("4 test message", &f);
 
         let b = BackupPages::new(2, &WORDS).unwrap();
+        // A counter, not the hardware RNG: the artefact stays diffable, and the
+        // run lengths still vary per scanline the way the device's will.
+        let mut noise = Counter(0);
         for i in 0..b.len() {
-            assert!(b.render(i, &mut f));
+            assert!(b.render(i, &mut f, &mut noise));
             show(&format!("5 backup display page {}/{}", i + 1, b.len()), &f);
         }
 
@@ -2588,9 +3832,9 @@ mod tests {
             words: &words,
             partial: "abo",
         };
-        assert!(e.render(0, &mut f));
+        assert!(e.render(0, &mut f, &mut noise));
         show("6 backup entry (share index)", &f);
-        assert!(e.render(e.cursor(), &mut f));
+        assert!(e.render(e.cursor(), &mut f, &mut noise));
         show("6 backup entry (word 3)", &f);
 
         backup_quiz(&mut f, "word 7 was:", ["absorb", "absurd", "abstract"], Some(0));
@@ -2598,5 +3842,23 @@ mod tests {
 
         address_verify(&mut f, ADDR, "m/0/17", 3).unwrap();
         show("8 address verify", &f);
+
+        let c = confirm();
+        pin_words(&mut f, true, ["abandon", "absurd"]).unwrap();
+        show("9 PIN anti-phishing words (first time)", &f);
+        pin_entry(&mut f, PinPrompt::Prefix, "12", 13, c).unwrap();
+        show("9 PIN entry (prefix, 13 left)", &f);
+        pin_entry(&mut f, PinPrompt::Suffix, "1234", 3, c).unwrap();
+        show("9 PIN entry (suffix, 3 left)", &f);
+        pin_checking(&mut f);
+        show("9 PIN checking", &f);
+        pin_wrong(&mut f, 2, 11);
+        show("9 PIN wrong (2 left)", &f);
+        pin_entry(&mut f, PinPrompt::Suffix, "1234", 1, c).unwrap();
+        show("9 PIN LAST TRY (1 left, PIN shown, confirm-digit gate)", &f);
+        pin_entry(&mut f, PinPrompt::Suffix, "1234", 0, c).unwrap();
+        show("9 PIN bricked (0 left)", &f);
+        pin_mismatch(&mut f);
+        show("9 PIN mismatch (first-time set)", &f);
     }
 }

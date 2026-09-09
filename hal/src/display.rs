@@ -562,6 +562,10 @@ impl PanelToken {
         {
             let _ = &self;
             enable_clocks();
+            // SAFETY: `SPI1_CR1` (`0x4001_3000`) and `SPI1_CR2` (`0x4001_3004`) are
+            // 4-byte-aligned memory-mapped registers and these are reads with no side
+            // effects. `enable_clocks` above has ungated `SPI1` on APB2, so the reads
+            // return configuration rather than faulting on a clock-gated peripheral.
             let (cr1, cr2) =
                 unsafe { (core::ptr::read_volatile(SPI1_CR1), core::ptr::read_volatile(SPI1_CR2)) };
             check_spi(cr1, cr2)?;

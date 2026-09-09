@@ -30,6 +30,7 @@
 //! | [`display`] | the 128×64 SSD1306 on SPI1: `CS`/`DC` via `BSRR`, the 1,024-byte full-frame blit, and the **zero-initialisation** decision the bootloader's `HAL_GPIO_LockPin` forces on us | [`singleton`] |
 //! | [`flash`] | `StmFlash`: `NorFlash` + `ReadNorFlash` over `FLASH_FS`, reachable only by consuming a `StmFlashToken` (so the `DBANK` geometry check cannot be skipped), plus [`flash::fake`] for host tests | [`singleton`] |
 //! | [`heap`] | **constants only, no code**: the measured heap budget, and why the region and the allocator are deferred to phase 5 | [`comms`] (the decode bound), `memmap` |
+//! | [`keypad`] | the 4×3 membrane pad: cols `PB0`-`PB2` in, rows `PD8`-`PD11` open-drain out, the `mempad.py:19` decode table, the Tempest row shuffle, and the ghost-rejecting debounce that makes simultaneous keys a **refusal** | [`display`] (the `BSRR` half-word encoders), [`singleton`] |
 //! | [`rng`] | the fail-closed 2-source `RngCore` and its checked constructor | [`callgate`] (SE1/SE2 legs), [`singleton`] |
 //! | [`mod@panic`] | `#[panic_handler]`, `NVIC_SystemReset`, the RTC backup-register counters | [`callgate`] (late DFU fallback) |
 //! | [`singleton`] | the one tagged take-once guard `flash`, `rng` and `usb` use | nothing in-crate |
@@ -127,6 +128,7 @@ pub mod display;
 pub mod flash;
 pub mod heap;
 pub mod identity;
+pub mod keypad;
 pub mod panic;
 pub mod rng;
 pub mod singleton;
@@ -206,9 +208,38 @@ pub mod memmap {
     /// everything above it.
     pub const FS_NONCE_LEN: u32 = 32 * 1024;
 
-    /// First `FLASH_FS` byte no region claims. Shares and any future log go here;
-    /// deliberately not carved up until something needs it.
-    pub const FS_FREE_OFFSET: u32 = FS_NONCE_OFFSET + FS_NONCE_LEN;
+    /// Where the keygen share record lives (`coldsnap_firmware::store`).
+    ///
+    /// **16 K, not 8, and the extra 8 K is the whole point.** `AbSlot::new`
+    /// halves its partition (`ab_write.rs:31-35`), so 4 sectors give each copy
+    /// exactly 2 sectors = one `DBANK == 0` page, and `Slot::try_write`'s
+    /// `erase_all()` (`ab_write.rs:162`) then erases exactly that page. At 8 K an
+    /// erase of copy A would take copy B with it if `DBANK` turns out to be 0 —
+    /// the hazard `flash::ab_copies_would_share_one_page_at_dbank_zero` already
+    /// pins for the nonce region — which would make the A/B redundancy of the one
+    /// record on this device that has **no backup path** imaginary.
+    ///
+    /// Like [`FS_IDENTITY_OFFSET`], this cannot change once a unit ships: moving
+    /// it orphans the share, and the share cannot be re-derived.
+    pub const FS_SHARE_OFFSET: u32 = FS_NONCE_OFFSET + FS_NONCE_LEN;
+    /// 4 sectors, 16 K: 2 per A/B copy. See [`FS_SHARE_OFFSET`].
+    pub const FS_SHARE_LEN: u32 = 16 * 1024;
+
+    /// Where the device name record goes. Reserved, not yet written: `SetName`
+    /// (PLAN.md gap 3) is separate work, but the constant has to exist *now*
+    /// because carving it out later would move the share region, and moving the
+    /// share region orphans the share.
+    ///
+    /// A separate region from [`FS_SHARE_OFFSET`] on purpose: the loss
+    /// consequences differ. A lost name is retyped; a lost share is gone. Sharing
+    /// a region would let a rename erase a sector the share lives in.
+    pub const FS_NAME_OFFSET: u32 = FS_SHARE_OFFSET + FS_SHARE_LEN;
+    /// 4 sectors, 16 K, for the same A/B-page reason as [`FS_SHARE_LEN`].
+    pub const FS_NAME_LEN: u32 = 16 * 1024;
+
+    /// First `FLASH_FS` byte no region claims — 440 K of the 512 K still
+    /// unclaimed. Deliberately not carved up until something needs it.
+    pub const FS_FREE_OFFSET: u32 = FS_NAME_OFFSET + FS_NAME_LEN;
 
     /// SRAM1 base = start of the contiguous SRAM1+2+3 window (`layout.ld:21`).
     pub const SRAM_BASE: u32 = 0x2000_0000;
@@ -325,6 +356,16 @@ pub mod memmap {
         assert!(FS_IDENTITY_OFFSET % DBANK0_PAGE == 0);
         assert!(FS_IDENTITY_LEN % DBANK0_PAGE == 0);
         assert!(FS_NONCE_LEN % DBANK0_PAGE == 0);
+        assert!(FS_SHARE_LEN % DBANK0_PAGE == 0);
+        assert!(FS_NAME_LEN % DBANK0_PAGE == 0);
+        // Stronger than page alignment, and the reason both regions are 16 K:
+        // each A/B *copy* must itself be a whole number of `DBANK == 0` pages, or
+        // erasing one copy reaches the other and the redundancy is fiction.
+        assert!(FS_SHARE_LEN % (2 * DBANK0_PAGE) == 0);
+        assert!(FS_NAME_LEN % (2 * DBANK0_PAGE) == 0);
+        // No region overlaps its neighbour and everything fits.
+        assert!(FS_SHARE_OFFSET == FS_NONCE_OFFSET + FS_NONCE_LEN);
+        assert!(FS_NAME_OFFSET == FS_SHARE_OFFSET + FS_SHARE_LEN);
         assert!(FS_FREE_OFFSET <= FLASH_FS_LEN);
     };
 }

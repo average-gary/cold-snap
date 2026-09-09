@@ -40,9 +40,20 @@
 //! it into a fail-open, so it shows up as a block that says what was refused and
 //! why.
 //!
-//! DETERMINISTIC: no clock, no RNG, no `HashMap`. The address highlight seed is
-//! an explicit argument. Same input, same bytes out, so a layout regression is a
-//! diff and not a judgement call.
+//! DETERMINISTIC, but no longer RNG-free. No clock and no `HashMap`; the address
+//! highlight seed is still an explicit argument. What changed: the backup display
+//! and entry screens take a **required** `RngCore`, because every row with a seed
+//! word on it is covered by `Frame::mark_sensitive` — a fresh random-length run
+//! per scanline (`shared/display.py:201-205`), which is only a defence if it is
+//! actually random. Those screens are therefore NOT a pure function of their
+//! arguments on the device.
+//!
+//! Here they are fed `Counter`, a fixed-seed counter re-created per page, so the
+//! artefacts stay byte-stable and a layout regression is still a diff. The cost of
+//! that choice, stated so nobody reads the BMPs as evidence: the ragged margin
+//! looks the SAME on every page here and it will not on the device. What these
+//! files show is the geometry — that the noise starts clear of the words — not the
+//! distribution.
 //!
 //! Run:
 //! ```text
@@ -50,8 +61,8 @@
 //! ```
 
 use coldsnap_hal::ui::{
-    self, BackupPages, EntryPages, Frame, Recipient, SignPage, SignPages, ADDRESS_ROWS,
-    BACKUP_WORDS, COLS, HEIGHT, WIDTH,
+    self, BackupPages, ConfirmDigit, EntryPages, Frame, PinPrompt, Recipient, SignPage, SignPages,
+    ADDRESS_ROWS, BACKUP_WORDS, COLS, HEIGHT, MAX_PIN_PART_LEN, WIDTH,
 };
 use std::fmt::Write as _;
 use std::fs;
@@ -475,12 +486,19 @@ fn main() {
     // --- screen 5: backup display -----------------------------------------
     let backup = BackupPages::new(2, &WORDS).expect("25 lowercase BIP39-shaped words");
     for i in 0..backup.len() {
-        assert!(backup.render(i, &mut f), "backup page {i} must render");
+        // Fresh counter per page, so adding a screen above does not re-noise every
+        // page below it and turn the diff into confetti. The device draws a fresh
+        // pattern per render; here the pattern is per page and repeats.
+        assert!(
+            backup.render(i, &mut f, &mut Counter(0)),
+            "backup page {i} must render"
+        );
         out.emit(
             &format!("5 backup display — page {}/{}", i + 1, backup.len()),
             &format!(
-                "share #2, {BACKUP_WORDS} words \"{}..{}\" (NN: shape preserved for Coldcard's \
-                 mark_sensitive)",
+                "share #2, {BACKUP_WORDS} words \"{}..{}\" — the ragged right margin on each \
+                 word row is Frame::mark_sensitive (shared/display.py:201-205), one fresh run \
+                 per scanline; here from a counter, on the device from rng::Entropy",
                 WORDS[0],
                 WORDS[BACKUP_WORDS - 1]
             ),
@@ -508,7 +526,10 @@ fn main() {
         partial: "abso",
     };
     for i in 0..entry.len() {
-        assert!(entry.render(i, &mut f), "entry page {i} must render");
+        assert!(
+            entry.render(i, &mut f, &mut Counter(0)),
+            "entry page {i} must render"
+        );
         out.emit(
             &format!(
                 "6 backup entry — page {}/{}{}",
@@ -528,7 +549,7 @@ fn main() {
         partial: "1",
     };
     assert_eq!(pre.cursor(), 0, "word entry is gated behind the share index");
-    assert!(pre.render(0, &mut f));
+    assert!(pre.render(0, &mut f, &mut Counter(0)));
     out.emit(
         "6 backup entry — share index not yet confirmed (word entry gated)",
         "share_index None, 0 words, partial \"1\"",
@@ -598,7 +619,158 @@ fn main() {
         ),
     }
 
+    // --- screen 9: PIN (SECURITY: the attempts figure is the only warning
+    //     before an irreversible act) ---------------------------------------
+    //
+    // One drawn confirm digit for the whole block, from `Counter` below.
+    let confirm = ConfirmDigit::draw(&mut Counter(0));
+    //
+    // `attempts_left` here is what SE1's attempt struct would have reported; 13
+    // is `MAX_TARGET_ATTEMPTS` (`stm32/mk4-bootloader/pins.c:28`). Note that 1
+    // and 0 do NOT produce an entry screen at all — `pin_entry` diverts on the
+    // figure itself, so look at what it drew, not at what was asked for.
+    for (words, label, first) in [
+        (["abandon", "absurd"], "first time (record them)", true),
+        (["abandon", "absurd"], "login (recognise them)", false),
+        (["acoustic", "abstract"], "8-char words = exactly the panel at 2x", false),
+    ] {
+        match ui::pin_words(&mut f, first, words) {
+            Ok(()) => out.emit(
+                &format!("9 PIN anti-phishing words — {label}"),
+                &format!("words {words:?}, first_time {first} (derived ABOVE this seam: ui carries no wordlist)"),
+                &format!("pin-words-{}", if first { "learn" } else { "check" }),
+                &f,
+            ),
+            Err(e) => panic!("{label}: pin_words refused a legal word pair: {e:?}"),
+        }
+    }
+    match ui::pin_words(&mut f, false, ["abandon", "abilities"]) {
+        Ok(()) => panic!("a 9-char anti-phishing word was accepted"),
+        Err(e) => out.refused(
+            "9 PIN anti-phishing words — 9-char word",
+            "a word wider than 8 chars would be TRUNCATED at 2x, and a shortened \
+             anti-phishing word is one the user cannot tell from the right one",
+            "pin-words-over",
+            &format!("pin_words -> Err(Unrenderable::{e:?})"),
+        ),
+    }
+
+    for (prompt, typed, left, label, slug) in [
+        (PinPrompt::Prefix, "", 13u64, "prefix, nothing typed yet, 13 left", "pin-prefix-empty"),
+        (PinPrompt::Prefix, "12", 13, "prefix, 2 digits", "pin-prefix-2"),
+        (PinPrompt::Suffix, "123456", 13, "suffix, field full (6 digits)", "pin-suffix-full"),
+        (PinPrompt::Suffix, "1234", 3, "suffix, 3 left", "pin-suffix-3"),
+        (PinPrompt::Suffix, "1234", 2, "suffix, 2 left (last ordinary screen)", "pin-suffix-2"),
+        (PinPrompt::Suffix, "1234", 1, "asked with 1 left -> LAST TRY, PIN un-masked, confirm-digit gate", "pin-lasttry"),
+        (PinPrompt::Suffix, "1234", 0, "asked with 0 left -> terminal screen, no key offered", "pin-bricked"),
+        (PinPrompt::Set, "12", 13, "first-time set", "pin-set"),
+        (PinPrompt::Repeat, "1234", 13, "first-time set, confirm pass", "pin-repeat"),
+    ] {
+        match ui::pin_entry(&mut f, prompt, typed, left, confirm) {
+            Ok(drew) => out.emit(
+                &format!("9 PIN entry — {label}  [drew {drew:?}]"),
+                &format!(
+                    "{prompt:?}, {} digit(s) typed, attempts_left {left} (from SE1, never \
+                     computed here), confirm digit {}",
+                    typed.chars().count(),
+                    confirm.as_str()
+                ),
+                slug,
+                &f,
+            ),
+            Err(e) => panic!("{label}: pin_entry refused: {e:?}"),
+        }
+    }
+    match ui::pin_entry(&mut f, PinPrompt::Prefix, "1234567", 13, confirm) {
+        Ok(s) => panic!("a {}-digit PIN was accepted and drawn as {s:?}", 7),
+        Err(e) => out.refused(
+            &format!("9 PIN entry — 7 digits, one over MAX_PIN_PART_LEN ({MAX_PIN_PART_LEN})"),
+            "a star run that stops growing is a lie about what was typed",
+            "pin-over",
+            &format!("pin_entry -> Err(Unrenderable::{e:?})"),
+        ),
+    }
+
+    for (left, fails, label, slug) in [
+        (12u64, 1u64, "12 left", "pin-wrong-12"),
+        (2, 11, "2 left", "pin-wrong-2"),
+        (1, 12, "1 left — the next one ends the device", "pin-wrong-1"),
+        (13, 99, "num_fails 99, which is pins.c:478's SENTINEL not a count", "pin-wrong-sentinel"),
+        (u64::MAX, u64::MAX, "nonsense from the attempt struct: too wide for 2x, so it drops to 1x rather than being shortened into a plausible small number", "pin-wrong-absurd"),
+    ] {
+        ui::pin_wrong(&mut f, left, fails);
+        out.emit(
+            &format!("9 PIN wrong — {label}"),
+            &format!("attempts_left {left}, num_fails {fails} (both verbatim from SE1)"),
+            slug,
+            &f,
+        );
+    }
+
+    ui::pin_checking(&mut f);
+    out.emit(
+        "9 PIN checking — the screen that replaces a countdown this silicon has no delay for",
+        "no input: calc_delay_required returns a hard 0 on the 608 (pins.c:518-522); the \
+         rate limit IS the ~1.4 s KDF, and the callgate blocks the core so this cannot animate",
+        "pin-checking",
+        &f,
+    );
+
+    ui::pin_mismatch(&mut f);
+    out.emit(
+        "9 PIN mismatch — first-time set, the two entries differed",
+        "no input; says NO PIN WAS SET, because a user who thinks one was is locked out of a \
+         unit that has none",
+        "pin-mismatch",
+        &f,
+    );
+
+    ui::pin_bricked(&mut f);
+    out.emit(
+        "9 PIN bricked — the terminal screen, drawn directly",
+        "no input; identical to what pin_entry draws at 0 attempts",
+        "pin-bricked-direct",
+        &f,
+    );
+
     out.finish();
+}
+
+/// A fixed-seed LCG masquerading as an RNG, so the catalogue's BMPs stay
+/// byte-stable (see the module header's DETERMINISTIC note).
+///
+/// Deliberately worse than the hardware RNG and deliberately NOT a shortcut in
+/// `ui.rs`: a public const `ConfirmDigit` would be one a script could hardcode,
+/// which is the exact property the randomised digit exists to deny. The bad
+/// double lives here, in a host-only example, where it cannot reach firmware.
+///
+/// Not a constant and not a counter, and both rejections are about what the
+/// artefacts then SHOW. `Frame::mark_sensitive` draws one run length per scanline,
+/// so a constant draws a straight edge and a counter draws a monotonic wedge —
+/// either would put a picture of a *pattern* in front of a reviewer whose job is
+/// to see that the margin is ragged and clear of the words. The first value out is
+/// still 0, so `ConfirmDigit::draw` picks the same digit it always did.
+struct Counter(u32);
+
+impl rand_core::RngCore for Counter {
+    fn next_u32(&mut self) -> u32 {
+        let v = self.0;
+        // Numerical Recipes' constants; any full-period LCG would do.
+        self.0 = self.0.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        v
+    }
+    fn next_u64(&mut self) -> u64 {
+        self.next_u32() as u64
+    }
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        for b in dest {
+            *b = self.next_u32() as u8;
+        }
+    }
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
+        self.fill_bytes(dest);
+        Ok(())
+    }
 }
 
 /// Emit every page of one sign-approval transaction, or the refusal it produced.
