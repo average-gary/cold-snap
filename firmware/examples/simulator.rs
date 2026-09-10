@@ -93,7 +93,7 @@ use coldsnap_hal::{identity, memmap};
 use frostsnap_core::bitcoin_transaction::{PushInput, TransactionTemplate};
 use frostsnap_core::message::screen_verify::ScreenVerify;
 use frostsnap_core::message::{CoordinatorRestoration, CoordinatorToDeviceMessage};
-use frostsnap_core::{CheckedSignTask, EnterPhysicalId, MasterAppkey, SignTask};
+use frostsnap_core::{CheckedSignTask, CoordShareDecryptionContrib, MasterAppkey, SignTask};
 
 /// One thing a user can look at: a title, a note about how it was produced, and
 /// the frames, in order.
@@ -326,9 +326,18 @@ fn menu_frame(scenes: &[Scene], mpage: usize) -> Frame {
     f.text_inverted(
         0,
         0,
-        &format!("{:<width$}", format!("SCENES {}/{pages}", mpage + 1), width = ui::COLS),
+        &format!(
+            "{:<width$}",
+            format!("SCENES {}/{pages}", mpage + 1),
+            width = ui::COLS
+        ),
     );
-    for (n, sc) in scenes.iter().skip(mpage * MENU_ROWS).take(MENU_ROWS).enumerate() {
+    for (n, sc) in scenes
+        .iter()
+        .skip(mpage * MENU_ROWS)
+        .take(MENU_ROWS)
+        .enumerate()
+    {
         let mark = if sc.refusal.is_some() { '!' } else { ' ' };
         let name: String = sc.name.chars().take(ui::COLS - 2).collect();
         f.text(0, 1 + n, &format!("{}{mark}{name}", n + 1));
@@ -344,7 +353,11 @@ fn menu_frame(scenes: &[Scene], mpage: usize) -> Frame {
 /// composited onto one. The inverted header says whose screen this is.
 fn note_frame(msg: &str) -> Frame {
     let mut f = Frame::new();
-    f.text_inverted(0, 0, &format!("{:<width$}", "-- SIM NOTE --", width = ui::COLS));
+    f.text_inverted(
+        0,
+        0,
+        &format!("{:<width$}", "-- SIM NOTE --", width = ui::COLS),
+    );
     f.wrap(1, ui::ROWS - 1, msg);
     f
 }
@@ -466,7 +479,10 @@ fn relay(path: &str, fds: [i32; 4]) {
             return;
         }
     };
-    let _ = push(&mut disp, &note_frame(&format!("relay: waiting for a device on {path}")));
+    let _ = push(
+        &mut disp,
+        &note_frame(&format!("relay: waiting for a device on {path}")),
+    );
 
     // The numpad reader runs BEFORE `accept`, and that ordering is the point of the
     // channel: while no device has dialled in the main thread is parked in `accept`
@@ -484,7 +500,9 @@ fn relay(path: &str, fds: [i32; 4]) {
                 // quit path, and the main thread is blocked on a socket that may never
                 // speak again.
                 Ok(0) => {
-                    eprintln!("numpad EOF -- window closed. Nothing was signed, nothing was flashed.");
+                    eprintln!(
+                        "numpad EOF -- window closed. Nothing was signed, nothing was flashed."
+                    );
                     std::process::exit(0);
                 }
                 Err(e) => {
@@ -495,7 +513,11 @@ fn relay(path: &str, fds: [i32; 4]) {
             };
             // One read can carry several bytes: a click delivers the key and the
             // all-up `b"\0"` back to back, and ctrl-M writes 30x b"y\n" (`:1070`).
-            let pressed: Vec<u8> = buf[..n].iter().copied().filter(|k| PAD_KEYS.contains(k)).collect();
+            let pressed: Vec<u8> = buf[..n]
+                .iter()
+                .copied()
+                .filter(|k| PAD_KEYS.contains(k))
+                .collect();
             if pressed.is_empty() {
                 continue;
             }
@@ -513,7 +535,10 @@ fn relay(path: &str, fds: [i32; 4]) {
                 eprintln!("relay: key write failed ({e}) -- device gone, exiting.");
                 std::process::exit(1);
             }
-            eprintln!("relay: key(s) {:?} -> device", String::from_utf8_lossy(&pressed));
+            eprintln!(
+                "relay: key(s) {:?} -> device",
+                String::from_utf8_lossy(&pressed)
+            );
         }
     });
 
@@ -585,7 +610,9 @@ fn relay(path: &str, fds: [i32; 4]) {
 /// [`sim_fds`] already has to warn about at length. Empty is treated as unset so a
 /// launcher can pass the variable through unconditionally.
 fn relay_path() -> Option<String> {
-    std::env::var("COLDSNAP_GLASS_SOCKET").ok().filter(|p| !p.is_empty())
+    std::env::var("COLDSNAP_GLASS_SOCKET")
+        .ok()
+        .filter(|p| !p.is_empty())
 }
 
 /// The window front-end. Same scenes, same `Frame`s, same [`apply_key`]; the only
@@ -631,7 +658,9 @@ fn gui(scenes: &[Scene], fds: [i32; 4], refused: &str) {
                 // The parent exited (ctrl-Q / window closed) and its numpad_w copy
                 // went with it. This is the normal quit path.
                 Ok(0) => {
-                    eprintln!("numpad EOF -- window closed. Nothing was signed, nothing was flashed.");
+                    eprintln!(
+                        "numpad EOF -- window closed. Nothing was signed, nothing was flashed."
+                    );
                     return;
                 }
                 Err(e) => {
@@ -814,9 +843,12 @@ fn entropy(salt: u8) -> Entropy {
 
 /// The eight §4.2 screens plus the hostile fixtures, in §4.2's order.
 fn ui_scenes() -> Vec<Scene> {
-    let long_addr = bitcoin::Address::from_script(&witness_spk(WitnessVersion::V2, &[0x11; 40]), Network::Bitcoin)
-        .expect("witness v2 has an address form")
-        .to_string();
+    let long_addr = bitcoin::Address::from_script(
+        &witness_spk(WitnessVersion::V2, &[0x11; 40]),
+        Network::Bitcoin,
+    )
+    .expect("witness v2 has an address form")
+    .to_string();
     let p2tr_addr = bitcoin::Address::from_script(&p2tr(0x33), Network::Bitcoin)
         .expect("p2tr has an address form")
         .to_string();
@@ -831,7 +863,14 @@ fn ui_scenes() -> Vec<Scene> {
                 frame(|f| ui::standby(f, "coldsnap", "family funds", Some(3))),
                 frame(|f| ui::standby(f, "abcdefghijklmn", "family funds", Some(7))),
                 frame(|f| ui::standby(f, "MMMMMMMMMMMMMMMMMMMMMMMMMMMMMM", "no key yet", None)),
-                frame(|f| ui::standby(f, "\u{dc}n\u{ef}c\u{f8}d\u{e9} w\u{e5}llet", "\u{4e2d}\u{6587} key", Some(1))),
+                frame(|f| {
+                    ui::standby(
+                        f,
+                        "\u{dc}n\u{ef}c\u{f8}d\u{e9} w\u{e5}llet",
+                        "\u{4e2d}\u{6587} key",
+                        Some(1),
+                    )
+                }),
             ],
         ),
         // -- screen 2 -------------------------------------------------------
@@ -841,8 +880,12 @@ fn ui_scenes() -> Vec<Scene> {
              KeyGenPhase3 session hash, which needs a coordinator",
             vec![
                 frame(|f| ui::keygen_check(f, 2, 3, [0xde, 0xad, 0xbe, 0xef], "family funds")),
-                frame(|f| ui::keygen_check(f, 15, 15, [0x00, 0x0f, 0xf0, 0xff], "fifteen of fifteen")),
-                frame(|f| ui::keygen_check(f, 1, 2, [0x12, 0x34, 0x56, 0x78], "\u{fc}nicode key name")),
+                frame(|f| {
+                    ui::keygen_check(f, 15, 15, [0x00, 0x0f, 0xf0, 0xff], "fifteen of fifteen")
+                }),
+                frame(|f| {
+                    ui::keygen_check(f, 1, 2, [0x12, 0x34, 0x56, 0x78], "\u{fc}nicode key name")
+                }),
             ],
         ),
     ];
@@ -857,7 +900,9 @@ fn ui_scenes() -> Vec<Scene> {
         "3b sign approval: 17 recipients (2 pages each + fee + confirm)",
         "the page count is the thing to look at",
         &bitcoin_task(
-            (0..17u8).map(|i| (p2tr(i + 1), 100_000 + i as u64)).collect(),
+            (0..17u8)
+                .map(|i| (p2tr(i + 1), 100_000 + i as u64))
+                .collect(),
             5_000,
         ),
     ));
@@ -889,17 +934,17 @@ fn ui_scenes() -> Vec<Scene> {
         "3g sign approval: OP_RETURN output -> REFUSAL",
         "Address::from_script errs on OP_RETURN; sign_consent turns that into a refusal",
         &bitcoin_task(
-            vec![(ScriptBuf::from_bytes(vec![0x6a, 0x02, 0x01, 0x02]), 0), (p2tr(0x66), 5_000)],
+            vec![
+                (ScriptBuf::from_bytes(vec![0x6a, 0x02, 0x01, 0x02]), 0),
+                (p2tr(0x66), 5_000),
+            ],
             1_000,
         ),
     ));
     scenes.push(sign_scene(
         "3h sign approval: 33 recipients, one over MAX_RECIPIENTS -> REFUSAL",
         "SignPages::new refuses the whole transaction rather than paginate 32 of 33",
-        &bitcoin_task(
-            (0..33u8).map(|i| (p2tr(i + 1), 10_000)).collect(),
-            1_000,
-        ),
+        &bitcoin_task((0..33u8).map(|i| (p2tr(i + 1), 10_000)).collect(), 1_000),
     ));
 
     scenes.extend([
@@ -921,7 +966,12 @@ fn ui_scenes() -> Vec<Scene> {
                     }
                 }),
                 frame(|f| {
-                    if ui::sign_test_message(f, "\u{3053}\u{3093}\u{306b}\u{3061}\u{306f} \u{20ac}5").is_err() {
+                    if ui::sign_test_message(
+                        f,
+                        "\u{3053}\u{3093}\u{306b}\u{3061}\u{306f} \u{20ac}5",
+                    )
+                    .is_err()
+                    {
                         ui::refusal(f);
                     }
                 }),
@@ -941,16 +991,32 @@ fn ui_scenes() -> Vec<Scene> {
             "5 backup display: share index + 7 word pages",
             "8 pages: the share-index page is not optional, a backup without it is \
              unrestorable. Word rows are noised per scanline (mark_sensitive)",
-            (0..b.len()).map(|i| frame(|f| { b.render(i, f, &mut noise); })).collect(),
+            (0..b.len())
+                .map(|i| {
+                    frame(|f| {
+                        b.render(i, f, &mut noise);
+                    })
+                })
+                .collect(),
         )),
-        Err(e) => scenes.push(Scene::refused("5 backup display", "25 good words", format!("{e:?}"))),
+        Err(e) => scenes.push(Scene::refused(
+            "5 backup display",
+            "25 good words",
+            format!("{e:?}"),
+        )),
     }
     let short: Vec<&str> = WORDS[..24].to_vec();
     match ui::BackupPages::new(3, &short) {
         Ok(b) => scenes.push(Scene::shown(
             "5b backup display, 24 words: EXPECTED A REFUSAL",
             "a word list that is not 25 long must be refused",
-            (0..b.len()).map(|i| frame(|f| { b.render(i, f, &mut noise); })).collect(),
+            (0..b.len())
+                .map(|i| {
+                    frame(|f| {
+                        b.render(i, f, &mut noise);
+                    })
+                })
+                .collect(),
         )),
         Err(e) => scenes.push(Scene::refused(
             "5b backup display: 24 words -> REFUSAL",
@@ -1012,7 +1078,9 @@ fn ui_scenes() -> Vec<Scene> {
                 }
             }),
             frame(|f| {
-                if ui::address_verify(f, &long_addr, "m/86'/0'/0'/0/4294967295", 4_294_967_295).is_err() {
+                if ui::address_verify(f, &long_addr, "m/86'/0'/0'/0/4294967295", 4_294_967_295)
+                    .is_err()
+                {
                     ui::refusal(f);
                 }
             }),
@@ -1038,12 +1106,28 @@ fn session_scenes(
     let short: String = format!("{id}").chars().take(12).collect();
     let mut out = Outbox::new(id);
     let announced = session
-        .announce(
-            frostsnap_comms::Sha256Digest([0x11; 32]),
-            &mut out,
-        )
+        .announce(frostsnap_comms::Sha256Digest([0x11; 32]), &mut out)
         .map(|()| format!("{} frames, {} bytes", out.frames(), out.bytes().len()))
         .unwrap_or_else(|e| format!("announce failed: {e:?}"));
+
+    // A real 1-of-1 polynomial, so `CheckBackup` below is refused by the DISPATCH
+    // rather than by the signer failing to find a key. `Fingerprint::NONE` because
+    // the production one grinds ~262,144 hashes per coefficient and nothing on this
+    // path reads a fingerprint.
+    let quiz_key = {
+        let secret = frostsnap_core::schnorr_fun::fun::Scalar::from_bytes([0x4bu8; 32])
+            .and_then(|s| s.non_zero())
+            .expect("a fixed non-zero scalar below the order");
+        let (shares, root) = frost_backup::ShareBackup::generate_shares(
+            secret,
+            1,
+            1,
+            frost_backup::Fingerprint::NONE,
+            rng,
+        );
+        let index = shares.first().expect("one share was asked for").index();
+        (root, index)
+    };
 
     let hostile: Vec<(&str, &str, CoordinatorSendBody)> = vec![
         (
@@ -1055,11 +1139,25 @@ fn session_scenes(
             )),
         ),
         (
-            "9b session: EnterPhysicalBackup -> REFUSAL",
-            "no entry UI exists, so there is nothing to consent with",
+            // WAS `EnterPhysicalBackup`, which is now ADMITTED and answers with a
+            // consent screen, so it is no longer a refusal and cannot hold this
+            // fixture's assertion. `CheckBackup` is the restoration message that
+            // MUST stay refused — its screen renders the true word among three AND
+            // all 25, so admitting it while `show_backup` draws plain words would
+            // answer a quiz request with a full plaintext reveal — which makes it the
+            // right one to pin here.
+            "9b session: CheckBackup -> REFUSAL",
+            "its quiz reveals more than DisplayBackup does and the distractor picker \
+             does not exist, so there is nothing honest to draw",
             CoordinatorSendBody::Core(CoordinatorToDeviceMessage::Restoration(
-                CoordinatorRestoration::EnterPhysicalBackup {
-                    enter_physical_id: EnterPhysicalId::new(rng),
+                CoordinatorRestoration::CheckBackup {
+                    coord_share_decryption_contrib: CoordShareDecryptionContrib::for_master_share(
+                        id,
+                        quiz_key.1,
+                        &quiz_key.0,
+                    ),
+                    share_index: quiz_key.1,
+                    root_shared_key: quiz_key.0.clone(),
                 },
             )),
         ),
@@ -1078,30 +1176,32 @@ fn session_scenes(
 
     hostile
         .into_iter()
-        .map(|(name, note, body)| match session.recv(body, rng, &mut out) {
-            Ok(prompts) if prompts.is_empty() => Scene::shown(
-                name,
-                &format!("{note} [announce: {announced}]"),
-                vec![frame(|f| ui::standby(f, "coldsnap", &short, None))],
-            ),
-            // Any real prompt would be drawn by main.rs's draw_prompt; none of
-            // these messages can produce one.
-            Ok(prompts) => Scene::shown(
-                name,
-                &format!("{note} -- {} prompt(s), UNEXPECTED", prompts.len()),
-                vec![frame(|f| ui::standby(f, "coldsnap", &short, None))],
-            ),
-            Err(Fault::Refused(r)) => {
-                Scene::refused(name, note, format!("Fault::Refused(Refusal::{r:?})"))
-            }
-            // main.rs draws nothing here, and that is the honest thing to show:
-            // an empty page list would be a lie, so this is standby unchanged.
-            Err(f) => Scene::shown(
-                name,
-                &format!("{note} -- Fault::{f:?}: main.rs leaves the screen UNCHANGED"),
-                vec![frame(|fr| ui::standby(fr, "coldsnap", &short, None))],
-            ),
-        })
+        .map(
+            |(name, note, body)| match session.recv(body, rng, &mut out) {
+                Ok(prompts) if prompts.is_empty() => Scene::shown(
+                    name,
+                    &format!("{note} [announce: {announced}]"),
+                    vec![frame(|f| ui::standby(f, "coldsnap", &short, None))],
+                ),
+                // Any real prompt would be drawn by main.rs's draw_prompt; none of
+                // these messages can produce one.
+                Ok(prompts) => Scene::shown(
+                    name,
+                    &format!("{note} -- {} prompt(s), UNEXPECTED", prompts.len()),
+                    vec![frame(|f| ui::standby(f, "coldsnap", &short, None))],
+                ),
+                Err(Fault::Refused(r)) => {
+                    Scene::refused(name, note, format!("Fault::Refused(Refusal::{r:?})"))
+                }
+                // main.rs draws nothing here, and that is the honest thing to show:
+                // an empty page list would be a lie, so this is standby unchanged.
+                Err(f) => Scene::shown(
+                    name,
+                    &format!("{note} -- Fault::{f:?}: main.rs leaves the screen UNCHANGED"),
+                    vec![frame(|fr| ui::standby(fr, "coldsnap", &short, None))],
+                ),
+            },
+        )
         .collect()
 }
 
@@ -1146,7 +1246,8 @@ a window has no scrollback. There is no `q`: close the window.
 ";
 
 fn menu(scenes: &[Scene], msg: &str) -> String {
-    let mut s = String::from("\n-- screens ------------------------------------------------------\n");
+    let mut s =
+        String::from("\n-- screens ------------------------------------------------------\n");
     for (i, sc) in scenes.iter().enumerate() {
         s.push_str(&format!(
             "{:>3}  {}{}\n",

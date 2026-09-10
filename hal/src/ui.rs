@@ -104,11 +104,22 @@
 //!   [`FEE_UNVERIFIED_1`] / [`FEE_UNVERIFIED_2`] on the same page as the number.
 //! - **A row with a seed word on it is noised.** §4.2's note on
 //!   `shared/display.py:284-285` is [`Frame::mark_sensitive`], a fresh
-//!   random-length run per scanline; [`BackupPages::render`] and
-//!   [`EntryPages::render`] take the RNG for it as a **required** argument, so
-//!   there is no un-noised way to put a share on the glass. Its one unclosed
+//!   random-length run per scanline. Every screen that can put share material on
+//!   the glass takes the RNG for it as a **required** argument —
+//!   [`BackupPages::render`] (reveal), [`WordEntry::render`] (entry, including the
+//!   candidate letters, which are a function of the secret prefix) and
+//!   [`backup_quiz_word`] (the check quiz, which draws all 25 words over 26
+//!   screens) — and all of them go through one private `sensitive_row`, so a row
+//!   cannot get the text without the noise. There is no opt-in variant, because an
+//!   opt-in fails open. The one screen that has no RNG, [`backup_quiz`], MASKS any
+//!   option that is a word rather than drawing it unprotected. Its one unclosed
 //!   edge — averaging over redraws — is documented on `mark_sensitive` itself
 //!   rather than left for a reader to discover.
+//! - **Nothing here blanks on a timer, and that is a decision.** No screen in this
+//!   module has a timeout: not the reveal, not the quiz, not entry. Transcribing or
+//!   typing 25 words is slow, and a screen that clears mid-word costs a second full
+//!   disclosure of the same secret. The words leave the glass when a key or a
+//!   coordinator prompt says so.
 //!
 //! # What is deliberately not here
 //!
@@ -229,6 +240,25 @@ const _: () = assert!(
     SENSITIVE_TEXT_CELLS * CELL + SENSITIVE_MAX < WIDTH,
     "the sensitive-row noise would overlap the word it is drawn beside"
 );
+
+/// Draw a row of share-derived text and cover it with [`Frame::mark_sensitive`],
+/// in one call that cannot do one without the other.
+///
+/// Every share-bearing screen here goes through this — the backup display, both
+/// word rows of entry, the candidate letters, and all three rows of the check
+/// quiz. It exists because the pair was written out four times, and a fifth
+/// caller that drew the text and forgot the noise would have compiled, rendered,
+/// and passed every test that did not happen to look at that row. Now dropping
+/// the noise is one edit that breaks all four screens at once, and each has a
+/// named test on it.
+///
+/// `col` is always 0 (a noised row is a full row), so it is not a parameter: the
+/// budget the geometry assert reserves is measured from column 0, and an indented
+/// row would silently spend it.
+fn sensitive_row(frame: &mut Frame, row: usize, text: &str, rng: &mut impl rand_core::RngCore) {
+    frame.text(0, row, text);
+    frame.mark_sensitive(row, rng);
+}
 
 /// Absolute high-fee threshold in sats, from `sign_prompt.rs:30`. Strictly
 /// greater, and it short-circuits the relative test.
@@ -1065,12 +1095,15 @@ const _: () = {
 /// an RNG parameter instead would make all three non-deterministic to test and
 /// buy nothing.
 ///
-/// [`BackupPages::render`] and [`EntryPages::render`] *do* take an RNG, and that
-/// is not a contradiction: their randomness is not a value to be shown and then
-/// compared against a keypress, it is the [`Frame::mark_sensitive`] noise, which
-/// is only a defence if it is fresh on every scanline of every render. There is
-/// no "data" form of it to pass in. Nothing on those two screens is authorised by
-/// a key, so nothing there needs to stay comparable.
+/// [`BackupPages::render`], [`WordEntry::render`] and [`backup_quiz_word`] *do*
+/// take an RNG, and that is not a contradiction: their randomness is not a value
+/// to be shown and then compared against a keypress, it is the
+/// [`Frame::mark_sensitive`] noise, which is only a defence if it is fresh on
+/// every scanline of every render. There is no "data" form of it to pass in.
+/// Nothing on those screens is authorised by a digit — entry and the quiz are
+/// answered by the fixed keys their own legends print ([`ENTRY_LETTER_KEYS`],
+/// [`QUIZ_KEYS`]), which is why those legends carry their own const asserts — so
+/// nothing there needs to stay comparable.
 ///
 /// # Why a digit at all, and why it replaced a hold
 ///
@@ -1808,9 +1841,7 @@ impl<'a> BackupPages<'a> {
                         .push_str(w);
                     // Draw, then noise the same row. Structural, not text-sniffed:
                     // this is a row we just put a word on, so it gets covered.
-                    let row = 2 + i;
-                    frame.text(0, row, b.as_str());
-                    frame.mark_sensitive(row, rng);
+                    sensitive_row(frame, 2 + i, b.as_str(), rng);
                 }
                 frame.text(0, 7, BACKUP_BACK_LEGEND);
             }
@@ -1819,9 +1850,202 @@ impl<'a> BackupPages<'a> {
     }
 }
 
+/// Screen 5b: the question that CLOSES a reveal — did the human actually write
+/// the words down?
+///
+/// Upstream's `CommsMisc::BackupRecorded` means exactly that and nothing weaker
+/// (`frostsnap/device/src/frosty_ui.rs:335` fires it when the display widget
+/// FINISHES, `esp32_run.rs:744-746` sends it), and the coordinator's
+/// `DisplayBackupProtocol` waits for it before closing its dialog
+/// (`frostsnap_coordinator/src/display_backup.rs:87`). Without a screen that asks,
+/// the honest device says nothing and the app waits forever. This is the screen.
+///
+/// # It carries no word, structurally
+///
+/// There is no `&str` parameter here and no [`Frame::mark_sensitive`] call, and
+/// both absences are the point: this screen is drawn AFTER the grant is dropped,
+/// so the words are already off the glass and there is nothing on this frame to
+/// noise. A share cannot reach it because none is passed to it — the same
+/// argument the backup *consent* screen rests on, at the other end of the flow.
+///
+/// # Why the randomised digit and not a fixed key
+///
+/// The answer becomes a claim to the coordinator that a backup EXISTS on paper,
+/// and a wallet whose owner believes that falsely has no backup at all. So the
+/// yes gesture must be one nobody can press reflexively: [`NEXT_KEY`] is what
+/// walked the human onto this screen, [`BACK_KEY`] is what they were pressing to
+/// re-read word 20, and either as the yes key would turn an over-press into a
+/// false claim. A digit from [`CONFIRM_CHARSET`] is const-asserted off both.
+///
+/// A "no" is a screen the human simply does not answer with that digit, and it
+/// sends nothing at all — which leaves the coordinator's dialog open, because a
+/// backup that was not written down was not recorded. That is the honest state,
+/// not a missing feature.
+pub fn backup_recorded(frame: &mut Frame, confirm: ConfirmDigit) {
+    frame.clear();
+    frame.text(0, 0, "Wrote down all");
+    frame.text(0, 1, "25 words + the");
+    frame.text(0, 2, "share index?");
+    frame.text(0, 4, "No word is");
+    frame.text(0, 5, "shown again.");
+    let mut b = press_legend(confirm);
+    b.push_str(" x=no");
+    frame.text(0, FOOTER_ROW, b.as_str());
+}
+
 // ---------------------------------------------------------------------------
 // Screen 6 — backup entry
 // ---------------------------------------------------------------------------
+
+/// The nine keys the word-entry screen offers as LETTERS, in the order
+/// [`WordEntry`] prints them: key `1` picks the leftmost candidate.
+///
+/// # Positional, because 16 columns cannot hold nine labelled pairs
+///
+/// `1A 2B 3C ...` is 18 cells for nine letters and this panel has 16, so the
+/// alternatives were five letters per page (twice the paging, on a screen a user
+/// already visits 25 times) or a ruler row of digits above the letters. The ruler
+/// is drawn **from this array**, so a key that moves cannot keep its old printed
+/// digit — that is the `5=next 8=back` class (see `BACKUP_NEXT_LEGEND`) closed
+/// by construction rather than by an assert on a string literal.
+///
+/// Nine and not ten: `0` pages, because a prefix can have up to 25 valid
+/// continuations (every letter but `x` starts a BIP39 word) and a keypad with no
+/// way to reach letters 10..25 is a keypad that cannot type half the wordlist.
+/// # These OVERLAP [`CONFIRM_CHARSET`] completely, and that is deliberate
+///
+/// `CONFIRM_CHARSET` is `12346`; every one of those five keys is also an entry letter
+/// key. So a keypress alone cannot tell you whether the user meant "confirm" or
+/// "letter 3" — **the `Consent` variant in `firmware/src/main.rs` is the entire
+/// separation**, and it holds structurally rather than by value: `Consent::Entry` is a
+/// unit variant carrying no `ConfirmDigit`, so `Answer::Yes` cannot be produced from it
+/// and there is nothing to hand `Session::confirm_at`.
+///
+/// Do NOT "fix" the overlap by carving the sets apart. Nine numbered letters is what
+/// makes word entry 142 presses instead of Coldcard's 291, and five confirm digits is
+/// Coldcard's own considered choice for their highest-stakes approval
+/// (`shared/hsm_ux.py:58`). Both sets are right; the context is what disambiguates.
+///
+/// What IS asserted below is the narrower property that actually could break silently:
+/// [`NEXT_KEY`] and [`BACK_KEY`] must not be drawable as confirm digits, because paging
+/// a screen would then be indistinguishable from signing on one prompt in five.
+pub const ENTRY_LETTER_KEYS: [u8; 9] = *b"123456789";
+/// Candidate letters per page — one per [`ENTRY_LETTER_KEYS`] entry, by
+/// definition rather than a second const nobody ties to the first.
+pub const ENTRY_LETTERS_PER_PAGE: usize = ENTRY_LETTER_KEYS.len();
+/// The key that shows the next page of candidate letters. It **wraps**, so there
+/// is no out-of-range page and therefore no arithmetic on this screen that a
+/// release build (`overflow-checks = false`) could wrap silently.
+pub const ENTRY_PAGE_KEY: u8 = b'0';
+/// The key that accepts the word being typed. `y`, the pad's OK
+/// ([`crate::keypad::KEY_OK`]) — const-asserted equal to it below.
+pub const ENTRY_OK_KEY: u8 = b'y';
+/// The key that deletes **one letter**, not the whole word.
+///
+/// Coldcard's own nest menu has no character backspace: `x` runs
+/// `WordNestMenu.on_cancel` (`shared/seed.py:276-291`), which pops the last
+/// COMMITTED word and restarts it from its first letter, so fixing word 20 means
+/// re-typing word 20. One letter is the difference between correcting a typo and
+/// losing a word, on the flow whose whole job is not to lose a share.
+pub const ENTRY_DELETE_KEY: u8 = b'x';
+/// The most candidate letters [`WordEntry`] will accept: the alphabet. Over-bound
+/// is a refusal, not a wrap into page 4 of a list that has no page 4.
+pub const MAX_CANDIDATE_LETTERS: usize = 26;
+
+/// `(y)ok ` — with its trailing space, so the three footer pieces concatenate to
+/// the exact worst case the const assert below measures.
+///
+/// Parenthesised and not `y=ok` for [`NEXT_LEGEND`]'s reason: `firmware/examples/
+/// stub.rs` reads `<k>=<what>` on the footer row as a plain-press CONSENT legend,
+/// and typing a letter authorises nothing.
+const ENTRY_OK_LEGEND: &str = "(y)ok ";
+/// `(x)del`. Drawn on every entry screen: deleting is always available, including
+/// on an empty field, where it is how a user backs out of a word.
+const ENTRY_DELETE_LEGEND: &str = "(x)del";
+/// `(0)+` — more candidate letters than this page holds. Drawn only when there
+/// ARE more, because a paging key on a single-page list is a key that does
+/// nothing.
+const ENTRY_PAGE_LEGEND: &str = "(0)+";
+/// Label on the letter-page indicator row, e.g. `letters 2/3`.
+///
+/// `(0)+` says another page EXISTS; this says which one is up and how many there
+/// are. Both are needed and neither is the other: a user who has pressed `0`
+/// twice and is looking at the same nine letters cannot tell "wrapped back to
+/// page 1" from "the key did nothing" without a page number, and a user on page
+/// 1 of 3 who is told only `+` does not know whether one more press or two is
+/// the cheap way to the letter they want.
+///
+/// Says `letters` and not `page`, because the pages a user has already turned on
+/// this device are pages of WORDS (`BACKUP_NEXT_LEGEND`) and these are not those.
+const ENTRY_PAGE_LABEL: &str = "letters ";
+
+const _: () = {
+    // Every legend names the key the firmware compares. This is the assert that
+    // was missing when `5=next 8=back` shipped on the backup pages.
+    assert!(
+        ENTRY_OK_LEGEND.as_bytes()[1] == ENTRY_OK_KEY,
+        "the entry accept legend must name ENTRY_OK_KEY"
+    );
+    assert!(
+        ENTRY_DELETE_LEGEND.as_bytes()[1] == ENTRY_DELETE_KEY,
+        "the entry delete legend must name ENTRY_DELETE_KEY"
+    );
+    assert!(
+        ENTRY_PAGE_LEGEND.as_bytes()[1] == ENTRY_PAGE_KEY,
+        "the entry paging legend must name ENTRY_PAGE_KEY"
+    );
+    // All three at once is the worst-case footer: a complete word with more
+    // candidate pages behind it. One column over and the delete key would be the
+    // half-drawn thing on the screen a user is fixing a typo on.
+    assert!(
+        ENTRY_OK_LEGEND.len() + ENTRY_DELETE_LEGEND.len() + ENTRY_PAGE_LEGEND.len() <= COLS,
+        "the entry footer does not fit one row"
+    );
+    // The indicator lives on a NOISED row, so its budget is the 12 cells the
+    // geometry assert reserves and not the 16 the panel has. `letters 3/3` is 11.
+    assert!(
+        ENTRY_PAGE_LABEL.len() + "N/N".len() <= SENSITIVE_TEXT_CELLS,
+        "the letter-page indicator does not fit the noised-row budget"
+    );
+    // ... and `N/N` is only three cells while the page count stays one digit,
+    // which is a property of MAX_CANDIDATE_LETTERS. Raising that const past 89
+    // letters is what would silently make it four.
+    assert!(
+        MAX_CANDIDATE_LETTERS.div_ceil(ENTRY_LETTERS_PER_PAGE) < 10,
+        "a two-digit letter-page count would not fit the indicator budget"
+    );
+    // The pad half. These two are `u8`s, not registers: naming them here ties the
+    // legend to the byte `hal::keypad`'s decode table actually reports, so moving
+    // OK or CANCEL on the matrix is a build failure and not a screen that
+    // advertises a key nobody can press.
+    assert!(
+        ENTRY_OK_KEY == crate::keypad::KEY_OK,
+        "the entry accept key must be the pad's OK"
+    );
+    assert!(
+        ENTRY_DELETE_KEY == crate::keypad::KEY_CANCEL,
+        "the entry delete key must be the pad's CANCEL"
+    );
+    // A letter key may not double as one of the three keys that do something
+    // else, or picking the 9th letter and paging (or accepting the word) would be
+    // the same press.
+    let mut i = 0;
+    while i < ENTRY_LETTER_KEYS.len() {
+        assert!(
+            ENTRY_LETTER_KEYS[i] != ENTRY_PAGE_KEY,
+            "a letter key must not also page"
+        );
+        assert!(
+            ENTRY_LETTER_KEYS[i] != ENTRY_OK_KEY,
+            "a letter key must not also accept the word"
+        );
+        assert!(
+            ENTRY_LETTER_KEYS[i] != ENTRY_DELETE_KEY,
+            "a letter key must not also delete"
+        );
+        i += 1;
+    }
+};
 
 /// One page of backup entry.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1919,6 +2143,19 @@ impl<'a> EntryPages<'a> {
     /// letter. A field that has stopped accepting letters showing no cursor is
     /// honest; a letter silently dropped from the word a user is transcribing would
     /// not be.
+    /// # This form draws NO candidate letters, and therefore advertises no letter
+    /// keys
+    ///
+    /// `EntryPages` carries no candidate list — see the type docs — so the word
+    /// page it draws has an empty letter row and a footer offering only
+    /// [`ENTRY_DELETE_KEY`]. That is a screen a human cannot type a word on, which
+    /// is the honest rendering of a state machine that has not been given the
+    /// wordlist. The device path is [`WordEntry`], and this delegates to it so
+    /// there is exactly one drawing of a word row in this module.
+    ///
+    /// `false` past the end **and** on any word this module refuses to render (see
+    /// [`WordEntry::render`]): both mean "do not put this on the glass", and a
+    /// caller that wants to tell them apart should be holding a `WordEntry`.
     pub fn render(
         &self,
         index: usize,
@@ -1928,44 +2165,278 @@ impl<'a> EntryPages<'a> {
         let Some(page) = self.page(index) else {
             return false;
         };
-        frame.clear();
         match page {
             EntryPage::ShareIndex { partial } => {
+                frame.clear();
                 frame.text(0, 0, "Restore backup");
                 frame.text(0, 2, "share index:");
                 let mut b = Buf::<16>::new();
                 b.push_str(partial).push_str("_");
                 frame.text(0, 4, b.as_str());
-                frame.text(0, 7, "1=ok x=del");
+                let mut f = Buf::<16>::new();
+                // An empty index cannot be accepted, so `y` is not offered yet.
+                if !partial.is_empty() {
+                    f.push_str(ENTRY_OK_LEGEND);
+                }
+                f.push_str(ENTRY_DELETE_LEGEND);
+                frame.text(0, FOOTER_ROW, f.as_str());
+                true
             }
             EntryPage::Word {
                 number,
                 partial,
                 previous,
-            } => {
-                let mut head = Buf::<16>::new();
-                head.push_str("word ")
-                    .push_u64(number as u64)
-                    .push_str(" of ")
-                    .push_u64(BACKUP_WORDS as u64);
-                frame.text(0, 0, head.as_str());
-                if let Some(p) = previous {
-                    let mut b = Buf::<SENSITIVE_TEXT_CELLS>::new();
-                    b.push_u8_pad2((number - 1) as u8).push_str(": ").push_str(p);
-                    frame.text(0, 2, b.as_str());
-                    frame.mark_sensitive(2, rng);
-                }
-                let mut b = Buf::<SENSITIVE_TEXT_CELLS>::new();
-                b.push_u8_pad2(number as u8)
-                    .push_str(": ")
-                    .push_str(partial)
-                    .push_str("_");
-                frame.text(0, 4, b.as_str());
-                frame.mark_sensitive(4, rng);
-                frame.text(0, 7, "1=ok x=del");
+            } => WordEntry {
+                number,
+                partial,
+                previous,
+                candidates: "",
+                page: 0,
+                complete: false,
             }
+            .render(frame, rng)
+            .is_ok(),
         }
-        true
+    }
+}
+
+/// Screen 6's word page **with the candidate letters on it** — the field
+/// [`EntryPages`] does not have, and the reason word entry was refused.
+///
+/// # What was wrong, and why a candidate row is the fix
+///
+/// Without it a user presses digits blind: nothing on the glass says which keys
+/// are live or what they would type, so entering a share is guessing. Coldcard
+/// solves the same problem with a nested prefix menu (`shared/seed.py:56-108`
+/// `letter_choices`, `:152-320` `WordNestMenu`) driven by libngu's
+/// `bip39.next_char`, which PLAN.md §1 forbids us. The equivalent narrowing is
+/// already vendored in-tree — `frost_backup::bip39_words::get_valid_next_letters`
+/// and `words_with_prefix` — so `firmware/` computes [`WordEntry::candidates`]
+/// from those and this screen only draws them. Measured against the vendored
+/// list, that map costs a mean 5.69 presses per word and 9 at worst, against 11.64
+/// mean / 27 worst for Coldcard's menu.
+///
+/// **Feed it UPPERCASE.** `bip39_words::letter_to_index` accepts `'A'..='Z'` only
+/// and `BIP39_WORDS` is uppercase, so a lowercase prefix yields an empty candidate
+/// set with no error. This module accepts either case (`check_word`'s rule, one
+/// consistent case per field) because it cannot see that list; the trap is on the
+/// caller's side and is recorded here because this is where a reader looks.
+///
+/// # No timeout, deliberately
+///
+/// Nothing here blanks. A share being typed back in is on the glass exactly as
+/// long as the human needs, for the same reason the reveal has no timeout: a
+/// screen that clears mid-word costs a second full disclosure of the same secret,
+/// and 25 words is slow. That is a chosen property, not a missing one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct WordEntry<'a> {
+    /// 1-based word number, 1..=[`BACKUP_WORDS`]. Anything else is a refusal.
+    pub number: usize,
+    /// Letters typed so far. Empty is legal — that is a fresh word.
+    pub partial: &'a str,
+    /// The previously entered word, for context. `None` on word 1.
+    pub previous: Option<&'a str>,
+    /// Every letter that can legally follow [`WordEntry::partial`], in the order
+    /// they are offered. Empty means the word is finished — see
+    /// [`WordEntry::complete`].
+    pub candidates: &'a str,
+    /// Which page of [`ENTRY_LETTERS_PER_PAGE`] candidates to show. Taken modulo
+    /// the page count, so [`ENTRY_PAGE_KEY`] can simply increment it forever.
+    pub page: usize,
+    /// Whether [`ENTRY_OK_KEY`] is live: [`WordEntry::partial`] is a whole BIP39
+    /// word, **or** only one word can still follow it, in which case accepting
+    /// commits that one word rather than the prefix.
+    ///
+    /// Both halves, and not just the first: accepting at uniqueness is where the
+    /// 5.69 presses per word come from (7.45 if `y` waited for every letter, over
+    /// 25 words 186 presses against 142). The cost is that the committed word can
+    /// be one the user did not finish typing — `ABA` commits `ABANDON` — which is
+    /// why the word just accepted is drawn back as [`WordEntry::previous`] on the
+    /// next screen instead of vanishing.
+    ///
+    /// A separate flag and not `candidates.is_empty()`, because 49 words are
+    /// proper prefixes of longer ones — `ACT` is a word AND the way to `ACTION` —
+    /// so a finished word can still have candidates. Deriving it here would need
+    /// the wordlist this module does not have, and guessing it would put `(y)ok` on
+    /// a screen where `y` does nothing: the same class of defect as printing a
+    /// paging key that means No.
+    pub complete: bool,
+}
+
+impl WordEntry<'_> {
+    /// Pages of candidate letters. At least 1, so `page % pages()` is always
+    /// defined and never divides by zero.
+    pub fn pages(&self) -> usize {
+        self.candidates
+            .len()
+            .div_ceil(ENTRY_LETTERS_PER_PAGE)
+            .max(1)
+    }
+
+    /// The candidate letter [`ENTRY_LETTER_KEYS`] `key` picks **on the page this
+    /// screen is showing**, or `None` if `key` is not a letter key or this page
+    /// has no letter under that digit.
+    ///
+    /// # Why this is a function and not two copies of `(page % pages) * 9 + slot`
+    ///
+    /// The screen and the keypad have to agree about which letter key 7 means, and
+    /// that agreement is one expression written in two crates: here, to draw the
+    /// ruler, and in `firmware/` to decide what a press typed. [`render`] builds
+    /// its ruler and letter rows from **this** function, so a mis-based page
+    /// cannot draw one letter and type another — it draws and types the same wrong
+    /// letter, which the independently-computed expectation in
+    /// `entry_letters_are_numbered_by_the_keys_the_firmware_compares` catches.
+    /// This is the `5=next 8=back` class closed by construction for nine keys at
+    /// once, the same way the ruler is built from the key array rather than typed
+    /// out as `"1..9"`.
+    ///
+    /// `None`, never a wrap, on a SHORT page: 25 candidates put 7 letters on page
+    /// 3, so keys 8 and 9 there select nothing rather than selecting page 1's
+    /// letters. A caller treats `None` as a no-op press.
+    ///
+    /// [`render`]: WordEntry::render
+    pub fn letter_for_key(&self, key: u8) -> Option<u8> {
+        let slot = ENTRY_LETTER_KEYS.iter().position(|k| *k == key)?;
+        // `page` is reduced modulo `pages()` first, so the multiply is bounded by
+        // the candidate list and nothing here can wrap in a release build.
+        let start = (self.page % self.pages()).saturating_mul(ENTRY_LETTERS_PER_PAGE);
+        self.candidates
+            .as_bytes()
+            .get(start.saturating_add(slot))
+            .copied()
+            // Byte indexing is sound for everything `render` accepts (single-case
+            // ASCII letters) and this filter is what keeps it sound for everything
+            // it does not: a caller holding an unvalidated `WordEntry` gets `None`
+            // rather than half a UTF-8 sequence.
+            .filter(u8::is_ascii_alphabetic)
+    }
+
+    /// Compose the screen, or refuse it.
+    ///
+    /// # The rows, top to bottom
+    ///
+    /// ```text
+    /// 0  word 3 of 25        which word, un-noised: the POSITION is not the secret
+    /// 1  letters 2/3         which page of candidates, and how many        NOISED
+    /// 2  02: ABANDON         the word just committed                       NOISED
+    /// 4  03: AB_             the prefix being typed, with its cursor       NOISED
+    /// 5  123456789           the ruler: ENTRY_LETTER_KEYS                  NOISED
+    /// 6  CDEFGHIJK           this page's candidate letters                 NOISED
+    /// 7  (y)ok (x)del(0)+    only the keys that are live right now
+    /// ```
+    ///
+    /// `rng` is mandatory for [`BackupPages::render`]'s reason and the threat is
+    /// the same: a share being typed back in is on the glass exactly as much as one
+    /// being read out. **Five** rows go through `sensitive_row` here, not two — the
+    /// previous word, the word being typed, both candidate rows, and the page
+    /// indicator:
+    ///
+    /// * the letters are a function of the secret prefix, so their identity leaks
+    ///   it directly;
+    /// * the *count* of them is a function of the prefix too, so the ruler row is
+    ///   noised even though it only ever prints digits — and both rows are noised
+    ///   even when there are no candidates at all, because a row whose noise
+    ///   appears and disappears announces that the word just finished;
+    /// * the page TOTAL is that same count divided by nine, and it is not a
+    ///   harmless summary of it: measured over the vendored list, 3 pages happens
+    ///   only at a prefix of 0 or 1 letters and 2 pages only at 3 or fewer, so an
+    ///   un-noised indicator would put the prefix LENGTH in the clear on the screen
+    ///   whose other rows spend 12 cells hiding it. Which page the user is *on* is
+    ///   their own key presses and leaks nothing, but it shares the row.
+    ///
+    /// Every noised row is built at `SENSITIVE_TEXT_CELLS` (12) and the candidate
+    /// rows are at most [`ENTRY_LETTERS_PER_PAGE`] (9) cells, so nothing here can
+    /// reach the noise gutter for any input this function accepts. That is what
+    /// [`MAX_CANDIDATE_LETTERS`] and the page split are for: 26 letters on one row
+    /// would be truncated at 12 and the missing 14 would be unreachable keys.
+    ///
+    /// Refuses (`Unrenderable::BadWordList`) a word number outside 1..=25, a
+    /// partial or previous word that is not BIP39-shaped, and a candidate list that
+    /// is not 0..=[`MAX_CANDIDATE_LETTERS`] single-case ASCII letters. A refusal
+    /// draws **nothing at all** — every check runs before the `clear`, so there is
+    /// no half-composed screen for a caller to flush by accident; the caller puts
+    /// [`refusal`] on the glass, exactly as `SignPages::new` requires.
+    pub fn render(
+        &self,
+        frame: &mut Frame,
+        rng: &mut impl rand_core::RngCore,
+    ) -> Result<(), Unrenderable> {
+        if !(1..=BACKUP_WORDS).contains(&self.number) {
+            return Err(Unrenderable::BadWordList);
+        }
+        if !self.partial.is_empty() {
+            check_word(self.partial)?;
+        }
+        if let Some(p) = self.previous {
+            check_word(p)?;
+        }
+        check_letters(self.candidates, MAX_CANDIDATE_LETTERS)?;
+
+        frame.clear();
+        let pages = self.pages();
+        let mut head = Buf::<16>::new();
+        head.push_str("word ")
+            .push_u64(self.number as u64)
+            .push_str(" of ")
+            .push_u64(BACKUP_WORDS as u64);
+        frame.text(0, 0, head.as_str());
+
+        // Which page of candidate letters is up, and how many there are. Empty
+        // when there is only one page — a page indicator on an unpageable list is
+        // the paging key's problem restated.
+        let mut pg = Buf::<SENSITIVE_TEXT_CELLS>::new();
+        if pages > 1 {
+            pg.push_str(ENTRY_PAGE_LABEL)
+                .push_u64((self.page % pages) as u64 + 1)
+                .push_str("/")
+                .push_u64(pages as u64);
+        }
+        sensitive_row(frame, 1, pg.as_str(), rng);
+
+        if let Some(p) = self.previous {
+            let mut b = Buf::<SENSITIVE_TEXT_CELLS>::new();
+            b.push_u8_pad2(self.number.saturating_sub(1) as u8)
+                .push_str(": ")
+                .push_str(p);
+            sensitive_row(frame, 2, b.as_str(), rng);
+        }
+        let mut b = Buf::<SENSITIVE_TEXT_CELLS>::new();
+        b.push_u8_pad2(self.number as u8)
+            .push_str(": ")
+            .push_str(self.partial)
+            .push_str("_");
+        sensitive_row(frame, 4, b.as_str(), rng);
+
+        // Both rows come from `letter_for_key`, the function the firmware asks what
+        // a press meant, so the digit above a letter is the byte that types it and
+        // the row is bounded by the nine keys that exist rather than by the length
+        // of the list. A candidate list too long for one page is therefore SPLIT,
+        // never truncated into letters no key can reach.
+        let mut ruler = Buf::<SENSITIVE_TEXT_CELLS>::new();
+        let mut letters = Buf::<SENSITIVE_TEXT_CELLS>::new();
+        for key in ENTRY_LETTER_KEYS {
+            // Contiguous by construction, so the first key with no letter under it
+            // is the end of the page: stopping keeps the two rows aligned, where
+            // skipping a gap would print a digit over the wrong letter.
+            let Some(letter) = self.letter_for_key(key) else {
+                break;
+            };
+            ruler.push(key);
+            letters.push(letter);
+        }
+        sensitive_row(frame, 5, ruler.as_str(), rng);
+        sensitive_row(frame, 6, letters.as_str(), rng);
+
+        let mut footer = Buf::<16>::new();
+        if self.complete {
+            footer.push_str(ENTRY_OK_LEGEND);
+        }
+        footer.push_str(ENTRY_DELETE_LEGEND);
+        if pages > 1 {
+            footer.push_str(ENTRY_PAGE_LEGEND);
+        }
+        frame.text(0, FOOTER_ROW, footer.as_str());
+        Ok(())
     }
 }
 
@@ -1973,20 +2444,139 @@ impl<'a> EntryPages<'a> {
 // Screen 7 — backup check quiz
 // ---------------------------------------------------------------------------
 
-/// Screen 7: a multiple-choice quiz question, three options on the `1`/`2`/`3`
-/// keys.
+/// The three keys the check quiz answers to, and the digits it prints beside its
+/// options: option `n` is [`QUIZ_KEYS`]`[n]`, drawn from this array so a moved key
+/// cannot keep its old label.
+pub const QUIZ_KEYS: [u8; 3] = *b"123";
+/// `(x)no` — the quiz's decline. Parenthesised for [`NEXT_LEGEND`]'s reason.
+const QUIZ_REFUSE_LEGEND: &str = "(x)no";
+/// What [`backup_quiz`] prints in place of an option that is a WORD. Fixed width,
+/// so it does not leak the length it is hiding (word length alone is 2.3355 bits —
+/// see [`Frame::mark_sensitive`]).
+const QUIZ_MASK: &str = "(hidden)";
+
+const _: () = {
+    assert!(
+        QUIZ_REFUSE_LEGEND.as_bytes()[1] == crate::keypad::KEY_CANCEL,
+        "the quiz refuse legend must name the pad's CANCEL"
+    );
+    // An answer key that also turns a page, accepts, or declines would make
+    // answering the quiz and leaving it the same press.
+    let mut i = 0;
+    while i < QUIZ_KEYS.len() {
+        assert!(QUIZ_KEYS[i] != NEXT_KEY, "a quiz key must not also page");
+        assert!(QUIZ_KEYS[i] != BACK_KEY, "a quiz key must not also page back");
+        assert!(
+            QUIZ_KEYS[i] != crate::keypad::KEY_CANCEL,
+            "a quiz key must not also decline"
+        );
+        assert!(
+            QUIZ_KEYS[i] != crate::keypad::KEY_OK,
+            "a quiz key must not be the pad's OK"
+        );
+        i += 1;
+    }
+    // The widest option row: `N) ` plus the longest word, inside the budget the
+    // noise geometry reserves. One cell of slack, same as the backup rows.
+    assert!(
+        "N) ".len() + MAX_WORD_LEN <= SENSITIVE_TEXT_CELLS,
+        "a quiz option does not fit the noised-row budget"
+    );
+};
+
+/// Screen 7: the check quiz's **word** question — the true word among three, on
+/// the [`QUIZ_KEYS`].
 ///
-/// The distractors are chosen above this seam (upstream `distractor.rs` picks the
-/// two most-confusable BIP39 words by edit distance) because that needs the
-/// wordlist, which this crate does not carry. `question` and the options are
-/// device-generated, not coordinator text, but they still go through the same
-/// bounded text path.
+/// # This screen carries the WHOLE share, and it is not the cheap one
+///
+/// `CheckBackup` renders the true word among three for the share index and for all
+/// 25 words (`frostsnap_widgets/src/backup/check_backup.rs:19` `TOTAL_SCREENS =
+/// 26`), from the same `BackupDisplayPhase` `DisplayBackup` decrypts. So the
+/// exposure is [`BackupPages`]'s, not less: 26 renders instead of 8, every one of
+/// them with a real word on it. It therefore takes the RNG on the same
+/// **mandatory** terms and noises every option row, and the caller must have
+/// obtained consent on the digit before the first one is drawn — a quiz that shows
+/// words and then asks has already leaked them.
+///
+/// # The distractors are the caller's problem, and upstream's are broken
+///
+/// They are picked above this seam because that needs the wordlist. **Do not port
+/// upstream's `distractor.rs`**: it chooses the two words minimising
+/// `levenshtein*3 - shared_suffix*2` against the true word, which is a pure
+/// function of the answer, so the triple identifies it with no human input — for
+/// 1,288 of the 2,048 words uniquely, a mean residual of 0.467 bits against
+/// `log2(3)` = 1.585, i.e. 11.7 bits over 25 words rather than 39.6, which
+/// `ShareBackup`'s 11-bit word checksum plus 8-bit polynomial checksum then close
+/// completely. A photograph of that quiz is a full share disclosure. A distractor
+/// rule leaks exactly when it is *asymmetric* — computable from the true word but
+/// not from a distractor — so draw all three uniformly from `rng::Entropy` (never
+/// libngu, PLAN.md §1) inside a predicate that is symmetric over the triple.
+///
+/// # No selection state, and no timeout
+///
+/// There is no `selected` cursor: three options on three keys need no cursor to
+/// move, and a cursor plus a confirm would be two presses where the pad affords
+/// one. And nothing here blanks, for the reveal's reason — see [`WordEntry`].
+///
+/// Refuses (`Unrenderable::BadWordList`) a word number outside 1..=25 or any option
+/// that is not BIP39-shaped, before touching the frame.
+pub fn backup_quiz_word(
+    frame: &mut Frame,
+    number: usize,
+    options: [&str; 3],
+    rng: &mut impl rand_core::RngCore,
+) -> Result<(), Unrenderable> {
+    if !(1..=BACKUP_WORDS).contains(&number) {
+        return Err(Unrenderable::BadWordList);
+    }
+    for opt in options {
+        check_word(opt)?;
+    }
+    frame.clear();
+    let mut head = Buf::<16>::new();
+    head.push_str("word ")
+        .push_u64(number as u64)
+        .push_str(" was?");
+    frame.text(0, 0, head.as_str());
+    for (i, opt) in options.iter().enumerate() {
+        let mut b = Buf::<SENSITIVE_TEXT_CELLS>::new();
+        b.push(*QUIZ_KEYS.get(i).unwrap_or(&b'?'))
+            .push_str(") ")
+            .push_str(opt);
+        sensitive_row(frame, 2 + i * 2, b.as_str(), rng);
+    }
+    frame.text(0, FOOTER_ROW, QUIZ_REFUSE_LEGEND);
+    Ok(())
+}
+
+/// Screen 7's **share-index** question: three candidate indices on the
+/// [`QUIZ_KEYS`]. Takes no RNG, and therefore MASKS any option that is a word.
+///
+/// A share index is not the secret — it is what makes the secret restorable, and
+/// [`BackupPages`] does not noise its index page either — so this form needs no
+/// noise and stays a pure function of its arguments. The masking is what stops it
+/// from being the un-noised way to draw a word: this function cannot noise a row
+/// (it has no RNG to do it with), so an option `check_word` accepts is replaced
+/// with `QUIZ_MASK` rather than drawn. An opt-in defence fails open; a caller
+/// with a word and no RNG gets a visibly redacted screen and goes to
+/// [`backup_quiz_word`], which is the correct answer rather than an inconvenience.
+///
+/// For the index options themselves, draw all three uniformly from `1..=n`. Do NOT
+/// copy upstream, whose three are always `correct`, `correct-1`, `correct+1`
+/// shuffled by position only (`check_backup.rs:54-80`): the true index is then
+/// always the median of three consecutive integers, which is a 100% leak for every
+/// index a real share can have (`ShareIndex` is 1-based).
 pub fn backup_quiz(frame: &mut Frame, question: &str, options: [&str; 3], selected: Option<usize>) {
     frame.clear();
     frame.text(0, 0, question);
     for (i, opt) in options.iter().enumerate() {
         let mut b = Buf::<16>::new();
-        b.push_u64(i as u64 + 1).push_str(") ").push_str(opt);
+        b.push(*QUIZ_KEYS.get(i).unwrap_or(&b'?')).push_str(") ");
+        if check_word(opt).is_ok() {
+            b.push_str(QUIZ_MASK);
+        } else {
+            b.push_str(opt);
+        }
         let row = 2 + i * 2;
         if selected == Some(i) {
             frame.text_inverted(0, row, b.as_str());
@@ -1994,6 +2584,7 @@ pub fn backup_quiz(frame: &mut Frame, question: &str, options: [&str; 3], select
             frame.text(0, row, b.as_str());
         }
     }
+    frame.text(0, FOOTER_ROW, QUIZ_REFUSE_LEGEND);
 }
 
 // ---------------------------------------------------------------------------
@@ -2358,11 +2949,30 @@ pub fn pin_words(
 /// will reasonably wonder which is significant. BIP39 recovery is case-insensitive,
 /// so the refusal costs nothing real and buys a consistent page.
 fn check_word(w: &str) -> Result<(), Unrenderable> {
-    if w.is_empty() || w.len() > MAX_WORD_LEN {
+    if w.is_empty() {
         return Err(Unrenderable::BadWordList);
     }
-    let all_upper = w.bytes().all(|b| b.is_ascii_uppercase());
-    let all_lower = w.bytes().all(|b| b.is_ascii_lowercase());
+    check_letters(w, MAX_WORD_LEN)
+}
+
+/// `s` is at most `max` **bytes** of ASCII letters of a single case, or a refusal.
+/// Empty passes — this is the shape rule, and "there is nothing here yet" is a
+/// legal state for a partial word and for a finished one's candidate list.
+///
+/// Extracted from [`check_word`] rather than copied, because a second word-shape
+/// rule is one of the two being wrong, and [`WordEntry`] needs the same rule at a
+/// different length (26 candidate letters, no [`MAX_WORD_LEN`]).
+///
+/// The bound is on `len()`, i.e. bytes, which for non-ASCII input is *stricter*
+/// than a char count — and non-ASCII is refused by the case test on the next line
+/// anyway. Fail-closed in the direction that matters: nothing over-long ever
+/// reaches a `Buf` that would truncate it.
+fn check_letters(s: &str, max: usize) -> Result<(), Unrenderable> {
+    if s.len() > max {
+        return Err(Unrenderable::BadWordList);
+    }
+    let all_upper = s.bytes().all(|b| b.is_ascii_uppercase());
+    let all_lower = s.bytes().all(|b| b.is_ascii_lowercase());
     if !(all_upper || all_lower) {
         return Err(Unrenderable::BadWordList);
     }
@@ -3480,7 +4090,19 @@ mod tests {
                 );
             }
         }
-        assert_eq!(row_text(&f, 7), "1=ok x=del");
+        // `EntryPages` carries no candidate list, so its word page offers no letter
+        // key and no paging key — only the delete. A footer here that advertised a
+        // letter key would be advertising a key that types nothing.
+        assert_eq!(row_text(&f, 7), ENTRY_DELETE_LEGEND);
+        // ... and the two candidate rows are still NOISED even though they are
+        // empty. If the noise appeared only when there were candidates, its
+        // appearing and disappearing would announce that the word just finished.
+        for row in [5, 6] {
+            assert_eq!(noised_row_text(&f, row), "", "row {row} must be empty here");
+            for y in row * CELL..row * CELL + CELL {
+                assert!(f.pixel(WIDTH - 1, y), "candidate row {row} not noised");
+            }
+        }
         // A shorter field keeps its cursor.
         let e = EntryPages { partial: "abs", ..e };
         let mut g = Frame::new();
@@ -3490,6 +4112,377 @@ mod tests {
         let mut h = Frame::new();
         assert!(e.render(0, &mut h, &mut Counter(0)));
         assert_eq!(row_text(&h, 2), "share index:");
+    }
+
+    /// Every candidate letter is numbered by the key the firmware compares, taken
+    /// from `ENTRY_LETTER_KEYS` rather than counted out here.
+    ///
+    /// The expectation is BUILT from the const, so re-ordering or re-basing the key
+    /// array while the ruler still prints `1..9` fails here. That is the
+    /// `5=next 8=back` class — a legend naming a key nobody wired up — closed for a
+    /// row of nine of them.
+    #[test]
+    fn entry_letters_are_numbered_by_the_keys_the_firmware_compares() {
+        // 25 valid continuations: the empty-prefix case, every letter but X.
+        const ALL: &str = "ABCDEFGHIJKLMNOPQRSTUVWYZ";
+        let w = WordEntry {
+            number: 1,
+            partial: "",
+            previous: None,
+            candidates: ALL,
+            page: 0,
+            complete: false,
+        };
+        assert_eq!(w.pages(), 3, "25 letters at 9 a page");
+        let expect_ruler: String = ENTRY_LETTER_KEYS.iter().map(|k| *k as char).collect();
+        for page in 0..w.pages() {
+            let mut f = Frame::new();
+            WordEntry { page, ..w }.render(&mut f, &mut Counter(0)).unwrap();
+            let letters: String = ALL
+                .chars()
+                .skip(page * ENTRY_LETTERS_PER_PAGE)
+                .take(ENTRY_LETTERS_PER_PAGE)
+                .collect();
+            assert_eq!(noised_row_text(&f, 6), letters, "page {page} letters");
+            assert_eq!(
+                noised_row_text(&f, 5),
+                expect_ruler[..letters.len()],
+                "page {page} ruler must be ENTRY_LETTER_KEYS, one per letter"
+            );
+        }
+        // The page key just increments; the screen wraps, so there is no
+        // out-of-range page and no arithmetic for a release build to wrap.
+        let mut f = Frame::new();
+        WordEntry { page: 3, ..w }.render(&mut f, &mut Counter(0)).unwrap();
+        let mut g = Frame::new();
+        WordEntry { page: 0, ..w }.render(&mut g, &mut Counter(0)).unwrap();
+        assert_eq!(noised_row_text(&f, 6), noised_row_text(&g, 6), "page 3 wraps to 0");
+        WordEntry { page: usize::MAX, ..w }
+            .render(&mut f, &mut Counter(0))
+            .unwrap();
+        assert!(!noised_row_text(&f, 6).is_empty(), "usize::MAX must still draw a page");
+    }
+
+    /// The screen says WHICH page of letters is up and how many there are — not
+    /// merely that another one exists — and it says it on a NOISED row.
+    ///
+    /// Three things at once, because they are the same defect from three sides: an
+    /// indicator that is missing while letters are hidden (a user cannot tell nine
+    /// candidates from twenty-five), an indicator that disagrees with the paging
+    /// legend (`(0)+` offering a page the row says is not there, or a row counting
+    /// pages the key cannot reach), and an indicator drawn in the clear (the page
+    /// TOTAL is the candidate count divided by nine, and the count is a function of
+    /// the secret prefix — the ruler row's reason).
+    #[test]
+    fn the_entry_screen_says_which_page_of_letters_it_is_showing() {
+        // 25 / 10 / 9 candidates: 3 pages, 2 pages, and the unpageable case.
+        const ALL: &str = "ABCDEFGHIJKLMNOPQRSTUVWYZ";
+        let w = WordEntry {
+            number: 3,
+            partial: "",
+            previous: Some("ABILITY"),
+            candidates: ALL,
+            page: 0,
+            complete: false,
+        };
+        for (candidates, page, want) in [
+            (ALL, 0, "letters 1/3"),
+            (ALL, 1, "letters 2/3"),
+            (ALL, 2, "letters 3/3"),
+            // The page key just increments forever, so the indicator wraps with the
+            // letters it describes — a fourth page would be a lie about a page that
+            // does not exist.
+            (ALL, 3, "letters 1/3"),
+            (ALL, usize::MAX, "letters 1/3"),
+            ("ABCDEFGHIJ", 0, "letters 1/2"),
+            ("ABCDEFGHIJ", 1, "letters 2/2"),
+            // Nine letters is one page: no indicator, because there is no other
+            // page to be on. The row is still noised — see below.
+            ("ABCDEFGHI", 0, ""),
+            ("", 0, ""),
+        ] {
+            let v = WordEntry {
+                candidates,
+                page,
+                ..w
+            };
+            let mut f = Frame::new();
+            v.render(&mut f, &mut Counter(0)).unwrap();
+            assert_eq!(
+                noised_row_text(&f, 1),
+                want,
+                "{} candidates, page {page}",
+                candidates.len()
+            );
+            // The indicator and the paging legend are one fact rendered twice, so
+            // they must never disagree: a legend without an indicator is a key
+            // whose effect is invisible, and an indicator without the legend is a
+            // page with no way to reach it.
+            assert_eq!(
+                row_text(&f, FOOTER_ROW).contains(ENTRY_PAGE_LEGEND),
+                !want.is_empty(),
+                "{} candidates: legend and indicator disagree",
+                candidates.len()
+            );
+            // Noised on every scanline, empty or not, and clear of the gutter.
+            for y in CELL..2 * CELL {
+                assert!(f.pixel(WIDTH - 1, y), "page-indicator row scanline {y} not noised");
+                assert!(
+                    !f.pixel(SENSITIVE_TEXT_CELLS * CELL, y),
+                    "page-indicator row scanline {y}: text and noise met at the gutter"
+                );
+            }
+        }
+    }
+
+    /// The key a user presses picks the letter drawn under its digit — every page,
+    /// every byte the pad can emit.
+    ///
+    /// This is the contract `firmware/` consumes: it asks `letter_for_key` what a
+    /// press meant, and the ruler above the letters is the promise. Both come from
+    /// the one function, so what this pins is that the function's answer matches
+    /// the *pixels*, including the two cases a hand-written copy of the arithmetic
+    /// gets wrong — a short last page (25 candidates leave 7 on page 3, so keys 8
+    /// and 9 there must select nothing rather than page 1's letters) and the three
+    /// keys that are not letter keys at all.
+    #[test]
+    fn the_letter_a_key_picks_is_the_letter_drawn_under_its_digit() {
+        const ALL: &str = "ABCDEFGHIJKLMNOPQRSTUVWYZ";
+        let w = WordEntry {
+            number: 3,
+            partial: "",
+            previous: None,
+            candidates: ALL,
+            page: 0,
+            complete: false,
+        };
+        let mut typed = String::new();
+        for page in 0..w.pages() {
+            let v = WordEntry { page, ..w };
+            let mut f = Frame::new();
+            v.render(&mut f, &mut Counter(0)).unwrap();
+            let ruler = noised_row_text(&f, 5);
+            let letters = noised_row_text(&f, 6);
+            for key in 0..=u8::MAX {
+                let drawn = ruler
+                    .bytes()
+                    .position(|k| k == key)
+                    .and_then(|slot| letters.as_bytes().get(slot).copied());
+                assert_eq!(
+                    v.letter_for_key(key),
+                    drawn,
+                    "page {page}, key {:?}: what it picks is not what is drawn under it",
+                    key as char
+                );
+                if let Some(l) = drawn {
+                    typed.push(l as char);
+                }
+            }
+            // Nothing outside the ruler may pick anything: a key with no digit on
+            // the glass that nevertheless types a letter is an unlabelled control.
+            assert_eq!(
+                ENTRY_LETTER_KEYS
+                    .iter()
+                    .filter(|k| v.letter_for_key(**k).is_some())
+                    .map(|k| *k as char)
+                    .collect::<String>(),
+                ruler,
+                "page {page}: the ruler is not the set of keys that pick a letter"
+            );
+        }
+        assert_eq!(typed, ALL, "paging must type every candidate exactly once");
+        // The three keys that do something else pick no letter, at any page.
+        for key in [ENTRY_PAGE_KEY, ENTRY_OK_KEY, ENTRY_DELETE_KEY] {
+            for page in 0..=w.pages() {
+                assert_eq!(
+                    WordEntry { page, ..w }.letter_for_key(key),
+                    None,
+                    "{:?} picked a letter",
+                    key as char
+                );
+            }
+        }
+        // `letter_for_key` is public and `candidates` is a public field, so it can
+        // be asked about a list `render` would refuse. It answers `None` rather
+        // than half a UTF-8 sequence.
+        let odd = WordEntry {
+            candidates: "é1 ",
+            ..w
+        };
+        for key in ENTRY_LETTER_KEYS {
+            assert_eq!(odd.letter_for_key(key), None, "{:?} picked a non-letter", key as char);
+        }
+        assert_eq!(
+            odd.render(&mut Frame::new(), &mut Counter(0)),
+            Err(Unrenderable::BadWordList),
+            "and the screen refuses it outright"
+        );
+    }
+
+    /// A candidate row can never reach the noise, at any page of the longest list.
+    ///
+    /// The page split is what makes that true: 26 letters on one row would be
+    /// truncated at `SENSITIVE_TEXT_CELLS` and the missing 14 would be keys with no
+    /// letter to press. Nine per page is 9 of the 12 reserved cells.
+    #[test]
+    fn the_candidate_rows_cannot_reach_the_noise_gutter() {
+        let all: String = ('A'..='Z').collect();
+        assert_eq!(all.len(), MAX_CANDIDATE_LETTERS);
+        let w = WordEntry {
+            number: 25,
+            partial: "ABSTRACT",
+            previous: Some("ABSURD"),
+            candidates: &all,
+            page: 0,
+            complete: true,
+        };
+        let mut seen = String::new();
+        for page in 0..w.pages() {
+            let mut f = Frame::new();
+            WordEntry { page, ..w }.render(&mut f, &mut Counter(0)).unwrap();
+            seen.push_str(&noised_row_text(&f, 6));
+            for row in [2, 4, 5, 6] {
+                for y in row * CELL..row * CELL + CELL {
+                    assert!(f.pixel(WIDTH - 1, y), "page {page} row {row} not noised");
+                    assert!(
+                        !f.pixel(SENSITIVE_TEXT_CELLS * CELL, y),
+                        "page {page} row {row}: text and noise met at the gutter"
+                    );
+                }
+            }
+        }
+        assert_eq!(seen, all, "paging must reach every letter exactly once, in order");
+    }
+
+    /// The footer names exactly the keys that do something on THIS screen: the
+    /// accept only when the word is finished, the paging key only when there is
+    /// another page, the delete always.
+    ///
+    /// `complete` is a flag and not `candidates.is_empty()` because 49 BIP39 words
+    /// are proper prefixes of longer ones — `ACT` is a word and the road to
+    /// `ACTION` — so both combinations below are real states of the vendored list.
+    #[test]
+    fn word_entry_offers_ok_only_when_the_word_is_complete() {
+        let w = WordEntry {
+            number: 3,
+            partial: "ACT",
+            previous: Some("ABSURD"),
+            candidates: "IOR",
+            page: 0,
+            complete: false,
+        };
+        let cases = [
+            // complete, candidates, expected footer
+            (false, "IOR", "(x)del"),
+            (true, "IOR", "(y)ok (x)del"),
+            (true, "", "(y)ok (x)del"),
+            (false, "ABCDEFGHIJ", "(x)del(0)+"),
+            (true, "ABCDEFGHIJ", "(y)ok (x)del(0)+"),
+        ];
+        for (complete, candidates, want) in cases {
+            let mut f = Frame::new();
+            WordEntry {
+                complete,
+                candidates,
+                ..w
+            }
+            .render(&mut f, &mut Counter(0))
+            .unwrap();
+            assert_eq!(
+                row_text(&f, FOOTER_ROW),
+                want,
+                "complete={complete} candidates={candidates:?}"
+            );
+            assert!(
+                row_text(&f, FOOTER_ROW).chars().count() <= COLS,
+                "footer clipped"
+            );
+        }
+    }
+
+    #[test]
+    fn word_entry_refuses_what_it_cannot_render() {
+        let w = WordEntry {
+            number: 3,
+            partial: "ACT",
+            previous: Some("ABSURD"),
+            candidates: "IOR",
+            page: 0,
+            complete: false,
+        };
+        let bad = [
+            WordEntry { number: 0, ..w },
+            WordEntry {
+                number: BACKUP_WORDS + 1,
+                ..w
+            },
+            // A 9-letter partial would be truncated on a row a user is copying.
+            WordEntry {
+                partial: "ABSTRACTS",
+                ..w
+            },
+            WordEntry { partial: "Act", ..w },
+            WordEntry {
+                previous: Some(""),
+                ..w
+            },
+            // 27 candidates would page to a 4th page this screen does not have.
+            WordEntry {
+                candidates: "ABCDEFGHIJKLMNOPQRSTUVWXYZA",
+                ..w
+            },
+            WordEntry {
+                candidates: "AbC",
+                ..w
+            },
+            WordEntry {
+                candidates: "A1C",
+                ..w
+            },
+        ];
+        for case in bad {
+            let mut f = Frame::new();
+            assert_eq!(
+                case.render(&mut f, &mut Counter(0)),
+                Err(Unrenderable::BadWordList),
+                "{case:?} was not refused"
+            );
+            assert_eq!(screen_text(&f).trim(), "", "a refusal drew something: {case:?}");
+        }
+        // An empty partial and a missing previous word are the legal edges: word 1,
+        // nothing typed yet.
+        let mut f = Frame::new();
+        WordEntry {
+            number: 1,
+            partial: "",
+            previous: None,
+            ..w
+        }
+        .render(&mut f, &mut Counter(0))
+        .unwrap();
+        assert_eq!(noised_row_text(&f, 4), "01: _");
+    }
+
+    /// Every key these screens print is a key the pad can actually emit.
+    ///
+    /// A legend is a promise, and `hal::keypad::DECODER` is the only thing that
+    /// decides which bytes a press can produce. The const block beside the legends
+    /// ties the printed digit to the compared byte; this ties the compared byte to
+    /// the hardware, which a `const` cannot do (`[u8]::contains` is not const).
+    #[test]
+    fn every_key_the_entry_and_quiz_screens_print_is_on_the_pad() {
+        let pad = crate::keypad::DECODER;
+        for key in ENTRY_LETTER_KEYS
+            .iter()
+            .chain(QUIZ_KEYS.iter())
+            .chain([ENTRY_PAGE_KEY, ENTRY_OK_KEY, ENTRY_DELETE_KEY].iter())
+        {
+            assert!(
+                pad.contains(key),
+                "{:?} is printed on a screen but the pad cannot emit it",
+                *key as char
+            );
+        }
     }
 
     /// `SENSITIVE_LABEL_CELLS` is a hand-written 4 standing in for two pushes. Tie
@@ -3509,16 +4502,170 @@ mod tests {
         assert_eq!(b.len() * CELL + SENSITIVE_MAX, WIDTH - 1, "one column of slack");
     }
 
+    /// The recorded question advertises the RANDOMISED digit as its yes, on the
+    /// footer row, and never a paging key.
+    ///
+    /// Both halves matter and both are cheap. The footer row is where
+    /// `firmware/examples/stub.rs`'s `advertised_key` reads a screen's yes key
+    /// from, so a legend anywhere else is a screen no harness can answer. And the
+    /// yes key must not be [`NEXT_KEY`] or [`BACK_KEY`]: those are the two keys a
+    /// human has been pressing for eight pages to get here, so either as the yes
+    /// would let an over-press claim to the coordinator that a backup exists on
+    /// paper when it does not. `CONFIRM_CHARSET` is const-asserted off both, so
+    /// this checks the legend actually uses that charset rather than re-checking
+    /// the assert.
+    #[test]
+    fn the_recorded_question_asks_for_the_digit_and_not_a_paging_key() {
+        for d in CONFIRM_CHARSET {
+            let mut f = Frame::new();
+            let c = ConfirmDigit::draw(&mut Counter(
+                CONFIRM_CHARSET.iter().position(|x| *x == d).unwrap() as u32,
+            ));
+            backup_recorded(&mut f, c);
+            let footer = row_text(&f, FOOTER_ROW);
+            assert!(
+                footer.contains(&format!("Press ({})", c.as_str())),
+                "the footer must name the drawn digit: {footer:?}"
+            );
+            assert!(footer.contains("x=no"), "no refusal offered: {footer:?}");
+            for key in [NEXT_KEY, BACK_KEY] {
+                assert!(
+                    !c.accepts(key),
+                    "a paging key must never be the yes on this screen"
+                );
+            }
+            // Nothing on this screen may be clipped: it is a yes/no question and a
+            // half-drawn question is not one.
+            assert!(
+                screen_text(&f).lines().all(|l| l.chars().count() <= COLS),
+                "clipped: {:?}",
+                screen_text(&f)
+            );
+            // And the question has to be a QUESTION, or a human cannot know what
+            // the digit claims.
+            assert!(screen_text(&f).contains('?'), "not phrased as a question");
+        }
+    }
+
     #[test]
     fn quiz_shows_three_numbered_options_and_marks_the_selection() {
         let mut f = Frame::new();
-        backup_quiz(&mut f, "word 7 was:", ["absorb", "absurd", "abstract"], Some(1));
+        backup_quiz(&mut f, "index was:", ["11", "12", "13"], Some(1));
         let t = screen_text(&f);
-        for want in ["word 7 was:", "1) absorb", "2) absurd", "3) abstract"] {
+        for want in ["index was:", "1) 11", "2) 12", "3) 13"] {
             assert!(t.contains(want), "missing {want:?}: {t}");
         }
         assert_eq!(f.cell(0, 4).map(|(_, inv)| inv), Some(true), "row 4 inverted");
         assert_eq!(f.cell(0, 2).map(|(_, inv)| inv), Some(false));
+        assert_eq!(row_text(&f, FOOTER_ROW), QUIZ_REFUSE_LEGEND);
+    }
+
+    /// The RNG-free quiz form cannot put a share word on the glass, because it
+    /// cannot noise the row it would put it on.
+    ///
+    /// This is the one screen in the file that could have shipped a word with no
+    /// `mark_sensitive` on it — it takes no RNG, so there is nothing to noise with —
+    /// and both investigations flagged it. Masking is the structural answer: a
+    /// caller holding a word and no RNG gets a visibly redacted screen instead of a
+    /// silently unprotected one, and the mask is FIXED WIDTH, so it does not leak
+    /// the 2.3355 bits of word length that `mark_sensitive` exists to cover.
+    #[test]
+    fn the_un_noised_quiz_cannot_put_a_word_on_the_glass() {
+        for words in [
+            ["absorb", "absurd", "abstract"],
+            ["ABSORB", "ABSURD", "ABSTRACT"],
+            // The shortest and longest BIP39 shapes, so a length-dependent bypass
+            // shows up here rather than on the device.
+            ["zoo", "abandon", "abstract"],
+        ] {
+            let mut f = Frame::new();
+            backup_quiz(&mut f, "word 7 was:", words, None);
+            let t = screen_text(&f);
+            for (i, w) in words.iter().enumerate() {
+                assert!(
+                    !t.contains(w),
+                    "option {i} ({w:?}) reached the glass un-noised: {t}"
+                );
+                assert_eq!(
+                    row_text(&f, 2 + i * 2),
+                    format!("{}) {QUIZ_MASK}", QUIZ_KEYS[i] as char),
+                    "option {i} was not masked"
+                );
+            }
+            // Fixed width: three different-length words all mask identically.
+            assert_eq!(row_text(&f, 2).len(), row_text(&f, 6).len());
+        }
+        // Nothing else is masked. An index is not the secret, and this form exists
+        // to draw one.
+        let mut f = Frame::new();
+        backup_quiz(&mut f, "index was:", ["7", "8", "9x"], None);
+        let t = screen_text(&f);
+        assert!(t.contains("1) 7") && t.contains("2) 8") && t.contains("3) 9x"), "{t}");
+    }
+
+    /// Every option row of the WORD quiz is noised, all three of them, and the
+    /// words stay readable inside the reserved budget.
+    ///
+    /// `CheckBackup` draws 26 of these — the index plus all 25 words, from the same
+    /// decrypted `BackupDisplayPhase` `DisplayBackup` uses — so this screen carries
+    /// the whole share and a missing noise call on any one row would leak the word
+    /// on it.
+    #[test]
+    fn the_word_quiz_noises_every_option_row_and_keeps_the_words_readable() {
+        let options = ["absorb", "absurd", "abstract"];
+        let mut f = Frame::new();
+        backup_quiz_word(&mut f, 7, options, &mut Counter(0)).unwrap();
+        assert_eq!(row_text(&f, 0), "word 7 was?");
+        for (i, w) in options.iter().enumerate() {
+            let row = 2 + i * 2;
+            assert_eq!(
+                noised_row_text(&f, row),
+                format!("{}) {w}", QUIZ_KEYS[i] as char),
+                "option {i} text"
+            );
+            for y in row * CELL..row * CELL + CELL {
+                assert!(f.pixel(WIDTH - 1, y), "option row {row} scanline {y} not noised");
+                assert!(
+                    !f.pixel(SENSITIVE_TEXT_CELLS * CELL, y),
+                    "option row {row} scanline {y}: text and noise met at the gutter"
+                );
+            }
+        }
+        assert_eq!(row_text(&f, FOOTER_ROW), QUIZ_REFUSE_LEGEND);
+        // Two renders differ ONLY in the noise columns — the same property
+        // `BackupPages` has, and the reason this screen is not a pure function.
+        let mut g = Frame::new();
+        backup_quiz_word(&mut g, 7, options, &mut Counter(99)).unwrap();
+        for i in 0..3 {
+            assert_eq!(noised_row_text(&f, 2 + i * 2), noised_row_text(&g, 2 + i * 2));
+        }
+        assert_ne!(f.as_bytes(), g.as_bytes(), "the noise did not change at all");
+    }
+
+    #[test]
+    fn the_word_quiz_refuses_what_it_cannot_render() {
+        let ok = ["absorb", "absurd", "abstract"];
+        let mut f = Frame::new();
+        for (number, options) in [
+            (0, ok),
+            (BACKUP_WORDS + 1, ok),
+            (7, ["absorb", "absurd", "abstracted"]),
+            (7, ["absorb", "absurd", ""]),
+            (7, ["absorb", "absurd", "Abstract"]),
+            (7, ["absorb", "absurd", "\u{202e}drain"]),
+        ] {
+            assert_eq!(
+                backup_quiz_word(&mut f, number, options, &mut Counter(0)),
+                Err(Unrenderable::BadWordList),
+                "word {number} {options:?} was not refused"
+            );
+            assert_eq!(
+                screen_text(&f).trim(),
+                "",
+                "a refusal drew something: {options:?}"
+            );
+        }
+        assert!(backup_quiz_word(&mut f, BACKUP_WORDS, ok, &mut Counter(0)).is_ok());
     }
 
     #[test]
@@ -3826,6 +4973,9 @@ mod tests {
             show(&format!("5 backup display page {}/{}", i + 1, b.len()), &f);
         }
 
+        backup_recorded(&mut f, confirm());
+        show("5b backup recorded?", &f);
+
         let words = ["abandon", "ability"];
         let e = EntryPages {
             share_index: Some(2),
@@ -3835,10 +4985,53 @@ mod tests {
         assert!(e.render(0, &mut f, &mut noise));
         show("6 backup entry (share index)", &f);
         assert!(e.render(e.cursor(), &mut f, &mut noise));
-        show("6 backup entry (word 3)", &f);
+        show("6 backup entry (word 3, NO candidate row: EntryPages has no list)", &f);
 
+        for (label, w) in [
+            (
+                "fresh, 25 first letters, page 1/3",
+                WordEntry {
+                    number: 3,
+                    partial: "",
+                    previous: Some("ABILITY"),
+                    candidates: "ABCDEFGHIJKLMNOPQRSTUVWYZ",
+                    page: 0,
+                    complete: false,
+                },
+            ),
+            (
+                "ACT: a whole word that is also a prefix",
+                WordEntry {
+                    number: 3,
+                    partial: "ACT",
+                    previous: Some("ABILITY"),
+                    candidates: "IOR",
+                    page: 0,
+                    complete: true,
+                },
+            ),
+            (
+                "narrowed to one: no letters left",
+                WordEntry {
+                    number: 25,
+                    partial: "ABSTRACT",
+                    previous: Some("ABSURD"),
+                    candidates: "",
+                    page: 0,
+                    complete: true,
+                },
+            ),
+        ] {
+            w.render(&mut f, &mut noise).unwrap();
+            show(&format!("6 word entry — {label}"), &f);
+        }
+
+        backup_quiz_word(&mut f, 7, ["absorb", "absurd", "abstract"], &mut noise).unwrap();
+        show("7 backup quiz (word: every option row noised)", &f);
+        backup_quiz(&mut f, "index was:", ["1", "2", "3"], Some(0));
+        show("7 backup quiz (share index: no noise, none needed)", &f);
         backup_quiz(&mut f, "word 7 was:", ["absorb", "absurd", "abstract"], Some(0));
-        show("7 backup quiz", &f);
+        show("7 backup quiz (a WORD in the RNG-free form is MASKED)", &f);
 
         address_verify(&mut f, ADDR, "m/0/17", 3).unwrap();
         show("8 address verify", &f);

@@ -58,10 +58,10 @@ use coldsnap_hal::memmap;
 use coldsnap_hal::ui;
 use embedded_storage::nor_flash::{ErrorType, NorFlash, ReadNorFlash};
 use frostsnap_comms::{
-    DeviceName, DeviceSendBody, DeviceSendMessage, Downstream, NameCommand, Sha256Digest,
+    CommsMisc, DeviceName, DeviceSendBody, DeviceSendMessage, Downstream, NameCommand, Sha256Digest,
 };
 use frostsnap_core::device::{
-    restoration::{BackupDisplayPhase, ToUserRestoration},
+    restoration::{BackupDisplayPhase, EnterBackupPhase, ToUserRestoration},
     DeviceSecretDerivation, DeviceToUserMessage, FrostSigner,
 };
 use frostsnap_core::message::{
@@ -82,6 +82,8 @@ use sha2::{Digest, Sha256};
 // `store.rs`'s `//!` docs and resolve their intra-doc links in *this* scope,
 // which is 11 rustdoc warnings.
 pub mod store;
+
+pub mod wordentry;
 
 use store::{ShareStore, StoreFault};
 
@@ -169,9 +171,24 @@ pub enum Refusal {
     /// when no human has consented, which is the case that matters most: a reveal
     /// with no grant behind it is refused, not drawn.
     DisplayBackup,
-    /// `EnterPhysicalBackup` / `SavePhysicalBackup` / `SavePhysicalBackup2` /
-    /// `Consolidate` / `CheckBackup`: write or verify share material entered by
-    /// a human. No entry UI exists, so there is nothing to consent with.
+    /// A physical-backup operation this device will not perform.
+    ///
+    /// No longer the blanket refusal of five messages it was: `EnterPhysicalBackup`,
+    /// `SavePhysicalBackup`, `SavePhysicalBackup2` and `Consolidate` are ADMITTED
+    /// ([`Session::recv`]) and drive [`wordentry::Entry`] behind a consent digit.
+    /// What is left under this name:
+    ///
+    /// * **`CheckBackup` — still refused outright.** It is not the cheap one: its
+    ///   screen renders the TRUE word among three *and* all 25
+    ///   (`frostsnap_widgets/src/backup/check_backup.rs:98-111`), so its exposure
+    ///   exceeds `DisplayBackup`'s, and the distractor picker DECISIONS.md:46
+    ///   declined to vendor does not exist. Admitting it while `show_backup` draws
+    ///   plain words would answer a quiz request with a full plaintext reveal.
+    /// * A `Consolidate` whose share index is not a `u32`, so the consent screen
+    ///   cannot name the share the human is being asked to store.
+    /// * [`Session::entry_key`] with no entry in progress — the fail-closed answer
+    ///   to a caller that has lost track of the flow, and the reason a keypress
+    ///   cannot start an ingest that no digit consented to.
     PhysicalBackup,
     /// `ScreenVerify`: address display. Harmless but unimplemented; refusing
     /// beats silently dropping it, which leaves the app waiting.
@@ -628,6 +645,72 @@ pub struct Session<'a, F: NorFlash + fmt::Debug> {
     /// a page cursor: the page is an argument to `show_backup`, exactly as it is to
     /// `confirm_at`.
     reveal: Option<BackupDisplayPhase>,
+    /// A reveal has SHOWN EVERY PAGE and then ended, and nobody has been asked yet
+    /// whether they wrote the words down. The one gate on
+    /// [`Session::backup_recorded`].
+    ///
+    /// Set in exactly one place — [`Session::show_backup`]'s `Ok(false)` leg, and
+    /// there only when `seen_pages` covers the whole set — and that leg is reachable
+    /// only past the grant `take()` at the top of it, so this flag cannot be raised
+    /// without a human having consented to a reveal first. Consumed by
+    /// `backup_recorded`, so one reveal buys at most one ack.
+    ///
+    /// This is a `bool` and not the phase because the ack carries nothing
+    /// (`CommsMisc::BackupRecorded` is a unit variant) and because keeping the
+    /// phase alive past the reveal would keep an encrypted share and a
+    /// `SharedKey` resident for as long as a human takes to answer a question
+    /// that does not need them. A share cannot reach the outbox through a flag.
+    ///
+    /// RAM-only, like the grant: an unplug mid-question is a backup nobody
+    /// confirmed, and the coordinator's own `disconnected` handler aborts the
+    /// protocol (`frostsnap_coordinator/src/display_backup.rs:76-79`).
+    record_pending: bool,
+    /// Which pages of the CURRENT reveal have been composed into a frame, one bit
+    /// per page index.
+    ///
+    /// Cleared in exactly ONE place: [`Session::confirm_at`], where a grant is issued.
+    /// That is the only way back into [`Session::show_backup`], so one site covers
+    /// every reveal — including one that faulted out mid-way, which the reveal's own
+    /// legs do not reach. A second reset on the end leg or in `Cancel` would be a line
+    /// no mutation can falsify, so there is none (MEASURED, and reported).
+    ///
+    /// A bit set and not a high-water mark: pages are paged forwards and backwards,
+    /// so "the highest page reached" and "every page reached" are different facts and
+    /// only the second one licenses the ack. A `u32` covers 31 pages against the 8
+    /// this device draws; [`all_pages`] returns `None` above that and the ack is
+    /// refused, which is the right direction for a constant nobody has changed yet.
+    ///
+    /// This is NOT the page cursor. It never decides what to draw — `page` remains an
+    /// argument to [`Session::show_backup`], exactly as it is to
+    /// [`Session::confirm_at`] — it only records what was drawn.
+    seen_pages: u32,
+    /// The share a human has CONSENTED to type IN, mid-transcription.
+    ///
+    /// The mirror image of `reveal`, and private for the same reason: written in
+    /// exactly one place — [`Session::confirm_at`]'s `EnterBackup` arm, i.e. behind
+    /// the [`prompt_screen_at`] funnel — so "consent precedes the ingest" is a
+    /// property of the type. [`Session::entry_key`] is the only thing that reads it
+    /// and it refuses when there is nothing here, so a caller cannot start an ingest
+    /// by pressing a key: there is no other constructor for a
+    /// [`wordentry::Entry`] on this side of the seam and no way to hand one in.
+    ///
+    /// A restore INGESTS a secret, which is why the gate is a digit and not a
+    /// keypress: the 25 words go on the glass as they are typed, and this device
+    /// must not be steerable into displaying a share-shaped screen by a coordinator
+    /// message alone.
+    ///
+    /// It holds no plaintext until the human types one — the `EnterBackupPhase` the
+    /// prompt carried is a 16-byte `EnterPhysicalId` and nothing else — and it never
+    /// holds a `ShareBackup`: [`wordentry::Step::Entered`] is consumed inside
+    /// `entry_key`, which hands it straight to
+    /// `tell_coordinator_about_backup_load_result` and drops this. So the completed
+    /// share never crosses back to the caller and cannot be logged by one. ~270 B on
+    /// 32-bit, allocating nothing (see `wordentry`'s heap note).
+    ///
+    /// Cleared on `Cancel` and when entry ends either way. RAM-only, like the reveal
+    /// grant and like the restore progress `store::ShareStore::persist_staged` drops:
+    /// an unplug mid-restore costs re-typing 25 words and never a share.
+    entry: Option<wordentry::Entry>,
 }
 
 impl<'a, F: NorFlash + fmt::Debug> Session<'a, F> {
@@ -689,6 +772,11 @@ impl<'a, F: NorFlash + fmt::Debug> Session<'a, F> {
             // consent is to one ceremony, and a coordinator that wants the backup
             // again must ask again.
             reveal: None,
+            record_pending: false,
+            seen_pages: 0,
+            // Same rule, other direction: a half-typed share does not survive a
+            // reset, and consent is to one ceremony.
+            entry: None,
         })
     }
 
@@ -821,6 +909,20 @@ impl<'a, F: NorFlash + fmt::Debug> Session<'a, F> {
                 // next `show_backup` call put that share on the glass for a flow
                 // nobody approved.
                 self.reveal = None;
+                // And the unanswered "did you write it down?" question, so a
+                // cancelled ceremony acks nothing at all. The ack is a claim about a
+                // protocol run the coordinator has just abandoned, and the whole
+                // point of `BackupRecorded` is that it is trusted. `seen_pages` needs
+                // no clearing here: `confirm_at` clears it when it issues a grant,
+                // and a grant is the only way back into `show_backup`.
+                self.record_pending = false;
+                // And the half-typed share, for the reveal grant's reason run
+                // backwards: the human consented to type a share into THIS ceremony,
+                // and `clear_tmp_data` above has just dropped the signer's
+                // `tmp_loaded_backups`, so a surviving `Entry` would be typing words
+                // towards an `enter_physical_id` no coordinator is listening for —
+                // words that would sit on the glass for whatever comes next.
+                self.entry = None;
                 Ok(Vec::new())
             }
 
@@ -896,38 +998,99 @@ impl<'a, F: NorFlash + fmt::Debug> Session<'a, F> {
             CoordinatorToDeviceMessage::Restoration(CoordinatorRestoration::DisplayBackup {
                 ..
             }) => {}
-            // THE OTHER FIVE RESTORATION MESSAGES ALL STAY REFUSED, and not one of
-            // the blockers is in this file. Recorded here so the next reader does
-            // not re-derive the wrong order; nothing below is repaired:
+            // THE RESTORE FLOW, ADMITTED — the four messages that between them let a
+            // human type a share back IN. It is the only path on this device that
+            // INGESTS a secret, so the order of the gates matters more here than
+            // anywhere else and is worth stating once:
+            //
+            //  1. `EnterPhysicalBackup` writes NOTHING and stages NOTHING. The signer
+            //     answers with a `ToUserRestoration::EnterBackup` PROMPT carrying an
+            //     `EnterBackupPhase`, which is a 16-byte `EnterPhysicalId` and no
+            //     secret at all (`device/restoration.rs:57-63`). What a coordinator
+            //     gets for asking is a question on a screen.
+            //  2. THE CONSENT DIGIT. [`prompt_screen_at`] draws it and
+            //     [`Session::confirm_at`] is the only thing that can grant the
+            //     [`wordentry::Entry`] — `self.entry` has no other writer and
+            //     `Entry::new` no other caller. So a coordinator cannot put a
+            //     share-shaped screen on the glass, and a caller cannot type into one
+            //     that no human authorised.
+            //  3. THE WORDS NEVER LEAVE. [`Session::entry_key`] consumes
+            //     `Step::Entered` itself and sends `DeviceRestoration::PhysicalEntered`,
+            //     whose payload is the `EnteredPhysicalBackup { enter_physical_id,
+            //     share_image }` — a PUBLIC point and index, upstream's own reply
+            //     (`:350-357`). No word, no scalar, no `Debug`.
+            //     `no_word_of_a_typed_backup_ever_reaches_the_outbox` holds that.
+            //  4. `SavePhysicalBackup`/`SavePhysicalBackup2` move the typed share from
+            //     the signer's `tmp_loaded_backups` into its `saved_backups` and stage
+            //     a `Mutation::Restoration(Save2)` carrying a PLAINTEXT `ShareBackup`.
+            //     That mutation is DROPPED at the top of `run`, never written — see
+            //     [`store::ShareStore::persist_staged`]. Both are admitted without a
+            //     second consent screen deliberately: they move nothing off the
+            //     device, they write nothing durable, and the human has already
+            //     consented to the ingest that produced the material. The legacy
+            //     `SavePhysicalBackup` is upstream's own alias — it rebuilds itself as
+            //     a `SavePhysicalBackup2` and recurses (`:64-82`) — so refusing one
+            //     while admitting the other would be a version check dressed as a
+            //     policy.
+            //  5. `Consolidate` is the DESTRUCTIVE one and it gets its own digit. It
+            //     validates the typed share's polynomial checksum against the
+            //     coordinator's `root_shared_key` (`:137-158`) and, on consent,
+            //     `finish_consolidation` encrypts it and stages the keygen triple —
+            //     which REPLACES whatever share this device already held, because the
+            //     store keeps one record. Its screen says so.
+            //
+            // NO TIMEOUT on any of it, chosen and not missing: transcribing 25 words
+            // is slow and a screen that blanks mid-flow costs a second full
+            // disclosure. `wordentry` has no clock to expire against.
+            CoordinatorToDeviceMessage::Restoration(
+                CoordinatorRestoration::EnterPhysicalBackup { .. }
+                | CoordinatorRestoration::SavePhysicalBackup { .. }
+                | CoordinatorRestoration::SavePhysicalBackup2(_)
+                | CoordinatorRestoration::Consolidate(_),
+            ) => {}
+            // `CheckBackup` STAYS REFUSED, and not one of the blockers is in this
+            // file. Recorded here so the next reader does not re-derive the wrong
+            // order; nothing below is repaired:
             //  - `CheckBackup` is not the cheap one, and it is NOT a `DisplayBackup`
             //    with a quiz bolted on. Upstream's quiz renders the TRUE word among
             //    three for the index and all 25 words
             //    (`frostsnap_widgets/src/backup/check_backup.rs:98-111`), so it
             //    reveals as much as `DisplayBackup` and additionally wants the
-            //    distractor picker DECISIONS.md:46 declined to vendor. There is no
-            //    distractor source in this tree, and inventing one from `Entropy`
-            //    would be a new security-relevant primitive on a screen that reveals
-            //    a share — not a dispatch change.
-            //  - `SavePhysicalBackup2` stages a `Mutation::Restoration`, which
-            //    [`store::ShareStore::persist_staged`] can never accept — see the
-            //    wedge documented there. It is already a CLEAN refusal
-            //    (`Fault::Store(NotOneKeygen)`: nothing written, nothing acked) and
-            //    it is unreachable, because this arm refuses the only message that
-            //    would stage one. What is left is that such a mutation would stay
-            //    staged for the rest of the boot; nothing can put one there, so
-            //    there is nothing here to fix and no code was added pretending
-            //    otherwise.
-            //  - `EnterPhysicalBackup` / `SavePhysicalBackup` / `Consolidate` need a
-            //    word-ENTRY flow. `ui::EntryPages` exists, but the keypad-to-letter
-            //    mapping and the `store` body do not, and both are outside this
-            //    file.
-            CoordinatorToDeviceMessage::Restoration(
-                CoordinatorRestoration::EnterPhysicalBackup { .. }
-                | CoordinatorRestoration::SavePhysicalBackup { .. }
-                | CoordinatorRestoration::SavePhysicalBackup2(_)
-                | CoordinatorRestoration::Consolidate(_)
-                | CoordinatorRestoration::CheckBackup { .. },
-            ) => return Err(Fault::Refused(Refusal::PhysicalBackup)),
+            //    distractor picker DECISIONS.md:46 declined to vendor. `ui` now has
+            //    the SCREEN (`ui::backup_quiz_word`: mandatory `rng`, every option
+            //    row noised); what is still missing is the picker and the key
+            //    routing, and admitting this message with either of them absent
+            //    would be worse than refusing it. `confirm_at`'s grant is read by
+            //    `show_backup`, which draws PLAIN WORDS, and `boot()` starts a
+            //    reveal on any confirmed `Restoration` prompt — so a `CheckBackup`
+            //    admitted today would answer a quiz request with a full plaintext
+            //    reveal and never send `CommsMisc::BackupChecked`. Landing it needs
+            //    a second grant, a second `Reveal` state and 1/2/3 key handling,
+            //    all of which live in `main.rs`.
+            //
+            //    Do NOT port `frostsnap_widgets/src/backup/distractor.rs` when it
+            //    does land. `find_closest_distractors` is a pure function of the
+            //    TRUE word (`levenshtein*3 - shared_suffix*2`, no RNG), so the
+            //    triple identifies its own answer: MEASURED over the vendored 2048
+            //    words, 1288 of them are recovered from the displayed triple with
+            //    no human input, leaving ~0.467 of `log2(3)` bits per word — 11.7
+            //    bits over 25 words, which `ShareBackup::from_words`' 11-bit word
+            //    checksum plus its 8-bit poly checksum reduce to one candidate. A
+            //    photograph of upstream's quiz is a full share disclosure. Its index
+            //    screen is worse: the three options are always consecutive integers
+            //    and the true one is always the median. The rule that does not leak
+            //    is uniform choice inside a predicate SYMMETRIC over the triple —
+            //    three draws from `rng::Entropy` over all 2048, rejecting the true
+            //    word and duplicates under a hard iteration cap, and indices drawn
+            //    from `1..=n` rather than `correct ± 1`.
+            //
+            //    Landing it also needs the ONE thing the restore flow above did not
+            //    weaken: `show_backup`'s grant and this device's confirm digit. A
+            //    `CheckBackup` admitted on the entry path would be a quiz answered
+            //    with a reveal, so it stays here.
+            CoordinatorToDeviceMessage::Restoration(CoordinatorRestoration::CheckBackup {
+                ..
+            }) => return Err(Fault::Refused(Refusal::PhysicalBackup)),
             CoordinatorToDeviceMessage::ScreenVerify(_) => {
                 return Err(Fault::Refused(Refusal::AddressVerify))
             }
@@ -1047,9 +1210,11 @@ impl<'a, F: NorFlash + fmt::Debug> Session<'a, F> {
             // recorded before a single word had been drawn — the same
             // ack-ahead-of-the-fact this crate's persist-before-ack ordering exists
             // to prevent, in the one direction where the fact is a human's pen. The
-            // screen that asks "did you write it down?" is a §4.2 screen
-            // `hal/src/ui.rs` does not have; until it does, this device says nothing,
-            // which is the honest answer and the fail-closed one.
+            // ack is [`Session::backup_recorded`], gated on `record_pending`, which
+            // [`Session::show_backup`] sets only once the pages have RUN OUT under a
+            // live grant — so the earliest moment this device can claim a backup was
+            // recorded is after every word has been on the glass and a human has
+            // answered [`ui::backup_recorded`]'s digit. Not here.
             //
             // `Ok(Vec::new())`, not the prompt back again: `recv` returns prompts and
             // `confirm` answers them, and a prompt returned from here would be
@@ -1063,12 +1228,72 @@ impl<'a, F: NorFlash + fmt::Debug> Session<'a, F> {
                     // derived words are dropped at the end of this statement — the
                     // grant keeps the phase, never the plaintext.
                     backup_pages(&phase, &mut self.secrets, |_| ())?;
+                    // A NEW grant retires the previous one's unanswered question and
+                    // its page set. This is the only place `self.reveal` is written,
+                    // so it is the one place that can guarantee it: without the
+                    // first line, a reveal shown whole and never answered would let
+                    // an abort of the NEXT reveal ack the coordinator's current
+                    // ceremony (`CommsMisc::BackupRecorded` names no share, so
+                    // whatever dialog is open is the one that closes); without the
+                    // second, the pages already seen would count towards it.
+                    self.record_pending = false;
+                    self.seen_pages = 0;
                     self.reveal = Some(phase);
                     Ok(Vec::new())
                 }
-                // The other four `ToUserRestoration` variants are reached only
-                // through a message `recv` refuses, and none of them is a consent
-                // prompt this device can honour. Fail closed.
+                // THE ENTRY GRANT, and the mirror image of the reveal one: the human
+                // read `prompt_screen_at`'s "type in a backup?" screen and pressed the
+                // digit it printed. This is what that press buys, and all of it —
+                // permission for [`Session::entry_key`] to accept a keystroke.
+                //
+                // `out` is not touched. `DeviceRestoration::PhysicalEntered` is the
+                // wire answer and it belongs to the moment 25 words CHECKSUM, not to
+                // the moment a human agrees to start typing: the coordinator's
+                // `enter_physical_backup.rs` dialog closes on it, so sending it here
+                // would claim a share had been entered before a letter was typed. The
+                // same ack-ahead-of-the-fact this crate's persist-before-ack ordering
+                // exists to prevent.
+                //
+                // A NEW grant discards a previous entry, unfinished words and all.
+                // That is the honest direction rather than the destructive one: the
+                // coordinator has issued a fresh `enter_physical_id`, so the words
+                // typed towards the old one can no longer be acked against anything,
+                // and `wordentry`'s "nothing is ever discarded" property is about the
+                // 25 slots WITHIN one entry, not across two ceremonies.
+                ToUserRestoration::EnterBackup { phase } => {
+                    self.entry = Some(wordentry::Entry::new(phase.enter_physical_id));
+                    Ok(Vec::new())
+                }
+                // CONSOLIDATION — the one restore step that writes flash, and the one
+                // that can destroy a share. `finish_consolidation` encrypts the typed
+                // share under this device's own derivation and stages the
+                // `NewKey`/`NewAccessStructure`/`SaveShare` triple
+                // (`device/restoration.rs:410-434`), which `run` persists at its top,
+                // BEFORE the `FinishedConsolidation` ack reaches the outbox. Same
+                // ordering as the keygen and for a stronger version of the same
+                // reason: the store holds ONE record, so this write replaces whatever
+                // share the device had, and a coordinator told the consolidation
+                // finished when the write did not would believe in a share that is
+                // gone. `consolidation_persists_the_share_before_it_acks` holds it.
+                //
+                // The polynomial checksum was already checked, by the signer, before
+                // this prompt existed (`:137-158`) — a share that does not belong to
+                // the coordinator's `root_shared_key` never reaches a human.
+                //
+                // `phase` carries a PLAINTEXT `SecretShare` (`CompleteSecretShare`,
+                // `device.rs:629-635`). It is consumed here and never returned, and
+                // the screen that asked prints the key name, the share index and the
+                // threshold — no word and no scalar.
+                ToUserRestoration::ConsolidateBackup(phase) => {
+                    let sends = self
+                        .signer
+                        .finish_consolidation(&mut self.secrets, phase, rng);
+                    self.run(sends, out)
+                }
+                // `BackupSaved` is informational — `prompt_screen_at` draws no screen
+                // for it, so the funnel above has already refused it — and
+                // `CheckBackup` is reached only through a message `recv` refuses.
+                // Fail closed.
                 _ => Err(Fault::NotConfirmable),
             },
             _ => Err(Fault::NotConfirmable),
@@ -1092,7 +1317,8 @@ impl<'a, F: NorFlash + fmt::Debug> Session<'a, F> {
     /// * **One-way.** The grant is taken at entry and put back only while pages
     ///   remain, so `page` past the end (or any fault) ends the reveal and the next
     ///   call refuses. A coordinator wanting a second look must ask again and a
-    ///   human must consent again.
+    ///   human must consent again. Running off the end — and *only* that, never a
+    ///   fault — also arms [`Session::backup_recorded`]; see `record_pending`.
     /// * **Noised.** The words go through [`ui::BackupPages::render`], whose RNG is a
     ///   required parameter, so PLAN.md §4.2's side-channel defence
     ///   ([`ui::Frame::mark_sensitive`]) covers every word row. There is no
@@ -1122,13 +1348,198 @@ impl<'a, F: NorFlash + fmt::Debug> Session<'a, F> {
         let Some(phase) = self.reveal.take() else {
             return Err(Fault::Refused(Refusal::DisplayBackup));
         };
-        let drawn = backup_pages(&phase, &mut self.secrets, |pages| {
-            pages.render(page, frame, rng)
+        let (drawn, len) = backup_pages(&phase, &mut self.secrets, |pages| {
+            (pages.render(page, frame, rng), pages.len())
         })?;
         if drawn {
+            // One bit per page that has actually been on the glass. Not a cursor —
+            // it decides nothing about what is drawn, and `page` stays an argument —
+            // but it is the only thing this function can consult to know whether a
+            // human has seen the whole share, and see below for why a caller's
+            // paging discipline is not an acceptable substitute.
+            self.seen_pages |= page_bit(page).unwrap_or(0);
             self.reveal = Some(phase);
+        } else {
+            // THE REVEAL ENDED. Not "a fault happened" and not "nobody consented":
+            // both of those return `Err` above, so this leg means a grant existed
+            // and the pages ran out under it.
+            //
+            // Ending is NOT enough to earn the right to ask a human whether they
+            // wrote the words down. `main.rs` ends an ABORTED reveal through this
+            // same call — any unadvertised key on a backup page asks for the page
+            // past the last one, deliberately, so there is one ending and not two —
+            // so "a page was drawn and then the set ended" is also what pressing `x`
+            // on page 0 looks like from here. Arming on that would offer
+            // "wrote it down?" to someone who has seen the share index and no word,
+            // and one fumbled digit later the coordinator closes its dialog and the
+            // app presents an unbacked-up wallet as backed up.
+            //
+            // So the gate is the WHOLE SET, checked as a bit set: every page of this
+            // reveal has been composed into a frame. That is enforced here rather
+            // than left to the caller's `+1`/`-1` paging because the caller is
+            // `boot()`, which is `#[cfg(target_arch = "arm")]` and therefore
+            // compiled by no gate in this tree and executed by none (PLAN.md §9 item
+            // 22) — a property that lives only in that function is a property
+            // nothing checks. A caller that jumps straight to the last page gets a
+            // refusal, not an ack.
+            //
+            // `seen_pages` is deliberately NOT reset here. The reset that matters is
+            // at the grant, which is the only way back into this function, so a reset
+            // here would be a line no mutation can falsify — MEASURED: deleting it
+            // left all 98 tests green. One clearing site, at the choke point.
+            self.record_pending = all_pages(len).is_some_and(|all| self.seen_pages == all);
         }
         Ok(drawn)
+    }
+
+    /// Is the device waiting for a human to say they wrote the backup down?
+    ///
+    /// True from the moment a reveal runs off the end of its pages until
+    /// [`Session::backup_recorded`] spends it. The caller draws
+    /// [`ui::backup_recorded`] while this holds; nothing else reads it.
+    pub fn record_pending(&self) -> bool {
+        self.record_pending
+    }
+
+    /// A human answered YES to [`ui::backup_recorded`]: tell the coordinator the
+    /// backup is on paper.
+    ///
+    /// This is the ack the coordinator's `DisplayBackupProtocol` blocks on
+    /// (`frostsnap_coordinator/src/display_backup.rs:87`), and without it the app's
+    /// dialog never closes however correct the reveal was. Upstream sends the same
+    /// message at the same moment — when its display widget finishes, not when the
+    /// reveal is granted (`device/src/frosty_ui.rs:330-336`,
+    /// `esp32_run.rs:744-746`).
+    ///
+    /// **Call this only from a keypress on the digit that screen drew.** Two gates
+    /// stand behind it and they are independent:
+    ///
+    /// * `record_pending` — a reveal must have ENDED. It is set past the grant
+    ///   `take()` in [`Session::show_backup`], so a device that never revealed
+    ///   anything cannot ack, and it is taken here, so one reveal cannot ack twice.
+    ///   A coordinator has no way to raise it.
+    /// * the keypress — the caller's, on the randomised digit
+    ///   [`ui::backup_recorded`] printed. `ui::CONFIRM_CHARSET` is const-asserted
+    ///   off both paging keys, so the key that walked a human onto that screen
+    ///   cannot also answer it.
+    ///
+    /// **Nothing about the share goes out.** `CommsMisc::BackupRecorded` is a unit
+    /// variant: no share index, no words, no phase, nothing derived from any of
+    /// them. This function has no `Secrets`, no RNG and no `BackupDisplayPhase` in
+    /// scope, so there is nothing here it *could* leak.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::DisplayBackup`] when no reveal has ended — the fail-closed
+    /// direction, and the reason this is not an infallible `fn`: a caller that has
+    /// lost track of the flow gets a refusal on the glass rather than a false claim
+    /// on the wire. [`Fault::Comms`] if the frame will not encode.
+    pub fn backup_recorded(&mut self, out: &mut Outbox) -> Result<(), Fault> {
+        if !core::mem::take(&mut self.record_pending) {
+            return Err(Fault::Refused(Refusal::DisplayBackup));
+        }
+        out.push(DeviceSendBody::Misc(CommsMisc::BackupRecorded))?;
+        Ok(())
+    }
+
+    /// What the backup-entry flow wants on the glass, or `None` when no entry is
+    /// live.
+    ///
+    /// `None` is the whole gate seen from the drawing side: [`Session::confirm_at`]
+    /// is the only writer of the grant, so a caller with no consent behind it has
+    /// nothing to render and no cursor to advance. Borrowed from the
+    /// [`wordentry::Entry`], so this is not a copy of anything typed.
+    ///
+    /// Draw it with `ui::EntryPages`/[`ui::WordEntry`], whose `rng` is mandatory —
+    /// the word and prefix rows are `ui::Frame::mark_sensitive`'d, exactly as the
+    /// reveal's are. [`wordentry::Step::Unchanged`] means **do not redraw**: an
+    /// unchanged share row redrawn is a second noise sample over the same pixels,
+    /// which is the one thing that averaging defence cannot afford.
+    #[must_use]
+    pub fn entry_screen(&self) -> Option<wordentry::Screen<'_>> {
+        self.entry.as_ref().map(wordentry::Entry::screen)
+    }
+
+    /// One keypress into the backup a human consented to type in.
+    ///
+    /// The live keys are [`ui::ENTRY_LETTER_KEYS`], [`ui::ENTRY_PAGE_KEY`],
+    /// [`ui::ENTRY_OK_KEY`] and [`ui::ENTRY_DELETE_KEY`]; every other byte is
+    /// [`Typed::Unchanged`]. The decision is [`wordentry::Entry::key`]'s — pure, and
+    /// pinned there over all 2,048 words — and this function is only the two impure
+    /// halves it cannot own: the grant, and the wire.
+    ///
+    /// **The completed share does not come back.** [`wordentry::Step::Entered`] is
+    /// consumed here: the `ShareBackup` goes straight into
+    /// `tell_coordinator_about_backup_load_result`, which parks it in the signer's
+    /// RAM-only `tmp_loaded_backups` and answers
+    /// `DeviceRestoration::PhysicalEntered` — an `enter_physical_id` and a
+    /// `share_image`, both public (`device/restoration.rs:337-360`). So there is no
+    /// return value a caller could log, no `Outbox` push carrying a word, and no
+    /// `Debug` anywhere on the path (`wordentry::Step` has a hand-written one that
+    /// prints the variant name).
+    ///
+    /// **A failed checksum discards nothing.** All 25 words stay in the
+    /// [`wordentry::Entry`] and the machine returns to word 25 on the next key, so a
+    /// device that has accepted 24 correct words never throws them away — the
+    /// half-built restore that would invite trust and then lose a share. Nothing is
+    /// sent for a failure either; the coordinator's dialog stays open, which is what
+    /// upstream's own `cancel()` ends.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::PhysicalBackup`] when no entry is live — no consent, or entry has
+    /// already ended. [`Fault::Comms`] if the reply will not frame, and
+    /// [`Fault::Store`] from `run`'s persist, which on this path drains nothing (an
+    /// entry stages no mutation) and so cannot fail on its own account.
+    ///
+    /// ponytail: ceiling named. Both of those fire AFTER the `take` above, so a fault
+    /// on the completing keypress ends the entry rather than offering a retry — the
+    /// 25 words are unreachable from the glass. It is not a lost share and not
+    /// reachable in practice: `Fault::Store` here needs a keygen triple left staged by
+    /// an EARLIER flash failure (a device whose flash is broken cannot finish the
+    /// restore either way), `Fault::Comms` needs a `PhysicalEntered` — one id and one
+    /// share image — to overrun `comms::FRAME_LIMIT`, and in both cases the typed
+    /// share is already in the signer's `tmp_loaded_backups`, so `Consolidate` can
+    /// still reach it and dropping the [`wordentry::Entry`] reduces no exposure. Left as is
+    /// because preserving it would buy a retry that fails identically. The upgrade
+    /// path is putting `entry` back on the `Err` leg, which is four lines and needs no
+    /// new state.
+    pub fn entry_key(&mut self, key: u8, out: &mut Outbox) -> Result<Typed, Fault> {
+        // TAKEN, like the reveal grant: every exit that is not "still typing" leaves
+        // the entry gone, so the fail-closed direction needs no `else` a later edit
+        // could forget.
+        let Some(mut entry) = self.entry.take() else {
+            return Err(Fault::Refused(Refusal::PhysicalBackup));
+        };
+        match entry.key(key) {
+            wordentry::Step::Unchanged => {
+                self.entry = Some(entry);
+                Ok(Typed::Unchanged)
+            }
+            wordentry::Step::Redraw => {
+                self.entry = Some(entry);
+                Ok(Typed::Redraw)
+            }
+            // The human backed out. SILENCE is the honest wire behaviour and not a
+            // gap: `DeviceRestoration` has no message for an abandoned entry, and
+            // upstream's coordinator ends the dialog on its own `cancel()`
+            // (`frostsnap_coordinator/src/enter_physical_backup.rs`). PUNTED
+            // UPSTREAM, not worked around.
+            wordentry::Step::Abort => Ok(Typed::Ended(Vec::new())),
+            wordentry::Step::Entered(backup) => {
+                let sends = self.signer.tell_coordinator_about_backup_load_result(
+                    EnterBackupPhase {
+                        enter_physical_id: entry.enter_physical_id(),
+                    },
+                    backup,
+                );
+                // The entry is already dropped by the `take` above, so the words are
+                // gone before the frame is built. `run` is the funnel every other
+                // reply goes through, so the caps and the persist ordering apply here
+                // too.
+                self.run(sends, out).map(Typed::Ended)
+            }
+        }
     }
 
     /// Persist a previewed name, then tell the coordinator about it.
@@ -1302,6 +1713,36 @@ pub fn sign_consent<T>(
     Ok(Some(show(&pages)))
 }
 
+/// Bit `page` of [`Session::seen_pages`], or `None` for a page index no `u32` bit
+/// set can hold.
+///
+/// A function and not `1 << page` inline, for the reason two mutations that survived
+/// all six gates were closed by making one: this is the arithmetic that decides
+/// whether a human is told their backup is safe. `overflow-checks = false` in
+/// release, so `1u32 << 32` there is `1` — page 32 aliasing page 0 — and
+/// `checked_shl` is what makes it `None` instead. `None` is fail-closed at both call
+/// sites: an un-recordable bit is never set, and an un-representable set is never
+/// complete.
+fn page_bit(page: usize) -> Option<u32> {
+    1u32.checked_shl(u32::try_from(page).ok()?)
+}
+
+/// Every page of a `len`-page set, as a full bit set — the value
+/// [`Session::seen_pages`] must equal for a reveal to have been shown WHOLE.
+///
+/// `None` for a set of no pages (nothing to see is not "everything seen") and for one
+/// of more than 31, so a future [`ui::WORDS_PER_PAGE`] that pushed the count past what
+/// the bits hold would refuse the ack rather than accept a truncated set. 31 rather
+/// than 32 because the mask is built from the bit ONE PAST the last page; the shipped
+/// geometry needs 8.
+fn all_pages(len: usize) -> Option<u32> {
+    match page_bit(len)? {
+        // `len == 0`. `checked_shl` never yields 0, so `bits - 1` below cannot wrap.
+        1 => None,
+        bits => Some(bits - 1),
+    }
+}
+
 /// Derive the 25 BIP39 words for one consented backup and hand the validated page
 /// set to `show` — the **only** place in this crate where a plaintext share exists.
 ///
@@ -1325,7 +1766,8 @@ pub fn sign_consent<T>(
 /// never invoked; `ui::BackupPages` does too and likewise), pushed to no `Outbox`
 /// — there is no `Outbox` in scope — and dropped when `show` returns. `show`'s only
 /// two callers are [`Session::confirm_at`], which passes `|_| ()`, and
-/// [`Session::show_backup`], which draws pixels and returns `bool`.
+/// [`Session::show_backup`], which draws pixels and returns `(bool, usize)` — a
+/// "was it drawn" and a page COUNT, neither of which is derived from a word.
 ///
 /// # Errors
 ///
@@ -1383,16 +1825,93 @@ fn backup_consent(
     share_index: u32,
     confirm: ui::ConfirmDigit,
 ) {
-    frame.clear();
-    frame.text(0, 0, "Reveal backup?");
-    // Attacker-controlled (it came from a keygen `Begin` and has been on flash
-    // since), and `Frame::text` is documented safe for arbitrary text of arbitrary
-    // length: walked with `chars()`, truncated at `COLS`, never sliced.
-    frame.text(0, 2, key_name);
     let mut what = ui::Buf::<16>::new();
     what.push_str("share #").push_u64(share_index as u64);
-    frame.text(0, 4, what.as_str());
-    frame.text(0, 6, "SECRET on glass");
+    consent_screen(
+        frame,
+        ["Reveal backup?", key_name, what.as_str(), "SECRET on glass"],
+        confirm,
+    );
+}
+
+/// The consent screen for typing a share back IN.
+///
+/// There is nothing here for a human to *match*: the `EnterBackupPhase` carries a
+/// 16-byte `EnterPhysicalId` and no key name, no share index and no threshold — the
+/// coordinator does not know which share is about to be typed either, since finding
+/// out is the point of the exercise. So the question this screen asks is the only one
+/// it can ask honestly: are you about to type a secret into this device?
+///
+/// That makes the digit the whole gate, and it is why this screen exists at all
+/// rather than the entry starting on the coordinator's word. A restore INGESTS a
+/// secret and puts it on the glass letter by letter; a coordinator message must not
+/// be able to reach that screen on its own.
+fn entry_consent(frame: &mut ui::Frame, confirm: ui::ConfirmDigit) {
+    let mut words = ui::Buf::<16>::new();
+    words.push_u64(ui::BACKUP_WORDS as u64).push_str(" words");
+    consent_screen(
+        frame,
+        [
+            "Type a backup?",
+            words.as_str(),
+            "onto THIS device",
+            "SECRET on glass",
+        ],
+        confirm,
+    );
+}
+
+/// The consent screen for STORING a typed share — the destructive one.
+///
+/// Everything on it is public: the coordinator-supplied key name, the share index
+/// and the threshold, all of which are on the app's own screen. The
+/// `ConsolidatePhase` behind it holds a plaintext `SecretShare` and this function is
+/// not handed it.
+///
+/// The "replaces stored" line is the part that is not decoration. `store` keeps ONE
+/// record, so consolidating overwrites whatever share this device already held, and a
+/// coordinator that wanted to destroy a share would send exactly this message. There
+/// is no undo and no second copy.
+fn consolidate_consent(
+    frame: &mut ui::Frame,
+    key_name: &str,
+    share_index: u32,
+    threshold: u16,
+    confirm: ui::ConfirmDigit,
+) {
+    let mut what = ui::Buf::<16>::new();
+    what.push_str("#")
+        .push_u64(share_index as u64)
+        .push_str(" of ")
+        .push_u64(threshold as u64)
+        .push_str("-of-n");
+    consent_screen(
+        frame,
+        ["Store share?", key_name, what.as_str(), "REPLACES stored"],
+        confirm,
+    );
+}
+
+/// The shape all three restoration consent screens share: four lines and the digit
+/// that grants.
+///
+/// One function and not three copies, because the property that matters is common to
+/// all of them — the legend prints the key, so a screen that forgot it would be
+/// asking for a gesture it never showed, and the mutation that deletes it fails every
+/// one of their tests at once. The legend text is
+/// `ui::sign_test_message_confirm`'s word for word ("Press (N) x=no"), so the
+/// highest-consequence screens on the device ask in the form the rest of it uses, and
+/// `x` is spelled out because a refusal must be as easy to reach as an approval.
+///
+/// `lines` land on rows 0, 2, 4 and 6 of 8. Every one of them may be
+/// attacker-controlled — a key name came off a coordinator's `Begin` — and
+/// `ui::Frame::text` is documented safe for arbitrary text of arbitrary length:
+/// walked with `chars()`, truncated at `ui::COLS`, never sliced.
+fn consent_screen(frame: &mut ui::Frame, lines: [&str; 4], confirm: ui::ConfirmDigit) {
+    frame.clear();
+    for (row, line) in lines.iter().enumerate() {
+        frame.text(0, row * 2, line);
+    }
     let mut legend = ui::Buf::<16>::new();
     legend
         .push_str("Press (")
@@ -1463,9 +1982,13 @@ fn sign_page(
 /// `SignTask::Test`, `SignPages` a real `BitcoinTransaction` — the one sign task
 /// `Session::recv` admits and this device could otherwise sign blind — and the
 /// backup-reveal question a real `BackupDisplayPhase`'s key name and share index.
-/// The three remaining §4.2 screens (backup entry, the quiz, address verify) have
-/// no caller because every message that reaches them is refused in
-/// [`Session::recv`]; adding one would be a lie about what the device does.
+/// The backup-ENTRY question and the consolidation question join them here, and are
+/// honest in the same way: the entry screen carries nothing (an `EnterBackupPhase` is
+/// a 16-byte id) and the consolidation screen carries a real `ConsolidatePhase`'s key
+/// name, share index and threshold — never its plaintext `SecretShare`. The two §4.2
+/// screens still without a caller are the QUIZ and address verify, because
+/// `CheckBackup` and `ScreenVerify` are refused in [`Session::recv`]; adding a screen
+/// for either would be a lie about what the device does.
 ///
 /// The backup *words* are not drawn from here and cannot be: this function has no
 /// [`Secrets`] to decrypt with and no RNG to noise with. [`Session::show_backup`] is
@@ -1554,9 +2077,38 @@ pub fn prompt_screen_at(
                 // `backup_pages` raises, at the earlier of the two points.
                 _ => Err(Refusal::DisplayBackup),
             },
-            // The other four are reached only through a message `Session::recv`
-            // refuses. `Shown::Nothing` here is what makes `confirm_at` answer
-            // `NotConfirmable` for them.
+            // The question that gates an INGEST. One page, page 0, and `page != 0` is
+            // a refusal for `DisplayBackup`'s reason: a caller that invents a page
+            // must not be able to keep guessing until something says `last: true`.
+            ToUserRestoration::EnterBackup { .. } if page == 0 => {
+                entry_consent(frame, confirm);
+                Ok(Shown::Page { last: true })
+            }
+            // The question that gates a flash write which REPLACES a share.
+            ToUserRestoration::ConsolidateBackup(phase) if page == 0 => {
+                match u32::try_from(phase.complete_share.secret_share.index) {
+                    Ok(index) => {
+                        consolidate_consent(
+                            frame,
+                            &phase.complete_share.key_name,
+                            index,
+                            phase.complete_share.threshold,
+                            confirm,
+                        );
+                        Ok(Shown::Page { last: true })
+                    }
+                    // A share index outside `u32` cannot be printed, so the human
+                    // cannot tell what they are being asked to store over. `try_from`
+                    // and never the `expect` upstream's own `Display` uses
+                    // (`share_backup.rs`, "Share index should fit in u32"): the index
+                    // came off the wire and a reachable panic here is permanent.
+                    Err(_) => Err(Refusal::PhysicalBackup),
+                }
+            }
+            // `BackupSaved` is informational, `CheckBackup` is reached only through a
+            // message `Session::recv` refuses, and the two arms above fall here for
+            // any page but 0. `Shown::Nothing` is what makes `confirm_at` answer
+            // `NotConfirmable`, which is the fail-closed direction for all three.
             _ => Ok(Shown::Nothing),
         },
         // `FinalizeKeyGen` is informational and `VerifyAddress` is reached only
@@ -1587,6 +2139,35 @@ pub enum Shown {
         /// Nothing left to read: this page prints the digit.
         last: bool,
     },
+}
+
+/// What one [`Session::entry_key`] press did — the typing-side counterpart of
+/// [`Shown`].
+///
+/// Three states and not two, for the same reason [`wordentry::Step`] has them: an
+/// invalid key must be distinguishable from a valid one, because a *redraw* of an
+/// unchanged share row re-samples [`ui::Frame::mark_sensitive`]'s noise over pixels
+/// that did not change, and that is the one thing an averaging defence cannot
+/// afford.
+///
+/// No `Debug` and no share: the completed `ShareBackup` is consumed inside
+/// `entry_key` and never reaches this value.
+#[must_use]
+pub enum Typed {
+    /// The key did nothing. **Do not redraw.**
+    Unchanged,
+    /// The state changed: draw [`Session::entry_screen`].
+    Redraw,
+    /// Entry is over — either the human backed out of the share index, or 25 words
+    /// passed their checksum and the coordinator has been told. Either way
+    /// [`Session::entry_screen`] is now `None` and the caller returns to standby.
+    ///
+    /// The `Vec` is whatever prompts the completion produced, which today is empty:
+    /// `tell_coordinator_about_backup_load_result` returns one coordinator-bound send
+    /// and nothing else (`device/restoration.rs:337-360`). Carried rather than
+    /// dropped so a vendored bump that adds a prompt cannot lose it silently — the
+    /// caller parks it exactly as it parks [`Session::recv`]'s.
+    Ended(Vec<DeviceToUserMessage>),
 }
 
 /// [`prompt_screen_at`] at page 0, reporting only whether the drawn screen is one a
@@ -1848,7 +2429,9 @@ mod tests {
             .nonce_slots()
             .get(stream)
             .expect("the nonce stream must survive the reset");
-        let value = slot.read_slot().expect("the slot must read back after the reset");
+        let value = slot
+            .read_slot()
+            .expect("the slot must read back after the reset");
         assert_eq!(
             value.index, CONSUMED,
             "the consumed index did not survive the reset: every nonce below it \
@@ -1928,9 +2511,9 @@ mod tests {
             needs_consolidation: false,
         };
         let one = frostsnap_core::message::DeviceRestoration::HeldShares2(vec![share.clone()]);
-        out.push(DeviceSendBody::Core(DeviceToCoordinatorMessage::Restoration(
-            one,
-        )))
+        out.push(DeviceSendBody::Core(
+            DeviceToCoordinatorMessage::Restoration(one),
+        ))
         .expect("one share fits");
         assert_eq!(out.frames(), 1);
         let before = out.bytes().len();
@@ -2030,10 +2613,7 @@ mod tests {
     /// path exists.
     #[test]
     fn data_erase_is_refused() {
-        assert_eq!(
-            refuse(CoordinatorSendBody::DataErase),
-            Refusal::DataErase
-        );
+        assert_eq!(refuse(CoordinatorSendBody::DataErase), Refusal::DataErase);
     }
 
     /// `DisplayBackup` for a share this device does not hold is refused **before any
@@ -2212,8 +2792,7 @@ mod tests {
         let header_end = header_off + memmap::FW_HEADER_SIZE as usize;
 
         // The whole slice `main.rs` hands it: FLASH_ISR + FLASH_TEXT, erased 0xff.
-        let mut image =
-            vec![0xffu8; (memmap::FLASH_ISR_LEN + memmap::FLASH_TEXT_LEN) as usize];
+        let mut image = vec![0xffu8; (memmap::FLASH_ISR_LEN + memmap::FLASH_TEXT_LEN) as usize];
         image[header_off..header_end].copy_from_slice(&signit_header(FIRMWARE_LENGTH));
 
         let got = firmware_digest(&image).expect("a signit-shaped header must hash");
@@ -2253,8 +2832,7 @@ mod tests {
     #[test]
     fn firmware_digest_alignment_bound_is_looser_than_mk4_requires() {
         let header_off = memmap::FW_HEADER_OFFSET as usize;
-        let mut image =
-            vec![0xffu8; (memmap::FLASH_ISR_LEN + memmap::FLASH_TEXT_LEN) as usize];
+        let mut image = vec![0xffu8; (memmap::FLASH_ISR_LEN + memmap::FLASH_TEXT_LEN) as usize];
         let misaligned = 299_008 + 512;
         assert_eq!(misaligned % 512, 0);
         assert_ne!(misaligned % 4096, 0);
@@ -2420,12 +2998,11 @@ mod tests {
                     remaining: 0,
                 },
                 rootkey: frostsnap_core::schnorr_fun::fun::G.normalize(),
-                coord_share_decryption_contrib:
-                    CoordShareDecryptionContrib::for_master_share(
-                        id,
-                        ShareIndex::one(),
-                        &shared_key(),
-                    ),
+                coord_share_decryption_contrib: CoordShareDecryptionContrib::for_master_share(
+                    id,
+                    ShareIndex::one(),
+                    &shared_key(),
+                ),
             },
         };
         let fault = session
@@ -2448,10 +3025,21 @@ mod tests {
         );
     }
 
-    /// `CheckBackup` -- one of the five messages the `PhysicalBackup` refusal
-    /// covers, and an arm a blanket `_ => {}` over `Restoration` would swallow.
+    /// `CheckBackup` is the LAST message the `PhysicalBackup` refusal covers, and the
+    /// arm a blanket `_ => {}` over `Restoration` would swallow now that its four
+    /// siblings are admitted.
+    ///
+    /// DECISIONS: it is not the cheap one. Its screen renders the true word among
+    /// three **and** all 25, so its exposure exceeds `DisplayBackup`'s, and its 26
+    /// redraws make `mark_sensitive`'s sqrt(N) averaging ~1.8x worse. The screen
+    /// exists (`ui::backup_quiz_word`); the distractor picker does not. Admitting it
+    /// while `show_backup` draws plain words would answer a quiz request with a full
+    /// plaintext reveal.
+    ///
+    /// MUTATION-VERIFY: add `| CoordinatorRestoration::CheckBackup { .. }` to the
+    /// admitted restore arm — the one-line "while we're here" edit — and this fails.
     #[test]
-    fn physical_backup_is_refused() {
+    fn check_backup_alone_stays_refused() {
         let body = CoordinatorSendBody::Core(CoordinatorToDeviceMessage::Restoration(
             CoordinatorRestoration::CheckBackup {
                 coord_share_decryption_contrib: CoordShareDecryptionContrib::for_master_share(
@@ -2464,6 +3052,64 @@ mod tests {
             },
         ));
         assert_eq!(refuse(body), Refusal::PhysicalBackup);
+    }
+
+    /// **A `SavePhysicalBackup2` for a share nobody typed in is a CLEAN refusal** —
+    /// the signer's, before it stages anything.
+    ///
+    /// This is the message that stages a `Mutation::Restoration` carrying a plaintext
+    /// `ShareBackup` (`device/restoration.rs:83-97`), and it is now ADMITTED by the
+    /// dispatch. The gate is no longer this file's refusal but the signer's own
+    /// `tmp_loaded_backups` lookup: with no entered backup there is nothing to save,
+    /// so a coordinator that skips the consented entry step gets
+    /// `Fault::Signer(InvalidMessage)` and an untouched device.
+    ///
+    /// MUTATION-VERIFY: make `recv_core` short-circuit this message to `Ok` (the shape
+    /// a "the app expects an answer" patch takes) and the frames assert fails.
+    ///
+    /// What this does NOT fix, and cannot from here: the coordinator hears **silence**.
+    /// A `Fault` draws `ui::refusal` on the glass and pushes nothing, and the wire
+    /// protocol has no "I refuse" message for a device to send — `DeviceSendBody`
+    /// carries no such variant and `DisplayBackupProtocol`/`RestorationProtocol` only
+    /// ever consume `CommsMisc`. So every refused restoration message leaves the app
+    /// waiting. UPSTREAM's gap; not worked around here.
+    #[test]
+    fn save_physical_backup2_without_an_entered_backup_is_refused_by_the_signer() {
+        let flash = fs_flash();
+        let mut rng = entropy(107);
+        let secret = identity::load_or_create(&mut *flash.borrow_mut(), &mut rng).unwrap();
+        let mut session = Session::open(&flash, &secret).unwrap();
+        let mut out = Outbox::new(session.device_id());
+
+        let body = CoordinatorSendBody::Core(CoordinatorToDeviceMessage::Restoration(
+            CoordinatorRestoration::SavePhysicalBackup2(alloc::boxed::Box::new(HeldShare2 {
+                access_structure_ref: None,
+                share_image: ShareImage {
+                    index: ShareIndex::one(),
+                    image: Point::zero(),
+                },
+                threshold: None,
+                key_name: None,
+                purpose: None,
+                needs_consolidation: false,
+            })),
+        ));
+        let fault = session
+            .recv(body, &mut rng, &mut out)
+            .expect_err("this message must be refused");
+        assert!(
+            matches!(fault, Fault::Signer(_)),
+            "expected the signer to refuse a save with nothing entered, got {fault:?}"
+        );
+        assert_eq!(out.frames(), 0, "a refused message must not answer");
+        assert!(
+            session.signer.staged_mutations().is_empty(),
+            "a refused save staged a `Mutation::Restoration` carrying a plaintext share"
+        );
+        // And the device still works afterwards.
+        assert!(session
+            .recv(CoordinatorSendBody::AnnounceAck, &mut rng, &mut out)
+            .is_ok());
     }
 
     /// The genuine check needs the ESP32 DS peripheral and a factory certificate
@@ -2603,7 +3249,11 @@ mod tests {
             bitcoin::ScriptBuf::new(),
         ] {
             assert_eq!(
-                sign_consent(&bitcoin_task(&[(300_000, addressable(1)), (1, bad)]), |_| ()).err(),
+                sign_consent(
+                    &bitcoin_task(&[(300_000, addressable(1)), (1, bad)]),
+                    |_| ()
+                )
+                .err(),
                 Some(Refusal::Undisplayable),
                 "an output with no address form must refuse the whole transaction"
             );
@@ -2789,8 +3439,7 @@ mod tests {
         let with_share = out.bytes().len();
 
         let blank = fs_flash();
-        let blank_secret =
-            identity::load_or_create(&mut *blank.borrow_mut(), &mut rng).unwrap();
+        let blank_secret = identity::load_or_create(&mut *blank.borrow_mut(), &mut rng).unwrap();
         let mut empty_session = Session::open(&blank, &blank_secret).unwrap();
         let mut empty_out = Outbox::new(empty_session.device_id());
         empty_session
@@ -3224,11 +3873,7 @@ mod tests {
             // clean refusal rather than a tear.
             let end = memmap::FS_NAME_OFFSET as usize + 4 + NAME_RECORD_LEN;
             flash.borrow_mut().0.scribble(end - torn, torn, 0xff);
-            assert_eq!(
-                store.load(),
-                None,
-                "a {torn}-byte tear read back as a name"
-            );
+            assert_eq!(store.load(), None, "a {torn}-byte tear read back as a name");
         }
 
         // The three fill patterns this board produces naturally are not names
@@ -3743,6 +4388,273 @@ mod tests {
         );
     }
 
+    /// **A backup nobody revealed can never be acked as recorded**, and one that was
+    /// can be acked exactly once.
+    ///
+    /// The ack is a claim to the coordinator that 25 words exist on paper; the app
+    /// closes its dialog and shows the wallet as backed up
+    /// (`display_backup.rs:87-93`). So the fail-open direction is a user who believes
+    /// they have a backup and does not, which is unrecoverable in exactly the case
+    /// the backup existed for. Hence: unreachable without a reveal that RAN TO ITS
+    /// END, and one-shot.
+    ///
+    /// MUTATION-VERIFY. Make `backup_recorded` unconditional (drop the
+    /// `core::mem::take` guard and its `Err`) and both the fresh-session leg and the
+    /// second-call leg fail. Set `record_pending` on the `Ok(true)` leg of
+    /// `show_backup` instead of `Ok(false)` — the "arm it as soon as we start
+    /// drawing" simplification — and the mid-reveal leg fails: a human could ack
+    /// after seeing the share index and no word.
+    #[test]
+    fn only_a_reveal_that_ran_to_its_end_can_be_acked_as_recorded() {
+        let flash = fs_flash();
+        let mut rng = entropy(101);
+        let (mut session, held) = a_device_holding_a_backup(&flash, &mut rng);
+        let mut out = Outbox::new(session.device_id());
+        let pages = 1 + ui::BACKUP_WORDS.div_ceil(ui::WORDS_PER_PAGE);
+        let mut frame = ui::Frame::new();
+
+        // A device that has revealed nothing.
+        assert!(!session.record_pending());
+        assert!(
+            matches!(
+                session.backup_recorded(&mut out),
+                Err(Fault::Refused(Refusal::DisplayBackup))
+            ),
+            "a device that never revealed a backup acked one as recorded"
+        );
+
+        let prompt = backup_prompt(&mut session, &held, &mut rng, &mut out);
+        session.confirm(prompt, &mut rng, &mut out).expect("grant");
+        // Consent is not a reveal, and the first pages are not the last one.
+        assert!(!session.record_pending(), "the grant alone armed the ack");
+        for page in 0..pages {
+            assert!(session.show_backup(page, &mut frame, &mut rng).unwrap());
+            assert!(
+                !session.record_pending(),
+                "page {page} of {pages} armed the ack before the words ran out"
+            );
+        }
+
+        // Off the end: the reveal is over, so now a human may be asked.
+        let framed = out.frames();
+        assert!(!session.show_backup(pages, &mut frame, &mut rng).unwrap());
+        assert!(
+            session.record_pending(),
+            "a finished reveal did not arm the ack"
+        );
+        // Still nothing on the wire until a key is pressed: `show_backup` has no
+        // outbox and `record_pending` is not an ack.
+        assert_eq!(
+            out.frames(),
+            framed,
+            "the reveal ending sent something itself"
+        );
+
+        session.backup_recorded(&mut out).expect("the ack");
+        assert_eq!(out.frames(), framed + 1, "the ack did not reach the outbox");
+        // One reveal, one ack. A second press must not re-claim it.
+        assert!(!session.record_pending());
+        assert!(
+            matches!(
+                session.backup_recorded(&mut out),
+                Err(Fault::Refused(Refusal::DisplayBackup))
+            ),
+            "one reveal acked twice"
+        );
+
+        // And the ack itself carries no share material — it is a unit variant, so
+        // this is checking the encoder as much as the call.
+        let bytes = out.bytes();
+        for word in held.words.iter() {
+            let lower = word.to_lowercase();
+            assert!(
+                !bytes
+                    .windows(lower.len())
+                    .any(|w| w.eq_ignore_ascii_case(lower.as_bytes())),
+                "{word:?} reached the outbox on the recorded ack"
+            );
+        }
+    }
+
+    /// **A reveal a human WALKED OUT OF cannot be acked**, and it reaches
+    /// [`Session::show_backup`] looking exactly like one that finished.
+    ///
+    /// This is the hazard the bit set exists for. `main.rs` deliberately has ONE
+    /// ending: any unadvertised key on a backup page asks for the page past the last,
+    /// the same call the natural `(9)next` off the end makes. So "a page was drawn,
+    /// then the set ended" is equally what `x` on page 0 looks like, and arming on
+    /// that would put "wrote it down?" in front of someone who has seen the share
+    /// index and no word — one fumbled digit from an app that presents an
+    /// unbacked-up wallet as backed up.
+    ///
+    /// The forwards-and-backwards leg is why a high-water page number is not enough
+    /// either: it is only "every page" that licenses the ack, and it stays licensed
+    /// once earned however the human then pages.
+    ///
+    /// MUTATION-VERIFY, all four caught here:
+    ///   * `self.record_pending = true` on the `Ok(false)` leg (the pre-bit-set
+    ///     shape) — the abort legs fail.
+    ///   * `page_bit`/`all_pages` off by one (`bits` for `bits - 1`) — the completed
+    ///     leg fails, because a whole set never equals the mask.
+    ///   * drop either half of `confirm_at`'s grant reset — the last two legs fail,
+    ///     one for `record_pending` and one for `seen_pages`.
+    #[test]
+    fn a_reveal_the_human_abandoned_early_cannot_be_acked_as_recorded() {
+        let flash = fs_flash();
+        let mut rng = entropy(109);
+        let (mut session, held) = a_device_holding_a_backup(&flash, &mut rng);
+        let mut out = Outbox::new(session.device_id());
+        let pages = 1 + ui::BACKUP_WORDS.div_ceil(ui::WORDS_PER_PAGE);
+        let mut frame = ui::Frame::new();
+
+        // `x` on the share-index page: one page drawn, then the same end-of-set call
+        // the natural ending makes.
+        let prompt = backup_prompt(&mut session, &held, &mut rng, &mut out);
+        session.confirm(prompt, &mut rng, &mut out).expect("grant");
+        assert!(session.show_backup(0, &mut frame, &mut rng).unwrap());
+        assert!(!session.show_backup(pages, &mut frame, &mut rng).unwrap());
+        assert!(
+            !session.record_pending(),
+            "walking out on the share-index page armed the ack: no word was drawn"
+        );
+
+        // And one page short of the end is still short.
+        let prompt = backup_prompt(&mut session, &held, &mut rng, &mut out);
+        session.confirm(prompt, &mut rng, &mut out).expect("grant");
+        for page in 0..pages - 1 {
+            assert!(session.show_backup(page, &mut frame, &mut rng).unwrap());
+        }
+        assert!(!session.show_backup(pages, &mut frame, &mut rng).unwrap());
+        assert!(
+            !session.record_pending(),
+            "{} of {pages} pages armed the ack: the last four words were never drawn",
+            pages - 1
+        );
+        let framed = out.frames();
+        assert!(
+            matches!(
+                session.backup_recorded(&mut out),
+                Err(Fault::Refused(Refusal::DisplayBackup))
+            ),
+            "a reveal that skipped a page was acked as recorded"
+        );
+        assert_eq!(out.frames(), framed, "a refused ack still reached the wire");
+
+        // A caller that JUMPS to the last page has shown no more than one page,
+        // whatever the number on it. `boot()` cannot do this — it pages `+1`/`-1` —
+        // but `boot()` is `cfg(target_arch = "arm")` and no gate here executes it, so
+        // the rule is enforced where it can be checked.
+        let prompt = backup_prompt(&mut session, &held, &mut rng, &mut out);
+        session.confirm(prompt, &mut rng, &mut out).expect("grant");
+        assert!(session
+            .show_backup(pages - 1, &mut frame, &mut rng)
+            .unwrap());
+        assert!(!session.show_backup(pages, &mut frame, &mut rng).unwrap());
+        assert!(
+            !session.record_pending(),
+            "jumping to the last page armed the ack"
+        );
+
+        // The whole set, and then paging back: earned, and it stays earned.
+        let prompt = backup_prompt(&mut session, &held, &mut rng, &mut out);
+        session.confirm(prompt, &mut rng, &mut out).expect("grant");
+        for page in 0..pages {
+            assert!(session.show_backup(page, &mut frame, &mut rng).unwrap());
+        }
+        assert!(session.show_backup(1, &mut frame, &mut rng).unwrap());
+        assert!(!session.show_backup(pages, &mut frame, &mut rng).unwrap());
+        assert!(
+            session.record_pending(),
+            "a reveal that showed every page and was then paged back did not arm the ack"
+        );
+        session.backup_recorded(&mut out).expect("the ack");
+
+        // A NEW grant retires the previous question. Show everything, do not answer,
+        // then start again and walk out: nothing is owed to the second ceremony, and
+        // the ack names no share, so the first one's credit must not close its dialog.
+        let prompt = backup_prompt(&mut session, &held, &mut rng, &mut out);
+        session.confirm(prompt, &mut rng, &mut out).expect("grant");
+        for page in 0..pages {
+            assert!(session.show_backup(page, &mut frame, &mut rng).unwrap());
+        }
+        assert!(!session.show_backup(pages, &mut frame, &mut rng).unwrap());
+        assert!(session.record_pending());
+        let prompt = backup_prompt(&mut session, &held, &mut rng, &mut out);
+        session.confirm(prompt, &mut rng, &mut out).expect("grant");
+        assert!(
+            !session.record_pending(),
+            "a new grant left the previous reveal's unanswered question armed"
+        );
+        assert!(session.show_backup(0, &mut frame, &mut rng).unwrap());
+        assert!(!session.show_backup(pages, &mut frame, &mut rng).unwrap());
+        assert!(
+            !session.record_pending(),
+            "the previous reveal's pages counted towards this one's set"
+        );
+    }
+
+    /// The two bit-set helpers, at the edges the reveal never reaches — because the
+    /// day [`ui::WORDS_PER_PAGE`] changes is the day they do.
+    ///
+    /// MUTATION-VERIFY. `1u32 << page` for `page_bit`'s `checked_shl` and the page-32
+    /// case fails (in release it would alias page 0, and `overflow-checks = false`
+    /// means silently). `Some(bits)` for `Some(bits - 1)` and every case fails.
+    #[test]
+    fn a_page_set_too_wide_for_the_bits_refuses_rather_than_wrapping() {
+        assert_eq!(page_bit(0), Some(1));
+        assert_eq!(page_bit(7), Some(0x80));
+        assert_eq!(page_bit(31), Some(1 << 31));
+        assert_eq!(page_bit(32), None, "page 32 aliased page 0");
+        assert_eq!(page_bit(usize::MAX), None);
+
+        assert_eq!(all_pages(0), None, "an empty set counted as fully seen");
+        assert_eq!(all_pages(1), Some(0b1));
+        // The shipped geometry: 1 index page + 7 word pages.
+        assert_eq!(
+            all_pages(1 + ui::BACKUP_WORDS.div_ceil(ui::WORDS_PER_PAGE)),
+            Some(0xff)
+        );
+        // 31 and not 32: the mask is built from the bit ONE PAST the last page, so a
+        // 32-page set has no representable "all seen" value and is refused.
+        assert_eq!(all_pages(31), Some(u32::MAX >> 1));
+        assert_eq!(all_pages(32), None, "a 32-page set claimed a complete u32");
+    }
+
+    /// A ceremony the coordinator ABANDONED acks nothing, even if the human had
+    /// already read every word.
+    ///
+    /// MUTATION-VERIFY. Drop `self.record_pending = false` from `recv`'s `Cancel` arm
+    /// and this fails.
+    #[test]
+    fn a_cancelled_ceremony_cannot_be_acked_as_recorded() {
+        let flash = fs_flash();
+        let mut rng = entropy(103);
+        let (mut session, held) = a_device_holding_a_backup(&flash, &mut rng);
+        let mut out = Outbox::new(session.device_id());
+        let pages = 1 + ui::BACKUP_WORDS.div_ceil(ui::WORDS_PER_PAGE);
+        let mut frame = ui::Frame::new();
+
+        let prompt = backup_prompt(&mut session, &held, &mut rng, &mut out);
+        session.confirm(prompt, &mut rng, &mut out).expect("grant");
+        for page in 0..pages {
+            assert!(session.show_backup(page, &mut frame, &mut rng).unwrap());
+        }
+        assert!(!session.show_backup(pages, &mut frame, &mut rng).unwrap());
+        assert!(session.record_pending());
+
+        session
+            .recv(CoordinatorSendBody::Cancel, &mut rng, &mut out)
+            .expect("Cancel is handled");
+        assert!(!session.record_pending(), "Cancel left the question armed");
+        assert!(
+            matches!(
+                session.backup_recorded(&mut out),
+                Err(Fault::Refused(Refusal::DisplayBackup))
+            ),
+            "an abandoned ceremony was acked as recorded"
+        );
+    }
+
     /// Every word row of the reveal is noised, so PLAN.md §4.2's side-channel
     /// defence is on the one path that actually puts a share on the glass.
     ///
@@ -3835,6 +4747,879 @@ mod tests {
             );
         }
         assert_eq!(out.frames(), 0, "a refused question must not answer");
+    }
+
+    // -----------------------------------------------------------------------
+    // GAP 5: the RESTORE — consent, then 25 typed words, then the store.
+    //
+    // This is the one flow on the device that INGESTS a secret, so every test
+    // below asserts on a fail-closed direction: no ingest without the digit, no
+    // ack without 25 words that checksum, no flash write after the ack, no word
+    // and no scalar on the wire, and nothing discarded when a checksum refuses.
+    // -----------------------------------------------------------------------
+
+    /// A real share to type back IN, and the plaintext that must never leave.
+    ///
+    /// `generate_shares` is upstream's own generator, so `words` is a genuine
+    /// 25-word backup with a real polynomial checksum — which is what makes the
+    /// `Consolidate` leg below a real validation rather than a stub. `plaintext` is
+    /// the scalar those words encode, kept for the byte searches.
+    ///
+    /// `Fingerprint::NONE` for `hold_a_backup`'s reason: the production fingerprint
+    /// grinds ~262,144 hashes per coefficient and nothing on this path reads one.
+    struct ShareToTypeIn {
+        index: u32,
+        share_index: ShareIndex,
+        share_image: ShareImage,
+        words: [&'static str; ui::BACKUP_WORDS],
+        root_shared_key: frostsnap_core::schnorr_fun::frost::SharedKey,
+        plaintext: [u8; 32],
+    }
+
+    fn a_share_to_type_in(rng: &mut Entropy) -> ShareToTypeIn {
+        a_share_of_group(rng, 0x3d)
+    }
+
+    fn a_share_of_group(rng: &mut Entropy, group_seed: u8) -> ShareToTypeIn {
+        let group = Scalar::<Secret, NonZero>::from_bytes([group_seed; 32])
+            .expect("a fixed non-zero scalar below the order");
+        let (shares, root_shared_key) = frost_backup::ShareBackup::generate_shares(
+            group,
+            1,
+            1,
+            frost_backup::Fingerprint::NONE,
+            rng,
+        );
+        let backup = shares.into_iter().next().expect("one share was asked for");
+        let share_index = backup.index();
+        ShareToTypeIn {
+            index: u32::try_from(share_index).expect("index 1 fits a u32"),
+            share_index,
+            share_image: backup.share_image(),
+            words: backup.to_words(),
+            plaintext: backup
+                .clone()
+                .extract_secret(&root_shared_key)
+                .expect("the polynomial we generated it from")
+                .share
+                .to_bytes(),
+            root_shared_key,
+        }
+    }
+
+    const RESTORED_KEY_NAME: &str = "restored";
+
+    fn enter_request(id: u8) -> CoordinatorSendBody {
+        CoordinatorSendBody::Core(CoordinatorToDeviceMessage::Restoration(
+            CoordinatorRestoration::EnterPhysicalBackup {
+                enter_physical_id: frostsnap_core::EnterPhysicalId([id; 16]),
+            },
+        ))
+    }
+
+    fn save_request(share: &ShareToTypeIn) -> CoordinatorSendBody {
+        CoordinatorSendBody::Core(CoordinatorToDeviceMessage::Restoration(
+            CoordinatorRestoration::SavePhysicalBackup2(alloc::boxed::Box::new(HeldShare2 {
+                access_structure_ref: None,
+                share_image: share.share_image,
+                threshold: Some(1),
+                key_name: Some(String::from(RESTORED_KEY_NAME)),
+                purpose: Some(frostsnap_core::device::KeyPurpose::Test),
+                needs_consolidation: true,
+            })),
+        ))
+    }
+
+    fn consolidate_request(share: &ShareToTypeIn) -> CoordinatorSendBody {
+        CoordinatorSendBody::Core(CoordinatorToDeviceMessage::Restoration(
+            CoordinatorRestoration::Consolidate(alloc::boxed::Box::new(
+                frostsnap_core::message::ConsolidateBackup {
+                    share_index: share.share_index,
+                    root_shared_key: share.root_shared_key.clone(),
+                    key_name: String::from(RESTORED_KEY_NAME),
+                    purpose: frostsnap_core::device::KeyPurpose::Test,
+                },
+            )),
+        ))
+    }
+
+    /// The variant name of a [`Typed`], for an `assert`.
+    ///
+    /// A helper and not `#[derive(Debug)]`, deliberately: `Typed::Ended` carries a
+    /// `Vec<DeviceToUserMessage>`, and `ToUserRestoration::ConsolidateBackup`'s
+    /// derived `Debug` prints a plaintext `SecretShare` in hex. A `Debug` on `Typed`
+    /// would put that one `{:?}` away from any log.
+    fn typed(step: &Typed) -> &'static str {
+        match step {
+            Typed::Unchanged => "Unchanged",
+            Typed::Redraw => "Redraw",
+            Typed::Ended(_) => "Ended",
+        }
+    }
+
+    /// [`Session::entry_key`] must REFUSE. Returns the fault.
+    ///
+    /// A helper rather than `expect_err`, which would need `Typed: Debug` — and
+    /// `Typed` deliberately has none (see `typed` above).
+    fn refused_key(
+        session: &mut Session<'_, DebugFlash<FakeFlash>>,
+        key: u8,
+        out: &mut Outbox,
+    ) -> Fault {
+        match session.entry_key(key, out) {
+            Err(fault) => fault,
+            Ok(step) => panic!(
+                "key {key} was accepted with no live entry: {}",
+                typed(&step)
+            ),
+        }
+    }
+
+    /// Take the coordinator's entry request all the way to a live entry: the prompt,
+    /// then the consent digit.
+    fn consent_to_an_entry(
+        session: &mut Session<'_, DebugFlash<FakeFlash>>,
+        rng: &mut Entropy,
+        out: &mut Outbox,
+        id: u8,
+    ) {
+        let mut prompts = session
+            .recv(enter_request(id), rng, out)
+            .expect("an entry request must reach the human");
+        assert_eq!(prompts.len(), 1, "one request, one question");
+        let prompt = prompts.pop().expect("checked above");
+        session
+            .confirm(prompt, rng, out)
+            .expect("the digit grants the entry");
+        assert!(
+            session.entry_screen().is_some(),
+            "the digit did not grant an entry"
+        );
+    }
+
+    /// Type the share index and accept it, leaving the machine on word 1.
+    fn type_index(session: &mut Session<'_, DebugFlash<FakeFlash>>, out: &mut Outbox, index: u32) {
+        let mut digits = StdVec::new();
+        let mut left = index;
+        while left > 0 {
+            digits.push(b'0' + (left % 10) as u8);
+            left /= 10;
+        }
+        for digit in digits.iter().rev() {
+            let step = session.entry_key(*digit, out).expect("a live entry");
+            assert_eq!(typed(&step), "Redraw", "a share-index digit was dead");
+        }
+        let step = session
+            .entry_key(ui::ENTRY_OK_KEY, out)
+            .expect("a live entry");
+        assert_eq!(typed(&step), "Redraw", "the share index would not accept");
+    }
+
+    /// Type `word` letter by letter through the SESSION's public API, paging when the
+    /// letter is not on the page showing.
+    ///
+    /// The honest driver, as in `wordentry`'s own tests: it can only press keys the
+    /// screen advertises, so a letter the ruler does not reach is a panic here rather
+    /// than a silent skip. It reads the ruler through `entry_screen`, i.e. through the
+    /// same value the renderer would be handed.
+    fn type_word(session: &mut Session<'_, DebugFlash<FakeFlash>>, out: &mut Outbox, word: &str) {
+        for wanted in word.bytes() {
+            let mut turns = 0;
+            loop {
+                // Scoped, so the borrow of `session` for the ruler is over before the
+                // `&mut` press.
+                let found = {
+                    let Some(wordentry::Screen::Word(showing)) = session.entry_screen() else {
+                        panic!("expected a word page while typing {word:?}");
+                    };
+                    let start = showing.page * ui::ENTRY_LETTERS_PER_PAGE;
+                    showing
+                        .candidates
+                        .as_bytes()
+                        .iter()
+                        .skip(start)
+                        .take(ui::ENTRY_LETTERS_PER_PAGE)
+                        .position(|&letter| letter == wanted)
+                        .map(|slot| ui::ENTRY_LETTER_KEYS[slot])
+                        .ok_or_else(|| showing.pages())
+                };
+                match found {
+                    Ok(key) => {
+                        let step = session.entry_key(key, out).expect("a live entry");
+                        assert_eq!(typed(&step), "Redraw", "letter key {key} was dead");
+                        break;
+                    }
+                    Err(pages) => {
+                        assert!(
+                            turns < pages,
+                            "{} is on no page of the ruler for {word:?}",
+                            wanted as char
+                        );
+                        turns += 1;
+                        let step = session
+                            .entry_key(ui::ENTRY_PAGE_KEY, out)
+                            .expect("a live entry");
+                        assert_eq!(typed(&step), "Redraw", "the page key was dead");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Type words `0..count` of `share` and accept each one. Returns the last step.
+    fn type_words(
+        session: &mut Session<'_, DebugFlash<FakeFlash>>,
+        out: &mut Outbox,
+        words: &[&str],
+    ) -> Typed {
+        let mut last = Typed::Unchanged;
+        for (n, word) in words.iter().enumerate() {
+            type_word(session, out, word);
+            last = session
+                .entry_key(ui::ENTRY_OK_KEY, out)
+                .expect("a live entry");
+            assert_ne!(typed(&last), "Unchanged", "word {} would not accept", n + 1);
+        }
+        last
+    }
+
+    /// A device with a real share typed IN and saved, sitting on the `Consolidate`
+    /// prompt. Everything up to the flash write, driven through the public API.
+    fn a_device_ready_to_consolidate<'a>(
+        flash: &'a RefCell<DebugFlash<FakeFlash>>,
+        rng: &mut Entropy,
+        out: &mut Outbox,
+    ) -> (
+        Session<'a, DebugFlash<FakeFlash>>,
+        ShareToTypeIn,
+        DeviceToUserMessage,
+    ) {
+        let secret = identity::load_or_create(&mut *flash.borrow_mut(), rng)
+            .expect("a blank fake flash must yield a fresh identity");
+        let mut session = Session::open(flash, &secret).expect("signer construction");
+        let share = a_share_to_type_in(rng);
+
+        consent_to_an_entry(&mut session, rng, out, 11);
+        type_index(&mut session, out, share.index);
+        let step = type_words(&mut session, out, &share.words);
+        assert_eq!(typed(&step), "Ended", "a real 25-word share must checksum");
+
+        session
+            .recv(save_request(&share), rng, out)
+            .expect("the entered share is there to save");
+        let mut prompts = session
+            .recv(consolidate_request(&share), rng, out)
+            .expect("a saved share is there to consolidate");
+        assert_eq!(prompts.len(), 1, "one consolidate request, one question");
+        (session, share, prompts.pop().expect("checked above"))
+    }
+
+    /// **CONSENT PRECEDES THE INGEST.** `recv` returns the question and grants
+    /// nothing; no key does anything until the digit that screen printed is pressed.
+    ///
+    /// The mirror of `a_backup_is_never_drawn_before_the_digit_is_pressed`, and the
+    /// property that matters most on this flow: a restore puts a secret on the glass
+    /// letter by letter, so a coordinator message must not be able to reach that
+    /// screen on its own.
+    ///
+    /// MUTATION-VERIFY, three ways. Set `self.entry` from `recv_core`'s admitted arm
+    /// — where the `enter_physical_id` first exists, so it is the shape a "just wire
+    /// it up" patch takes — and the pre-confirm asserts fail. Make `entry_key` return
+    /// `Ok(Typed::Unchanged)` instead of refusing when `self.entry` is `None` and the
+    /// key loop fails. Drop the legend from `consent_screen` and the digit half fails:
+    /// the screen asks for a key it never showed.
+    #[test]
+    fn typing_a_backup_in_needs_the_digit_first() {
+        let flash = fs_flash();
+        let mut rng = entropy(109);
+        let secret = identity::load_or_create(&mut *flash.borrow_mut(), &mut rng).unwrap();
+        let mut session = Session::open(&flash, &secret).unwrap();
+        let mut out = Outbox::new(session.device_id());
+
+        let mut prompts = session
+            .recv(enter_request(3), &mut rng, &mut out)
+            .expect("an entry request is admitted");
+        assert_eq!(
+            out.frames(),
+            0,
+            "`recv` must answer NOTHING for an entry request"
+        );
+        assert_eq!(prompts.len(), 1);
+        let prompt = prompts.pop().expect("checked above");
+        assert!(
+            session.signer.staged_mutations().is_empty(),
+            "an entry request staged a mutation"
+        );
+
+        // BEFORE the confirm: no screen to draw, and every live key refuses.
+        assert!(
+            session.entry_screen().is_none(),
+            "an entry began with no consent behind it"
+        );
+        let mut keys = StdVec::from(ui::ENTRY_LETTER_KEYS);
+        keys.extend([ui::ENTRY_PAGE_KEY, ui::ENTRY_OK_KEY, ui::ENTRY_DELETE_KEY]);
+        for key in keys {
+            let fault = refused_key(&mut session, key, &mut out);
+            assert!(
+                matches!(fault, Fault::Refused(Refusal::PhysicalBackup)),
+                "key {key}: got {fault:?}"
+            );
+        }
+
+        // The question is one page, it is the page that authorises, and it prints the
+        // digit — two different digits, two different screens.
+        let (a, b) = two_digits(&mut rng);
+        let draw = |digit: ui::ConfirmDigit| {
+            let mut frame = ui::Frame::new();
+            let shown = prompt_screen_at(&mut frame, &prompt, digit, 0);
+            (shown, frame)
+        };
+        let (shown, first) = draw(a);
+        assert_eq!(shown, Ok(Shown::Page { last: true }));
+        let (again, second) = draw(b);
+        assert_eq!(again, shown);
+        assert!(
+            first.as_bytes() != second.as_bytes(),
+            "the entry consent screen does not print the digit, so no human can read \
+             the key that grants the ingest"
+        );
+
+        // And no page it invented authorises either.
+        for page in [1usize, 2, usize::MAX] {
+            let mut frame = ui::Frame::new();
+            assert_eq!(
+                prompt_screen_at(&mut frame, &prompt, a, page),
+                Ok(Shown::Nothing),
+                "page {page} of a one-page question must draw nothing"
+            );
+            let fault = session
+                .confirm_at(prompt.clone(), page, &mut rng, &mut out)
+                .expect_err("a page that does not draw cannot authorise");
+            assert!(
+                matches!(fault, Fault::NotConfirmable),
+                "page {page}: {fault:?}"
+            );
+            assert!(
+                session.entry_screen().is_none(),
+                "page {page} granted an ingest"
+            );
+        }
+
+        // AFTER the confirm: the share-index page, and still nothing on the wire.
+        session
+            .confirm(prompt, &mut rng, &mut out)
+            .expect("the digit grants the entry");
+        assert_eq!(
+            session.entry_screen(),
+            Some(wordentry::Screen::ShareIndex { typed: None })
+        );
+        assert_eq!(
+            out.frames(),
+            0,
+            "granting an entry must not tell the coordinator a share was entered"
+        );
+    }
+
+    /// **A 24-WORD SET IS NOT A SHARE.** Nothing reaches the coordinator until all 25
+    /// words pass their checksum, and the entry stays alive until they do.
+    ///
+    /// The `wordentry` tests pin the keypress map over all 2,048 words; this pins the
+    /// WIRE, which is the half a dispatch layer can get wrong. A device that acked at
+    /// 24 would have the coordinator close its dialog on a share that does not exist.
+    ///
+    /// MUTATION-VERIFY. Make `wordentry::Entry::word_key`'s accept arm submit at
+    /// `next < ui::BACKUP_WORDS - 1` and this fails on "24 of 25 words was acked".
+    /// Have `entry_key` push the reply for `Step::Redraw` as well and it fails there
+    /// too.
+    #[test]
+    fn a_typed_share_is_acked_only_when_all_twenty_five_words_checksum() {
+        let flash = fs_flash();
+        let mut rng = entropy(113);
+        let secret = identity::load_or_create(&mut *flash.borrow_mut(), &mut rng).unwrap();
+        let mut session = Session::open(&flash, &secret).unwrap();
+        let mut out = Outbox::new(session.device_id());
+        let share = a_share_to_type_in(&mut rng);
+
+        consent_to_an_entry(&mut session, &mut rng, &mut out, 5);
+        type_index(&mut session, &mut out, share.index);
+        let step = type_words(&mut session, &mut out, &share.words[..ui::BACKUP_WORDS - 1]);
+        assert_eq!(typed(&step), "Redraw");
+        assert_eq!(out.frames(), 0, "24 of 25 words was acked");
+        assert!(
+            session.entry_screen().is_some(),
+            "24 accepted words must keep the entry alive"
+        );
+
+        let step = type_words(&mut session, &mut out, &share.words[ui::BACKUP_WORDS - 1..]);
+        match &step {
+            Typed::Ended(prompts) => assert!(
+                prompts.is_empty(),
+                "an entered share produced {} prompt(s)",
+                prompts.len()
+            ),
+            other => panic!("the 25th word did not end the entry: {}", typed(other)),
+        }
+        assert_eq!(out.frames(), 1, "one entered share, one reply");
+        assert!(
+            session.entry_screen().is_none(),
+            "a completed entry must be gone, words and all"
+        );
+        assert!(
+            session.signer.staged_mutations().is_empty(),
+            "entering a share staged a mutation, and it would carry the plaintext"
+        );
+    }
+
+    /// **A FAILED CHECKSUM DISCARDS NOTHING AND ACKS NOTHING.** All 25 words are still
+    /// held, the machine walks back to word 25, and one corrected word finishes the
+    /// share.
+    ///
+    /// A restore that threw away 24 correct words on the 25th would invite trust and
+    /// then lose a share, which is worse than refusing to restore at all. `wordentry`
+    /// pins the state; this pins that the wire stays silent through the failure and
+    /// that the recovery really does complete.
+    ///
+    /// MUTATION-VERIFY. Return `Step::Entered` from `wordentry::Entry::submit`'s `Err`
+    /// arm — the shape of "trust the words, the coordinator will check" — and the
+    /// silence assert fails. Clear the word array on failure and the fix leg fails.
+    #[test]
+    fn a_wrong_word_is_not_acked_and_costs_nothing() {
+        let flash = fs_flash();
+        let mut rng = entropy(127);
+        let secret = identity::load_or_create(&mut *flash.borrow_mut(), &mut rng).unwrap();
+        let mut session = Session::open(&flash, &secret).unwrap();
+        let mut out = Outbox::new(session.device_id());
+        let share = a_share_to_type_in(&mut rng);
+
+        // A different, real BIP39 word in the last slot. The 11-bit words checksum IS
+        // word 25, so exactly one word completes the other 24 and this is not it.
+        let last = share.words[ui::BACKUP_WORDS - 1];
+        let wrong = frost_backup::bip39_words::BIP39_WORDS
+            .iter()
+            .copied()
+            .find(|word| *word != last)
+            .expect("2048 words");
+
+        consent_to_an_entry(&mut session, &mut rng, &mut out, 9);
+        type_index(&mut session, &mut out, share.index);
+        let step = type_words(&mut session, &mut out, &share.words[..ui::BACKUP_WORDS - 1]);
+        assert_eq!(typed(&step), "Redraw");
+        let step = type_words(&mut session, &mut out, &[wrong]);
+        assert_eq!(
+            typed(&step),
+            "Redraw",
+            "a refused checksum is not an ending"
+        );
+        assert_eq!(
+            session.entry_screen(),
+            Some(wordentry::Screen::Failed),
+            "a wrong word must say so"
+        );
+        assert_eq!(
+            out.frames(),
+            0,
+            "a share that failed its checksum was acked"
+        );
+
+        // Any key walks back to word 25 with all 25 still in their slots.
+        let step = session
+            .entry_key(ui::ENTRY_LETTER_KEYS[0], &mut out)
+            .expect("a failed entry is still live");
+        assert_eq!(typed(&step), "Redraw");
+        let Some(wordentry::Screen::Word(showing)) = session.entry_screen() else {
+            panic!("expected the last word page");
+        };
+        assert_eq!(
+            showing.number,
+            ui::BACKUP_WORDS,
+            "walked back to the wrong word"
+        );
+        assert_eq!(
+            showing.partial,
+            wrong.to_uppercase(),
+            "the word was discarded"
+        );
+
+        // Fix exactly that one word: one delete per letter, then the right word.
+        for _ in 0..wrong.len() {
+            let step = session
+                .entry_key(ui::ENTRY_DELETE_KEY, &mut out)
+                .expect("a live entry");
+            assert_eq!(typed(&step), "Redraw", "delete was dead");
+        }
+        let step = type_words(&mut session, &mut out, &[last]);
+        assert_eq!(
+            typed(&step),
+            "Ended",
+            "one corrected word did not finish a share whose other 24 were right"
+        );
+        assert_eq!(out.frames(), 1, "the corrected share was not acked");
+    }
+
+    /// **NO WORD AND NO SCALAR REACHES THE OUTBOX** on any path this flow adds — not
+    /// a word, not the plaintext share, not a `Debug` line.
+    ///
+    /// The whole restore is driven, entry through consolidation, and then the outbox
+    /// is searched for all 25 words in both cases and for the 32-byte scalar in both
+    /// byte orders. The structural version of the claim is stronger and worth stating
+    /// beside it: `wordentry` has no `Outbox` and no `Debug`, and `Session::entry_key`
+    /// consumes `Step::Entered` itself, so the completed `ShareBackup` never crosses
+    /// back to a caller that could log it.
+    ///
+    /// MUTATION-VERIFY. Push the entered words as a `DeviceSendBody::Debug` from
+    /// `entry_key`'s `Entered` arm — the shape a "let the harness see it" patch takes
+    /// — and this fails on the first word.
+    /// `nothing_but_the_outbox_truncating_arm_may_construct_a_debug_send` is the
+    /// second net and catches the same edit textually.
+    #[test]
+    fn no_word_of_a_typed_backup_ever_reaches_the_outbox() {
+        let flash = fs_flash();
+        let mut rng = entropy(131);
+        let mut out = Outbox::new(DeviceId([0u8; 33]));
+        let (mut session, share, prompt) =
+            a_device_ready_to_consolidate(&flash, &mut rng, &mut out);
+        session
+            .confirm(prompt, &mut rng, &mut out)
+            .expect("the digit stores the share");
+
+        let bytes = out.bytes();
+        assert!(!bytes.is_empty(), "the search below must be a search");
+        for (i, word) in share.words.iter().enumerate() {
+            let needle = word.as_bytes();
+            assert!(
+                !bytes.windows(needle.len()).any(|w| w == needle),
+                "word {} ({word:?}) reached the outbox",
+                i + 1
+            );
+            let lower = word.to_lowercase();
+            assert!(
+                !bytes
+                    .windows(lower.len())
+                    .any(|w| w.eq_ignore_ascii_case(lower.as_bytes())),
+                "word {} ({word:?}) reached the outbox in some other case",
+                i + 1
+            );
+        }
+        let mut reversed = share.plaintext;
+        reversed.reverse();
+        for (name, needle) in [("big-endian", share.plaintext), ("byte-reversed", reversed)] {
+            assert!(
+                !bytes.windows(needle.len()).any(|w| w == needle),
+                "the {name} plaintext share scalar reached the outbox"
+            );
+        }
+    }
+
+    /// **PERSIST BEFORE THE ACK**, on the restore path as on the keygen one — and here
+    /// the write is DESTRUCTIVE, because the store keeps one record.
+    ///
+    /// A `FinishedConsolidation` the coordinator hears when the write did not happen
+    /// leaves it believing this device holds a share it does not, and the restore the
+    /// human just spent 25 words on is gone with no sign of it.
+    ///
+    /// Two sessions and not one retry, deliberately: `finish_consolidation` stages the
+    /// triple before `run` sees it, so consenting twice would stage six mutations and
+    /// `body_from` would refuse the pair. A flash that refuses is a broken device and
+    /// the honest behaviour is to stay refused — which is what the first half asserts.
+    ///
+    /// MUTATION-VERIFY. Move `persist_staged` from the top of `Session::run` to after
+    /// the loop and the first half fails on frames: the ack is on the wire and the
+    /// share is not on flash. `a_share_that_cannot_be_written_is_never_acked` is the
+    /// keygen-side twin.
+    #[test]
+    fn consolidation_persists_the_share_before_it_acks() {
+        // A flash that refuses: nothing acked, nothing stored.
+        let flash = fs_flash();
+        let mut rng = entropy(137);
+        let mut out = Outbox::new(DeviceId([0u8; 33]));
+        let (mut session, _share, prompt) =
+            a_device_ready_to_consolidate(&flash, &mut rng, &mut out);
+        let framed = out.frames();
+        flash.borrow_mut().0.refuse_erases_now();
+        let fault = session
+            .confirm(prompt, &mut rng, &mut out)
+            .expect_err("a consolidation that cannot be stored must not be acked");
+        assert!(
+            matches!(fault, Fault::Store(_)),
+            "expected a store fault, got {fault:?}"
+        );
+        assert_eq!(
+            out.frames(),
+            framed,
+            "the coordinator was told a consolidation finished that did not"
+        );
+        flash.borrow_mut().0.heal();
+        assert_eq!(
+            store::ShareStore::open(&flash).load(),
+            store::HeldShare::Vacant
+        );
+
+        // A healthy one: stored, THEN acked, and it survives the reset.
+        let flash = fs_flash();
+        let mut rng = entropy(139);
+        let mut out = Outbox::new(DeviceId([0u8; 33]));
+        let (mut session, share, prompt) =
+            a_device_ready_to_consolidate(&flash, &mut rng, &mut out);
+        let framed = out.frames();
+        session
+            .confirm(prompt, &mut rng, &mut out)
+            .expect("the digit stores the share");
+        assert_eq!(out.frames(), framed + 1, "one consolidation, one ack");
+        assert!(
+            session.signer.staged_mutations().is_empty(),
+            "a committed save must drain the staged set"
+        );
+
+        // The reset. A fresh `Session::open` over the same cells is what the next boot
+        // does, and the restored share must be a REAL hold — an access structure this
+        // device can sign with, not a `needs_consolidation` backup.
+        let secret = identity::load_or_create(&mut *flash.borrow_mut(), &mut rng)
+            .expect("the identity is already there");
+        let after = Session::open(&flash, &secret).expect("signer construction");
+        let held: StdVec<_> = after.signer.held_shares().collect();
+        assert_eq!(held.len(), 1, "a restored share did not survive the reset");
+        assert!(
+            !held[0].needs_consolidation,
+            "the reloaded share still wants consolidating"
+        );
+        assert_eq!(held[0].share_image, share.share_image);
+        assert_eq!(held[0].key_name.as_deref(), Some(RESTORED_KEY_NAME));
+    }
+
+    /// The consolidation question names what is about to be stored and what it will
+    /// destroy, and shows **no word and no scalar** — which matters here more than on
+    /// any other screen, because the `ConsolidatePhase` behind it is the one prompt in
+    /// the tree that carries a PLAINTEXT `SecretShare`.
+    ///
+    /// MUTATION-VERIFY. Print `phase.complete_share.secret_share` on the screen (the
+    /// shape a "show the human what they typed" patch takes) and the word/scalar half
+    /// fails. Drop the "REPLACES stored" line and the destruction half fails: a human
+    /// consents to storing a share without being told it overwrites one.
+    #[test]
+    fn the_consolidate_question_shows_no_secret_and_names_the_destruction() {
+        let flash = fs_flash();
+        let mut rng = entropy(149);
+        let mut out = Outbox::new(DeviceId([0u8; 33]));
+        let (_session, share, prompt) = a_device_ready_to_consolidate(&flash, &mut rng, &mut out);
+
+        let (a, b) = two_digits(&mut rng);
+        let draw = |digit: ui::ConfirmDigit| {
+            let mut frame = ui::Frame::new();
+            let shown = prompt_screen_at(&mut frame, &prompt, digit, 0);
+            (shown, frame)
+        };
+        let (shown, first) = draw(a);
+        assert_eq!(shown, Ok(Shown::Page { last: true }));
+        let text = all_rows(&first, ui::COLS);
+        for (i, word) in share.words.iter().enumerate() {
+            assert!(
+                !text.contains(word) && !text.to_lowercase().contains(&word.to_lowercase()),
+                "word {} ({word:?}) is on the CONSOLIDATE screen. Screen:\n{text}",
+                i + 1
+            );
+        }
+        // It does say which share, under which name, and that storing replaces.
+        assert!(
+            text.contains(RESTORED_KEY_NAME),
+            "the screen must name the key; got:\n{text}"
+        );
+        let mut what = ui::Buf::<16>::new();
+        what.push_str("#").push_u64(share.index as u64);
+        assert!(
+            text.contains(what.as_str()),
+            "the screen must name the share index; got:\n{text}"
+        );
+        assert!(
+            text.contains("REPLACES"),
+            "the screen must say that storing destroys the held share; got:\n{text}"
+        );
+
+        let (again, second) = draw(b);
+        assert_eq!(again, shown);
+        assert!(
+            first.as_bytes() != second.as_bytes(),
+            "the consolidate screen does not print the confirm digit"
+        );
+    }
+
+    /// A coordinator `Cancel` mid-transcription drops the half-typed share.
+    ///
+    /// The reveal grant's rule run backwards: the human consented to type a share into
+    /// THAT ceremony, and `clear_tmp_data` has just dropped the signer's side of it, so
+    /// a surviving entry would be typing words towards an `enter_physical_id` nobody is
+    /// listening for — words that would sit on the glass for whatever comes next.
+    ///
+    /// MUTATION-VERIFY. Drop `self.entry = None` from `recv`'s `Cancel` arm and this
+    /// fails: a cancelled restore keeps taking letters.
+    #[test]
+    fn cancel_drops_a_half_typed_backup() {
+        let flash = fs_flash();
+        let mut rng = entropy(151);
+        let secret = identity::load_or_create(&mut *flash.borrow_mut(), &mut rng).unwrap();
+        let mut session = Session::open(&flash, &secret).unwrap();
+        let mut out = Outbox::new(session.device_id());
+        let share = a_share_to_type_in(&mut rng);
+
+        consent_to_an_entry(&mut session, &mut rng, &mut out, 13);
+        type_index(&mut session, &mut out, share.index);
+        let step = type_words(&mut session, &mut out, &share.words[..3]);
+        assert_eq!(typed(&step), "Redraw");
+
+        session
+            .recv(CoordinatorSendBody::Cancel, &mut rng, &mut out)
+            .expect("Cancel is handled");
+        assert!(
+            session.entry_screen().is_none(),
+            "a cancelled ceremony left a half-typed share on the glass"
+        );
+        let fault = refused_key(&mut session, ui::ENTRY_LETTER_KEYS[0], &mut out);
+        assert!(
+            matches!(fault, Fault::Refused(Refusal::PhysicalBackup)),
+            "got {fault:?}"
+        );
+        assert_eq!(
+            out.frames(),
+            0,
+            "an abandoned entry answered the coordinator"
+        );
+    }
+
+    /// Backing out of the share index ends the entry and sends NOTHING.
+    ///
+    /// Silence is the honest wire behaviour and not a gap: `DeviceRestoration` has no
+    /// message for an abandoned entry, and upstream's coordinator ends the dialog on
+    /// its own `cancel()`. PUNTED UPSTREAM, not worked around.
+    #[test]
+    fn backing_out_of_the_share_index_ends_the_entry_in_silence() {
+        let flash = fs_flash();
+        let mut rng = entropy(157);
+        let secret = identity::load_or_create(&mut *flash.borrow_mut(), &mut rng).unwrap();
+        let mut session = Session::open(&flash, &secret).unwrap();
+        let mut out = Outbox::new(session.device_id());
+
+        consent_to_an_entry(&mut session, &mut rng, &mut out, 17);
+        let step = session
+            .entry_key(ui::ENTRY_DELETE_KEY, &mut out)
+            .expect("a live entry");
+        match &step {
+            Typed::Ended(prompts) => assert!(prompts.is_empty()),
+            other => panic!("delete on an empty index did not abort: {}", typed(other)),
+        }
+        assert!(session.entry_screen().is_none());
+        assert_eq!(
+            out.frames(),
+            0,
+            "an abandoned entry answered the coordinator"
+        );
+    }
+
+    /// **A CONSOLIDATE NAMING A DIFFERENT POLYNOMIAL IS REFUSED**, and the human is
+    /// never asked.
+    ///
+    /// This is the coordinator-hostile case on the restore path: the typed share is
+    /// plaintext in the signer's RAM, and `Consolidate` is the message that decides
+    /// which key it gets encrypted and stored under. A coordinator supplying its own
+    /// `root_shared_key` must not be able to have the device store the share against
+    /// it — nor to get a consent screen for doing so, because a screen is a chance for
+    /// a human to press the wrong key.
+    ///
+    /// Two nets stand behind it and both are upstream's, which is why the useful thing
+    /// to pin is the OUTCOME rather than the mechanism: the `share_image` derived from
+    /// the wrong polynomial misses both backup maps (`device/restoration.rs:129-135`),
+    /// and if it somehow hit, `extract_secret`'s polynomial checksum refuses
+    /// (`:137-147`). Either way it is a `Fault::Signer` with nothing staged, nothing
+    /// drawn and nothing written.
+    ///
+    /// MUTATION-VERIFY: give `recv_core`'s admitted arm a `Consolidate` fast path that
+    /// answers `FinishedConsolidation` without the signer — the shape a "the app is
+    /// waiting" patch takes — and the frames assert fails.
+    #[test]
+    fn a_consolidate_under_a_different_polynomial_is_refused() {
+        let flash = fs_flash();
+        let mut rng = entropy(163);
+        let secret = identity::load_or_create(&mut *flash.borrow_mut(), &mut rng).unwrap();
+        let mut session = Session::open(&flash, &secret).unwrap();
+        let mut out = Outbox::new(session.device_id());
+        let mine = a_share_of_group(&mut rng, 0x3d);
+        let theirs = a_share_of_group(&mut rng, 0x71);
+        assert_ne!(
+            mine.share_image, theirs.share_image,
+            "the two fixtures must be different shares for this test to mean anything"
+        );
+
+        consent_to_an_entry(&mut session, &mut rng, &mut out, 19);
+        type_index(&mut session, &mut out, mine.index);
+        let step = type_words(&mut session, &mut out, &mine.words);
+        assert_eq!(typed(&step), "Ended");
+        let framed = out.frames();
+
+        let fault = session
+            .recv(consolidate_request(&theirs), &mut rng, &mut out)
+            .expect_err("a share we did not enter must not be consolidated");
+        assert!(
+            matches!(fault, Fault::Signer(_)),
+            "expected the signer to refuse, got {fault:?}"
+        );
+        assert_eq!(
+            out.frames(),
+            framed,
+            "a refused consolidation answered the coordinator"
+        );
+        assert!(
+            session.signer.staged_mutations().is_empty(),
+            "a refused consolidation staged a mutation"
+        );
+        assert_eq!(
+            store::ShareStore::open(&flash).load(),
+            store::HeldShare::Vacant,
+            "a refused consolidation reached flash"
+        );
+    }
+
+    /// `SavePhysicalBackup2` produces a `ToUserRestoration::BackupSaved` prompt, which
+    /// is INFORMATIONAL: it has no screen and it answers nothing.
+    ///
+    /// A prompt a coordinator can now cause, so it is worth pinning on the way in
+    /// rather than after someone gives it an arm. `prompt_screen_at` draws
+    /// `Shown::Nothing` for it, which is what makes `confirm_at` refuse — the same
+    /// mechanism that makes a DELETED screen disable consent instead of blinding it.
+    #[test]
+    fn the_backup_saved_prompt_draws_nothing_and_answers_nothing() {
+        let flash = fs_flash();
+        let mut rng = entropy(167);
+        let secret = identity::load_or_create(&mut *flash.borrow_mut(), &mut rng).unwrap();
+        let mut session = Session::open(&flash, &secret).unwrap();
+        let mut out = Outbox::new(session.device_id());
+        let share = a_share_to_type_in(&mut rng);
+
+        consent_to_an_entry(&mut session, &mut rng, &mut out, 23);
+        type_index(&mut session, &mut out, share.index);
+        assert_eq!(
+            typed(&type_words(&mut session, &mut out, &share.words)),
+            "Ended"
+        );
+
+        let mut prompts = session
+            .recv(save_request(&share), &mut rng, &mut out)
+            .expect("the entered share is there to save");
+        assert_eq!(prompts.len(), 1, "one save, one notice");
+        let prompt = prompts.pop().expect("checked above");
+        let digit = ui::ConfirmDigit::draw(&mut rng);
+        let mut frame = ui::Frame::new();
+        assert_eq!(
+            prompt_screen_at(&mut frame, &prompt, digit, 0),
+            Ok(Shown::Nothing),
+            "an informational notice must draw no consent screen"
+        );
+        assert_eq!(
+            frame.as_bytes(),
+            ui::Frame::new().as_bytes(),
+            "the frame was touched"
+        );
+        let fault = session
+            .confirm(prompt, &mut rng, &mut out)
+            .expect_err("an informational notice is not answerable");
+        assert!(matches!(fault, Fault::NotConfirmable), "got {fault:?}");
     }
 
     /// Cancel is handled and silent: it clears half-finished state without

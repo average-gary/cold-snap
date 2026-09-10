@@ -3,7 +3,8 @@
 //! Before this module nothing drained `FrostSigner::staged_mutations()`, so a
 //! finished 9-of-9 keygen died at the next power cycle, `RequestHeldShares`
 //! answered empty forever, and — with `DisplayBackup` and every physical-backup
-//! path refused (`crate::Session::recv_core`) — the share was unrecoverable.
+//! path refused at the time (`crate::Session::recv_core` now admits both) — the
+//! share was unrecoverable.
 //!
 //! # What is stored, and why it is one record
 //!
@@ -351,12 +352,7 @@ impl<'a, F: NorFlash> ShareStore<'a, F> {
     #[must_use]
     pub fn open(flash: &'a RefCell<F>) -> Self {
         Self {
-            slot: AbSlot::new(FlashPartition::new(
-                flash,
-                START_SECTOR,
-                N_SECTORS,
-                "share",
-            )),
+            slot: AbSlot::new(FlashPartition::new(flash, START_SECTOR, N_SECTORS, "share")),
         }
     }
 
@@ -385,16 +381,47 @@ impl<'a, F: NorFlash> ShareStore<'a, F> {
     /// [`StoreFault::Flash`], where the same body can be written again.
     ///
     /// [`StoreFault::NotOneKeygen`] is permanent for the mutations that caused it:
-    /// [`body_from`] accepts only a keygen triple, so a `Mutation::Restoration` —
-    /// which is what `SavePhysicalBackup2` stages
-    /// (`device/restoration.rs:90-97`) — is refused, stays staged, and is refused
-    /// again by every later `Session::run` until a reset drops the signer's RAM
-    /// `VecDeque`. Fail-CLOSED (nothing is written, nothing is acked, no share is
-    /// lost), which is why it ships as is, and the reason lifting the
-    /// `PhysicalBackup` refusal in the dispatch is not a one-line change: it needs
-    /// a body `body_from` accepts first. Pinned by
-    /// `a_non_keygen_mutation_is_refused_and_stays_staged`.
+    /// `body_from` accepts only a keygen triple, so anything else staged alongside
+    /// one is refused, stays staged, and is refused again by every later
+    /// `Session::run` until a reset drops the signer's RAM `VecDeque`. Fail-CLOSED
+    /// (nothing is written, nothing is acked, no share is lost). Pinned by
+    /// `a_partial_or_mismatched_triple_is_refused_and_nothing_is_written`.
+    ///
+    /// # `Mutation::Restoration` is DROPPED, never written — it is PLAINTEXT
+    ///
+    /// The one exception to "refuse what you cannot store", and it is a security
+    /// property rather than a convenience. `RestorationMutation::Save`/`Save2` carry
+    /// a **`ShareBackup`, i.e. a plaintext `SecretShare`** (`share_backup.rs:47-50`,
+    /// `restoration.rs:532-538`), and it is what `SavePhysicalBackup2` stages
+    /// (`device/restoration.rs:90-97`) once a human has typed 25 words in. Nothing in
+    /// this tree has ever put an unencrypted share on internal flash — the keygen
+    /// record holds an `EncryptedSecretShare` and the identity record a scalar behind
+    /// RDP=2 — and this is not the change that starts. `_UnSave` is a documented
+    /// no-op (`:448-451`) and travels with them.
+    ///
+    /// Dropping is not a loss, and that is what makes it the right answer rather than
+    /// a compromise. `apply_mutation` has ALREADY applied the mutation to the
+    /// signer's RAM state before it reaches the staging queue (`device.rs:170-174`:
+    /// `mutate` = `apply_mutation` then `push_back`), so `saved_backups` holds the
+    /// typed share for the rest of the boot and `Consolidate` reads it back out of
+    /// there or out of `tmp_loaded_backups` (`restoration.rs:129-135`). The mutation
+    /// buys only the ability to unplug BETWEEN typing the words and consolidating.
+    /// The restore's durable artefact is the keygen triple `body_from` already
+    /// accepts: `finish_consolidation` (`:410-434`) calls `save_complete_share`,
+    /// which stages `NewKey` + `NewAccessStructure` + `SaveShare` with the share
+    /// ENCRYPTED (`:420-426`) — and `apply_mutation`'s `SaveShare` arm then evicts
+    /// the plaintext from RAM (`device.rs:230-232`).
+    ///
+    /// So restore progress is RAM-only by the same rule the reveal grant follows: a
+    /// reset mid-restore costs re-typing 25 words, never a share. Pinned by
+    /// `a_restoration_mutation_is_dropped_and_its_secret_never_reaches_flash`, which
+    /// asserts on the **bytes on flash** and not on a `Result` — a test that only
+    /// checked the return value would pass a persist that succeeded, which is exactly
+    /// the defect.
     pub fn persist_staged(&self, staged: &mut VecDeque<Mutation>) -> Result<(), StoreFault> {
+        // Before the emptiness check, so a queue holding nothing else comes out
+        // EMPTY and `Ok(())` rather than wedged: see above.
+        staged.retain(|mutation| !matches!(mutation, Mutation::Restoration(_)));
         if staged.is_empty() {
             return Ok(());
         }
@@ -544,7 +571,10 @@ fn unseal(record: &[u8; RECORD_LEN]) -> HeldShare {
     if tag_of(body) != check {
         return HeldShare::Damaged;
     }
-    let len = usize::from(u16::from_le_bytes([record[MAGIC_LEN], record[MAGIC_LEN + 1]]));
+    let len = usize::from(u16::from_le_bytes([
+        record[MAGIC_LEN],
+        record[MAGIC_LEN + 1],
+    ]));
     if !(FIXED_LEN..=BODY_MAX).contains(&len) {
         return HeldShare::Damaged;
     }
@@ -584,13 +614,29 @@ mod tests {
     extern crate std;
 
     use super::*;
+    use alloc::string::String;
     use coldsnap_hal::flash::fake::FakeFlash;
-    use frostsnap_core::device::restoration::RestorationMutation;
+    use embedded_storage::nor_flash::ReadNorFlash;
+    use frostsnap_core::device::restoration::{RestorationMutation, SavedBackup2};
     use frostsnap_core::schnorr_fun::frost::{ShareImage, ShareIndex};
     use frostsnap_core::schnorr_fun::fun::prelude::*;
-    use alloc::string::String;
     use frostsnap_core::{Ciphertext, SymmetricKey};
     use std::vec::Vec as StdVec;
+
+    /// Every cell the fake owns, for a test that must assert on what is NOT there.
+    ///
+    /// The whole device, not just the share partition: a needle search that only
+    /// looked where the record is supposed to go would miss a write that landed
+    /// somewhere else, and "the plaintext is nowhere on this part" is the claim
+    /// worth making.
+    fn all_cells(f: &RefCell<FakeFlash>) -> StdVec<u8> {
+        let mut flash = f.borrow_mut();
+        let mut cells = std::vec![0u8; flash.len()];
+        flash
+            .read(0, &mut cells)
+            .expect("the whole fake is in bounds");
+        cells
+    }
 
     /// A fake at the shipped geometry, sized to cover every claimed region so a
     /// write outside the share partition is out of bounds rather than silent.
@@ -682,7 +728,10 @@ mod tests {
         let mut staged = triple(9, "vault");
         let want = staged.clone();
         ShareStore::open(&f).persist_staged(&mut staged).unwrap();
-        assert!(staged.is_empty(), "a committed save must drain the staged set");
+        assert!(
+            staged.is_empty(),
+            "a committed save must drain the staged set"
+        );
 
         // A fresh store over the same cells is exactly what the next boot does.
         let reloaded = share_of(ShareStore::open(&f).load()).mutations();
@@ -906,39 +955,138 @@ mod tests {
         assert_eq!(store.load(), HeldShare::Vacant);
     }
 
-    /// MUTATION-VERIFY (a wedge that must stay visible, not a repair). `body_from`
-    /// accepts only a keygen triple, so the single `Mutation::Restoration` that
-    /// `SavePhysicalBackup2` stages (`device/restoration.rs:90-97`) is refused,
-    /// stays staged, and is refused again by every later `Session::run` until a
-    /// reset. Fail-closed, so it ships; pinned here so enabling that message can
-    /// never be a one-line dispatch change. Make `persist_staged` clear `staged`
-    /// off the error path and the "not dropped" assert fails; teach `body_from` to
-    /// accept a `Restoration` and the first assert fails.
+    /// A real typed-in backup, and the 32 plaintext bytes that must never be on
+    /// flash.
+    ///
+    /// `generate_shares` is upstream's own generator, so the `ShareBackup` here is
+    /// byte-for-byte what `SavePhysicalBackup2` stages after a human types 25 words.
+    /// `Fingerprint::NONE` rather than the production one: grinding 18 zero bits per
+    /// coefficient is ~262,144 hashes and nothing on this path reads a fingerprint.
+    fn a_typed_backup() -> (frost_backup::ShareBackup, [u8; 32]) {
+        let secret = Scalar::<Secret, NonZero>::from_bytes([0x5cu8; 32])
+            .expect("a fixed non-zero scalar below the order");
+        let (shares, shared_key) = frost_backup::ShareBackup::generate_shares(
+            secret,
+            1,
+            1,
+            frost_backup::Fingerprint::NONE,
+            &mut TestRng(3),
+        );
+        let backup = shares.into_iter().next().expect("one share was asked for");
+        let plaintext = backup
+            .clone()
+            .extract_secret(&shared_key)
+            .expect("the polynomial we generated it from")
+            .share
+            .to_bytes();
+        (backup, plaintext)
+    }
+
+    /// **MUTATION-VERIFY, AND THE ONE THAT IS A SECURITY DEFECT IF IT REGRESSES.**
+    /// A `Mutation::Restoration` is DROPPED — it carries a PLAINTEXT `SecretShare`
+    /// and must never reach flash — and this asserts on the **bytes of every cell
+    /// the fake owns**, not on the `Result`.
+    ///
+    /// That distinction is the whole test. `persist_staged` returns `Ok(())` here,
+    /// so a `Result`-only assertion would pass just as happily if the drop were
+    /// "fixed" into a persist: turn the `retain` into a `body_from` that flattens a
+    /// `Save2` and writes it, and a `Result` test stays green while 32 bytes of
+    /// share sit in `FS_SHARE`. This one fails on the needle. It also fails if the
+    /// mutation is left STAGED (`staged.is_empty()`), which is the pre-existing
+    /// wedge: a stuck `Restoration` made every later keygen in the boot unable to
+    /// persist its own share.
+    ///
+    /// The needle is searched in both byte orders. `Scalar::to_bytes` is
+    /// big-endian and bincode's `Scalar` encoding is not this crate's to promise,
+    /// so a little-endian encoder must not be able to smuggle the same 32 bytes
+    /// past the search.
     #[test]
-    fn a_non_keygen_mutation_is_refused_and_stays_staged() {
+    fn a_restoration_mutation_is_dropped_and_its_secret_never_reaches_flash() {
         let f = flash();
         let store = ShareStore::open(&f);
-        let mut staged = VecDeque::from(std::vec![Mutation::Restoration(
-            RestorationMutation::_UnSave(ShareImage {
-                index: ShareIndex::one(),
-                image: Point::zero(),
-            })
-        )]);
-        assert_eq!(
-            store.persist_staged(&mut staged),
-            Err(StoreFault::NotOneKeygen)
-        );
-        assert_eq!(staged.len(), 1, "a refused mutation must not be dropped");
-        assert_eq!(f.borrow().programs, 0, "a refused mutation reached flash");
+        let (backup, plaintext) = a_typed_backup();
+        let mut reversed = plaintext;
+        reversed.reverse();
 
-        // And it stays wedged: a later legitimate keygen stages three more behind
-        // the stuck one, which is four mutations and still not one record.
-        staged.extend(triple(1, "after"));
+        // Exactly what `SavePhysicalBackup2` stages (`device/restoration.rs:90-97`),
+        // plus the documented no-op that travels with it.
+        let mut staged = VecDeque::from(std::vec![
+            Mutation::Restoration(RestorationMutation::Save2(SavedBackup2 {
+                share_backup: backup.clone(),
+                threshold: Some(2),
+                purpose: Some(KeyPurpose::Test),
+                key_name: Some(String::from("restored")),
+            })),
+            Mutation::Restoration(RestorationMutation::_UnSave(backup.share_image())),
+        ]);
+        assert_eq!(store.persist_staged(&mut staged), Ok(()));
+
+        // THE BYTES, FIRST. Before the program count and before `load`, so that a
+        // "fix" which persists the mutation fails on the needle for the common shape.
+        //
+        // Not for EVERY shape, and the overstatement is worth correcting rather than
+        // leaving: when both staged restoration mutations are written, the second
+        // overwrites the first, so the failure lands one assertion later on
+        // `programs == 0`. Coverage is intact either way — `programs` is total over the
+        // region — but the needle is not always what fires first.
+        let cells = all_cells(&f);
+        for (name, needle) in [("big-endian", plaintext), ("byte-reversed", reversed)] {
+            assert!(
+                !cells.windows(needle.len()).any(|w| w == needle),
+                "the {name} plaintext share scalar is on flash"
+            );
+        }
+
+        assert!(
+            staged.is_empty(),
+            "a dropped mutation must leave the queue empty, or every later keygen \
+             in this boot is refused too"
+        );
         assert_eq!(
-            store.persist_staged(&mut staged),
-            Err(StoreFault::NotOneKeygen)
+            f.borrow().programs,
+            0,
+            "a restoration mutation reached flash"
         );
         assert_eq!(store.load(), HeldShare::Vacant);
+
+        // A legitimate keygen behind a dropped one still persists — the half the
+        // old wedge destroyed.
+        staged.extend(triple(1, "after"));
+        store.persist_staged(&mut staged).unwrap();
+        assert_eq!(
+            &share_of(store.load()).mutations()[..],
+            &StdVec::from(triple(1, "after"))[..]
+        );
+    }
+
+    /// A restoration mutation mixed in FRONT of a keygen triple is dropped without
+    /// taking the triple with it: four staged mutations are not one record, so a
+    /// `retain` placed after the length check would refuse a share the device has
+    /// just finished consolidating.
+    ///
+    /// MUTATION-VERIFY: move the `retain` below the `staged.is_empty()` check and
+    /// this still passes; move it below `body_from` (or delete it) and this fails
+    /// with `NotOneKeygen`.
+    #[test]
+    fn a_restoration_mutation_in_front_of_a_triple_does_not_refuse_the_triple() {
+        let f = flash();
+        let store = ShareStore::open(&f);
+        let (backup, plaintext) = a_typed_backup();
+        let mut staged = VecDeque::from(std::vec![Mutation::Restoration(
+            RestorationMutation::_UnSave(backup.share_image())
+        )]);
+        staged.extend(triple(4, "consolidated"));
+        store.persist_staged(&mut staged).unwrap();
+        assert!(staged.is_empty());
+        assert_eq!(
+            &share_of(store.load()).mutations()[..],
+            &StdVec::from(triple(4, "consolidated"))[..]
+        );
+        let cells = all_cells(&f);
+        assert!(
+            !cells.windows(plaintext.len()).any(|w| w == plaintext),
+            "the plaintext share scalar is on flash"
+        );
     }
 
     /// MUTATION-VERIFY (unbounded name). Remove `truncate_name`'s `nth` cut and
@@ -985,7 +1133,10 @@ mod tests {
     #[test]
     fn the_sealed_record_has_room_to_spare() {
         let record = seal(&body_from(&triple(1, "abcdefghijklmno")).unwrap()).unwrap();
-        let n = usize::from(u16::from_le_bytes([record[MAGIC_LEN], record[MAGIC_LEN + 1]]));
+        let n = usize::from(u16::from_le_bytes([
+            record[MAGIC_LEN],
+            record[MAGIC_LEN + 1],
+        ]));
         std::eprintln!("share body encodes to {n} bytes of {BODY_MAX} (fixed part {FIXED_LEN})");
         // MEASURED, not computed: 127 B of hand-laid fixed fields plus a 133-byte
         // bincode tuple (4-byte KeyPurpose tag, 4-byte AccessStructureKind tag,
@@ -1014,7 +1165,11 @@ mod tests {
             // Re-tag so the length is the only thing wrong.
             let tag = tag_of(&record[..RECORD_LEN - CHECK_LEN]);
             record[RECORD_LEN - CHECK_LEN..].copy_from_slice(&tag);
-            assert_eq!(unseal(&record), HeldShare::Damaged, "len {len} was accepted");
+            assert_eq!(
+                unseal(&record),
+                HeldShare::Damaged,
+                "len {len} was accepted"
+            );
         }
     }
 

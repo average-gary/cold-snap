@@ -1641,9 +1641,84 @@ catalogued on the device side, sitting on the host side of the same protocol.
     whose only available response is `#[allow]` is a permanent hall pass, which is
     exactly what this project forbids. Run them as a survey; keep them out of the list.
 
-    **STILL NOT CLOSED, and it is the larger half.** Linted is not executed. There is no
-    `thumbv7em` runner in this tree, so no assertion in any of those blocks has ever
-    evaluated — that needs QEMU or hardware and is a different piece of work. Nor does a
+    **PARTLY CLOSED 2026-09-09, and the wording above overstated the hole a second time.**
+    "No assertion in any of those blocks has ever evaluated" was false when written. Split
+    the claim in two:
+
+      - **COMPILE-TIME ASSERTIONS: CLOSED, and they were already closed by the gate above.**
+        Every `const _: ()` block in non-test `hal/src` and `firmware/src` (22 on
+        2026-09-09; the count moves with the source, so do not gate on it) is
+        const-evaluated *for `thumbv7em-none-eabihf`, with `usize` = 32 bits*, inside and
+        outside `cfg`-arm blocks alike, because const-eval is not optional in rustc and
+        happens for whatever target is being compiled. Proven by planting
+        `const _: () = assert!(size_of::<usize>() == 8, "PLANTED")`: `--target thumbv7em`
+        gives `error[E0080]: evaluation panicked: PLANTED`, `--target
+        aarch64-apple-darwin` compiles clean. A runner cannot add anything here — a
+        `const` item has no runtime. **Do not build one for this.**
+      - **RUNTIME ASSERTIONS: STILL OPEN, and still the larger half.** Every non-`const`
+        volatile access, every spin-limit countdown, every `Timeout` branch. That needs
+        QEMU or hardware, and see the fidelity ceiling below for how little QEMU buys.
+
+    **A REAL HOLE FOUND WHILE CHECKING THAT, AND CLOSED: the device gate ran `--release`,
+    where const-eval WRAPS.** `overflow-checks = false` does not merely skip a check in
+    const-eval; when the arithmetic sits inside a `const fn` body it silently wraps.
+    Measured three ways: `pub const fn scale(n: usize) -> usize { n * 4 }` called as
+    `scale(0x4000_0000)` returns **0** under `--release`, so `assert!(scale(..) > 0)`
+    fails on its own logic rather than naming the overflow, and
+    `const _: [(); 0] = [(); V]` type-checks and **exits 0**. Under the dev profile the
+    same expression is `error[E0080]: attempt to compute 1073741824_usize * 4_usize, which
+    would overflow`. At 64 bits the product is 4294967296 and no host gate can ever see
+    it. So a `usize` overflow that exists *only at 32 bits* was invisible to all six
+    gates, which is precisely the class this item exists to hunt.
+
+    **Closed by one more gate line, no `--release`** (README "Test"), 4.4 s warm, passing
+    clean today: `cargo clippy --target thumbv7em-none-eabihf -p coldsnap_hal
+    -p coldsnap_firmware`. Proven by a planted probe run on a `git archive HEAD` copy so
+    the working tree was never touched — `pub const fn planted_probe(n: usize) -> usize
+    { n * 100 }` plus `const _: () = assert!(planted_probe(FLASH_SPIN_LIMIT as usize) > 0)`
+    inside `flash.rs`'s existing `cfg`-arm block: the two `--release` lines exit **0** with
+    **0** `hal/src` hits, the new line exits **101** with **2**, `error[E0080] ... attempt
+    to compute 50000000_usize * 100_usize, which would overflow` at `hal/src/flash.rs:876`.
+    With the probe removed both go back to 0/0. The probe must be `pub` and documented, or
+    it trips `dead_code` and the existing gate catches it for the wrong reason — which is
+    how the first attempt at this demonstration was wrong. **No live instance exists in the
+    tree today**; the gate is a trap for the next one.
+
+    **AND A RUNNER WAS DELIBERATELY NOT BUILT.** `tools/qemu-boot.sh` boots the unmodified
+    release ELF under `-machine b-l475e-iot01a` with `-d guest_errors,unimp` and is
+    explicitly a **diagnostic, not a gate** — the image emits no semihosting output, so
+    there is no pass criterion. Its failure paths are what is verified, each demonstrated
+    with a stub `qemu-system-arm`: absent QEMU → 2, empty `.text` → 3, unknown machine → 4,
+    **QEMU exits 0 having printed nothing → 5**, **QEMU itself exits non-zero → 6**, wall
+    clock → 124. Exit 6 and the `timeout 15` on both `-machine help` probes were added
+    2026-09-09 by adversarial re-verification, which found the first cut treating qemu's
+    OWN stderr as a guest trace: a stub printing `Kernel image must be loaded` and exiting
+    1 got **exit 0 and the word OK**, guest never executed — and that is the likeliest real
+    first outcome, since nothing sets SP. A stub that hung on `-machine help` also hung the
+    script past `WALL`, which only ever covered the guest. Two mutations measured in the
+    same pass, on a `git archive HEAD` copy: a 32-bit-only `usize` overflow in a `cfg`-arm
+    block in `rng.rs` (a different file from the one the gate was demonstrated on) is caught
+    by the new dev line and by nothing else — `--release` device clippy exits 0 with 0 hits,
+    dev exits 101 with 2, `attempt to compute 1000000_usize * 4300_usize, which would
+    overflow` at `hal/src/rng.rs:593`. In the same tree, `transaction()` in `display.rs`
+    rewritten to `bsrr_set(CS_PIN)` where it must `bsrr_clear` — `CS` deasserted for the
+    whole transfer, so the panel receives nothing — produced **zero** diagnostics from
+    either line, and would produce none under QEMU either: GPIO writes are accepted and
+    nothing observes the pin. That mutation is the honest ceiling of every tier here.
+    **QEMU is not installed on this machine** (`brew install qemu`, ~1.5 GB). Three findings settled why a `no_std`
+    harness crate was rejected rather than deferred: (a) `cargo test --target thumbv7em`
+    cannot build a single test — `error[E0463]: can't find crate for 'test'`, libtest needs
+    std — so the 474 host tests can never run on ARM; (b) **zero** of the `cfg`-arm blocks
+    in `usb.rs`, `flash.rs`, `keypad.rs`, `display.rs` and `rng.rs` expose a `pub fn`, so a
+    separate crate cannot call any register code, and making them `pub` is the seam
+    `hal/Cargo.toml` calls "the libngu defect of §1 reproduced"; (c) a `no_std` thumbv7em
+    binary whose vector table is neither `#[used]` nor `KEEP`ed links "successfully" to a
+    **zero-byte `.text`** with cargo printing `Finished` — the silent-pass trap, which is
+    why the script asserts on `.text` bytes and on observed output, never on an exit code.
+    Nothing about registers changes at any tier: the callgate, SE1/SE2, the SSD1306, the
+    keypad, OTG_FS, the flash controller and RDP stay **unverified-on-silicon**.
+
+    Nor does a
     lint see a *deleted security property*: the keypad shuffle regression above would
     still pass all six gates today if `shuffle_rows` were replaced by a call to some
     other correctly-typed function. Source-level guards like
@@ -1850,8 +1925,8 @@ catalogued on the device side, sitting on the host side of the same protocol.
 | Rust toolchain | 1.88.0 (upstream pin) + `thumbv7em-none-eabihf` |
 | C cross-compiler | clang 21 (`/opt/homebrew/opt/llvm/bin/clang`) — still required, decision 4 |
 | Decisions record | [DECISIONS.md](DECISIONS.md), dated 2026-08-12 |
-| Flash, as built | 860,898 B = **60.4%** of `FLASH_TEXT`, re-measured in a clean target dir 2026-08-19 (844,229 at phase 0; +5,101 panic sites, +253 for §8.1 defects 10–12, **+15,873 `coldsnap_hal` rlib** — of which +3,461 is phase 3's `comms.rs` + `usb.rs` — less −4,482 instantiations that moved between rlibs; all with LTO off, so upper bounds). **This row read 893,099 B = 62.7% until 2026-08-19**, on the strength of a +32,513 B growth attributed to `comms::decode_body`; that does not reproduce clean and is retracted — see README "Flash budget". The live `./target` glob measures 1,311,110 B = 92.0% from 131 rlibs against a clean 48, which is the artefact to suspect first.  **The linked image is measured, and the rlib sum above overestimates it by ~2.9×:** `firmware/` links at **362,288 B = 25.42%** of `FLASH_TEXT` (`llvm-objdump -h`, 2026-09-08: `.vector_table` 64 + `.text` 304,948 + `.rodata` 57,240 + `.data` 36), because LTO plus `--gc-sections` keeps only what is reachable. `llvm-nm` finds **267** frostsnap/secp/schnorr/bitcoin symbols and **17** `coldsnap_hal::ui` symbols. The trajectory, each step a real caller appearing rather than a code addition: 11,604 B when `boot()` polled USB but touched no `comms` · 94,304 B with `Link::poll` + `decode_body` · 99,684 B with `identity` · 101,416 B once the identity-hold screen gave `ui`/`display` a caller · 282,080 B once a real `FrostSigner` was constructed and dispatched to · 297,064 B once the remaining §4.2 consent screens got honest callers · 331,116 B with the keypad driver and real consent · **362,288 B** once `DisplayBackup`, `mark_sensitive` and the persistent share store landed. Still not the ceiling: `EnterPhysicalBackup`, `SavePhysicalBackup`, `SavePhysicalBackup2`, `Consolidate`, `CheckBackup` and the naming flows are refused rather than implemented (§9), so their code is absent — and a PIN would add the SE1 paths that are currently bound but gc-sectioned out. Read the rlib rows for the MARGINAL cost of a change, never as a prediction of image size. |
-| Host tests passing | **474** (357 before the gap-closing pass; 355 before the signing pipeline; 344 on 2026-08-25 before `FrostSigner`; the firmware gate is now a SUM of two `test result` lines, 11 lib + 14 bin; 341 on 2026-08-24, +40 for `ui.rs`; 268 until 2026-08-24, which never counted `coldsnap_firmware`'s 14; +19 for `identity`; 204 at the phase-2 gate, 253 at the end of phase 3, 261 before §9 item 7(c)'s three outer-leg tests, 264 before the three inner-leg `decode_body` tests, 267 before the pin on the vendored `MAX_MESSAGE_ALLOC_SIZE`; `frostsnap_core` no longer needs an allowlist, `frost_backup` still does — §7) |
+| Flash, as built | 860,898 B = **60.4%** of `FLASH_TEXT`, re-measured in a clean target dir 2026-08-19 (844,229 at phase 0; +5,101 panic sites, +253 for §8.1 defects 10–12, **+15,873 `coldsnap_hal` rlib** — of which +3,461 is phase 3's `comms.rs` + `usb.rs` — less −4,482 instantiations that moved between rlibs; all with LTO off, so upper bounds). **This row read 893,099 B = 62.7% until 2026-08-19**, on the strength of a +32,513 B growth attributed to `comms::decode_body`; that does not reproduce clean and is retracted — see README "Flash budget". The live `./target` glob measures 1,311,110 B = 92.0% from 131 rlibs against a clean 48, which is the artefact to suspect first.  **The linked image is measured, and the rlib sum above overestimates it by ~2.9×:** `firmware/` links at **372,688 B = 26.15%** of `FLASH_TEXT` (`llvm-objdump -h`, 2026-09-10), because LTO plus `--gc-sections` keeps only what is reachable. `llvm-nm` finds **267** frostsnap/secp/schnorr/bitcoin symbols and **17** `coldsnap_hal::ui` symbols. The trajectory, each step a real caller appearing rather than a code addition: 11,604 B when `boot()` polled USB but touched no `comms` · 94,304 B with `Link::poll` + `decode_body` · 99,684 B with `identity` · 101,416 B once the identity-hold screen gave `ui`/`display` a caller · 282,080 B once a real `FrostSigner` was constructed and dispatched to · 297,064 B once the remaining §4.2 consent screens got honest callers · 331,116 B with the keypad driver and real consent · 362,288 B once `DisplayBackup`, `mark_sensitive` and the persistent share store landed · **372,688 B** once 25-word entry made restore possible. Still not the ceiling: `EnterPhysicalBackup`, `SavePhysicalBackup`, `SavePhysicalBackup2`, `Consolidate`, `CheckBackup` and the naming flows are refused rather than implemented (§9), so their code is absent — and a PIN would add the SE1 paths that are currently bound but gc-sectioned out. Read the rlib rows for the MARGINAL cost of a change, never as a prediction of image size. |
+| Host tests passing | **530** (357 before the gap-closing pass; 355 before the signing pipeline; 344 on 2026-08-25 before `FrostSigner`; the firmware gate is now a SUM of two `test result` lines, 11 lib + 14 bin; 341 on 2026-08-24, +40 for `ui.rs`; 268 until 2026-08-24, which never counted `coldsnap_firmware`'s 14; +19 for `identity`; 204 at the phase-2 gate, 253 at the end of phase 3, 261 before §9 item 7(c)'s three outer-leg tests, 264 before the three inner-leg `decode_body` tests, 267 before the pin on the vendored `MAX_MESSAGE_ALLOC_SIZE`; `frostsnap_core` no longer needs an allowlist, `frost_backup` still does — §7) |
 
 Vendored crates live in `vendor/frostsnap/` with upstream commit recorded in
 `vendor/README.md`, which also carries the local-modifications table. Changes are

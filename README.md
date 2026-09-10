@@ -162,8 +162,8 @@ cargo test --target $T -p frostsnap_macros                              #   7
 cargo test --target $T -p frostsnap_embedded --features std             #  17  (15 without std)
 cargo test --target $T -p frostsnap_comms    --features coordinator     #  10
 cargo test --target $T -p frostsnap_core     --features coordinator     #  63
-cargo test --target $T -p coldsnap_hal --features fake-flash,test-seam   # 267
-cargo test --target $T -p coldsnap_firmware                              #  91  (22 lib + 14 bin)
+cargo test --target $T -p coldsnap_hal --features fake-flash,test-seam   # 278
+cargo test --target $T -p coldsnap_firmware                              #  136  (22 lib + 14 bin)
 cargo test --target $T -p frost_backup --lib --test proptest \
   --test specification_tests --test recovery_tests --test error_handling \
   --test checksum_statistics                                            #  19
@@ -238,7 +238,43 @@ cargo doc --release --target thumbv7em-none-eabihf -p coldsnap_hal \
   --features fake-flash,test-seam --no-deps 2>&1 | grep -cE "^warning"          # 0
 ```
 
-Three things about those lines, each of which cost a run to learn:
+A **third** device line, added 2026-09-09. Note the missing `--release` — that is
+the entire point, and it is not a typo:
+
+```sh
+cargo clippy --target thumbv7em-none-eabihf \
+  -p coldsnap_hal -p coldsnap_firmware 2>&1 | grep -cE "hal/src|firmware/src"   # 0
+```
+
+Cost **4.4 s** warm, measured 2026-09-09, and it passes clean today. It is the only
+gate here in which const-eval runs with `overflow-checks` **on**, so it is the only
+one that can see a `usize` overflow that exists only at 32 bits. The release profile
+sets `overflow-checks = false`, and in const-eval that does not merely skip a check —
+**it wraps**, silently, whenever the arithmetic is inside a `const fn` body. Measured
+three ways: a `pub const fn scale(n: usize) -> usize { n * 4 }` called as
+`scale(0x4000_0000)` returns **0** under `--release`, so `assert!(scale(..) > 0)`
+fails on its own logic rather than on the overflow, and `const _: [(); 0] = [(); V]`
+type-checks and **exits 0**. The same expression under the dev profile is
+`error[E0080]: attempt to compute 1073741824_usize * 4_usize, which would overflow`,
+naming the operation. At 64 bits it is 4294967296 and no host gate can ever see it.
+
+**Proven by a planted probe, not by a passing count.** A
+`pub const fn planted_probe(n: usize) -> usize { n * 100 }` plus
+`const _: () = assert!(planted_probe(FLASH_SPIN_LIMIT as usize) > 0)`, inside the
+existing `#[cfg(target_arch = "arm")]` block in `hal/src/flash.rs`, run on a
+throwaway `git archive HEAD` copy so the live tree was never touched:
+
+| gate | exit | `hal/src\|firmware/src` hits |
+| --- | --- | --- |
+| `clippy --release --target thumbv7em` (the two existing lines) | **0** | **0** |
+| `clippy --target thumbv7em` (the new line) | **101** | **2** |
+
+50,000,000 × 100 wraps to 705,032,704, which is `> 0`, so the existing gate is
+clean — the probe must be `pub` and documented for this to be an honest comparison,
+because a private one trips `dead_code` and the existing gate catches that instead,
+for the wrong reason. With the probe removed, both gates go back to 0/0.
+
+Three things about the two `--release` lines, each of which cost a run to learn:
 
 - **No `--all-targets`.** Dev-dependencies (proptest → getrandom) have no
   `thumbv7em` support: 298 errors, mostly `can't find crate for std`. The library
@@ -256,8 +292,121 @@ Three things about those lines, each of which cost a run to learn:
 `cargo build --release` already catches *rustc*-level lints in `cfg`-arm code (a
 planted `[0u8; 4][9]` there fails it on `unconditional_panic`, deny-by-default).
 What it does not catch is anything clippy-only, which is the hole these two close.
-Neither runs the code: there is no `thumbv7em` runner in this tree, so those blocks
-are now LINTED and still never EXECUTED.
+
+**What these three lines do and do not execute.** They do not run any code, but they
+are not purely textual either: every `const _: ()` block and every `const` initialiser
+in `hal/` and `firmware/` is **const-evaluated for `thumbv7em-none-eabihf`, with
+`usize` = 32 bits**, inside and outside `cfg`-arm blocks alike, because const-eval is
+not optional in rustc. Verified by planting
+`const _: () = assert!(size_of::<usize>() == 8)`: `--target thumbv7em` gives
+`error[E0080]`, `--target aarch64-apple-darwin` compiles clean. So the **compile-time**
+half of the `cfg`-arm assertions already runs at the real pointer width; what has never
+run is anything **runtime** — every non-`const` register access, poll and spin limit.
+See PLAN.md §9 item 22 for exactly where that line falls.
+
+### `tools/qemu-boot.sh` — a diagnostic that has now been RUN, and still NOT a gate
+
+```sh
+brew install qemu                       # done here: qemu 11.1.1, 2026-09-09
+tools/qemu-boot.sh                      # bare -kernel on the ELF      -> exit 6
+SHIM=1 tools/qemu-boot.sh               # padded flat image            -> exit 6
+SHIM=1 SP=0x20018000 tools/qemu-boot.sh # + a FAKE stack (see below)   -> exit 124
+# MACHINE / WALL / QEMU / OBJDUMP / OBJCOPY override
+```
+
+Boots on `-machine b-l475e-iot01a` (STM32L4x5 — same family as our L4S5, so RCC and
+GPIO sit at the addresses our code writes) with `-d guest_errors,unimp`, which names
+every unmodelled register access as it happens. Zero new source files, no second linker
+script, and `.cargo/config.toml` is untouched. `SHIM=1` reshapes the image with
+`llvm-objcopy -O binary` **after** the link, never by relinking, so the ELF the signing
+tools consume is unchanged — confirmed by `shasum` before and after, and structurally
+guaranteed because nothing outside `tools/` was touched to add the mode.
+
+It is **not** in the gate list and must not be added to one: it depends on a `brew
+install`, and its result needs reading rather than asserting. The image emits no
+semihosting output, so there is no pass criterion. **Every register result is
+UNVERIFIED-ON-SILICON**, at every tier: QEMU models neither the PCROP bootloader, nor
+SE1/SE2, nor the SSD1306, nor the keypad, nor OTG_FS device mode, nor the flash
+programming controller, nor RDP. Do not use `netduinoplus2`: it models an
+`stm32f2xx_spi` at exactly our SPI1 base `0x4001_3000`, where `CR2.DS` and `SR.FTLVL` do
+not exist, so writes are accepted, `FTLVL` reads 0 and `drain()` returns `Ok` having
+verified nothing.
+
+**What the three modes actually produced, measured 2026-09-09 on qemu 11.1.1.**
+
+*Bare* is exit **6** and that is the correct answer, not a defect: a Cortex-M reads SP
+and PC from the flash base `0x0800_0000` at reset, our vector table is at `0x0802_0000`,
+and the 128 KiB below it is the PCROP bootloader QEMU does not have. The core loads
+`SP=0`, `PC=0` and locks up — `R13=ffffffe0`, `R15=00000000`, zero guest instructions.
+
+*`SHIM=1`* prepends `0x20000` bytes of `0xff` carrying our SP/PC in the first 8, so the
+reset fetch finds **our** table, and it proves exactly one thing: that table is well
+formed and its reset entry is a valid Thumb address in our image. `R13` comes back
+`2009dfe0` — our `0x2009e000` minus a 32-byte exception frame — which is only possible if
+QEMU read our vector table. Then it locks up with **zero instructions retired**:
+
+> `b-l475e-iot01a` is an STM32L475 with **96 KiB** of SRAM1, `0x2000_0000` ..
+> `0x2001_8000`. Our stack top is `0x2009_e000` and our `.bss` ends at `0x2001_8058`.
+> Both are outside the model, so the reset handler's first `push` faults. Probed by
+> bisecting the SP word: `0x2001_8000` runs, and `0x2002_0000` and every value above it
+> lock up after 4 translated instructions. **No available QEMU machine has both flash at
+> `0x0802_0000` and RAM at `0x2009_e000`**, so the unmodified image's bring-up cannot run
+> under any of them.
+
+`init_hardware` therefore does **not** execute under `SHIM=1`, and the callgate is never
+reached — so there is nothing to gain from parking a `bx lr` stub at `0x0800_0040` to get
+past it, and none is provided. `-d in_asm` confirms it: 4 translated instructions, none
+retired, and **zero** `unimp`/`guest error` lines, so nothing touched an unmodelled
+peripheral first either.
+
+*`SP=<addr>`* is **a deliberate lie**, loudly labelled at runtime, and the only setting
+under which any of our instructions retire. It overwrites the shim's stack-top word so
+the stack lands in the RAM this machine does model. At `0x20018000` the guest executes
+the VTOR write, the CPACR write and ~64 KiB of the `.bss` zero loop at real 32-bit width
+with hard-float; the loop then faults at `0x2001_8000`, past the model's SRAM and still
+`0x58` short of our `.bss` top, and **that fault dispatches through the VTOR just
+programmed** into `fault_trampoline`, which panics and `NVIC_SystemReset`s forever
+(exit **124**). The end state is the evidence — VTOR dispatch and the panic path ran on
+real widths — and the exit code deliberately stays **124** rather than becoming a pass,
+because a runner that started calling 124 success would lose the ability to report a real
+hang. It is not our memory map, it cannot produce a pass, and it is evidence about
+nothing else.
+
+The script's failure paths are the part that **is** verified, each demonstrated
+2026-09-09 with a stub `qemu-system-arm`, because a runner that exits 0 because nothing
+ran is the failure mode to rule out first: QEMU absent → **2** (prints the `brew`
+line), image missing or `.text` empty → **3**, machine unknown to the installed QEMU →
+**4**, QEMU exits 0 having printed **nothing** → **5**, QEMU itself exiting non-zero →
+**6**, wall clock exceeded → **124**. All five stub paths were re-run in **both** modes
+after `SHIM=1` was added; the two live paths (**6** bare and shim, **124** with `SP`) were
+re-run against real QEMU.
+
+`SHIM=1` adds four more ways to earn exit **3**, each proved live by mutation rather than
+by inspection: no `.vector_table` section, a `.vector_table` VMA that is not a plausible
+offset into a 1 MiB flash, a reset vector with bit 0 clear (an even PC takes an INVSTATE
+UsageFault before the first instruction and the trace then looks like the interesting
+failures), and a body that did not land at the pad offset. That last one is not
+hypothetical: **BSD `tr` is locale-aware**, so `tr '\0' '\377'` without `LC_ALL=C` emits
+the two UTF-8 bytes `c3 bf`, silently doubling the pad and shifting the entire body off
+its link address. Deleting the `LC_ALL=C` reproduces it, and the assert — the word at
+offset `PAD` must equal the word at offset 0, since both are the vector table's SP —
+catches it and refuses.
+
+**Exit 6 was added 2026-09-09 by adversarial re-verification, and it closes a real
+hole**: the first cut treated *any* non-empty log as "QEMU ran and produced a trace",
+but qemu's own stderr shares that log, so a stub answering `-machine help` and then
+printing `qemu-system-arm: Kernel image must be loaded` and exiting **1** got
+**exit 0 and the word OK** — with the guest never executing one instruction. It has since
+been vindicated: exit 6 is what **both** real modes return, and without it every run of
+this script to date would have printed OK. This image never calls semihosting exit,
+so a run that genuinely executes ends at the wall clock; any other non-zero rc is qemu
+failing. Both `-machine help` probes are now `timeout 15`-bounded as well — a stub that
+hung there hung the whole script past `WALL`, since `WALL` only ever covered the guest.
+The `.text` check is not paranoia: a `no_std` thumbv7em
+binary whose vector table is neither `#[used]` nor `KEEP`ed links "successfully" to a
+**zero-byte** `.text` under `--gc-sections`, and cargo still prints `Finished`.
+`WALL` defaults to 60 s because `FLASH_SPIN_LIMIT` is 50,000,000 volatile reads, which
+under TCG is tens of seconds — set it too low and a working run reads as a hang.
 
 Note `coldsnap_hal` needs `--features fake-flash,test-seam` for its `tests/`
 directory; both are off by default so a test double or an entropy bypass can never
@@ -329,7 +478,7 @@ Current state against Mk4's 1,425,408-byte `FLASH_TEXT`
 
 **Those are rlib sums with LTO off, i.e. upper bounds, and the gap to a real
 linked image is now measured and it is large.** `firmware/` links, and
-`target/thumbv7em-none-eabihf/release/coldsnap_firmware` is **362,288 B = 25.42%**
+`target/thumbv7em-none-eabihf/release/coldsnap_firmware` is **372,688 B = 26.15%**
 flash-resident (`.vector_table` 64 + `.text` 257,272 + `.rodata` 24,712 + `.data`
 32, from `llvm-objdump -h`), measured 2026-08-25 with a real `FrostSigner` linked.
 That is **3.1× smaller** than the

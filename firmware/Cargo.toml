@@ -53,6 +53,31 @@ linked_list_allocator = { version = "=0.10.6", default-features = false }
 frostsnap_core = { workspace = true }
 frostsnap_comms = { workspace = true }
 frostsnap_embedded = { workspace = true }
+# `src/wordentry.rs` — the BIP39 narrowing (`words_with_prefix`,
+# `get_valid_next_letters`, `BIP39_WORDS`) and `ShareBackup::from_words`, i.e. the
+# wordlist a user types a share back in against. `src/lib.rs`'s restore dispatch
+# names `ShareBackup` too. Promoted from `[dev-dependencies]` (where it was
+# TEST ONLY) because production code now names it; `frostsnap_core` does not
+# re-export it.
+#
+# ZERO new crates, ZERO new authors to trust and ZERO flash, all three MEASURED
+# rather than argued:
+#
+# * `cargo tree --target thumbv7em-none-eabihf -p coldsnap_firmware -e normal`
+#   already listed `frost_backup v0.1.0` under `frostsnap_core` BEFORE this line
+#   existed — it is a non-optional dependency there
+#   (`vendor/frostsnap/frostsnap_core/Cargo.toml`) and `device/restoration.rs` uses
+#   `ShareBackup`. With the line, it appears a second time as a direct edge marked
+#   `(*)`, i.e. the same crate node. So this only makes an existing edge NAMEABLE.
+# * Flash: **-4 B**. Moving this one line from `[dev-dependencies]` to here with no
+#   code change at all, on an otherwise untouched tree, took the linked image from
+#   362,176 B to 362,172 B (2026-09-10, ELF `.vector_table + .text + .rodata +
+#   .data`, the same sum PLAN.md §9's flash row uses). A codegen-unit boundary
+#   moving, not a cost. The wordlist blob was already there to be reached.
+#
+# It therefore clears `hal/Cargo.toml`'s "every crate is flash AND another author to
+# trust" bar by spending neither.
+frost_backup = { workspace = true }
 # Reach the curve through `frostsnap_core::schnorr_fun`, so no direct
 # `schnorr_fun`/`secp256kfun` entry can drift to a second version.
 sha2 = { workspace = true }
@@ -60,17 +85,10 @@ rand_core = { workspace = true }
 embedded-storage = { workspace = true }
 
 [dev-dependencies]
-# TEST ONLY, and the reason is specific: `ui::check_word` demanded lowercase while
-# the vendored BIP39 list is uppercase, so `BackupPages::new` refused every share a
-# keygen can produce — and nothing caught it because the gate lives in `coldsnap_hal`
-# (which has no `frost_backup`) and the list lives here. The two halves never met.
-# `every_vendored_bip39_word_is_renderable` is that meeting, so this dependency
-# exists to make a whole class of cross-crate mismatch a test failure.
-#
-# A dev-dependency adds ZERO flash and `resolver = "2"` keeps it out of the release
-# graph, so it does not touch the "every crate is flash and another author to trust"
-# bar that `hal/Cargo.toml` sets for real dependencies.
-frost_backup = { workspace = true }
+# `frost_backup` moved UP to `[dependencies]` — see the justification there. The
+# tests that first needed it (`every_vendored_bip39_word_is_renderable`, the
+# cross-crate meeting of `ui::check_word`'s case rule and the uppercase vendored
+# list) still have it, because a normal dependency is in the dev graph too.
 # The seam and the fake flash reach the lib's HOST tests only. A DEV-dependency
 # is by definition absent from `cargo build --release`, and resolver = "2" does
 # not unify dev features into a non-dev build — the same self-referencing shape

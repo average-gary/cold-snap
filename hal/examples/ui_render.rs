@@ -518,6 +518,17 @@ fn main() {
         ),
     }
 
+    // --- screen 5b: did the human actually write it down? -------------------
+    ui::backup_recorded(&mut f, ConfirmDigit::draw(&mut Counter(0)));
+    out.emit(
+        "5b backup recorded? — the question that CLOSES a reveal",
+        "no word, no phase and no Secrets reach this screen: the answer is a claim \
+         to the coordinator that a backup exists ON PAPER, so the yes is a fresh \
+         randomised digit and never a paging key",
+        "backup-recorded",
+        &f,
+    );
+
     // --- screen 6: backup entry -------------------------------------------
     let entered: Vec<&str> = WORDS[..7].to_vec();
     let entry = EntryPages {
@@ -557,19 +568,155 @@ fn main() {
         &f,
     );
 
+    // --- screen 6, the DEVICE form: the candidate letters ------------------
+    //
+    // `EntryPages` above has no candidate list, so its word page offers no letter
+    // key — a screen a human cannot type on. `WordEntry` is the one that can. The
+    // candidates come from `frost_backup::bip39_words::get_valid_next_letters`
+    // above this seam, UPPERCASE, and are fixtures here.
+    for (label, slug, w) in [
+        (
+            "fresh word, 25 valid first letters (3 pages)",
+            "wordentry-fresh",
+            ui::WordEntry {
+                number: 3,
+                partial: "",
+                previous: Some("ABILITY"),
+                candidates: "ABCDEFGHIJKLMNOPQRSTUVWYZ",
+                page: 0,
+                complete: false,
+            },
+        ),
+        (
+            "same word, page 3 of the letters (S..Z)",
+            "wordentry-page3",
+            ui::WordEntry {
+                number: 3,
+                partial: "",
+                previous: Some("ABILITY"),
+                candidates: "ABCDEFGHIJKLMNOPQRSTUVWYZ",
+                page: 2,
+                complete: false,
+            },
+        ),
+        (
+            "one letter in: 10 candidates, so 2 pages (page 2, the short one)",
+            "wordentry-page2of2",
+            ui::WordEntry {
+                number: 4,
+                partial: "A",
+                previous: Some("ABANDON"),
+                candidates: "BCDGILMNRT",
+                page: 1,
+                complete: false,
+            },
+        ),
+        (
+            "ACT: a word that is ALSO a prefix — (y) live AND letters left",
+            "wordentry-act",
+            ui::WordEntry {
+                number: 3,
+                partial: "ACT",
+                previous: Some("ABILITY"),
+                candidates: "IOR",
+                page: 0,
+                complete: true,
+            },
+        ),
+        (
+            "narrowed to one word: no letters left, (y) is the only way on",
+            "wordentry-done",
+            ui::WordEntry {
+                number: 25,
+                partial: "ABSTRACT",
+                previous: Some("ABSURD"),
+                candidates: "",
+                page: 0,
+                complete: true,
+            },
+        ),
+    ] {
+        w.render(&mut f, &mut Counter(0)).expect("renderable");
+        out.emit(
+            &format!("6 word entry (device form) — {label}"),
+            // Described, not `{w:?}`: `WordEntry` derives Debug and holds the
+            // partial word, so a formatted one is share material in a log line.
+            &format!(
+                "word {} of {BACKUP_WORDS}, {} candidate letters, page {} of {}, \
+                 complete={}. Row 1 is the letter-page indicator (blank when there \
+                 is only one page) and rows 5 and 6 are the ruler and the letters — \
+                 all three noised: the letters are a function of the secret prefix, \
+                 their COUNT is too, and the page total IS that count over nine",
+                w.number,
+                w.candidates.len(),
+                w.page % w.pages() + 1,
+                w.pages(),
+                w.complete
+            ),
+            slug,
+            &f,
+        );
+    }
+
+    match (ui::WordEntry {
+        number: 3,
+        partial: "ACT",
+        previous: Some("ABILITY"),
+        candidates: "ABCDEFGHIJKLMNOPQRSTUVWXYZA",
+        page: 0,
+        complete: true,
+    })
+    .render(&mut f, &mut Counter(0))
+    {
+        Ok(()) => panic!("27 candidate letters accepted"),
+        Err(e) => out.refused(
+            "6 word entry — 27 candidate letters",
+            "MAX_CANDIDATE_LETTERS is the alphabet: a longer list would page to a \
+             page this screen cannot show, i.e. letters with no key",
+            "wordentry-over",
+            &format!("WordEntry::render -> Err(Unrenderable::{e:?})"),
+        ),
+    }
+
     // --- screen 7: backup check quiz --------------------------------------
-    ui::backup_quiz(&mut f, "word 7 was?", ["account", "accuse", "acid"], None);
+    //
+    // The WORD form takes the RNG on the same mandatory terms as the backup
+    // display, because CheckBackup draws all 25 words and the share index — the
+    // same decrypted phase DisplayBackup uses, over 26 screens instead of 8.
+    ui::backup_quiz_word(&mut f, 7, ["account", "accuse", "acid"], &mut Counter(0))
+        .expect("renderable");
     out.emit(
-        "7 backup check quiz — nothing selected",
-        "question \"word 7 was?\", options [account, accuse, acid], selected None",
+        "7 backup check quiz — the WORD question (all three rows noised)",
+        "word 7, options [account, accuse, acid]. The distractors must be drawn \
+         UNIFORMLY from rng::Entropy: upstream's nearest-neighbour rule is a pure \
+         function of the answer and identifies it for 1,288 of 2,048 words",
+        "quiz-word",
+        &f,
+    );
+    ui::backup_quiz(&mut f, "index was?", ["1", "2", "3"], None);
+    out.emit(
+        "7 backup check quiz — the SHARE-INDEX question, nothing selected",
+        "options [1, 2, 3], selected None. No noise and no RNG: an index is not the \
+         secret, it is what makes the secret restorable. Draw the three uniformly \
+         from 1..=n — upstream's correct-1/correct/correct+1 leaves the true index \
+         the median of three consecutive integers, every time",
         "quiz-none",
         &f,
     );
-    ui::backup_quiz(&mut f, "word 7 was?", ["account", "accuse", "acid"], Some(1));
+    ui::backup_quiz(&mut f, "index was?", ["1", "2", "3"], Some(1));
     out.emit(
         "7 backup check quiz — option 2 selected (inverse video)",
         "same, selected Some(1)",
         "quiz-selected",
+        &f,
+    );
+    ui::backup_quiz(&mut f, "word 7 was?", ["account", "accuse", "acid"], None);
+    out.emit(
+        "7 backup check quiz — a WORD handed to the RNG-free form is MASKED",
+        "same options as the word screen above. This form cannot noise a row \
+         because it has no RNG, so it redacts rather than drawing an unprotected \
+         word; the mask is fixed width, so it does not leak the length either",
+        "quiz-masked",
         &f,
     );
 
