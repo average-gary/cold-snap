@@ -1593,7 +1593,10 @@ catalogued on the device side, sitting on the host side of the same protocol.
     not evidence**, and a green report from an agent whose gates never compiled the file
     is worth nothing — check the counts, not the claim.
 
-22. **152 `cfg(target_arch = "arm")` blocks were invisible to every LINT in this project.
+22. **169 `cfg(target_arch = "arm")` blocks were invisible to every LINT in this project.
+    (This heading read 152 until 2026-09-08; the re-count is in the body below, and the
+    miss was `entry.rs`, which no earlier pass had listed and therefore no earlier pass
+    had read.)
     Now they are linted; they are still never executed.** Measured 2026-09-02:
     keypad 8, display 8, usb 85, flash 20, panic 13, rng 6, callgate 5,
     firmware/src/main.rs 7. Every test, clippy and rustdoc command here runs
@@ -1633,12 +1636,14 @@ catalogued on the device side, sitting on the host side of the same protocol.
     it fails with 298 errors. Cost, measured not estimated: 8 s cold, 2.4 s incremental,
     0.22 s warm — the cheapest gate here.
 
-    **The 152 is a snapshot, not a bound, and it has already moved:** a recount on
-    2026-09-08 finds **169** (usb 85, flash 20, panic 13, callgate 11, firmware/src/main.rs
-    10, keypad 8, display 8, rng 6, firmware/src/entry.rs 4, firmware/src/lib.rs 2,
-    hal/src/lib.rs 1, ui.rs 1 — the first recount of this listed only 164 because it
-    missed `entry.rs` and `hal/src/lib.rs` entirely). Do not chase the
-    number — the gate is a whole-target compile, so it covers however many there are.
+    **The count is a snapshot, not a bound, and it has moved twice:** 152 → **169** on
+    2026-09-08 (the first recount said 164, missing `entry.rs` and `hal/src/lib.rs`
+    entirely) → **181** on 2026-09-10: usb 88, flash 22, main.rs 15, panic 13, callgate
+    11, keypad 8, display 8, rng 6, `firmware/src/lib.rs` 4, `firmware/src/entry.rs` 4,
+    `hal/src/lib.rs` 1, `ui.rs` 1. Do not chase the number — the gate is a whole-target
+    compile, so it covers however many there are. **`firmware/src/quiz.rs` contributes
+    0**, which is not an accident: a pure module is exhaustively host-testable, and a
+    `cfg` in one would put a security property where no host test can reach it.
 
     The gate bites where the four existing ones do not, proven by mutation:
     `ROW_SETTLE_SPINS as u32 + 0` in the same `cfg`-arm block left host tests at 261,
@@ -1926,7 +1931,7 @@ catalogued on the device side, sitting on the host side of the same protocol.
     needs an eye on screen 005 of `cargo run -p coldsnap_hal --example ui_render`,
     then a bench confirmation. The 16-vs-18 column point above stands unchanged.
 
-16. **The UI is now partly linked; seven of the eight screens still are not.**
+16. **CLOSED 2026-09-10 — the UI is fully linked; all eight screens have callers.**
     Until 2026-08-25 `boot()` referenced neither `ui` nor `display`, so
     `--gc-sections` dropped both entirely: **0** symbols, and the image was
     byte-identical at 99,684 B before and after ~3,000 lines of UI — the same trap
