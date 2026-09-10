@@ -162,8 +162,8 @@ cargo test --target $T -p frostsnap_macros                              #   7
 cargo test --target $T -p frostsnap_embedded --features std             #  17  (15 without std)
 cargo test --target $T -p frostsnap_comms    --features coordinator     #  10
 cargo test --target $T -p frostsnap_core     --features coordinator     #  63
-cargo test --target $T -p coldsnap_hal --features fake-flash,test-seam   # 278
-cargo test --target $T -p coldsnap_firmware                              #  136  (22 lib + 14 bin)
+cargo test --target $T -p coldsnap_hal --features fake-flash,test-seam   # 284  (267 lib + 5 + 12)
+cargo test --target $T -p coldsnap_firmware                              # 165  (114 lib + 51 bin)
 cargo test --target $T -p frost_backup --lib --test proptest \
   --test specification_tests --test recovery_tests --test error_handling \
   --test checksum_statistics                                            #  19
@@ -478,30 +478,40 @@ Current state against Mk4's 1,425,408-byte `FLASH_TEXT`
 
 **Those are rlib sums with LTO off, i.e. upper bounds, and the gap to a real
 linked image is now measured and it is large.** `firmware/` links, and
-`target/thumbv7em-none-eabihf/release/coldsnap_firmware` is **372,688 B = 26.15%**
-flash-resident (`.vector_table` 64 + `.text` 257,272 + `.rodata` 24,712 + `.data`
-32, from `llvm-objdump -h`), measured 2026-08-25 with a real `FrostSigner` linked.
-That is **3.1× smaller** than the
+`target/thumbv7em-none-eabihf/release/coldsnap_firmware` is **376,752 B = 26.43%**
+flash-resident (`.vector_table` 64 + `.text` 318,640 + `.rodata` 58,012 + `.data`
+36, from `objdump -h`), re-measured 2026-09-10 with a real `FrostSigner`, 25-word
+entry and the `CheckBackup` quiz all linked. That is **2.3× smaller** than the
 rlib estimate, because LTO plus `--gc-sections` drops everything unreferenced.
+`.bss` is `0x2000_8034..0x2001_8058`.
 
-It is a **floor, not the budget**, and the reason is specific: nothing in `boot()`
-constructs a `FrostSigner`, so keygen and signing are not referenced and the EC
-math is only partly pulled in (`llvm-nm` finds 37 frostsnap/secp/schnorr symbols
-and exactly **1** `rust-bitcoin` symbol against `rust-bitcoin`'s 23.0% rlib row).
-The trajectory so far: 11,604 B with `boot()` polling USB but never touching
+**Read the components, not just the headline.** Until 2026-09-10 this paragraph
+carried a `372,688 B` headline over a breakdown that summed to `282,080` and a
+following sentence claiming "nothing in `boot()` constructs a `FrostSigner`" — an
+image and a claim several steps stale, because the headline was updated in place
+and the prose beneath it was not. Every figure here is now re-measured together.
+
+It remains a **floor, not the budget**, but the margin is much smaller than it was
+and the reason has changed: `boot()` now constructs a real `FrostSigner`, so the EC
+math *is* linked — `llvm-nm` finds **267** frostsnap/secp/schnorr/bitcoin symbols
+and **17** `coldsnap_hal::ui` symbols. What is still absent is refused, not
+unreferenced (see PLAN.md §9). The trajectory, each step a real caller appearing
+rather than a code addition: 11,604 B with `boot()` polling USB but never touching
 `comms` — at which point `--gc-sections` had dropped the entire workload and the
 figure was bring-up overhead only — then 94,304 B once `comms::Link::poll` and
-`decode_body` were wired in, then 99,684 B with `identity`, then **101,416 B** once
-the identity-hold screen gave `ui`/`display` a caller (`+1,732 B`, of which
-`.rodata` `+924 B` is the measured font-table cost). Seven of the eight screens are
-still dropped because nothing calls them yet, then **282,080 B** once `boot()`
-constructed a real `FrostSigner` and dispatched to it — a 2.78× jump, with
-`rust-bitcoin` going **1 → 14** symbols and the frostsnap/secp/schnorr/bitcoin total
-reaching **205**. Deleting the single `session.recv` call drops `.text` by 142,916 B
-and `bitcoin` back to 1, which is how we know `boot()` is what pulls the workload in
-rather than `--gc-sections` keeping it by accident. Still a floor, but a much
-smaller-margin one: what remains unlinked is only the UI screens no dispatch arm
-reaches yet.
+`decode_body` were wired in · 99,684 B with `identity` · **101,416 B** once the
+identity-hold screen gave `ui`/`display` a caller (`+1,732 B`, of which `.rodata`
+`+924 B` is the measured font-table cost) · **282,080 B** once `boot()` constructed
+a real `FrostSigner` and dispatched to it — a 2.78× jump, with `rust-bitcoin` going
+**1 → 14** symbols. Deleting the single `session.recv` call drops `.text` by
+142,916 B and `bitcoin` back to 1, which is how we know `boot()` is what pulls the
+workload in rather than `--gc-sections` keeping it by accident · 297,064 B once the
+remaining §4.2 consent screens got honest callers · 331,116 B with the keypad
+driver and real consent · 362,288 B once `DisplayBackup`, `mark_sensitive` and the
+persistent share store landed · 372,688 B once 25-word entry made restore possible
+· **376,752 B** once `CheckBackup` became a real 8-question quiz behind its own
+consent digit (+4,064 B, of which +2,232 B is `firmware/src/quiz.rs` acquiring its
+first caller rather than any new code).
 
 That is **+16,669 (+1.2 pt) over the 844,229 phase-0 baseline**: +5,101 for the
 first round of panic-site work in the vendored crates, +15,873 for the

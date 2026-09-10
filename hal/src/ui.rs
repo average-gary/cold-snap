@@ -2450,6 +2450,23 @@ impl WordEntry<'_> {
 pub const QUIZ_KEYS: [u8; 3] = *b"123";
 /// `(x)no` — the quiz's decline. Parenthesised for [`NEXT_LEGEND`]'s reason.
 const QUIZ_REFUSE_LEGEND: &str = "(x)no";
+/// `(x)done` — dismiss the passed-quiz screen. The same key that leaves every
+/// other screen here, and parenthesised for [`NEXT_LEGEND`]'s reason: a passed
+/// quiz authorises nothing, so its footer must not read as a consent legend to
+/// `firmware/examples/stub.rs`'s `advertised_key`.
+const QUIZ_DONE_LEGEND: &str = "(x)done";
+/// The banner a **re-asked** position carries, in inverse video.
+///
+/// It says the ANSWER was wrong and says nothing whatever about the backup, which
+/// is the whole point of the wording: at this moment the share is almost certainly
+/// intact and the human almost certainly mis-tapped, and a device that answers a
+/// fat finger with "BACKUP CHECK FAILED" teaches a user to re-run a keygen they did
+/// not need to re-run. Coldcard's is `Wrong!` (`shared/seed.py:887`) and
+/// Frostsnap's is a per-button `FeedbackKind::Wrong`
+/// (`frostsnap_widgets/src/backup/check_backup.rs:28`); neither says anything about
+/// the backup either, and neither reports the miss to anybody — see
+/// [`backup_quiz_word`].
+const QUIZ_RETRY: &str = "No - try again";
 /// What [`backup_quiz`] prints in place of an option that is a WORD. Fixed width,
 /// so it does not leak the length it is hiding (word length alone is 2.3355 bits —
 /// see [`Frame::mark_sensitive`]).
@@ -2459,6 +2476,27 @@ const _: () = {
     assert!(
         QUIZ_REFUSE_LEGEND.as_bytes()[1] == crate::keypad::KEY_CANCEL,
         "the quiz refuse legend must name the pad's CANCEL"
+    );
+    // Same rule for the second legend this screen family prints. `5=next` shipped
+    // once because the assert covered one legend and not the other.
+    assert!(
+        QUIZ_DONE_LEGEND.as_bytes()[1] == crate::keypad::KEY_CANCEL,
+        "the quiz done legend must name the pad's CANCEL"
+    );
+    assert!(
+        QUIZ_RETRY.len() <= COLS,
+        "the quiz retry banner does not fit one row"
+    );
+    // The progress figures are two digits each, which is what the footer width
+    // below assumes; `total` is bounded by BACKUP_WORDS at the top of the render.
+    assert!(
+        BACKUP_WORDS < 100,
+        "a three-digit quiz total would not fit the footer beside its legend"
+    );
+    // The widest footer this screen can build: `pg 25/25` + a space + `(x)no`.
+    assert!(
+        "pg NN/NN ".len() + QUIZ_REFUSE_LEGEND.len() <= COLS,
+        "the quiz progress and its legend do not fit one row"
     );
     // An answer key that also turns a page, accepts, or declines would make
     // answering the quiz and leaving it the same press.
@@ -2484,19 +2522,68 @@ const _: () = {
     );
 };
 
+/// Which question the check quiz is asking, and whether it is asking it again.
+///
+/// # No word is in here, and that is structural
+///
+/// The three options stay a separate argument to [`backup_quiz_word`], so the type
+/// that derives `Debug` — the one a future `defmt` line or a `{:?}` in a panic
+/// message would reach for — holds only positions and counts. A word position is
+/// not the secret (it is why the header row of the question screen is not noised);
+/// the word at it is, and it is not here.
+///
+/// # Four fields and not four arguments
+///
+/// `number`, `asked` and `total` are three `usize`s that a positional call would let
+/// a caller transpose silently: `pg 8/3` and a quiz that asks word 3 twenty-five
+/// times are both a build that compiles. Named fields make the transposition
+/// visible at the call site, the same reason [`WordEntry`] is a struct.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct QuizWord {
+    /// Which backup word is being asked about: 1-based, 1..=[`BACKUP_WORDS`].
+    /// Anything else is a refusal.
+    pub number: usize,
+    /// Which question of the quiz this is, **0-based** like [`SignPages`]' page
+    /// index. Drawn as `asked + 1`, and must be less than `total`.
+    pub asked: usize,
+    /// How many questions the whole quiz asks, 1..=[`BACKUP_WORDS`].
+    ///
+    /// **Not** [`BACKUP_WORDS`] in general: both references quiz a subset (Coldcard
+    /// a third of the words, `shared/backups.py:442`), and the user cannot infer
+    /// how many that is, which is what makes drawing this number worth a row.
+    pub total: usize,
+    /// The previous answer at this position was wrong and this is the re-ask.
+    ///
+    /// The caller re-draws the options when it sets this — Coldcard reshuffles its
+    /// three (`shared/seed.py:866`) — because a re-ask that keeps the same three in
+    /// the same slots turns the second guess into a 1-in-2.
+    pub retry: bool,
+}
+
 /// Screen 7: the check quiz's **word** question — the true word among three, on
 /// the [`QUIZ_KEYS`].
 ///
-/// # This screen carries the WHOLE share, and it is not the cheap one
+/// # This screen carries real share words — fewer than a reveal, but reveal-class
 ///
-/// `CheckBackup` renders the true word among three for the share index and for all
-/// 25 words (`frostsnap_widgets/src/backup/check_backup.rs:19` `TOTAL_SCREENS =
-/// 26`), from the same `BackupDisplayPhase` `DisplayBackup` decrypts. So the
-/// exposure is [`BackupPages`]'s, not less: 26 renders instead of 8, every one of
-/// them with a real word on it. It therefore takes the RNG on the same
-/// **mandatory** terms and noises every option row, and the caller must have
-/// obtained consent on the digit before the first one is drawn — a quiz that shows
-/// words and then asks has already leaked them.
+/// Every row here is share-bearing: one option is the true word at the position
+/// being asked, and a second is a real word from elsewhere in the same share. Only
+/// the third is drawn from the whole 2,048. So a clean pass puts up to
+/// `2 * QUIZ_POSITIONS` = **16 of the 25 words** on the glass across 8 renders,
+/// against [`BackupPages`]'s 25 words over 7 — less material, no positional
+/// certainty, and 17 positions never shown, but the same *class* of secret.
+///
+/// It therefore takes the RNG on the same **mandatory** terms and noises every
+/// option row, and the caller must have obtained consent on the digit before the
+/// first one is drawn — a quiz that shows words and then asks has already leaked
+/// them.
+///
+/// Upstream's widget is the expensive shape this deliberately is not:
+/// `frostsnap_widgets/src/backup/check_backup.rs:19` `TOTAL_SCREENS = 26` asks
+/// every position plus the share index, from the same `BackupDisplayPhase`
+/// `DisplayBackup` decrypts, which is [`BackupPages`]'s exposure and then some. The
+/// protocol fixes the phase, not the rendering, so subsetting is ours to choose.
+/// This doc claimed the 26-render figure applied here until 2026-09-10; it never
+/// did, and the mistake read as a reason to refuse the screen outright.
 ///
 /// # The distractors are the caller's problem, and upstream's are broken
 ///
@@ -2518,15 +2605,51 @@ const _: () = {
 /// move, and a cursor plus a confirm would be two presses where the pad affords
 /// one. And nothing here blanks, for the reveal's reason — see [`WordEntry`].
 ///
-/// Refuses (`Unrenderable::BadWordList`) a word number outside 1..=25 or any option
-/// that is not BIP39-shaped, before touching the frame.
+/// # A wrong answer is re-asked HERE, and reported to nobody
+///
+/// [`QuizWord::retry`] draws the banner and the *same position* is asked again with
+/// freshly drawn options. That is both references' behaviour and not a compromise
+/// between them: Coldcard's `while 1:` reshuffles the three and asks the same index
+/// again after `Wrong!` (`shared/seed.py:865-887`) and Frostsnap keeps the quiz page
+/// up, marks the tapped button and clears the mark on the next tap
+/// (`frostsnap_widgets/src/backup/check_backup.rs:592-600`). So there is
+///
+/// * **no lockout** — the quiz is a "did you write it down correctly" checklist, not
+///   access control. It cannot be access control: `DisplayBackup` hands the same
+///   holder all 25 words for one confirm digit, so a 1-in-3 guess here is nowhere
+///   near the weak link, and
+/// * **no failure message** — `DeviceToUserMessage::Restoration(CheckBackup{..})`
+///   carries a `BackupDisplayPhase` and has no failure counterpart
+///   (`frostsnap_core/src/device/restoration.rs:265-323`); upstream's `feedback` is
+///   local UI state. Nothing about a miss reaches the coordinator, so nothing here
+///   pretends it does.
+///
+/// # What it deliberately does not offer: the words again
+///
+/// Coldcard's quiz answers `y` by re-showing the whole seed
+/// (`shared/seed.py:877-879`, `show_words(words)`). Not here. That would be a second full-reveal path
+/// reachable from a screen whose consent was obtained for a *quiz*, i.e. a reveal
+/// with weaker consent than [`BackupPages`] — which is exactly the ordering error
+/// this module refuses everywhere else. A user who needs to re-read the share asks
+/// the coordinator for `DisplayBackup`, which has its own consent gate and its own
+/// [`backup_recorded`] claim at the end of it. Fail-closed costs one round trip.
+///
+/// Refuses (`Unrenderable::BadWordList`) a word number outside 1..=25, a progress
+/// pair that cannot be true, or any option that is not BIP39-shaped — before
+/// touching the frame.
 pub fn backup_quiz_word(
     frame: &mut Frame,
-    number: usize,
+    q: QuizWord,
     options: [&str; 3],
     rng: &mut impl rand_core::RngCore,
 ) -> Result<(), Unrenderable> {
-    if !(1..=BACKUP_WORDS).contains(&number) {
+    if !(1..=BACKUP_WORDS).contains(&q.number) || !(1..=BACKUP_WORDS).contains(&q.total) {
+        return Err(Unrenderable::BadWordList);
+    }
+    // `asked` is 0-based, so the last question is `total - 1`. `asked == total`
+    // would draw `pg 9/8`: a progress indicator that lies in the direction of "you
+    // are finished", which is the one direction it must not lie in.
+    if q.asked >= q.total {
         return Err(Unrenderable::BadWordList);
     }
     for opt in options {
@@ -2535,9 +2658,16 @@ pub fn backup_quiz_word(
     frame.clear();
     let mut head = Buf::<16>::new();
     head.push_str("word ")
-        .push_u64(number as u64)
+        .push_u64(q.number as u64)
         .push_str(" was?");
     frame.text(0, 0, head.as_str());
+    // Un-noised, and on its own row above the options rather than replacing the
+    // question: which position was missed is the human's own key press, not share
+    // material, and the question has to stay legible because the next press answers
+    // it. Inverse video so it cannot be read past.
+    if q.retry {
+        frame.text_inverted(0, 1, QUIZ_RETRY);
+    }
     for (i, opt) in options.iter().enumerate() {
         let mut b = Buf::<SENSITIVE_TEXT_CELLS>::new();
         b.push(*QUIZ_KEYS.get(i).unwrap_or(&b'?'))
@@ -2545,7 +2675,57 @@ pub fn backup_quiz_word(
             .push_str(opt);
         sensitive_row(frame, 2 + i * 2, b.as_str(), rng);
     }
-    frame.text(0, FOOTER_ROW, QUIZ_REFUSE_LEGEND);
+    // `page_of`, the same `pg 3/8` the sign pages use, for the same reason they use
+    // it: a quiz that says nothing about position is a quiz a user cannot tell is
+    // nearly over, and 8 of 25 identical-looking screens is where someone starts
+    // guessing to make it stop. Upstream draws the same fact as a bar
+    // (`check_backup.rs:317-324`, `ProgressBars::new(total).progress(screen_idx)`);
+    // one row of text is that in 16 columns.
+    let mut footer = page_of(q.asked, q.total);
+    footer.push_str(" ").push_str(QUIZ_REFUSE_LEGEND);
+    frame.text(0, FOOTER_ROW, footer.as_str());
+    Ok(())
+}
+
+/// Screen 7's last frame: every question answered correctly.
+///
+/// # It claims what was CHECKED, not that the backup is good
+///
+/// Both references quiz a **subset** — Coldcard a third of the words
+/// (`shared/backups.py:442` `limited=num_pw_words//3`) — so `checked` is normally
+/// well under [`BACKUP_WORDS`] and "Backup verified" would be a claim about 17 words
+/// nobody looked at. The number and the rest-were-not-checked line are the honest
+/// form of the same screen, and they are the reason this takes `checked` at all
+/// instead of being a static frame.
+///
+/// # It cannot leak a word, structurally
+///
+/// No `&str` parameter and no RNG: like [`backup_recorded`], this frame is composed
+/// after the words are off the glass, and there is nothing on it to noise because a
+/// share cannot be passed to it. It is also why this one is a pure function of a
+/// `usize` while the question screen is not.
+///
+/// Refuses (`Unrenderable::BadWordList`) a count outside 1..=[`BACKUP_WORDS`]: "0 of
+/// 25 words matched" under a *passed* header is a false assurance, and 26 is a
+/// count that cannot have happened.
+pub fn backup_quiz_passed(frame: &mut Frame, checked: usize) -> Result<(), Unrenderable> {
+    if !(1..=BACKUP_WORDS).contains(&checked) {
+        return Err(Unrenderable::BadWordList);
+    }
+    frame.clear();
+    frame.text(0, 0, "Quiz passed");
+    let mut b = Buf::<16>::new();
+    b.push_u64(checked as u64)
+        .push_str(" of ")
+        .push_u64(BACKUP_WORDS as u64)
+        .push_str(" words");
+    frame.text(0, 2, b.as_str());
+    frame.text(0, 3, "matched.");
+    if checked < BACKUP_WORDS {
+        frame.text(0, 5, "The rest were");
+        frame.text(0, 6, "not checked.");
+    }
+    frame.text(0, FOOTER_ROW, QUIZ_DONE_LEGEND);
     Ok(())
 }
 
@@ -4603,6 +4783,18 @@ mod tests {
         assert!(t.contains("1) 7") && t.contains("2) 8") && t.contains("3) 9x"), "{t}");
     }
 
+    /// The ordinary first ask of word `number`, mid-quiz: question 3 of 8, the
+    /// Coldcard-shaped subset (`limited=25/3`). The fields the test is about get set
+    /// by the test.
+    fn question(number: usize) -> QuizWord {
+        QuizWord {
+            number,
+            asked: 2,
+            total: 8,
+            retry: false,
+        }
+    }
+
     /// Every option row of the WORD quiz is noised, all three of them, and the
     /// words stay readable inside the reserved budget.
     ///
@@ -4614,7 +4806,7 @@ mod tests {
     fn the_word_quiz_noises_every_option_row_and_keeps_the_words_readable() {
         let options = ["absorb", "absurd", "abstract"];
         let mut f = Frame::new();
-        backup_quiz_word(&mut f, 7, options, &mut Counter(0)).unwrap();
+        backup_quiz_word(&mut f, question(7), options, &mut Counter(0)).unwrap();
         assert_eq!(row_text(&f, 0), "word 7 was?");
         for (i, w) in options.iter().enumerate() {
             let row = 2 + i * 2;
@@ -4631,11 +4823,11 @@ mod tests {
                 );
             }
         }
-        assert_eq!(row_text(&f, FOOTER_ROW), QUIZ_REFUSE_LEGEND);
+        assert!(row_text(&f, FOOTER_ROW).ends_with(QUIZ_REFUSE_LEGEND));
         // Two renders differ ONLY in the noise columns — the same property
         // `BackupPages` has, and the reason this screen is not a pure function.
         let mut g = Frame::new();
-        backup_quiz_word(&mut g, 7, options, &mut Counter(99)).unwrap();
+        backup_quiz_word(&mut g, question(7), options, &mut Counter(99)).unwrap();
         for i in 0..3 {
             assert_eq!(noised_row_text(&f, 2 + i * 2), noised_row_text(&g, 2 + i * 2));
         }
@@ -4646,18 +4838,56 @@ mod tests {
     fn the_word_quiz_refuses_what_it_cannot_render() {
         let ok = ["absorb", "absurd", "abstract"];
         let mut f = Frame::new();
-        for (number, options) in [
-            (0, ok),
-            (BACKUP_WORDS + 1, ok),
-            (7, ["absorb", "absurd", "abstracted"]),
-            (7, ["absorb", "absurd", ""]),
-            (7, ["absorb", "absurd", "Abstract"]),
-            (7, ["absorb", "absurd", "\u{202e}drain"]),
+        for (q, options) in [
+            (question(0), ok),
+            (question(BACKUP_WORDS + 1), ok),
+            (question(7), ["absorb", "absurd", "abstracted"]),
+            (question(7), ["absorb", "absurd", ""]),
+            (question(7), ["absorb", "absurd", "Abstract"]),
+            (question(7), ["absorb", "absurd", "\u{202e}drain"]),
+            // A progress pair that cannot be true. `asked == total` is the one that
+            // matters: it draws `pg 9/8`, which claims the quiz is over.
+            (
+                QuizWord {
+                    number: 7,
+                    asked: 8,
+                    total: 8,
+                    retry: false,
+                },
+                ok,
+            ),
+            (
+                QuizWord {
+                    number: 7,
+                    asked: 0,
+                    total: 0,
+                    retry: false,
+                },
+                ok,
+            ),
+            (
+                QuizWord {
+                    number: 7,
+                    asked: 0,
+                    total: BACKUP_WORDS + 1,
+                    retry: false,
+                },
+                ok,
+            ),
+            (
+                QuizWord {
+                    number: 7,
+                    asked: usize::MAX,
+                    total: 8,
+                    retry: false,
+                },
+                ok,
+            ),
         ] {
             assert_eq!(
-                backup_quiz_word(&mut f, number, options, &mut Counter(0)),
+                backup_quiz_word(&mut f, q, options, &mut Counter(0)),
                 Err(Unrenderable::BadWordList),
-                "word {number} {options:?} was not refused"
+                "{q:?} {options:?} was not refused"
             );
             assert_eq!(
                 screen_text(&f).trim(),
@@ -4665,7 +4895,251 @@ mod tests {
                 "a refusal drew something: {options:?}"
             );
         }
-        assert!(backup_quiz_word(&mut f, BACKUP_WORDS, ok, &mut Counter(0)).is_ok());
+        assert!(backup_quiz_word(&mut f, question(BACKUP_WORDS), ok, &mut Counter(0)).is_ok());
+        // The widest legal progress pair, the one the footer const assert is sized
+        // for: 25 of 25, both figures two digits.
+        assert!(
+            backup_quiz_word(
+                &mut f,
+                QuizWord {
+                    number: BACKUP_WORDS,
+                    asked: BACKUP_WORDS - 1,
+                    total: BACKUP_WORDS,
+                    retry: true,
+                },
+                ok,
+                &mut Counter(0)
+            )
+            .is_ok()
+        );
+    }
+
+    /// The question screen says which question of how many it is asking, in the
+    /// `pg 3/8` shape the sign pages use, and the widest one still fits beside its
+    /// legend.
+    ///
+    /// Deleting the indicator leaves 8 indistinguishable screens with no way to tell
+    /// a quiz that is nearly done from one that has barely started — which is where
+    /// a user starts guessing to make it stop.
+    #[test]
+    fn the_word_quiz_says_which_question_of_how_many_it_is_asking() {
+        let ok = ["absorb", "absurd", "abstract"];
+        let mut f = Frame::new();
+        for (asked, total, want) in [(0usize, 8usize, "pg 1/8"), (2, 8, "pg 3/8"), (7, 8, "pg 8/8")]
+        {
+            backup_quiz_word(
+                &mut f,
+                QuizWord {
+                    number: 7,
+                    asked,
+                    total,
+                    retry: false,
+                },
+                ok,
+                &mut Counter(0),
+            )
+            .unwrap();
+            assert_eq!(
+                row_text(&f, FOOTER_ROW),
+                format!("{want} {QUIZ_REFUSE_LEGEND}"),
+                "progress for {asked}/{total}"
+            );
+        }
+        // 25/25 is the widest this screen can build, and it must not be truncated
+        // into a legend that names half a key.
+        backup_quiz_word(
+            &mut f,
+            QuizWord {
+                number: BACKUP_WORDS,
+                asked: BACKUP_WORDS - 1,
+                total: BACKUP_WORDS,
+                retry: false,
+            },
+            ok,
+            &mut Counter(0),
+        )
+        .unwrap();
+        let footer = row_text(&f, FOOTER_ROW);
+        assert_eq!(footer, format!("pg 25/25 {QUIZ_REFUSE_LEGEND}"));
+        assert!(footer.len() <= COLS, "footer {footer:?} is wider than the panel");
+    }
+
+    /// A re-asked position is visibly a re-ask, and the way it says so mentions the
+    /// ANSWER and never the backup.
+    ///
+    /// Both halves are the requirement. A retry screen identical to the first ask is
+    /// a device that swallows a wrong answer silently; a retry screen that says the
+    /// BACKUP failed sends a user to re-run a keygen because they fat-fingered a
+    /// keypad.
+    #[test]
+    fn a_reasked_quiz_position_says_so_without_blaming_the_backup() {
+        let ok = ["absorb", "absurd", "abstract"];
+        let mut first = Frame::new();
+        let mut again = Frame::new();
+        backup_quiz_word(&mut first, question(7), ok, &mut Counter(0)).unwrap();
+        backup_quiz_word(
+            &mut again,
+            QuizWord { retry: true, ..question(7) },
+            ok,
+            &mut Counter(0),
+        )
+        .unwrap();
+        // Distinguishable, and by the banner row specifically rather than by noise
+        // that happens to differ.
+        assert_eq!(row_text(&first, 1), "", "the first ask carries a banner");
+        assert_eq!(row_text(&again, 1), QUIZ_RETRY);
+        assert_eq!(
+            again.cell(0, 1),
+            Some((QUIZ_RETRY.as_bytes()[0], true)),
+            "the banner is not in inverse video"
+        );
+        // The question and its three options survive the banner: the next press
+        // answers this screen, so it has to still be answerable.
+        assert_eq!(row_text(&again, 0), row_text(&first, 0));
+        for i in 0..3 {
+            assert_eq!(
+                noised_row_text(&again, 2 + i * 2),
+                noised_row_text(&first, 2 + i * 2)
+            );
+        }
+        assert_eq!(row_text(&again, FOOTER_ROW), row_text(&first, FOOTER_ROW));
+        // Nothing on it accuses the share, and nothing on it is a verdict.
+        let t = screen_text(&again).to_ascii_lowercase();
+        for banned in ["backup", "fail", "bad", "corrupt", "wrong"] {
+            assert!(!t.contains(banned), "the retry screen says {banned:?}: {t}");
+        }
+    }
+
+    /// Only the noised rows carry candidate words. The header, the retry banner and
+    /// the footer are drawn with plain `text` and no `mark_sensitive`, so a word that
+    /// reached any of them would be a word in the clear.
+    #[test]
+    fn nothing_outside_the_noised_quiz_rows_carries_a_candidate_word() {
+        let options = ["absorb", "absurd", "abstract"];
+        let mut f = Frame::new();
+        backup_quiz_word(
+            &mut f,
+            QuizWord { retry: true, ..question(7) },
+            options,
+            &mut Counter(0),
+        )
+        .unwrap();
+        for row in [0, 1, 3, 5, FOOTER_ROW] {
+            let t = row_text(&f, row);
+            for w in options {
+                assert!(!t.contains(w), "row {row} ({t:?}) carries {w:?} un-noised");
+            }
+        }
+        // The pass screen takes no word at all, so the same check there is a check
+        // that its signature stayed that way.
+        let mut g = Frame::new();
+        backup_quiz_passed(&mut g, 8).unwrap();
+        let t = screen_text(&g);
+        for w in options {
+            assert!(!t.contains(w), "the pass screen carries {w:?}");
+        }
+    }
+
+    /// No option row is drawn differently from the others, in any order.
+    ///
+    /// This screen is not told which option is correct, and this is what keeps that
+    /// true in the rendering: if the layout emphasised a slot, sorted the three, or
+    /// varied by word length, the true word would be identifiable from the frame
+    /// without knowing the share — a distractor set that leaks by construction,
+    /// which is worse than no quiz because it teaches false confidence.
+    #[test]
+    fn no_quiz_option_row_is_drawn_differently_from_the_others() {
+        let mut f = Frame::new();
+        for order in [
+            ["absorb", "absurd", "abstract"],
+            ["absorb", "abstract", "absurd"],
+            ["absurd", "absorb", "abstract"],
+            ["absurd", "abstract", "absorb"],
+            ["abstract", "absorb", "absurd"],
+            ["abstract", "absurd", "absorb"],
+        ] {
+            backup_quiz_word(&mut f, question(7), order, &mut Counter(0)).unwrap();
+            for (i, w) in order.iter().enumerate() {
+                let row = 2 + i * 2;
+                assert_eq!(
+                    noised_row_text(&f, row),
+                    format!("{}) {w}", QUIZ_KEYS[i] as char),
+                    "{order:?} slot {i}"
+                );
+                // Same style on every row: an inverted or otherwise decorated slot
+                // would point at one of the three.
+                assert_eq!(
+                    f.cell(0, row),
+                    Some((QUIZ_KEYS[i], false)),
+                    "{order:?} slot {i} is decorated"
+                );
+            }
+        }
+    }
+
+    /// The pass screen says how much was checked, does not claim the backup is
+    /// verified, and refuses a count that cannot have happened.
+    #[test]
+    fn the_quiz_pass_screen_claims_only_what_was_checked() {
+        let mut f = Frame::new();
+        backup_quiz_passed(&mut f, 8).unwrap();
+        let t = screen_text(&f);
+        assert!(t.contains("8 of 25 words"), "{t}");
+        assert!(t.contains("matched."), "{t}");
+        assert!(t.contains("not checked."), "17 unchecked words went unsaid: {t}");
+        assert!(
+            !t.to_ascii_lowercase().contains("verified"),
+            "a third of the words checked is not a verified backup: {t}"
+        );
+        assert_eq!(row_text(&f, FOOTER_ROW), QUIZ_DONE_LEGEND);
+        // All 25 checked: the caveat would be false, so it is not drawn.
+        backup_quiz_passed(&mut f, BACKUP_WORDS).unwrap();
+        let all = screen_text(&f);
+        assert!(all.contains("25 of 25 words"), "{all}");
+        assert!(!all.contains("not checked"), "{all}");
+        for bad in [0, BACKUP_WORDS + 1, usize::MAX] {
+            let mut blank = Frame::new();
+            assert_eq!(
+                backup_quiz_passed(&mut blank, bad),
+                Err(Unrenderable::BadWordList),
+                "{bad} was not refused"
+            );
+            assert_eq!(screen_text(&blank).trim(), "", "a refusal drew something");
+        }
+    }
+
+    /// Both quiz footers name the pad key that actually leaves the screen.
+    ///
+    /// The const block asserts the constants; this asserts what is on the GLASS, so
+    /// a footer that hard-codes a different key than the constant it is documented
+    /// to print is caught too. `5=next` shipped once.
+    #[test]
+    fn the_quiz_footers_name_the_key_the_keypad_sends() {
+        let cancel = crate::keypad::KEY_CANCEL as char;
+        let mut f = Frame::new();
+        backup_quiz_word(&mut f, question(7), ["absorb", "absurd", "abstract"], &mut Counter(0))
+            .unwrap();
+        let footer = row_text(&f, FOOTER_ROW);
+        assert!(
+            footer.contains(&format!("({cancel})")),
+            "the question footer does not name CANCEL: {footer:?}"
+        );
+        backup_quiz_passed(&mut f, 8).unwrap();
+        let done = row_text(&f, FOOTER_ROW);
+        assert!(
+            done.contains(&format!("({cancel})")),
+            "the pass footer does not name CANCEL: {done:?}"
+        );
+        // No `=`: `firmware/examples/stub.rs`'s `advertised_key` reads `<k>=<what>`
+        // on the last row as a consent legend, and neither of these authorises
+        // anything.
+        assert!(!footer.contains('='), "{footer:?} reads as a consent legend");
+        assert!(!done.contains('='), "{done:?} reads as a consent legend");
+        // The answer keys are on the glass beside the options, not in the footer:
+        // the const block keeps them off CANCEL, OK and both paging keys.
+        for key in QUIZ_KEYS {
+            assert!(key != crate::keypad::KEY_CANCEL && key != crate::keypad::KEY_OK);
+        }
     }
 
     #[test]
@@ -5026,8 +5500,18 @@ mod tests {
             show(&format!("6 word entry — {label}"), &f);
         }
 
-        backup_quiz_word(&mut f, 7, ["absorb", "absurd", "abstract"], &mut noise).unwrap();
+        backup_quiz_word(&mut f, question(7), ["absorb", "absurd", "abstract"], &mut noise).unwrap();
         show("7 backup quiz (word: every option row noised)", &f);
+        backup_quiz_word(
+            &mut f,
+            QuizWord { retry: true, ..question(7) },
+            ["absorb", "absurd", "abstract"],
+            &mut noise,
+        )
+        .unwrap();
+        show("7 backup quiz (word: re-asked after a wrong answer)", &f);
+        backup_quiz_passed(&mut f, 8).unwrap();
+        show("7 backup quiz passed (8 of 25 checked, rest unchecked)", &f);
         backup_quiz(&mut f, "index was:", ["1", "2", "3"], Some(0));
         show("7 backup quiz (share index: no noise, none needed)", &f);
         backup_quiz(&mut f, "word 7 was:", ["absorb", "absurd", "abstract"], Some(0));

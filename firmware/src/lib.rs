@@ -83,6 +83,8 @@ use sha2::{Digest, Sha256};
 // which is 11 rustdoc warnings.
 pub mod store;
 
+pub mod quiz;
+
 pub mod wordentry;
 
 use store::{ShareStore, StoreFault};
@@ -173,22 +175,24 @@ pub enum Refusal {
     DisplayBackup,
     /// A physical-backup operation this device will not perform.
     ///
-    /// No longer the blanket refusal of five messages it was: `EnterPhysicalBackup`,
-    /// `SavePhysicalBackup`, `SavePhysicalBackup2` and `Consolidate` are ADMITTED
-    /// ([`Session::recv`]) and drive [`wordentry::Entry`] behind a consent digit.
-    /// What is left under this name:
+    /// No longer the blanket refusal of five messages it was: all five of
+    /// `EnterPhysicalBackup`, `SavePhysicalBackup`, `SavePhysicalBackup2`,
+    /// `Consolidate` and `CheckBackup` are ADMITTED ([`Session::recv`]) and drive
+    /// [`wordentry::Entry`] or [`quiz::Quiz`] behind a consent digit. What is left
+    /// under this name:
     ///
-    /// * **`CheckBackup` — still refused outright.** It is not the cheap one: its
-    ///   screen renders the TRUE word among three *and* all 25
-    ///   (`frostsnap_widgets/src/backup/check_backup.rs:98-111`), so its exposure
-    ///   exceeds `DisplayBackup`'s, and the distractor picker DECISIONS.md:46
-    ///   declined to vendor does not exist. Admitting it while `show_backup` draws
-    ///   plain words would answer a quiz request with a full plaintext reveal.
     /// * A `Consolidate` whose share index is not a `u32`, so the consent screen
     ///   cannot name the share the human is being asked to store.
     /// * [`Session::entry_key`] with no entry in progress — the fail-closed answer
     ///   to a caller that has lost track of the flow, and the reason a keypress
     ///   cannot start an ingest that no digit consented to.
+    /// * [`Session::quiz_key`] with no quiz in progress, for the same reason: the
+    ///   quiz puts one real share word among three on the glass, so a keypress must
+    ///   not be able to start one.
+    /// * A `CheckBackup` whose share [`quiz::Quiz::new`] will not quiz honestly — a
+    ///   word outside the vendored list, or 25 words with no two distinct, so no
+    ///   own-set distractor exists. A refused quiz is a `CheckBackup` this device
+    ///   does not answer, which is where the message stood entirely until now.
     PhysicalBackup,
     /// `ScreenVerify`: address display. Harmless but unimplemented; refusing
     /// beats silently dropping it, which leaves the app waiting.
@@ -711,6 +715,54 @@ pub struct Session<'a, F: NorFlash + fmt::Debug> {
     /// grant and like the restore progress `store::ShareStore::persist_staged` drops:
     /// an unplug mid-restore costs re-typing 25 words and never a share.
     entry: Option<wordentry::Entry>,
+    /// The backup a human has CONSENTED to be QUIZZED on, mid-quiz.
+    ///
+    /// Private, and written in exactly one place — [`Session::confirm_at`]'s
+    /// `CheckBackup` arm, i.e. behind the [`prompt_screen_at`] funnel — so "consent
+    /// precedes the first candidate" is a property of the type: [`quiz::Quiz::new`]
+    /// has no other caller here, [`Session::quiz_key`] and
+    /// [`Session::quiz_screen`] are the only readers, and both refuse when this is
+    /// `None`.
+    ///
+    /// **This is the one grant on the device that holds PLAINTEXT for the whole
+    /// flow, and it is inherent rather than sloppy.** `reveal` keeps the phase and
+    /// re-derives the words per page, because a page is a pure function of the
+    /// share; a quiz is not — its position order, its counter and the three
+    /// candidates now on the glass are state that has to survive between keypresses,
+    /// and [`quiz::Quiz`] holds the words to draw the next own-set distractor from.
+    /// Upstream does the same (`ui::Workflow::CheckBackup { backup, .. }` holds the
+    /// decrypted `ShareBackup` for the duration, `device/src/esp32_run.rs:687-700`).
+    /// The residency is 25 `&'static str` pointers into the vendored word table plus
+    /// [`quiz::QUIZ_POSITIONS`] position bytes — ~240 B, allocating nothing (see
+    /// `quiz`'s heap note) — and it is a full share disclosure to anything that can
+    /// read this device's RAM, exactly as the signer's decrypted share already is
+    /// while it signs.
+    ///
+    /// Cleared on `Cancel` and when the quiz ends either way, and a new grant
+    /// retires the previous quiz. RAM-only, like both other grants: an unplug
+    /// mid-quiz costs a round trip and never a share.
+    check: Option<Checking>,
+}
+
+/// One consented quiz: the machine, plus the two PUBLIC values
+/// [`Session::quiz_key`] needs to ack a pass with.
+///
+/// Both are coordinator-supplied and coordinator-known — `share_index` came off the
+/// wire in the `CheckBackup` message and `access_structure_ref` is
+/// `AccessStructureRef::from_root_shared_key` of the `root_shared_key` that came with
+/// it — so echoing them back in `CommsMisc::BackupChecked` reveals nothing the
+/// coordinator did not send. It is also what makes the ack match its request: the
+/// coordinator drops a `BackupChecked` whose pair is not the one it asked about
+/// (`frostsnap_coordinator/src/check_backup.rs:136-156`).
+///
+/// A struct and not a tuple because `(Quiz, AccessStructureRef, ShareIndex)` at a use
+/// site is `.1`/`.2` — the transposition hazard `ui::QuizWord` grew four named fields
+/// to avoid. No `Debug`: [`quiz::Quiz`] has none, on purpose, and a derive here would
+/// demand one.
+struct Checking {
+    quiz: quiz::Quiz,
+    access_structure_ref: AccessStructureRef,
+    share_index: frostsnap_core::schnorr_fun::frost::ShareIndex,
 }
 
 impl<'a, F: NorFlash + fmt::Debug> Session<'a, F> {
@@ -777,6 +829,9 @@ impl<'a, F: NorFlash + fmt::Debug> Session<'a, F> {
             // Same rule, other direction: a half-typed share does not survive a
             // reset, and consent is to one ceremony.
             entry: None,
+            // And the same rule again, for the grant that holds PLAINTEXT: a quiz
+            // does not survive a reset, so the words are gone with the RAM.
+            check: None,
         })
     }
 
@@ -923,6 +978,12 @@ impl<'a, F: NorFlash + fmt::Debug> Session<'a, F> {
                 // towards an `enter_physical_id` no coordinator is listening for —
                 // words that would sit on the glass for whatever comes next.
                 self.entry = None;
+                // And the quiz, which matters MORE than either of the two above: it is
+                // the only grant holding a plaintext share, and its screens carry a
+                // real word of that share. A surviving quiz would be candidate words
+                // on the glass for a ceremony the coordinator has abandoned, and a
+                // pass would ack a `CheckBackup` nothing is listening for.
+                self.check = None;
                 Ok(Vec::new())
             }
 
@@ -1048,49 +1109,59 @@ impl<'a, F: NorFlash + fmt::Debug> Session<'a, F> {
                 | CoordinatorRestoration::SavePhysicalBackup2(_)
                 | CoordinatorRestoration::Consolidate(_),
             ) => {}
-            // `CheckBackup` STAYS REFUSED, and not one of the blockers is in this
-            // file. Recorded here so the next reader does not re-derive the wrong
-            // order; nothing below is repaired:
-            //  - `CheckBackup` is not the cheap one, and it is NOT a `DisplayBackup`
-            //    with a quiz bolted on. Upstream's quiz renders the TRUE word among
-            //    three for the index and all 25 words
-            //    (`frostsnap_widgets/src/backup/check_backup.rs:98-111`), so it
-            //    reveals as much as `DisplayBackup` and additionally wants the
-            //    distractor picker DECISIONS.md:46 declined to vendor. `ui` now has
-            //    the SCREEN (`ui::backup_quiz_word`: mandatory `rng`, every option
-            //    row noised); what is still missing is the picker and the key
-            //    routing, and admitting this message with either of them absent
-            //    would be worse than refusing it. `confirm_at`'s grant is read by
-            //    `show_backup`, which draws PLAIN WORDS, and `boot()` starts a
-            //    reveal on any confirmed `Restoration` prompt — so a `CheckBackup`
-            //    admitted today would answer a quiz request with a full plaintext
-            //    reveal and never send `CommsMisc::BackupChecked`. Landing it needs
-            //    a second grant, a second `Reveal` state and 1/2/3 key handling,
-            //    all of which live in `main.rs`.
+            // `CheckBackup` — ADMITTED, and it is a REVEAL-CLASS flow wearing a
+            // quiz's clothes. One of the three candidates on every screen is the true
+            // word at the position being asked and a second is a real word from
+            // elsewhere in the same share, so it gets `DisplayBackup`'s gates, in
+            // `DisplayBackup`'s order, and not the restore flow's:
             //
-            //    Do NOT port `frostsnap_widgets/src/backup/distractor.rs` when it
-            //    does land. `find_closest_distractors` is a pure function of the
-            //    TRUE word (`levenshtein*3 - shared_suffix*2`, no RNG), so the
-            //    triple identifies its own answer: MEASURED over the vendored 2048
-            //    words, 1288 of them are recovered from the displayed triple with
-            //    no human input, leaving ~0.467 of `log2(3)` bits per word — 11.7
-            //    bits over 25 words, which `ShareBackup::from_words`' 11-bit word
-            //    checksum plus its 8-bit poly checksum reduce to one candidate. A
-            //    photograph of upstream's quiz is a full share disclosure. Its index
-            //    screen is worse: the three options are always consecutive integers
-            //    and the true one is always the median. The rule that does not leak
-            //    is uniform choice inside a predicate SYMMETRIC over the triple —
-            //    three draws from `rng::Entropy` over all 2048, rejecting the true
-            //    word and duplicates under a hard iteration cap, and indices drawn
-            //    from `1..=n` rather than `correct ± 1`.
+            //  1. THE SIGNER, before any human is asked. It refuses unless this
+            //     device actually holds that share (key, access structure, share
+            //     index — `device/restoration.rs:265-323`, the same lookups the
+            //     `DisplayBackup` arm above passes through), so a quiz request for a
+            //     share we do not have is a `Fault::Signer` with nothing on the
+            //     glass. What a coordinator gets for asking is a question on a screen:
+            //     the handler returns exactly ONE `DeviceSend::ToUser` carrying a
+            //     `BackupDisplayPhase` — the SAME phase type `DisplayBackup` uses —
+            //     and nothing to the coordinator.
+            //  2. THE CONSENT SCREEN. [`prompt_screen_at`] draws it and it carries no
+            //     word, structurally: that function has no [`Secrets`], so nothing
+            //     reachable from it can decrypt a share.
+            //  3. THE GRANT. Only [`Session::confirm_at`] builds the [`quiz::Quiz`]
+            //     and only [`Session::quiz_key`] reads it, so the digit precedes the
+            //     first candidate by construction. The quiz grant is a SEPARATE field
+            //     from the reveal grant and neither writes the other:
+            //     `consenting_to_a_quiz_does_not_grant_a_reveal` is the test, because
+            //     the one-line "wire it up" patch is to set `self.reveal` here too,
+            //     and that answers a request for one word of three with all 25 in
+            //     plain.
             //
-            //    Landing it also needs the ONE thing the restore flow above did not
-            //    weaken: `show_backup`'s grant and this device's confirm digit. A
-            //    `CheckBackup` admitted on the entry path would be a quiz answered
-            //    with a reveal, so it stays here.
+            // NO FAILURE MESSAGE, ever, and there is none to send: `CheckBackup`
+            // carries a `BackupDisplayPhase` and has no failure counterpart, upstream's
+            // own `feedback` is local UI state cleared on the next tap
+            // (`frostsnap_widgets/src/backup/check_backup.rs:592-600`) and Coldcard
+            // just re-asks (`shared/seed.py:865-887`). A wrong answer re-asks the same
+            // position with three freshly drawn candidates and tells nobody; the only
+            // wire traffic this flow ever produces is `CommsMisc::BackupChecked` on a
+            // PASS ([`Session::quiz_key`]).
+            //
+            // Do NOT port `frostsnap_widgets/src/backup/distractor.rs`, and
+            // [`quiz`] does not: `find_closest_distractors` is a pure function of the
+            // TRUE word (`levenshtein*3 - shared_suffix*2`, no RNG), so the triple
+            // identifies its own answer — MEASURED over the vendored 2048 words, 1288
+            // of them are recovered from the displayed triple with no human input,
+            // leaving ~0.467 of `log2(3)` bits per word, i.e. 11.7 bits over 25 words,
+            // which `ShareBackup::from_words`' 11-bit word checksum plus its 8-bit poly
+            // checksum reduce to one candidate. A photograph of upstream's quiz is a
+            // full share disclosure. Its index screen is worse: the three options are
+            // always consecutive integers and the true one is always the median. The
+            // rule that does not leak is uniform choice inside a predicate SYMMETRIC
+            // over the triple, which is what `quiz::Quiz::draw_options` does.
+            //
+            // NO TIMEOUT here either, chosen: see the restore flow above.
             CoordinatorToDeviceMessage::Restoration(CoordinatorRestoration::CheckBackup {
                 ..
-            }) => return Err(Fault::Refused(Refusal::PhysicalBackup)),
+            }) => {}
             CoordinatorToDeviceMessage::ScreenVerify(_) => {
                 return Err(Fault::Refused(Refusal::AddressVerify))
             }
@@ -1290,10 +1361,52 @@ impl<'a, F: NorFlash + fmt::Debug> Session<'a, F> {
                         .finish_consolidation(&mut self.secrets, phase, rng);
                     self.run(sends, out)
                 }
+                // THE QUIZ GRANT. The human read `prompt_screen_at`'s "check backup?"
+                // screen — which named the key and the share index and showed no word
+                // — and pressed the digit it printed. This is what that press buys:
+                // permission for [`Session::quiz_key`] to score a keystroke, and for
+                // [`Session::quiz_screen`] to put three candidates on the glass, ONE
+                // OF WHICH IS A REAL WORD OF THIS SHARE.
+                //
+                // It buys nothing else, and `self.reveal` is deliberately NOT written
+                // here. That is the whole distinction the old refusal was protecting:
+                // `show_backup` draws all 25 words in plain, so a quiz consent that
+                // also granted a reveal would answer a request for one word of three
+                // with the entire share. Two fields, two readers, no assignment
+                // between them — `consenting_to_a_quiz_does_not_grant_a_reveal`.
+                //
+                // The decrypt happens HERE and once, rather than per keypress, because
+                // a quiz is not a pure function of the share the way a reveal page is:
+                // the position order and the candidates on the glass have to survive
+                // between presses. `Quiz::new` refuses a share it cannot quiz honestly
+                // (`Refusal::PhysicalBackup`), and that refusal lands before any
+                // candidate exists.
+                //
+                // `out` is not touched. `CommsMisc::BackupChecked` is the wire answer
+                // and it belongs to the moment the last question is answered, not to
+                // the moment a human agrees to be asked — the coordinator treats it as
+                // "the user completed the backup check workflow"
+                // (`frostsnap_comms/src/lib.rs:504-509`) and closes its dialog on it,
+                // so sending it here would claim a check that had not happened. Same
+                // ack-ahead-of-the-fact this crate's persist-before-ack ordering exists
+                // to prevent, and the same reason the reveal's ack is
+                // [`Session::backup_recorded`] and not this function.
+                //
+                // A NEW grant retires the previous quiz, words and all: the coordinator
+                // has asked about a share again, and progress towards the old question
+                // set cannot be acked against the new one.
+                ToUserRestoration::CheckBackup { phase, .. } => {
+                    let quiz = quiz::Quiz::new(backup_words(&phase, &mut self.secrets)?, rng)
+                        .ok_or(Fault::Refused(Refusal::PhysicalBackup))?;
+                    self.check = Some(Checking {
+                        quiz,
+                        access_structure_ref: phase.access_structure_ref,
+                        share_index: phase.share_index,
+                    });
+                    Ok(Vec::new())
+                }
                 // `BackupSaved` is informational — `prompt_screen_at` draws no screen
-                // for it, so the funnel above has already refused it — and
-                // `CheckBackup` is reached only through a message `recv` refuses.
-                // Fail closed.
+                // for it, so the funnel above has already refused it. Fail closed.
                 _ => Err(Fault::NotConfirmable),
             },
             _ => Err(Fault::NotConfirmable),
@@ -1542,6 +1655,123 @@ impl<'a, F: NorFlash + fmt::Debug> Session<'a, F> {
         }
     }
 
+    /// What the backup CHECK quiz wants on the glass, or `None` when no quiz is live.
+    ///
+    /// `None` is the whole gate seen from the drawing side, exactly as it is for
+    /// [`Session::entry_screen`]: [`Session::confirm_at`] is the only writer of the
+    /// grant, so a caller with no consent behind it has nothing to draw — and here
+    /// "nothing to draw" is what keeps a real share word off the glass.
+    ///
+    /// Draw [`quiz::Screen::Word`] with `ui::backup_quiz_word(frame, question,
+    /// options, rng)`, whose `rng` is mandatory: one of the three options is the true
+    /// word at that position and a second is a real word from elsewhere in the same
+    /// share, so every option row is [`ui::Frame::mark_sensitive`]'d and there is no
+    /// un-noised path. Draw [`quiz::Screen::Passed`] with
+    /// `ui::backup_quiz_passed(frame, checked)`, which takes no `&str` and cannot
+    /// carry a word.
+    ///
+    /// [`Checked::Unchanged`] means **do not redraw**, for the reveal's and the
+    /// entry's reason: re-rendering an unchanged option row re-samples the noise over
+    /// pixels that did not change, which is the one thing that averaging defence
+    /// cannot afford.
+    ///
+    /// The [`quiz::Screen`] is a `Copy` snapshot and it is not the machine's state:
+    /// [`Session::quiz_key`] scores against the [`quiz::Quiz`], so a caller that
+    /// keeps a stale screen cannot answer a question that is no longer being asked.
+    #[must_use]
+    pub fn quiz_screen(&self) -> Option<quiz::Screen> {
+        self.check.as_ref().map(|c| c.quiz.screen())
+    }
+
+    /// One keypress into the quiz a human consented to sit.
+    ///
+    /// The live keys are [`ui::QUIZ_KEYS`] and `keypad::KEY_CANCEL`; every other byte
+    /// is [`Checked::Unchanged`]. The decision is [`quiz::Quiz::key`]'s — pure, and
+    /// pinned there over all 256 bytes at every state — and this function is only the
+    /// two impure halves it cannot own: the grant, and the wire.
+    ///
+    /// **A wrong answer sends NOTHING.** It is [`Checked::Redraw`] and the same
+    /// position is asked again with three freshly drawn candidates. There is no
+    /// failure message in the protocol to send, no attempt counter and no lockout —
+    /// both references agree (`shared/seed.py:865-887` re-asks after `Wrong!`;
+    /// `frostsnap_widgets/src/backup/check_backup.rs:592-600` clears its local
+    /// `FeedbackKind::Wrong` on the next tap), and a lockout would be ours alone. The
+    /// quiz is a "did you write it down correctly" checklist and cannot be access
+    /// control while `DisplayBackup` hands the same holder all 25 words for one
+    /// confirm digit.
+    ///
+    /// **The ack is success-only and carries no share material.**
+    /// `CommsMisc::BackupChecked { access_structure_ref, share_index }` echoes the two
+    /// values the coordinator sent in the request it answers (the private `Checking`
+    /// grant holds them, and says why they are safe to echo);
+    /// upstream sends the same message at the same moment, from its widget's
+    /// `is_verified` (`device/src/esp32_run.rs:748-757`). No word, no candidate, no
+    /// scalar of the share, and no `Debug` on the path — [`quiz::Step`] is
+    /// payload-free and [`Checked`] carries one `usize` count.
+    ///
+    /// **Coldcard's `y` — "show me all the words again" (`shared/seed.py:877-879`) —
+    /// is deliberately NOT here**, and `keypad::KEY_OK` is dead on this path. It would
+    /// be a second full-reveal path reachable from a screen whose consent was obtained
+    /// for a *quiz*, i.e. a reveal with weaker consent than a reveal: `show_backup`'s
+    /// grant is issued only by a `DisplayBackup` digit, and routing a quiz keypress
+    /// into it would make this function the one place on the device where 25 plain
+    /// words appear without that digit. A human who needs to re-read the share asks
+    /// the coordinator for `DisplayBackup`, which has its own consent screen and its
+    /// own `BackupRecorded` claim at the end of it. Fail-closed costs one round trip,
+    /// and `ui::backup_quiz_word` prints no legend for such a key anyway.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::PhysicalBackup`] when no quiz is live — no consent, or the quiz has
+    /// already ended. [`Fault::Comms`] if the ack will not frame, and [`Fault::Store`]
+    /// from `run`'s persist, which on this path drains nothing (a quiz stages no
+    /// mutation) and so cannot fail on its own account.
+    pub fn quiz_key<R: rand_core::RngCore>(
+        &mut self,
+        key: u8,
+        rng: &mut R,
+        out: &mut Outbox,
+    ) -> Result<Checked, Fault> {
+        // TAKEN, like both other grants: every exit that is not "still being asked"
+        // leaves the quiz gone — and with it the plaintext words — so the fail-closed
+        // direction needs no `else` a later edit could forget.
+        let Some(mut check) = self.check.take() else {
+            return Err(Fault::Refused(Refusal::PhysicalBackup));
+        };
+        match check.quiz.key(key, rng) {
+            quiz::Step::Unchanged => {
+                self.check = Some(check);
+                Ok(Checked::Unchanged)
+            }
+            quiz::Step::Redraw => {
+                self.check = Some(check);
+                Ok(Checked::Redraw)
+            }
+            // The human gave up, or answered wrongly enough times to want out. SILENCE,
+            // for `entry_key`'s reason and one stronger: the ack is success-only, so
+            // there is no "quiz abandoned" or "quiz failed" message in the protocol at
+            // all, and inventing one would report a fat finger to a coordinator that
+            // would then have to decide what it meant.
+            quiz::Step::Abort => Ok(Checked::Ended { checked: None }),
+            quiz::Step::Passed => {
+                // Pushed straight to the outbox, not through `run`: this is a
+                // `CommsMisc` and not a `DeviceSend`, so there is no signer work to
+                // drain and no mutation to persist — the same shape
+                // [`Session::backup_recorded`] uses for the reveal's ack. The body
+                // carries the two coordinator-supplied values and nothing else; the
+                // quiz is already unreachable from the session (the `take` above) and
+                // is dropped when this arm returns.
+                out.push(DeviceSendBody::Misc(CommsMisc::BackupChecked {
+                    access_structure_ref: check.access_structure_ref,
+                    share_index: check.share_index,
+                }))?;
+                Ok(Checked::Ended {
+                    checked: Some(quiz::QUIZ_POSITIONS),
+                })
+            }
+        }
+    }
+
     /// Persist a previewed name, then tell the coordinator about it.
     ///
     /// PERSIST BEFORE THE ACK, the same ordering as the share and for a related
@@ -1743,8 +1973,10 @@ fn all_pages(len: usize) -> Option<u32> {
     }
 }
 
-/// Derive the 25 BIP39 words for one consented backup and hand the validated page
-/// set to `show` — the **only** place in this crate where a plaintext share exists.
+/// Page the 25 BIP39 words of one consented backup and hand the validated page set to
+/// `show` — the only place in this crate where a plaintext share reaches a
+/// FRAMEBUFFER. (The decrypt itself is [`backup_words`], which the quiz grant shares:
+/// one function, one audit.)
 ///
 /// [`sign_consent`]'s shape, for [`sign_consent`]'s reason: `ui::BackupPages`
 /// borrows its `&[&str]` and the words are a local, so returning the pages would
@@ -1761,13 +1993,13 @@ fn all_pages(len: usize) -> Option<u32> {
 ///
 /// # LEAK AUDIT of this function, which is where a leak would live
 ///
-/// The `ShareBackup` and the `[&str; 25]` are locals of this call. They are moved
-/// into no field, formatted by nothing (`ShareBackup` derives `Debug` and it is
-/// never invoked; `ui::BackupPages` does too and likewise), pushed to no `Outbox`
-/// — there is no `Outbox` in scope — and dropped when `show` returns. `show`'s only
-/// two callers are [`Session::confirm_at`], which passes `|_| ()`, and
-/// [`Session::show_backup`], which draws pixels and returns `(bool, usize)` — a
-/// "was it drawn" and a page COUNT, neither of which is derived from a word.
+/// The `[&str; 25]` and the `ui::BackupPages` are locals of this call. They are moved
+/// into no field, formatted by nothing (`ui::BackupPages` derives `Debug` and it is
+/// never invoked), pushed to no `Outbox` — there is no `Outbox` in scope — and dropped
+/// when `show` returns. `show`'s only two callers are [`Session::confirm_at`], which
+/// passes `|_| ()`, and [`Session::show_backup`], which draws pixels and returns
+/// `(bool, usize)` — a "was it drawn" and a page COUNT, neither of which is derived
+/// from a word.
 ///
 /// # Errors
 ///
@@ -1783,26 +2015,82 @@ fn backup_pages<T>(
     secrets: &mut Secrets,
     show: impl FnOnce(&ui::BackupPages<'_>) -> T,
 ) -> Result<T, Fault> {
-    let backup = phase.decrypt_to_backup(secrets).map_err(Fault::Action)?;
+    let words = backup_words(phase, secrets)?;
     // `try_from`, never the `expect` upstream's own `Display` impl uses
     // (`share_backup.rs`, "Share index should fit in u32"): the index arrives off the
     // wire, and a reachable panic on this unit is permanent.
     let index =
         u32::try_from(phase.share_index).map_err(|_| Fault::Refused(Refusal::DisplayBackup))?;
-    let words = backup.to_words();
     let pages =
         ui::BackupPages::new(index, &words).map_err(|_| Fault::Refused(Refusal::DisplayBackup))?;
     Ok(show(&pages))
 }
 
-/// The backup-reveal consent screen: what is being asked for, and the digit that
-/// grants it.
+/// The 25 BIP39 words of one consented backup — **the one decrypt in this crate**,
+/// and the only expression that turns a stored share into plaintext.
+///
+/// [`backup_pages`] and [`Session::confirm_at`]'s quiz grant are its two callers, and
+/// it is a function rather than two copies of the same two lines for the reason two
+/// mutations that survived every gate were closed by making one: this is where a leak
+/// would live, so there is one place to audit, one place a `Debug` could appear, and
+/// one place the [`Fault::Action`] mapping can be got wrong.
+///
+/// The words are `&'static str` entries of the vendored `BIP39_WORDS`, so this returns
+/// them by value rather than through a closure the way `backup_pages` must: there is
+/// no borrow of a local here, only 25 pointers into `.rodata`. Which words they are is
+/// the secret; the pointers are the share.
+///
+/// # LEAK AUDIT
+///
+/// The `ShareBackup` is a local of this call, moved nowhere and dropped on return.
+/// This function has no `Outbox`, no formatter and no RNG; nothing in it formats,
+/// logs or `defmt`s, and `ShareBackup`'s own `Debug` derive is never invoked. Its two
+/// callers are audited where they stand: `backup_pages`' closure sees pixels only, and
+/// the quiz grant hands the array straight into [`quiz::Quiz::new`], which never sends
+/// or formats a word either (`quiz`'s own leak note; [`quiz::Step`] is payload-free).
+///
+/// # Errors
+///
+/// [`Fault::Action`] if the stored ciphertext does not decrypt under the
+/// coordinator's contribution — a share that is not the one the coordinator asked
+/// about, or a device whose state changed under the phase. Upstream `expect`s here
+/// (`device/src/esp32_run.rs:693`, "state changed while checking backup"); on this
+/// unit a reachable panic is permanent, so it is an arm.
+fn backup_words(
+    phase: &BackupDisplayPhase,
+    secrets: &mut Secrets,
+) -> Result<[&'static str; ui::BACKUP_WORDS], Fault> {
+    Ok(phase
+        .decrypt_to_backup(secrets)
+        .map_err(Fault::Action)?
+        .to_words())
+}
+
+/// Row 0 of the reveal question: all 25 words, in plain, on paged screens.
+const REVEAL_QUESTION: &str = "Reveal backup?";
+/// Row 0 of the quiz question. The ONE difference between the two screens, and it is
+/// a `const` rather than a literal at the call site so that the mutation which swaps
+/// them is one visible token — a human who consents to "Check" and is shown all 25
+/// words has been lied to by a screen, which is the failure this whole file is shaped
+/// against.
+const CHECK_QUESTION: &str = "Check backup?";
+
+/// The consent screen shared by the two flows that put SHARE WORDS on the glass: the
+/// reveal ([`REVEAL_QUESTION`]) and the check quiz ([`CHECK_QUESTION`]). What is being
+/// asked for, and the digit that grants it.
 ///
 /// **It cannot show a word, and that is structural rather than careful.** This
 /// function takes no phase, no `Secrets` and no share; the only secret-adjacent
 /// thing on it is the share *index*, which is `1..=n` and is printed on the
 /// coordinator's own screen. So "consent precedes the reveal" is not an ordering
 /// this function has to get right — there is nothing here to reveal.
+///
+/// One function for both because the property that matters is common: the quiz shows
+/// one true word in three plus a second real word of the same share, so it warrants
+/// `DisplayBackup`'s warning and `DisplayBackup`'s digit, not the entry screen's. What
+/// the two screens must NOT share is the grant, and they do not — that is
+/// [`Session::confirm_at`]'s two arms, and `consenting_to_a_quiz_does_not_grant_a_reveal`
+/// is the test.
 ///
 /// `share_index` is shown because it is what a human matches against the request
 /// they made: a coordinator that asks for share 2 while the app says share 1 is
@@ -1817,10 +2105,11 @@ fn backup_pages<T>(
 /// `hal/src/ui.rs` beside the other eight, where `tools/pixel-check.py` and the
 /// simulator would cover it. It is composed here from `ui::Frame` primitives
 /// because that file is owned by another change; the upgrade path is
-/// `ui::backup_reveal_confirm(frame, key_name, share_index, confirm)` and deleting
-/// this function, with no caller change beyond the name.
+/// `ui::backup_reveal_confirm(frame, question, key_name, share_index, confirm)` and
+/// deleting this function, with no caller change beyond the name.
 fn backup_consent(
     frame: &mut ui::Frame,
+    question: &str,
     key_name: &str,
     share_index: u32,
     confirm: ui::ConfirmDigit,
@@ -1829,7 +2118,7 @@ fn backup_consent(
     what.push_str("share #").push_u64(share_index as u64);
     consent_screen(
         frame,
-        ["Reveal backup?", key_name, what.as_str(), "SECRET on glass"],
+        [question, key_name, what.as_str(), "SECRET on glass"],
         confirm,
     );
 }
@@ -1985,16 +2274,18 @@ fn sign_page(
 /// The backup-ENTRY question and the consolidation question join them here, and are
 /// honest in the same way: the entry screen carries nothing (an `EnterBackupPhase` is
 /// a 16-byte id) and the consolidation screen carries a real `ConsolidatePhase`'s key
-/// name, share index and threshold — never its plaintext `SecretShare`. The two §4.2
-/// screens still without a caller are the QUIZ and address verify, because
-/// `CheckBackup` and `ScreenVerify` are refused in [`Session::recv`]; adding a screen
-/// for either would be a lie about what the device does.
+/// name, share index and threshold — never its plaintext `SecretShare`. So do the quiz
+/// question, which carries a real `BackupDisplayPhase`'s key name and share index and
+/// nothing else. The one §4.2 screen still without a caller is address verify, because
+/// `ScreenVerify` is refused in [`Session::recv`]; adding a screen for it would be a
+/// lie about what the device does.
 ///
-/// The backup *words* are not drawn from here and cannot be: this function has no
-/// [`Secrets`] to decrypt with and no RNG to noise with. [`Session::show_backup`] is
-/// the reveal, and the grant it needs comes only from [`Session::confirm_at`] — so
-/// the screen that asks and the screen that shows are separated by a consent step
-/// that no caller can route around.
+/// The backup *words* are not drawn from here and cannot be — neither the reveal's 25
+/// nor the quiz's three candidates: this function has no [`Secrets`] to decrypt with
+/// and no RNG to noise with. [`Session::show_backup`] is the reveal and
+/// [`Session::quiz_screen`] is the quiz, and the grants they need come only from
+/// [`Session::confirm_at`] — so the screen that asks and the screen that shows are
+/// separated by a consent step that no caller can route around.
 ///
 /// `confirm` is the randomised digit the two **signing** screens print, drawn by
 /// the caller from its own RNG (on ARM `rng::Entropy`, never libngu — PLAN.md
@@ -2067,7 +2358,7 @@ pub fn prompt_screen_at(
                 key_name, phase, ..
             } => match u32::try_from(phase.share_index) {
                 Ok(index) if page == 0 => {
-                    backup_consent(frame, key_name, index, confirm);
+                    backup_consent(frame, REVEAL_QUESTION, key_name, index, confirm);
                     // The whole question is on this page, so this page may authorise
                     // — and the thing it authorises is a reveal, not a signature.
                     Ok(Shown::Page { last: true })
@@ -2077,6 +2368,23 @@ pub fn prompt_screen_at(
                 // `backup_pages` raises, at the earlier of the two points.
                 _ => Err(Refusal::DisplayBackup),
             },
+            // The question that gates the QUIZ, and it is the reveal question's screen
+            // with one word changed, because it is a reveal-class flow: one candidate
+            // in three is the true word at the position being asked. Same phase type,
+            // same share index for a human to match, same "SECRET on glass" warning,
+            // same digit. What it is NOT is the same GRANT — see `confirm_at`.
+            ToUserRestoration::CheckBackup { key_name, phase, .. } => {
+                match u32::try_from(phase.share_index) {
+                    Ok(index) if page == 0 => {
+                        backup_consent(frame, CHECK_QUESTION, key_name, index, confirm);
+                        Ok(Shown::Page { last: true })
+                    }
+                    // `DisplayBackup`'s refusal, for `DisplayBackup`'s reason: a share
+                    // index that cannot be printed is a question the human cannot match
+                    // against the request they made.
+                    _ => Err(Refusal::DisplayBackup),
+                }
+            }
             // The question that gates an INGEST. One page, page 0, and `page != 0` is
             // a refusal for `DisplayBackup`'s reason: a caller that invents a page
             // must not be able to keep guessing until something says `last: true`.
@@ -2105,10 +2413,9 @@ pub fn prompt_screen_at(
                     Err(_) => Err(Refusal::PhysicalBackup),
                 }
             }
-            // `BackupSaved` is informational, `CheckBackup` is reached only through a
-            // message `Session::recv` refuses, and the two arms above fall here for
-            // any page but 0. `Shown::Nothing` is what makes `confirm_at` answer
-            // `NotConfirmable`, which is the fail-closed direction for all three.
+            // `BackupSaved` is informational, and the two `if page == 0` arms above
+            // fall here for any page but 0. `Shown::Nothing` is what makes `confirm_at`
+            // answer `NotConfirmable`, which is the fail-closed direction for both.
             _ => Ok(Shown::Nothing),
         },
         // `FinalizeKeyGen` is informational and `VerifyAddress` is reached only
@@ -2168,6 +2475,46 @@ pub enum Typed {
     /// dropped so a vendored bump that adds a prompt cannot lose it silently — the
     /// caller parks it exactly as it parks [`Session::recv`]'s.
     Ended(Vec<DeviceToUserMessage>),
+}
+
+/// What one [`Session::quiz_key`] press did — [`Typed`]'s sibling for the check quiz.
+///
+/// Three states for [`Typed`]'s reason: an invalid key must be distinguishable from a
+/// valid one, because a redraw of an unchanged option row re-samples
+/// [`ui::Frame::mark_sensitive`]'s noise over pixels that did not change.
+///
+/// **There is no `Wrong` variant, and that is the design.** A wrong answer is
+/// [`Checked::Redraw`] — the same position asked again with three freshly drawn
+/// candidates — because a miss is reported to nobody: no lockout, no attempt counter,
+/// and no failure message in the protocol to send. See [`Session::quiz_key`].
+///
+/// `Debug`, unlike [`Typed`], because every variant is payload-free but for one
+/// `usize` count: there is no share material in this type for a formatter to reach,
+/// which is also why [`quiz::Step`] derives it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum Checked {
+    /// The key did nothing. **Do not redraw.**
+    Unchanged,
+    /// The state changed — a correct answer moved to the next question, or a wrong one
+    /// re-asked this one. Draw [`Session::quiz_screen`].
+    Redraw,
+    /// The quiz is over and [`Session::quiz_screen`] is now `None`.
+    ///
+    /// `checked` is `Some(n)` for a PASS: every question was answered correctly, `n`
+    /// words were checked, and `CommsMisc::BackupChecked` is in the outbox. Draw
+    /// `ui::backup_quiz_passed(frame, n)` — which prints "n of 25 words matched, the
+    /// rest were not checked", the honest claim — and then return to standby.
+    ///
+    /// `None` is the human giving up. **Nothing was sent**, and there is nothing to
+    /// send: the ack is success-only and the protocol has no failure counterpart.
+    ///
+    /// A count and not the words, so this value cannot carry share material even if a
+    /// caller logs it.
+    Ended {
+        /// How many words a PASS checked, or `None` for an abandoned quiz.
+        checked: Option<usize>,
+    },
 }
 
 /// [`prompt_screen_at`] at page 0, reporting only whether the drawn screen is one a
@@ -2256,6 +2603,7 @@ mod tests {
     use super::*;
     use coldsnap_hal::flash::fake::FakeFlash;
     use coldsnap_hal::identity;
+    use coldsnap_hal::keypad;
     use coldsnap_hal::rng::{mix_sources, Entropy, ProvenSeed, SE1_BYTES, SE2_BYTES, TRNG_BYTES};
     use frostsnap_core::message::signing::OpenNonceStreams;
     use frostsnap_core::message::HeldShare2;
@@ -3025,21 +3373,26 @@ mod tests {
         );
     }
 
-    /// `CheckBackup` is the LAST message the `PhysicalBackup` refusal covers, and the
-    /// arm a blanket `_ => {}` over `Restoration` would swallow now that its four
-    /// siblings are admitted.
+    /// **A quiz request for a share we do not hold is refused BEFORE any human is
+    /// asked**, by the signer, and nothing is drawn and nothing is answered.
     ///
-    /// DECISIONS: it is not the cheap one. Its screen renders the true word among
-    /// three **and** all 25, so its exposure exceeds `DisplayBackup`'s, and its 26
-    /// redraws make `mark_sensitive`'s sqrt(N) averaging ~1.8x worse. The screen
-    /// exists (`ui::backup_quiz_word`); the distractor picker does not. Admitting it
-    /// while `show_backup` draws plain words would answer a quiz request with a full
-    /// plaintext reveal.
+    /// `display_backup_for_a_share_we_do_not_hold_is_refused_pre_consent`'s twin, and
+    /// it has to be: `CheckBackup` is no longer refused by the dispatch, so the FIRST
+    /// gate is now the signer's three lookups — key, access structure, share index
+    /// (`device/restoration.rs:265-323`). A device that answered this with a question
+    /// on the glass would be offering to quiz a human on a share it cannot decrypt.
     ///
-    /// MUTATION-VERIFY: add `| CoordinatorRestoration::CheckBackup { .. }` to the
-    /// admitted restore arm — the one-line "while we're here" edit — and this fails.
+    /// MUTATION-VERIFY: give `recv_core`'s `CheckBackup` arm an early
+    /// `return Ok(Vec::new())` — the shape a "swallow it, the app is waiting" patch
+    /// takes — and the `expect_err` fails.
     #[test]
-    fn check_backup_alone_stays_refused() {
+    fn check_backup_for_a_share_we_do_not_hold_is_refused_pre_consent() {
+        let flash = fs_flash();
+        let mut rng = entropy(71);
+        let secret = identity::load_or_create(&mut *flash.borrow_mut(), &mut rng)
+            .expect("a blank fake flash must yield a fresh identity");
+        let mut session = Session::open(&flash, &secret).expect("signer construction");
+        let mut out = Outbox::new(session.device_id());
         let body = CoordinatorSendBody::Core(CoordinatorToDeviceMessage::Restoration(
             CoordinatorRestoration::CheckBackup {
                 coord_share_decryption_contrib: CoordShareDecryptionContrib::for_master_share(
@@ -3051,7 +3404,22 @@ mod tests {
                 root_shared_key: shared_key(),
             },
         ));
-        assert_eq!(refuse(body), Refusal::PhysicalBackup);
+        let fault = session
+            .recv(body, &mut rng, &mut out)
+            .expect_err("a quiz on a share we do not hold must be refused");
+        assert!(
+            matches!(fault, Fault::Signer(_)),
+            "expected the signer to refuse, got {fault:?}"
+        );
+        assert_eq!(out.frames(), 0, "a refused quiz request must not answer");
+        assert!(
+            session.quiz_screen().is_none(),
+            "a refused quiz request left a quiz live"
+        );
+        assert!(
+            session.signer.staged_mutations().is_empty(),
+            "a refused quiz request must stage nothing"
+        );
     }
 
     /// **A `SavePhysicalBackup2` for a share nobody typed in is a CLEAN refusal** —
@@ -3949,8 +4317,19 @@ mod tests {
     /// the flash leg), so the device state here is the post-unplug state.
     struct HeldBackup {
         request: CoordinatorSendBody,
+        /// The `CheckBackup` request for the SAME share — the quiz's way in. Built
+        /// from the same polynomial and the same decryption contribution, because
+        /// upstream builds the same `BackupDisplayPhase` for both messages
+        /// (`device/restoration.rs:265-323`), so a test that quizzes and a test that
+        /// reveals are asking about one share.
+        check: CoordinatorSendBody,
         words: [&'static str; ui::BACKUP_WORDS],
         index: u32,
+        /// The two PUBLIC values `CommsMisc::BackupChecked` must echo. Kept so a test
+        /// can find them in the encoded frame: a coordinator drops an ack whose pair
+        /// is not the one it asked about, which is a silent hang.
+        access_structure_ref: AccessStructureRef,
+        share_index: frostsnap_core::schnorr_fun::frost::ShareIndex,
     }
 
     fn hold_a_backup(
@@ -4015,6 +4394,17 @@ mod tests {
         }
 
         HeldBackup {
+            check: CoordinatorSendBody::Core(CoordinatorToDeviceMessage::Restoration(
+                // No `access_structure_ref` field: the signer derives it from the
+                // `root_shared_key` itself (`device/restoration.rs:270`), which is why
+                // the ack echoes a value the coordinator can recompute rather than one
+                // this device chose.
+                CoordinatorRestoration::CheckBackup {
+                    coord_share_decryption_contrib,
+                    share_index,
+                    root_shared_key: root_shared_key.clone(),
+                },
+            )),
             request: CoordinatorSendBody::Core(CoordinatorToDeviceMessage::Restoration(
                 CoordinatorRestoration::DisplayBackup {
                     access_structure_ref,
@@ -4025,6 +4415,8 @@ mod tests {
             )),
             words,
             index,
+            access_structure_ref,
+            share_index,
         }
     }
 
@@ -4066,18 +4458,38 @@ mod tests {
             .join("\n")
     }
 
-    /// Drive the request to the one prompt it produces.
+    /// Drive one body to the single prompt it produces.
+    fn one_prompt(
+        session: &mut Session<'_, DebugFlash<FakeFlash>>,
+        body: CoordinatorSendBody,
+        rng: &mut Entropy,
+        out: &mut Outbox,
+    ) -> DeviceToUserMessage {
+        let mut prompts = session
+            .recv(body, rng, out)
+            .expect("a backup we hold must reach the human");
+        assert_eq!(prompts.len(), 1, "one request, one question");
+        prompts.pop().expect("checked above")
+    }
+
+    /// The `DisplayBackup` question for the held share.
     fn backup_prompt(
         session: &mut Session<'_, DebugFlash<FakeFlash>>,
         held: &HeldBackup,
         rng: &mut Entropy,
         out: &mut Outbox,
     ) -> DeviceToUserMessage {
-        let mut prompts = session
-            .recv(held.request.clone(), rng, out)
-            .expect("a backup we hold must reach the human");
-        assert_eq!(prompts.len(), 1, "one request, one question");
-        prompts.pop().expect("checked above")
+        one_prompt(session, held.request.clone(), rng, out)
+    }
+
+    /// The `CheckBackup` question for the same share — the quiz's way in.
+    fn quiz_prompt(
+        session: &mut Session<'_, DebugFlash<FakeFlash>>,
+        held: &HeldBackup,
+        rng: &mut Entropy,
+        out: &mut Outbox,
+    ) -> DeviceToUserMessage {
+        one_prompt(session, held.check.clone(), rng, out)
     }
 
     /// **CONSENT PRECEDES THE REVEAL.** `recv` returns the question and answers
@@ -4747,6 +5159,774 @@ mod tests {
             );
         }
         assert_eq!(out.frames(), 0, "a refused question must not answer");
+    }
+
+    // -----------------------------------------------------------------------
+    // GAP 6: the backup CHECK quiz — consent, then eight questions, then one ack.
+    //
+    // A REVEAL-CLASS flow: one of the three candidates on every screen is the true
+    // word at the position being asked and a second is a real word from elsewhere in
+    // the same share. So every test below asserts on the same fail-closed directions
+    // the reveal's do — no candidate without the digit, no reveal bought by a quiz
+    // digit, no word on the wire — plus the two that are the quiz's own: a wrong
+    // answer sends NOTHING, and a whole quiz cannot amount to a full disclosure.
+    // -----------------------------------------------------------------------
+
+    /// The question now on the glass: which backup word it asks about, and the three
+    /// candidates. Panics when the quiz has already passed or was never granted, both
+    /// of which are a mistake in the test rather than a state a human can reach.
+    fn quiz_question(
+        session: &Session<'_, DebugFlash<FakeFlash>>,
+    ) -> (usize, [&'static str; quiz::QUIZ_OPTIONS]) {
+        match session.quiz_screen().expect("a quiz must be live") {
+            quiz::Screen::Word { question, options } => {
+                assert_eq!(question.total, quiz::QUIZ_POSITIONS);
+                assert!(question.asked < question.total);
+                (question.number, options)
+            }
+            quiz::Screen::Passed { .. } => panic!("the quiz has already passed"),
+        }
+    }
+
+    /// The key that answers the live question CORRECTLY, and one that does not.
+    ///
+    /// Also the assertion that exactly one candidate is the true word: a triple with
+    /// two would make a wrong answer unreachable and a triple with none would make the
+    /// quiz unpassable, and either way the rest of these tests would be theatre.
+    fn quiz_keys(
+        held: &HeldBackup,
+        number: usize,
+        options: [&'static str; quiz::QUIZ_OPTIONS],
+    ) -> (u8, u8) {
+        let truth = held.words[number - 1];
+        assert_eq!(
+            options.iter().filter(|o| **o == truth).count(),
+            1,
+            "the true word at position {number} must be exactly one of {options:?}"
+        );
+        let right = options
+            .iter()
+            .position(|o| *o == truth)
+            .expect("counted one just above");
+        (
+            ui::QUIZ_KEYS[right],
+            ui::QUIZ_KEYS[(right + 1) % quiz::QUIZ_OPTIONS],
+        )
+    }
+
+    /// Consent to the quiz on the held share, through the shipped funnel and the
+    /// shipped digit, and leave it live.
+    fn consent_to_a_quiz(
+        session: &mut Session<'_, DebugFlash<FakeFlash>>,
+        held: &HeldBackup,
+        rng: &mut Entropy,
+        out: &mut Outbox,
+    ) {
+        let prompt = quiz_prompt(session, held, rng, out);
+        assert_eq!(
+            prompt_screen(&mut ui::Frame::new(), &prompt, ui::ConfirmDigit::draw(rng)),
+            Ok(true),
+            "the quiz question must be a single-page screen that prints a key"
+        );
+        session.confirm(prompt, rng, out).expect("the quiz grant");
+    }
+
+    /// Answer every question correctly. Returns every triple that was on the glass, in
+    /// order, and the ending.
+    fn pass_the_quiz(
+        session: &mut Session<'_, DebugFlash<FakeFlash>>,
+        held: &HeldBackup,
+        rng: &mut Entropy,
+        out: &mut Outbox,
+    ) -> (StdVec<(usize, [&'static str; quiz::QUIZ_OPTIONS])>, Checked) {
+        let mut seen = StdVec::new();
+        for question in 0..quiz::QUIZ_POSITIONS {
+            let (number, options) = quiz_question(session);
+            seen.push((number, options));
+            let (right, _) = quiz_keys(held, number, options);
+            let step = session
+                .quiz_key(right, rng, out)
+                .expect("a live quiz must take a key");
+            if question + 1 == quiz::QUIZ_POSITIONS {
+                return (seen, step);
+            }
+            assert_eq!(
+                step,
+                Checked::Redraw,
+                "a correct answer to question {question} did not move the quiz on"
+            );
+        }
+        unreachable!("the loop returns on the last question");
+    }
+
+    /// **CONSENT PRECEDES THE FIRST CANDIDATE.** `recv` returns the question and
+    /// answers nothing; no candidate exists until `confirm_at` has been through the
+    /// [`prompt_screen`] funnel, and a keypress cannot start a quiz.
+    ///
+    /// `a_backup_is_never_drawn_before_the_digit_is_pressed` for the quiz, and the
+    /// property is the same one: one candidate in three is a real word of this share,
+    /// so a screen drawn before the digit has already leaked it.
+    ///
+    /// MUTATION-VERIFY: build the `Quiz` in `recv_core`'s `CheckBackup` arm — which is
+    /// the shape a "just wire it up" patch takes, because that is where the phase first
+    /// exists — and the pre-consent legs fail with "a quiz was live with no consent
+    /// behind it". Delete the `self.check.take()` guard in `quiz_key` and it does not
+    /// compile, which is the stronger version of the same property.
+    #[test]
+    fn a_quiz_candidate_is_never_drawn_before_the_digit_is_pressed() {
+        let flash = fs_flash();
+        let mut rng = entropy(127);
+        let (mut session, held) = a_device_holding_a_backup(&flash, &mut rng);
+        let mut out = Outbox::new(session.device_id());
+
+        let prompt = quiz_prompt(&mut session, &held, &mut rng, &mut out);
+        assert_eq!(
+            out.frames(),
+            0,
+            "`recv` must answer NOTHING for a quiz request"
+        );
+        assert!(
+            session.quiz_screen().is_none(),
+            "a quiz was live with no consent behind it"
+        );
+        // And a keypress cannot start one, on any key including the answer keys.
+        for key in ui::QUIZ_KEYS.iter().chain(&[keypad::KEY_CANCEL, b'9']) {
+            assert!(
+                matches!(
+                    session.quiz_key(*key, &mut rng, &mut out),
+                    Err(Fault::Refused(Refusal::PhysicalBackup))
+                ),
+                "key {key:#04x} started a quiz nobody consented to"
+            );
+        }
+
+        // The consent screen, then the digit.
+        let mut frame = ui::Frame::new();
+        assert_eq!(
+            prompt_screen(&mut frame, &prompt, ui::ConfirmDigit::draw(&mut rng)),
+            Ok(true),
+            "the quiz question must be a single-page screen that prints a key"
+        );
+        session
+            .confirm(prompt, &mut rng, &mut out)
+            .expect("the quiz grant");
+        assert_eq!(
+            out.frames(),
+            0,
+            "consenting to a quiz must not answer the coordinator either"
+        );
+
+        // AFTER: a question exists, and it is renderable by the screen it is for.
+        let (number, options) = quiz_question(&session);
+        assert!((1..=ui::BACKUP_WORDS).contains(&number));
+        assert_eq!(
+            ui::backup_quiz_word(
+                &mut frame,
+                match session.quiz_screen().expect("live") {
+                    quiz::Screen::Word { question, .. } => question,
+                    quiz::Screen::Passed { .. } => panic!("just asked a question"),
+                },
+                options,
+                &mut rng,
+            ),
+            Ok(()),
+            "the machine produced a question its own screen refuses"
+        );
+    }
+
+    /// The quiz consent screen carries **NO WORD**, it says CHECK and not REVEAL, and
+    /// it prints the digit that grants.
+    ///
+    /// `the_backup_consent_screen_shows_no_word_and_prints_the_digit` for the quiz,
+    /// plus the half that is the quiz's own: a human who is told "reveal" and shown a
+    /// quiz has merely been confused, but a human who is told "check" and shown all 25
+    /// words has been lied to by a screen. So the two questions must differ on the
+    /// glass, and only page 0 may authorise either.
+    ///
+    /// MUTATION-VERIFY, three ways. Draw the candidates on the consent screen and the
+    /// first half fails, naming the word. Pass `REVEAL_QUESTION` to `backup_consent`
+    /// from the `CheckBackup` arm — the copy-paste — and the "says CHECK" half fails.
+    /// Drop the `Press (N)` line from `consent_screen` and the digit half fails.
+    #[test]
+    fn the_quiz_consent_screen_shows_no_word_and_names_the_check() {
+        let flash = fs_flash();
+        let mut rng = entropy(131);
+        let (mut session, held) = a_device_holding_a_backup(&flash, &mut rng);
+        let mut out = Outbox::new(session.device_id());
+        let prompt = quiz_prompt(&mut session, &held, &mut rng, &mut out);
+
+        let (a, b) = two_digits(&mut rng);
+        let draw = |digit: ui::ConfirmDigit, page: usize| {
+            let mut frame = ui::Frame::new();
+            let shown = prompt_screen_at(&mut frame, &prompt, digit, page);
+            (shown, frame)
+        };
+        let (shown, first) = draw(a, 0);
+        assert_eq!(
+            shown,
+            Ok(Shown::Page { last: true }),
+            "the quiz question is one page and it is the page that authorises"
+        );
+
+        let text = all_rows(&first, ui::COLS);
+        for (i, word) in held.words.iter().enumerate() {
+            assert!(
+                !text.contains(word),
+                "word {} ({word:?}) is on the quiz CONSENT screen — a candidate was \
+                 drawn before anyone consented to one. Screen:\n{text}",
+                i + 1
+            );
+        }
+        assert!(
+            text.contains(CHECK_QUESTION),
+            "the quiz question must say it is a CHECK; got:\n{text}"
+        );
+        assert!(
+            !text.contains(REVEAL_QUESTION),
+            "the quiz question reads as a full reveal; got:\n{text}"
+        );
+        // It does say which share, so a human can match it against the request.
+        let mut what = ui::Buf::<16>::new();
+        what.push_str("share #").push_u64(held.index as u64);
+        assert!(
+            text.contains(what.as_str()),
+            "the quiz question must name the share index; got:\n{text}"
+        );
+
+        let (again, second) = draw(b, 0);
+        assert_eq!(again, shown);
+        assert!(
+            first.as_bytes() != second.as_bytes(),
+            "the quiz question does not print the confirm digit, so no human can read \
+             the key that grants it"
+        );
+
+        // No page but 0 draws or authorises — the reveal question's rule
+        // (`only_page_0_of_the_backup_question_draws_or_authorises`), because a caller
+        // that invents a page must not be able to keep guessing until something says
+        // `last: true`.
+        for page in [1usize, 2, 8, usize::MAX] {
+            assert_eq!(
+                draw(a, page).0,
+                Err(Refusal::DisplayBackup),
+                "page {page} of a one-page question must refuse"
+            );
+            let fault = session
+                .confirm_at(prompt.clone(), page, &mut rng, &mut out)
+                .expect_err("a page that does not draw cannot authorise");
+            assert!(
+                matches!(fault, Fault::Refused(Refusal::DisplayBackup)),
+                "page {page}: got {fault:?}"
+            );
+            assert!(
+                session.quiz_screen().is_none(),
+                "page {page} of the quiz question granted a quiz"
+            );
+        }
+        assert_eq!(out.frames(), 0, "a refused question must not answer");
+    }
+
+    /// **A quiz digit does not buy a reveal, and a reveal digit does not buy a quiz.**
+    ///
+    /// This is the whole reason `CheckBackup` was refused until now, stated as a test.
+    /// `show_backup` draws all 25 words in plain, so a `CheckBackup` consent that also
+    /// wrote `self.reveal` would answer a request to check one word in three with the
+    /// entire share — and it is a ONE-LINE patch away, because both arms of
+    /// `confirm_at` hold the same `BackupDisplayPhase`.
+    ///
+    /// MUTATION-VERIFY: add `self.reveal = Some(phase);` to `confirm_at`'s
+    /// `CheckBackup` arm and the first half fails on "a quiz consent granted a
+    /// reveal". Add `self.check = Some(..)` to the `DisplayBackup` arm and the second
+    /// half fails.
+    #[test]
+    fn consenting_to_a_quiz_does_not_grant_a_reveal() {
+        let flash = fs_flash();
+        let mut rng = entropy(137);
+        let (mut session, held) = a_device_holding_a_backup(&flash, &mut rng);
+        let mut out = Outbox::new(session.device_id());
+        let mut frame = ui::Frame::new();
+
+        consent_to_a_quiz(&mut session, &held, &mut rng, &mut out);
+        assert!(session.quiz_screen().is_some(), "the quiz grant");
+        assert!(
+            matches!(
+                session.show_backup(0, &mut frame, &mut rng),
+                Err(Fault::Refused(Refusal::DisplayBackup))
+            ),
+            "a quiz consent granted a reveal: all 25 words for a question about three"
+        );
+        assert!(
+            frame.as_bytes().iter().all(|b| *b == 0),
+            "a refused reveal touched the frame"
+        );
+        // Nor the reveal's ack, which is what the coordinator's `DisplayBackup` dialog
+        // waits on: a quiz must not be able to close it.
+        assert!(!session.record_pending());
+        assert!(
+            matches!(
+                session.backup_recorded(&mut out),
+                Err(Fault::Refused(Refusal::DisplayBackup))
+            ),
+            "a quiz acked a backup as RECORDED"
+        );
+
+        // And the other direction, on a fresh device so no quiz grant is in play.
+        let flash2 = fs_flash();
+        let mut rng2 = entropy(139);
+        let (mut session2, held2) = a_device_holding_a_backup(&flash2, &mut rng2);
+        let mut out2 = Outbox::new(session2.device_id());
+        let prompt = backup_prompt(&mut session2, &held2, &mut rng2, &mut out2);
+        session2
+            .confirm(prompt, &mut rng2, &mut out2)
+            .expect("the reveal grant");
+        assert!(
+            session2.quiz_screen().is_none(),
+            "a reveal consent granted a quiz"
+        );
+        assert!(
+            matches!(
+                session2.quiz_key(ui::QUIZ_KEYS[0], &mut rng2, &mut out2),
+                Err(Fault::Refused(Refusal::PhysicalBackup))
+            ),
+            "a reveal consent let a quiz key be scored"
+        );
+    }
+
+    /// **A WRONG ANSWER TELLS THE COORDINATOR NOTHING**, and re-asks the same position
+    /// with three freshly drawn candidates.
+    ///
+    /// Both references agree and neither invents a failure message: Coldcard re-asks
+    /// the same index after `Wrong!` (`shared/seed.py:865-887`) and Frostsnap keeps the
+    /// quiz page up, marks the tapped button `FeedbackKind::Wrong` and clears it on the
+    /// next tap (`frostsnap_widgets/src/backup/check_backup.rs:592-600`). There is no
+    /// failure counterpart to `BackupDisplayPhase` in the protocol, so there is nothing
+    /// to send — and no lockout either, which would be ours alone.
+    ///
+    /// The re-ask also carries the banner (`ui::QuizWord::retry`), because a device
+    /// that redraws an identical screen has told the human nothing.
+    ///
+    /// MUTATION-VERIFY, three ways. Push `CommsMisc::BackupChecked` on
+    /// `quiz::Step::Redraw` — the "the app is waiting" patch — and the frames assert
+    /// fails. Return `Checked::Ended` for a wrong answer (advance past it) and the
+    /// "still asking" assert fails. Reuse the same options on the re-ask (drop
+    /// `draw_options` from `quiz::Quiz::ask`) and the fresh-candidates assert fails.
+    #[test]
+    fn a_wrong_quiz_answer_tells_the_coordinator_nothing_and_re_asks() {
+        let flash = fs_flash();
+        let mut rng = entropy(149);
+        let (mut session, held) = a_device_holding_a_backup(&flash, &mut rng);
+        let mut out = Outbox::new(session.device_id());
+        consent_to_a_quiz(&mut session, &held, &mut rng, &mut out);
+
+        let (number, options) = quiz_question(&session);
+        // Ten misses in a row. No lockout, no counter, no ack, and the same position
+        // every time.
+        let mut previous = options;
+        for miss in 0..10 {
+            let (_, wrong) = quiz_keys(&held, number, previous);
+            assert_eq!(
+                session
+                    .quiz_key(wrong, &mut rng, &mut out)
+                    .expect("a live quiz must take a key"),
+                Checked::Redraw,
+                "miss {miss} did not re-ask"
+            );
+            assert_eq!(
+                out.frames(),
+                0,
+                "miss {miss} told the coordinator something. There is no failure \
+                 message in this protocol to tell it with."
+            );
+            let screen = session.quiz_screen().expect("still asking");
+            let (again, fresh) = match screen {
+                quiz::Screen::Word { question, options } => {
+                    assert!(question.retry, "miss {miss} redrew an identical screen");
+                    (question.number, options)
+                }
+                quiz::Screen::Passed { .. } => panic!("miss {miss} passed the quiz"),
+            };
+            assert_eq!(again, number, "miss {miss} moved to a different position");
+            assert_ne!(
+                fresh, previous,
+                "miss {miss} re-asked with the same three candidates in the same \
+                 slots, which makes the second guess 1-in-2"
+            );
+            previous = fresh;
+        }
+
+        // And the position is still passable: a miss costs nothing but a redraw.
+        let (right, _) = quiz_keys(&held, number, previous);
+        assert_eq!(
+            session
+                .quiz_key(right, &mut rng, &mut out)
+                .expect("a live quiz must take a key"),
+            Checked::Redraw
+        );
+        assert_eq!(out.frames(), 0, "answering correctly acked mid-quiz");
+        match session.quiz_screen().expect("still asking") {
+            quiz::Screen::Word { question, .. } => {
+                assert!(!question.retry, "the banner outlived the wrong answer");
+                assert_eq!(question.asked, 1, "a correct answer did not count");
+            }
+            quiz::Screen::Passed { .. } => panic!("one question is not the whole quiz"),
+        }
+    }
+
+    /// **NO CANDIDATE WORD EVER REACHES THE OUTBOX** — not on a miss, not on a pass,
+    /// not on the ack — and the one thing a pass does send is the pair the coordinator
+    /// asked about.
+    ///
+    /// The reveal's `no_word_of_a_revealed_backup_ever_reaches_the_outbox` for the
+    /// quiz. Read out of the ENCODED BYTES, case-insensitively, so it covers the
+    /// encoder as much as the call: `quiz::Step` is payload-free, `Checked` carries one
+    /// `usize`, and `CommsMisc::BackupChecked` carries two values the coordinator sent
+    /// us — so there should be nothing in this frame derived from a word.
+    ///
+    /// MUTATION-VERIFY: push a `DeviceSendBody::Debug` carrying the chosen option from
+    /// `quiz_key` (the debug line a "why did that answer fail" patch adds) and this
+    /// fails, naming the word.
+    #[test]
+    fn no_candidate_word_of_a_quiz_ever_reaches_the_outbox() {
+        let flash = fs_flash();
+        let mut rng = entropy(151);
+        let (mut session, held) = a_device_holding_a_backup(&flash, &mut rng);
+        let mut out = Outbox::new(session.device_id());
+        consent_to_a_quiz(&mut session, &held, &mut rng, &mut out);
+
+        // One miss first, so the bytes cover the wrong-answer path too.
+        let (number, options) = quiz_question(&session);
+        let (_, wrong) = quiz_keys(&held, number, options);
+        assert_eq!(
+            session
+                .quiz_key(wrong, &mut rng, &mut out)
+                .expect("a live quiz must take a key"),
+            Checked::Redraw,
+            "a miss must re-ask, not advance"
+        );
+        assert_eq!(out.frames(), 0, "a miss reached the wire");
+
+        let (seen, ending) = pass_the_quiz(&mut session, &held, &mut rng, &mut out);
+        assert_eq!(
+            ending,
+            Checked::Ended {
+                checked: Some(quiz::QUIZ_POSITIONS)
+            },
+            "a fully correct quiz did not pass"
+        );
+        assert_eq!(out.frames(), 1, "a passed quiz must send exactly one ack");
+
+        let bytes = out.bytes();
+        for word in held.words.iter() {
+            let lower = word.to_lowercase();
+            assert!(
+                !bytes
+                    .windows(lower.len())
+                    .any(|w| w.eq_ignore_ascii_case(lower.as_bytes())),
+                "{word:?} reached the outbox on the quiz path"
+            );
+        }
+        // Every candidate that was ever on the glass, including the distractors drawn
+        // from outside the share.
+        for (_, options) in &seen {
+            for candidate in options {
+                let lower = candidate.to_lowercase();
+                assert!(
+                    !bytes
+                        .windows(lower.len())
+                        .any(|w| w.eq_ignore_ascii_case(lower.as_bytes())),
+                    "candidate {candidate:?} reached the outbox"
+                );
+            }
+        }
+        // What the ack DOES carry: the pair the coordinator sent in the request. An ack
+        // whose pair does not match is dropped by
+        // `frostsnap_coordinator/src/check_backup.rs:136-156`, i.e. a silent hang.
+        let key_id = held.access_structure_ref.key_id.0;
+        assert!(
+            bytes.windows(key_id.len()).any(|w| w == key_id),
+            "the ack does not name the access structure it answers for"
+        );
+        assert_eq!(
+            held.share_index,
+            match &held.check {
+                CoordinatorSendBody::Core(CoordinatorToDeviceMessage::Restoration(
+                    CoordinatorRestoration::CheckBackup { share_index, .. },
+                )) => *share_index,
+                _ => panic!("the check request is a CheckBackup"),
+            },
+            "the fixture's own pair disagrees, so this test proves nothing"
+        );
+    }
+
+    /// **A WHOLE QUIZ CANNOT BE A FULL DISCLOSURE.** It asks
+    /// [`quiz::QUIZ_POSITIONS`] of the 25 positions and puts at most two words of this
+    /// share on the glass per question, so it cannot reach all 25 however it is
+    /// answered — and the screen that ends it says so.
+    ///
+    /// This is the objection that kept `CheckBackup` refused, measured instead of
+    /// asserted: the claim was that the quiz "renders the true word among three AND all
+    /// 25 words", which is upstream's widget and not this one. Coldcard's `limited`
+    /// subset is what we copy (`shared/backups.py:442`, `len(words)//3`).
+    ///
+    /// MUTATION-VERIFY, two ways, both in `quiz.rs`: set `QUIZ_POSITIONS` to
+    /// `ui::BACKUP_WORDS` and the "not every word" assert fails with all 25 shown; make
+    /// `draw_order` return `0..QUIZ_POSITIONS` and the "always the last word" assert
+    /// fails.
+    #[test]
+    fn a_whole_quiz_cannot_put_the_whole_share_on_the_glass() {
+        let flash = fs_flash();
+        let mut rng = entropy(157);
+        let (mut session, held) = a_device_holding_a_backup(&flash, &mut rng);
+        let mut out = Outbox::new(session.device_id());
+        consent_to_a_quiz(&mut session, &held, &mut rng, &mut out);
+        let (seen, _) = pass_the_quiz(&mut session, &held, &mut rng, &mut out);
+
+        assert_eq!(
+            seen.len(),
+            quiz::QUIZ_POSITIONS,
+            "the quiz did not ask the number of questions it says it asks"
+        );
+        // A `const` assert and not a runtime one: a quiz that asks about every position
+        // is a reveal with extra steps, and that should be a BUILD failure rather than
+        // a test failure. (It is also what clippy's `assertions_on_constants` asks for.)
+        const _: () = assert!(quiz::QUIZ_POSITIONS < ui::BACKUP_WORDS);
+        let mut positions: StdVec<usize> = seen.iter().map(|(number, _)| *number).collect();
+        positions.sort_unstable();
+        positions.dedup();
+        assert_eq!(
+            positions.len(),
+            quiz::QUIZ_POSITIONS,
+            "the same position was asked twice, so fewer words were checked than \
+             `ui::backup_quiz_passed` will claim"
+        );
+        assert!(
+            positions.contains(&ui::BACKUP_WORDS),
+            "the LAST word was not asked about. Coldcard always includes it \
+             (`shared/seed.py:838-847`) because it is the checksum word."
+        );
+
+        // Which words of THIS share were ever on the glass: one true word per question
+        // plus at most one own-set distractor, so at most two thirds of the share, and
+        // never all of it.
+        let mut shown: StdVec<&str> = seen
+            .iter()
+            .flat_map(|(_, options)| options.iter().copied())
+            .filter(|candidate| held.words.contains(candidate))
+            .collect();
+        shown.sort_unstable();
+        shown.dedup();
+        assert!(
+            shown.len() < ui::BACKUP_WORDS,
+            "every word of the share appeared as a candidate: the quiz WAS the reveal"
+        );
+        assert!(
+            shown.len() <= 2 * quiz::QUIZ_POSITIONS,
+            "{} of the share's words were shown, more than two per question",
+            shown.len()
+        );
+    }
+
+    /// **THE TRUE WORD IS NOT AT A PREDICTABLE SLOT.** Over a hundred questions it
+    /// lands on all three keys.
+    ///
+    /// A picker that leaks the answer by position is worse than no quiz, because it
+    /// teaches false confidence: a human who "passes" by always pressing `2` has
+    /// checked nothing. Uniformity is `quiz.rs`'s own test
+    /// (`the_answer_lands_in_every_slot_uniformly`, 3,200 samples); this is the
+    /// end-to-end version, through the grant and the keypress path a device actually
+    /// walks, so a caller that sorted or reordered the options would fail here.
+    ///
+    /// MUTATION-VERIFY: remove the shuffle from `quiz::Quiz::draw_options` (the answer
+    /// is built at slot 0) and this fails on the slot that never occurs.
+    #[test]
+    fn the_true_word_is_not_at_a_predictable_slot() {
+        let flash = fs_flash();
+        let mut rng = entropy(163);
+        let (mut session, held) = a_device_holding_a_backup(&flash, &mut rng);
+        let mut out = Outbox::new(session.device_id());
+        let mut hits = [0usize; quiz::QUIZ_OPTIONS];
+
+        // Misses re-draw, so one grant is enough to sample many triples for one
+        // position — and it samples the RE-ASK path, which is the one that would be
+        // easiest to get wrong.
+        consent_to_a_quiz(&mut session, &held, &mut rng, &mut out);
+        for _ in 0..120 {
+            let (number, options) = quiz_question(&session);
+            let (right, wrong) = quiz_keys(&held, number, options);
+            hits[ui::QUIZ_KEYS
+                .iter()
+                .position(|k| *k == right)
+                .expect("the right key is one of the three")] += 1;
+            assert_eq!(
+            session
+                .quiz_key(wrong, &mut rng, &mut out)
+                .expect("a live quiz must take a key"),
+            Checked::Redraw,
+            "a miss must re-ask, not advance"
+        );
+        }
+        assert_eq!(out.frames(), 0, "120 misses reached the wire");
+        for (slot, count) in hits.iter().enumerate() {
+            assert!(
+                *count > 0,
+                "the true word never landed on key {} in 120 questions: {hits:?}",
+                ui::QUIZ_KEYS[slot] as char
+            );
+        }
+    }
+
+    /// **A CANCELLED CEREMONY DROPS THE QUIZ**, plaintext words and all, and a passed
+    /// quiz acks exactly once.
+    ///
+    /// The quiz grant is the only one on this device that holds a decrypted share for
+    /// the whole flow, so `Cancel` matters more here than for the reveal (which keeps
+    /// only ciphertext) or the entry (which holds nothing until a human types it). A
+    /// surviving quiz would put candidate words on the glass for a ceremony the
+    /// coordinator has abandoned.
+    ///
+    /// MUTATION-VERIFY, two ways: drop `self.check = None` from the `Cancel` arm and
+    /// the first half fails; put the quiz back on the `Step::Passed` leg of `quiz_key`
+    /// and the second half fails with a second ack.
+    #[test]
+    fn cancel_drops_a_live_quiz_and_a_pass_acks_once() {
+        let flash = fs_flash();
+        let mut rng = entropy(167);
+        let (mut session, held) = a_device_holding_a_backup(&flash, &mut rng);
+        let mut out = Outbox::new(session.device_id());
+
+        consent_to_a_quiz(&mut session, &held, &mut rng, &mut out);
+        assert!(session.quiz_screen().is_some());
+        assert!(session
+            .recv(CoordinatorSendBody::Cancel, &mut rng, &mut out)
+            .expect("cancel is always handled")
+            .is_empty());
+        assert!(
+            session.quiz_screen().is_none(),
+            "a cancelled ceremony left a quiz — and a share — live"
+        );
+        assert!(
+            matches!(
+                session.quiz_key(ui::QUIZ_KEYS[0], &mut rng, &mut out),
+                Err(Fault::Refused(Refusal::PhysicalBackup))
+            ),
+            "a cancelled quiz still scored a keypress"
+        );
+        assert_eq!(out.frames(), 0, "a cancelled quiz sent something");
+
+        // A second grant, passed this time. One ack, and then nothing at all.
+        consent_to_a_quiz(&mut session, &held, &mut rng, &mut out);
+        let (_, ending) = pass_the_quiz(&mut session, &held, &mut rng, &mut out);
+        assert_eq!(
+            ending,
+            Checked::Ended {
+                checked: Some(quiz::QUIZ_POSITIONS)
+            }
+        );
+        assert_eq!(out.frames(), 1, "a passed quiz did not ack exactly once");
+        assert!(
+            session.quiz_screen().is_none(),
+            "a passed quiz stayed live, so its words are still resident"
+        );
+        for key in ui::QUIZ_KEYS.iter().chain(&[keypad::KEY_CANCEL]) {
+            assert!(
+                matches!(
+                    session.quiz_key(*key, &mut rng, &mut out),
+                    Err(Fault::Refused(Refusal::PhysicalBackup))
+                ),
+                "key {key:#04x} was scored after the quiz ended"
+            );
+        }
+        assert_eq!(out.frames(), 1, "one quiz acked twice");
+    }
+
+    /// **GIVING UP SENDS NOTHING**, from any question, including a re-ask.
+    ///
+    /// Silence is the honest wire behaviour and not a gap: the ack is success-only, so
+    /// there is no "quiz abandoned" and no "quiz failed" message to send, and the
+    /// coordinator's own dialog ends on its `cancel()`
+    /// (`frostsnap_coordinator/src/check_backup.rs`). PUNTED UPSTREAM.
+    ///
+    /// MUTATION-VERIFY: ack on `quiz::Step::Abort` (the "tell it we are done" patch)
+    /// and this fails.
+    #[test]
+    fn giving_up_on_a_quiz_ends_it_in_silence() {
+        let flash = fs_flash();
+        let mut rng = entropy(173);
+        let (mut session, held) = a_device_holding_a_backup(&flash, &mut rng);
+        let mut out = Outbox::new(session.device_id());
+        consent_to_a_quiz(&mut session, &held, &mut rng, &mut out);
+
+        // One miss, so the abort comes from the re-ask screen: a human cannot be
+        // trapped on a screen that has just told them they were wrong.
+        let (number, options) = quiz_question(&session);
+        let (_, wrong) = quiz_keys(&held, number, options);
+        assert_eq!(
+            session
+                .quiz_key(wrong, &mut rng, &mut out)
+                .expect("a live quiz must take a key"),
+            Checked::Redraw,
+            "a miss must re-ask, not advance"
+        );
+
+        assert_eq!(
+            session
+                .quiz_key(keypad::KEY_CANCEL, &mut rng, &mut out)
+                .expect("cancel on a live quiz"),
+            Checked::Ended { checked: None },
+            "cancel did not end the quiz"
+        );
+        assert_eq!(out.frames(), 0, "an abandoned quiz told the coordinator");
+        assert!(session.quiz_screen().is_none());
+    }
+
+    /// Every byte that is not an answer key or cancel is a NO-OP at every state, and
+    /// `Checked::Unchanged` is what says "do not redraw".
+    ///
+    /// The redraw distinction is not cosmetic: re-rendering an unchanged option row
+    /// re-samples `ui::Frame::mark_sensitive`'s noise over pixels that did not change,
+    /// which is the one thing that averaging defence cannot afford. `keypad::KEY_OK` is
+    /// in here deliberately — it is Coldcard's "show me all the words again" key
+    /// (`shared/seed.py:877-879`) and it is DEAD on this device, because a reveal
+    /// reachable from a quiz screen is a reveal with weaker consent than a reveal.
+    ///
+    /// MUTATION-VERIFY: route `keypad::KEY_OK` to `show_backup`'s grant and this fails
+    /// on the "moved the quiz on" assert (and `consenting_to_a_quiz_does_not_grant_a_reveal`
+    /// fails too).
+    #[test]
+    fn no_key_but_an_answer_or_cancel_moves_a_quiz() {
+        let flash = fs_flash();
+        let mut rng = entropy(179);
+        let (mut session, held) = a_device_holding_a_backup(&flash, &mut rng);
+        let mut out = Outbox::new(session.device_id());
+        consent_to_a_quiz(&mut session, &held, &mut rng, &mut out);
+        let before = session.quiz_screen().expect("a quiz is live");
+
+        for key in 0..=u8::MAX {
+            if ui::QUIZ_KEYS.contains(&key) || key == keypad::KEY_CANCEL {
+                continue;
+            }
+            assert_eq!(
+                session
+                    .quiz_key(key, &mut rng, &mut out)
+                    .expect("a live quiz must take every key"),
+                Checked::Unchanged,
+                "key {key:#04x} moved the quiz on"
+            );
+            assert_eq!(
+                session.quiz_screen(),
+                Some(before),
+                "key {key:#04x} changed the question"
+            );
+        }
+        assert_eq!(out.frames(), 0, "256 dead keys reached the wire");
+        // And the reveal was not granted along the way, by any of them.
+        assert!(
+            matches!(
+                session.show_backup(0, &mut ui::Frame::new(), &mut rng),
+                Err(Fault::Refused(Refusal::DisplayBackup))
+            ),
+            "a key on a quiz screen granted a reveal"
+        );
     }
 
     // -----------------------------------------------------------------------

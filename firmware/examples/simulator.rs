@@ -93,7 +93,7 @@ use coldsnap_hal::{identity, memmap};
 use frostsnap_core::bitcoin_transaction::{PushInput, TransactionTemplate};
 use frostsnap_core::message::screen_verify::ScreenVerify;
 use frostsnap_core::message::{CoordinatorRestoration, CoordinatorToDeviceMessage};
-use frostsnap_core::{CheckedSignTask, CoordShareDecryptionContrib, MasterAppkey, SignTask};
+use frostsnap_core::{CheckedSignTask, MasterAppkey, SignTask};
 
 /// One thing a user can look at: a title, a note about how it was produced, and
 /// the frames, in order.
@@ -1110,25 +1110,6 @@ fn session_scenes(
         .map(|()| format!("{} frames, {} bytes", out.frames(), out.bytes().len()))
         .unwrap_or_else(|e| format!("announce failed: {e:?}"));
 
-    // A real 1-of-1 polynomial, so `CheckBackup` below is refused by the DISPATCH
-    // rather than by the signer failing to find a key. `Fingerprint::NONE` because
-    // the production one grinds ~262,144 hashes per coefficient and nothing on this
-    // path reads a fingerprint.
-    let quiz_key = {
-        let secret = frostsnap_core::schnorr_fun::fun::Scalar::from_bytes([0x4bu8; 32])
-            .and_then(|s| s.non_zero())
-            .expect("a fixed non-zero scalar below the order");
-        let (shares, root) = frost_backup::ShareBackup::generate_shares(
-            secret,
-            1,
-            1,
-            frost_backup::Fingerprint::NONE,
-            rng,
-        );
-        let index = shares.first().expect("one share was asked for").index();
-        (root, index)
-    };
-
     let hostile: Vec<(&str, &str, CoordinatorSendBody)> = vec![
         (
             "9a session: RequestHeldShares (read-only, ALLOWED)",
@@ -1139,27 +1120,22 @@ fn session_scenes(
             )),
         ),
         (
-            // WAS `EnterPhysicalBackup`, which is now ADMITTED and answers with a
-            // consent screen, so it is no longer a refusal and cannot hold this
-            // fixture's assertion. `CheckBackup` is the restoration message that
-            // MUST stay refused — its screen renders the true word among three AND
-            // all 25, so admitting it while `show_backup` draws plain words would
-            // answer a quiz request with a full plaintext reveal — which makes it the
-            // right one to pin here.
-            "9b session: CheckBackup -> REFUSAL",
-            "its quiz reveals more than DisplayBackup does and the distractor picker \
-             does not exist, so there is nothing honest to draw",
-            CoordinatorSendBody::Core(CoordinatorToDeviceMessage::Restoration(
-                CoordinatorRestoration::CheckBackup {
-                    coord_share_decryption_contrib: CoordShareDecryptionContrib::for_master_share(
-                        id,
-                        quiz_key.1,
-                        &quiz_key.0,
-                    ),
-                    share_index: quiz_key.1,
-                    root_shared_key: quiz_key.0.clone(),
-                },
-            )),
+            // WAS `EnterPhysicalBackup`, then `CheckBackup`. Both are now ADMITTED and
+            // answer with a consent screen, so neither can hold this fixture's
+            // assertion any longer — **every** `CoordinatorRestoration` variant is
+            // admitted today, each behind a digit, so there is no restoration message
+            // left to pin here. `DataErase` is the nearest thing with the same
+            // consequence: it destroys shares, it is refused outright by the dispatch,
+            // and no other scene covers it.
+            //
+            // `CheckBackup` moved because the quiz landed: `Session::confirm_at` builds
+            // a `quiz::Quiz` and `Session::quiz_key` scores it, with the true word among
+            // three on `ui::QUIZ_KEYS` and never a plain page of 25. Its refusals are
+            // covered by `firmware/src/lib.rs`'s tests, not by a fixture here.
+            "9b session: DataErase -> REFUSAL",
+            "it destroys shares, so it may only ever run behind physical consent — and \
+             no such screen or button path exists on this device",
+            CoordinatorSendBody::DataErase,
         ),
         (
             "9c session: ScreenVerify::VerifyAddress -> REFUSAL",

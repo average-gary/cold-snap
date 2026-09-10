@@ -66,28 +66,32 @@
 //! (`stm32/sigheader.py:30`, `256*1024`), and
 //! `signit.py:295,305` pads it to 512 and then, on the Mk4/Mk5 branch, to **4096**
 //! (`verify.c:106`: the installer erases 4 K pages). The measured body is
-//! **372,624 B**, 110,480 B over the floor, and signit pads it by 112 B
-//! (`align_to(372_624, 512) = 372_736`, and `align_to(.., 4096)` is the same number).
+//! **376,760 B**, 114,616 B over the floor, and signit pads it by 72 B
+//! (`align_to(376_760, 512) = 376_832`, and `align_to(.., 4096)` is the same number).
 //! Padding is signit's job; never hand it a pre-padded body.
 //!
 //! Those three numbers were 282,016 / 19,872 / 608 before the dispatch,
 //! 331,052 / 68,908 / 724 before the backup reveal was reachable,
-//! 362,316 / 100,172 / 2,228 before the recorded question, and
-//! 364,588 / 102,444 / 4,052 before the restore flow was reachable from the pad; they
+//! 362,316 / 100,172 / 2,228 before the recorded question,
+//! 364,588 / 102,444 / 4,052 before the restore flow was reachable from the pad, and
+//! 374,960 / 112,816 / 336 before the check quiz was; they
 //! are re-measured off the linked ELF, not carried. A stale MEASURED number reads
 //! exactly like a checked one, which is why they are corrected here rather than left
-//! for the next reader to trust — the previous step's, which landed the library side
-//! without a caller, was one of them.
+//! for the next reader to trust — two consecutive steps' were, each of them a change
+//! that landed the library side without a caller in this file.
 //!
-//! MEASURED cost of the last step, which is the entry becoming REACHABLE: **+8,036 B**
-//! of image (+7,708 `.text`, +328 `.rodata`, `.bss` unchanged at
-//! `0x2000_8034..0x2001_8058`). Almost none of that is this file's ~200 lines. Before
-//! it, nothing in `boot` called `Session::entry_key` or `ui::WordEntry::render`, so LTO
-//! dropped the whole typing path — the word machine, the checksum, the candidate
-//! narrowing and both entry renderers monomorphised for `rng::Entropy` — out of the
-//! image. A `cfg(arm)` event loop is what decides which of `coldsnap_firmware` exists
-//! on the device, and that is worth knowing before reading a flash delta as the size of
-//! a diff.
+//! MEASURED cost of the last step, which is the check QUIZ becoming REACHABLE:
+//! **+1,800 B** of image (+1,712 `.text`, +88 `.rodata`, `.bss` unchanged at
+//! `0x2000_8034..0x2001_8058`), taking the image to **376,824 B**, 26.44% of
+//! `FLASH_TEXT`. Measured by building the tree with this file reverted and again with
+//! it, not inferred from a diff. Little of it is this file's ~250 lines: before them,
+//! nothing in `boot` called `Session::quiz_key` or either quiz renderer, so LTO dropped
+//! `ui::backup_quiz_word` and `backup_quiz_passed` monomorphised for `rng::Entropy`,
+//! and `coldsnap_firmware::quiz`'s generics were never instantiated at all — which is
+//! why that module's author measured it at 0 B. The step before this one was the same
+//! story for the entry (+8,036 B, +7,708 `.text`, +328 `.rodata`). A `cfg(arm)` event
+//! loop is what decides which of `coldsnap_firmware` exists on the device, and that is
+//! worth knowing before reading a flash delta as the size of a diff.
 //!
 //! Neither rule bounds `firmware_length` in the header, which is the whole image
 //! including the 16 K: `verify.c:215` floors *that* at 256 K and `verify.c:212-217`
@@ -125,15 +129,28 @@
 //! * **No store failure counter.** A `Fault::Store` draws a refusal and the loop
 //!   carries on; nothing counts how often flash refused. See the `Fault::Store`
 //!   arm for why that is not a hold and not a reset.
-//! * **No backup quiz.** `hal::ui` has the screen ([`ui::backup_quiz_word`]) and
-//!   this file has the pad, but `Session::recv` still refuses `CheckBackup` and
-//!   there is no distractor picker behind it, so a cursor here would be a keypad
-//!   with nothing to page. It is also not the cheap one: that screen renders the
-//!   true word among three AND all 25, so admitting it while `show_backup` draws
-//!   plain words would answer a quiz request with a full disclosure. See the
-//!   `CheckBackup` arm of [`grants`] — it is the fourth gate, and it says no.
+//! * **No "show me the words again" key on the quiz.** Coldcard's quiz answers `y` by
+//!   re-showing the whole seed (`shared/seed.py:877-879`, `show_words(words)`). Not
+//!   here: that would be a full reveal reachable from a screen whose consent was taken
+//!   for a *quiz*, i.e. a reveal with weaker consent than a reveal, and
+//!   [`Grant::Reveal`] is issued only by a `DisplayBackup` digit. So `keypad::KEY_OK`
+//!   is dead on this path — it is delivered like every other byte and
+//!   `Session::quiz_key` ignores it — and [`ui::backup_quiz_word`] prints no legend for
+//!   it either. A human who needs to re-read the share asks the coordinator for
+//!   `DisplayBackup`, which has its own consent screen and its own `BackupRecorded`
+//!   claim at the end of it. Fail-closed costs one round trip.
 //!
-//!   Word ENTRY, by contrast, is live: `Session::recv` admits
+//!   The quiz ITSELF is live: `Session::recv` admits `CheckBackup`, the state machine is
+//!   `coldsnap_firmware::quiz` (pure, Coldcard's `word_quiz` construction, 8 of the 25
+//!   positions), and this file owns four things and nothing else — the fifth
+//!   [`Consent`] variant, the [`CheckStep`] routing, [`quiz_frame`], and the
+//!   [`Grant::Check`] arm of [`grants`]. It hangs off the same `else if` chain as the
+//!   reveal and the entry, so an iteration still does at most ONE bounded pad read and
+//!   `cdc.poll` is never starved, and it holds no word: the 25 words, the position order
+//!   and the three candidates live in `Session`, which is what makes
+//!   `Session::confirm_at` the only thing that can start a quiz.
+//!
+//!   Word ENTRY is live the same way: `Session::recv` admits
 //!   `EnterPhysicalBackup`/`SavePhysicalBackup`/`SavePhysicalBackup2`/`Consolidate`,
 //!   the state machine is `coldsnap_firmware::wordentry` (pure, 2,048 words pinned),
 //!   and this file owns three things and nothing else — the fourth [`Consent`]
@@ -142,16 +159,18 @@
 //!   pad read and `cdc.poll` is never starved, and it holds no word: the 25 slots,
 //!   the prefix and the candidate letters live in `Session`, which is what makes
 //!   `Session::confirm_at` the only thing that can start an ingest.
-//! * **No `Consent` variant for the entry's own keys that can confirm anything.**
-//!   The entry keys are `ui::ENTRY_LETTER_KEYS` plus
+//! * **No `Consent` variant for the entry's or the quiz's own keys that can confirm
+//!   anything.** The entry keys are `ui::ENTRY_LETTER_KEYS` plus
 //!   `ui::ENTRY_PAGE_KEY`/`ENTRY_OK_KEY`/`ENTRY_DELETE_KEY` — `1`-`9`, `0`, `y`, `x`
 //!   — and five of those bytes are ALSO in [`ui::CONFIRM_CHARSET`] (`1`, `2`, `3`,
-//!   `4`, `6`). There is no byte-level separation to lean on, unlike
+//!   `4`, `6`). The quiz's are [`ui::QUIZ_KEYS`], `1`/`2`/`3`, and **all three** are in
+//!   the charset. There is no byte-level separation to lean on in either case, unlike
 //!   [`ui::NEXT_KEY`]/[`ui::BACK_KEY`] which are const-asserted off the charset
-//!   (`hal/src/ui.rs:1069-1076`). [`Consent::Entry`] is the whole separation, and it
-//!   is a UNIT variant: no digit to accept and no prompt to hand
+//!   (`hal/src/ui.rs:1069-1076`). [`Consent::Entry`] and [`Consent::Quiz`] are the whole
+//!   separation, and both are UNIT variants: no digit to accept and no prompt to hand
 //!   `Session::confirm_at`, so [`Answer::Yes`] is unreachable while a share is being
-//!   typed — the same type-level argument [`Consent::Pages`] makes for the reveal.
+//!   typed or a candidate is being picked — the same type-level argument
+//!   [`Consent::Pages`] makes for the reveal.
 //! * **No UI task.** The panel is drawn on the way into a state and never in a
 //!   loop, here as in the identity hold: one `show` per event, so a wedged panel
 //!   can never turn the event loop into a hang.
@@ -355,6 +374,26 @@ enum Consent<'a> {
     /// `ui::NEXT_KEY` (`9`) and `ui::BACK_KEY` (`7`) are `ENTRY_LETTER_KEYS[8]` and
     /// `[6]`, so a paging arm ahead of it would eat two of the nine letter keys.
     Entry,
+    /// A backup CHECK QUIZ is on the glass: every byte is a keystroke for
+    /// `Session::quiz_key`, and none of them authorises anything.
+    ///
+    /// A unit variant for [`Consent::Entry`]'s reason, and the overlap it separates is
+    /// worse rather than better: the quiz's answer keys are [`ui::QUIZ_KEYS`] (`1`,
+    /// `2`, `3`) and **all three are members of [`ui::CONFIRM_CHARSET`]** (`12346`), so
+    /// a keypress alone cannot say whether a human meant "candidate 2" or "confirm".
+    /// There is no const-assert to fall back on either — `hal/src/ui.rs:1069-1076`
+    /// asserts only that `NEXT_KEY` and `BACK_KEY` stay *out* of the charset, and
+    /// `hal/src/ui.rs:2503-2515` asserts only that a quiz key is not also a paging,
+    /// cancel or OK key. This variant is the whole separation: with no
+    /// [`ui::ConfirmDigit`] in scope there is nothing to accept, and with no prompt
+    /// there is nothing to hand `Session::confirm_at`, so [`Answer::Yes`] is
+    /// unreachable while three candidates are on the glass.
+    ///
+    /// The quiz's own decline (`x`) is *not* special-cased here. It arrives as
+    /// [`Answer::Key`] like every other byte and `coldsnap_firmware::quiz::Quiz::key`
+    /// — which is pure and total over all 256 — is what turns it into an abort. One
+    /// decision, in the module that already tests it over every byte at every state.
+    Quiz,
 }
 
 /// One pad [`keypad::Event`] plus the prompt it is answering, into a verdict.
@@ -406,15 +445,18 @@ enum Consent<'a> {
 /// type-level half of "the recorded question authorises no signature and no
 /// reveal": all it can buy is the one call its own caller makes.
 ///
-/// [`Consent::Entry`] carries neither, and it is the only screen whose keys OVERLAP
-/// the ones a signing screen asks for: `1`, `2`, `3`, `4` and `6` are members of
-/// [`ui::CONFIRM_CHARSET`] *and* live letter keys. So the variant does the whole
-/// separation, and it does it in the direction that cannot fail open — under it the
-/// function returns [`Answer::Key`], which is not [`Answer::Yes`] and which the
-/// parked-prompt arm refuses. The converse is the property worth naming twice: under
-/// [`Consent::Prompt`] this function never returns [`Answer::Key`], so a keystroke
-/// cannot reach a prompt either. `an_entry_key_cannot_answer_a_signing_or_revealing_screen`
-/// checks both directions over all 256 bytes.
+/// [`Consent::Entry`] and [`Consent::Quiz`] carry neither, and they are the two
+/// screens whose keys OVERLAP the ones a signing screen asks for: `1`, `2`, `3`, `4`
+/// and `6` are members of [`ui::CONFIRM_CHARSET`] *and* live letter keys, and all
+/// three of [`ui::QUIZ_KEYS`] (`1`, `2`, `3`) are members of it too. So the variant
+/// does the whole separation, and it does it in the direction that cannot fail open —
+/// under either one the function returns [`Answer::Key`], which is not
+/// [`Answer::Yes`] and which the parked-prompt arm refuses. The converse is the
+/// property worth naming twice: under [`Consent::Prompt`] this function never returns
+/// [`Answer::Key`], so a keystroke cannot reach a prompt either.
+/// `an_entry_key_cannot_answer_a_signing_or_revealing_screen` and
+/// `a_quiz_answer_key_cannot_answer_a_signing_or_revealing_screen` check both
+/// directions over all 256 bytes.
 ///
 /// [`ui::NEXT_KEY`] on the last page **clamps** to [`Answer::Wait`] rather than
 /// refusing, which is Coldcard's own story behaviour (`shared/ux.py:237-247`
@@ -434,19 +476,28 @@ fn answer(
         // human has done anything, so "all up" is the ordinary answer while
         // someone reads the screen.
         Ok(keypad::Event::AllUp | keypad::Event::Unsettled) => Answer::Wait,
-        // A SHARE IS BEING TYPED IN: every byte is a keystroke, and this arm comes
-        // FIRST because the two arms below it would otherwise eat two of the nine
-        // letter keys — `ui::NEXT_KEY` is `9`, which is `ENTRY_LETTER_KEYS[8]`, and
-        // `ui::BACK_KEY` is `7`, which is `[6]`. It is also ahead of the `!last`
-        // refusal, so no value of `last` can turn typing into a refusal: the entry
-        // screen is not a page of a set and has no last page to be on.
+        // A SHARE IS BEING TYPED IN, OR A QUIZ IS BEING ANSWERED: every byte is a
+        // keystroke, and this arm comes FIRST because the two arms below it would
+        // otherwise eat two of the nine letter keys — `ui::NEXT_KEY` is `9`, which is
+        // `ENTRY_LETTER_KEYS[8]`, and `ui::BACK_KEY` is `7`, which is `[6]`. It is also
+        // ahead of the `!last` refusal, so no value of `last` can turn typing or
+        // answering into a refusal: neither screen is a page of a set and neither has a
+        // last page to be on.
         //
-        // It authorises NOTHING. `Consent::Entry` is a unit variant, so there is no
-        // digit here to accept and no prompt to hand `Session::confirm_at`; the
-        // strongest statement about the overlap between the entry keys and
-        // `ui::CONFIRM_CHARSET` is that `Answer::Key` is not `Answer::Yes` and cannot
-        // become one without a type changing.
-        Ok(keypad::Event::Down(key)) if matches!(consent, Consent::Entry) => Answer::Key(key),
+        // ONE arm for both, not two, because the verdict is the same value and the
+        // routing is `Flow`'s job: `flow_consent` already decided which screen is on
+        // the glass, so a second arm here would be a second place for the two to
+        // disagree.
+        //
+        // It authorises NOTHING. Both variants are unit variants, so there is no digit
+        // here to accept and no prompt to hand `Session::confirm_at`; the strongest
+        // statement about the overlap between these keys and `ui::CONFIRM_CHARSET` —
+        // five of twelve for the entry, and all THREE of the quiz's answer keys — is
+        // that `Answer::Key` is not `Answer::Yes` and cannot become one without a type
+        // changing.
+        Ok(keypad::Event::Down(key)) if matches!(consent, Consent::Entry | Consent::Quiz) => {
+            Answer::Key(key)
+        }
         // Turn the page, or clamp. Checked before anything else that is about the
         // request because it is the one key that is about the *set*, and it can
         // never be a confirm key (see the docs above).
@@ -474,11 +525,11 @@ fn answer(
         Ok(keypad::Event::Down(_)) if !last => Answer::No,
         Ok(keypad::Event::Down(key)) => match consent {
             // Unreachable: the guarded arm at the top of this `match` takes every
-            // `Down` under `Consent::Entry`. Spelled with the SAME value rather than a
-            // different one, so that removing the guard changes behaviour nowhere —
-            // an "unreachable" arm that disagreed with the reachable one is how the
-            // next refactor introduces a bug.
-            Consent::Entry => Answer::Key(key),
+            // `Down` under `Consent::Entry` and `Consent::Quiz` alike. Spelled with the
+            // SAME value rather than a different one, so that removing the guard changes
+            // behaviour nowhere — an "unreachable" arm that disagreed with the reachable
+            // one is how the next refactor introduces a bug.
+            Consent::Entry | Consent::Quiz => Answer::Key(key),
             // A screen with no digit and no prompt cannot be answered — there is
             // nothing to accept and nothing to confirm. Unreachable in this image
             // (the only `Pages` caller is the reveal, which passes `last` false and
@@ -554,7 +605,10 @@ fn answer(
 /// keypress never claims a backup exists on paper. During an entry
 /// ([`Consent::Entry`]) it is [`Answer::No`] once more, which [`entry_step`] routes
 /// to the ending — so a pad that stops mid-word takes the prefix and the previous
-/// word off the glass instead of leaving them lit for whoever walks past next.
+/// word off the glass instead of leaving them lit for whoever walks past next. During
+/// a quiz ([`Consent::Quiz`]) the same, through [`check_step`]: one of the three
+/// candidates on that screen is a true word of the share, so a pad that stops
+/// mid-quiz must take them off the glass rather than leave them lit.
 fn ask<R: rand_core::RngCore>(
     pad: Option<&mut keypad::Keypad>,
     rng: &mut R,
@@ -720,6 +774,14 @@ enum Flow {
     /// digit having been pressed first. What it can do is stop delivering keystrokes,
     /// which is what dropping this variant means.
     Entry,
+    /// A granted backup CHECK QUIZ, at the screen it is on — see [`Check`].
+    ///
+    /// Carries a state and not a cursor: the position order, the question counter and
+    /// the three candidates all live in the `coldsnap_firmware::quiz::Quiz` inside
+    /// `Session`, which only `Session::confirm_at` can create. So this file cannot
+    /// start a quiz, cannot pick a distractor and cannot put a share word on the glass
+    /// without a digit having been pressed first.
+    Check(Check),
 }
 
 /// What the flow currently on the glass will accept, and whether it is the last page
@@ -740,6 +802,12 @@ fn flow_consent(flow: Flow) -> (Consent<'static>, bool) {
     match flow {
         Flow::Reveal(state) => reveal_consent(state),
         Flow::Entry => (Consent::Entry, true),
+        // Both quiz screens, and `last` is irrelevant to both for the entry's reason.
+        // ONE pairing for the question and for the passed screen, because the
+        // difference between them is what a keystroke MEANS ([`check_step`]) and not
+        // which keys reach it: the passed screen's own legend is `(x)done`, so it wants
+        // a byte delivered too.
+        Flow::Check(_) => (Consent::Quiz, true),
     }
 }
 
@@ -880,20 +948,183 @@ fn entry_frame(
     }
 }
 
-/// Which device-driven flow a `yes` to this prompt GRANTS, if any — permission for
-/// `Session::show_backup` to draw the whole share in plain, or for
-/// `Session::entry_key` to take a keystroke.
+/// What a granted check quiz has on the glass, and therefore what the next keypress
+/// means.
 ///
-/// Exactly two prompts in the protocol grant anything, they grant DIFFERENT things,
+/// Two states rather than a unit variant, and the second one is not decoration:
+/// `ui::backup_quiz_passed`'s footer prints `(x)done` (`hal/src/ui.rs:2457`), so a key
+/// has to be able to dismiss that screen. `Session::quiz_key` cannot serve it — the
+/// pass DROPPED the quiz, so every later call refuses — and a refusal drawn over
+/// "Quiz passed" would be a screen saying CANNOT DISPLAY for a quiz that displayed
+/// fine. The state is what makes the legend honest.
+///
+/// **A CURSOR AND NOTHING ELSE**, exactly as [`Reveal`] is. The grant lives in
+/// [`Session`](coldsnap_firmware::Session), set only by `confirm_at` and read only by
+/// `quiz_screen`/`quiz_key`, so this cannot authorise a quiz any more than a page
+/// number can authorise a signature — and it holds no word, no candidate and no
+/// position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Check {
+    /// A question is on the glass: three candidates on [`ui::QUIZ_KEYS`], one of which
+    /// is a true word of the share. **No digit**, so nothing pressed here can
+    /// authorise anything.
+    Asking,
+    /// The quiz passed and `ui::backup_quiz_passed` is up. The words are already off
+    /// the glass — that screen takes a count and cannot be handed a `&str` — and
+    /// `CommsMisc::BackupChecked` is already in the outbox, so this screen answers
+    /// NOTHING: any key dismisses it and the ack cannot be sent twice.
+    Passed,
+}
+
+/// What the event loop does next with a check quiz on the glass.
+///
+/// The counterpart of [`RevealStep`] and [`EntryStep`], and deliberately **not**
+/// [`EntryStep`] even though the three states line up: `EntryStep::Key` is documented
+/// as "hand this byte to `Session::entry_key`", which INGESTS a share, and the two
+/// routers would then differ by one identifier in a `match` arm that reads the same.
+/// A quiz keystroke reaching `entry_key` is not a compile error and never would be, so
+/// the separation that is on offer is a distinct pattern in a distinct arm — which is
+/// what the source pins on both flows can then hold.
+///
+/// There is no `Ack` here, unlike [`RevealStep`]: `Session::quiz_key` sends
+/// `CommsMisc::BackupChecked` itself, and only when every question has been answered
+/// correctly. Nothing this file can press acks a quiz.
+///
+/// `Debug` is hand-written below, redacting the press, for [`Answer`]'s reason.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CheckStep {
+    /// Nothing pressed. Keep the same screen and **do not redraw it**: a redraw
+    /// re-samples [`ui::Frame::mark_sensitive`]'s noise over three option rows, one of
+    /// which holds a true word of the share, and averaging that over N observations is
+    /// the one open edge that defence documents.
+    Park,
+    /// A live key: hand this byte to `Session::quiz_key`. Reached only from
+    /// [`Check::Asking`].
+    Key(u8),
+    /// End the flow: standby over the candidates. Reached by two contacts, an
+    /// unreadable scan, a pad that never opened, or any key on the passed screen —
+    /// never by a timer, see below.
+    Done,
+}
+
+/// The variant name, with the press redacted. See [`Answer`]'s impl for the argument.
+///
+/// The byte here is `1`, `2` or `3` — which candidate slot a human tapped — and on its
+/// own that is not the secret, because the slot means nothing without the three words
+/// it indexed (and no `Debug` in this tree prints those: `quiz::Screen`'s manual impl
+/// drops the options and `ui::QuizWord` never holds one). Redacted anyway, because the
+/// pairing is one log line away and because a `Key(u8)` that prints its byte is the
+/// habit this file already refused twice.
+impl core::fmt::Debug for CheckStep {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            CheckStep::Park => "Park",
+            CheckStep::Key(_) => "Key(<press>)",
+            CheckStep::Done => "Done",
+        })
+    }
+}
+
+/// One pad verdict against a check quiz on the glass, into the next step.
+///
+/// Exhaustive over both enums with no `_` on [`Answer`], so a new pad verdict is a
+/// compile error here as it is in [`answer`], [`reveal_step`] and [`entry_step`].
+///
+/// **[`Answer::Yes`] ends the quiz, it does not confirm anything.** It is unreachable
+/// — [`flow_consent`] hands a quiz [`Consent::Quiz`], which carries no digit and no
+/// prompt — and this is the value-level half of that claim: even if it arrived, the
+/// only thing it could buy is standby. There is no `Session::confirm_at` reachable
+/// from this function and no prompt in scope to pass one, which matters more here than
+/// anywhere else in this file because all three answer keys are also confirm digits.
+///
+/// The decline (`x`) is **not** a step of its own. It arrives as [`Answer::Key`] and
+/// `coldsnap_firmware::quiz::Quiz::key` turns it into an abort, so "which key gives
+/// up" is decided in one pure module that already drives all 256 bytes at every state
+/// — rather than twice, in two places free to disagree about `x`.
+///
+/// NO TIMEOUT, and that is CHOSEN. There is no clock in this signature and nowhere to
+/// put one: eight questions is minutes of comparing words against paper, and a screen
+/// that blanked mid-quiz would cost the human the whole quiz *and* a second consent to
+/// re-take it — at which point the coordinator draws three more real words. Which is
+/// strictly worse than three that stay lit until a key or a coordinator prompt.
+/// [`Answer::Wait`] is what a human reading produces, and it parks.
+fn check_step(state: Check, answer: Answer) -> CheckStep {
+    match (state, answer) {
+        (_, Answer::Wait) => CheckStep::Park,
+        (Check::Asking, Answer::Key(key)) => CheckStep::Key(key),
+        // ANY key dismisses the passed screen, not only the `(x)done` its footer
+        // prints. There is nothing on it a further press could change, and nothing to
+        // send twice, so being generous here costs nothing — while refusing every byte
+        // but one would leave a screen up that says it can be dismissed.
+        (Check::Passed, Answer::Key(_)) => CheckStep::Done,
+        // Two contacts, an unreadable scan, or no pad at all. Fail-closed in the
+        // direction that clears the glass — the same choice the reveal and the entry
+        // make, and for a sharper version of the same reason: one of the three rows on
+        // this screen is a true word of the share.
+        (_, Answer::No) => CheckStep::Done,
+        // All three are unreachable: `Consent::Quiz`'s arm in `answer` takes every
+        // `Down` before the paging arms can produce `Next`/`Back`, and neither of the
+        // two arms that can produce `Yes` is reachable without a digit. Grouped with
+        // the ending rather than given an `unreachable!()`, because a panic in the
+        // event loop is a counted reset a coordinator could provoke.
+        (_, Answer::Next | Answer::Back | Answer::Yes) => CheckStep::Done,
+    }
+}
+
+/// Compose the quiz screen `coldsnap_firmware` says is current. `false` means
+/// **nothing was drawn** and the caller must put something else on the glass.
+///
+/// A module item rather than a closure inside `boot`, for [`entry_frame`]'s reason:
+/// `boot` is `#[cfg(target_arch = "arm")]`, so a frame built in there is composed by no
+/// test in this tree — and this is the frame that carries a real share word.
+///
+/// Every row of it comes from `hal::ui`'s own renderers, so the `mark_sensitive` noise
+/// over the three option rows, the 12-cell sensitive budget and the footer legends are
+/// the ones `hal`'s pixel gate covers, and this function only chooses between them.
+/// `rng` is mandatory in [`ui::backup_quiz_word`], which is why it is mandatory here;
+/// an opt-in would fail OPEN over a row holding a true word.
+///
+/// `Err` from either renderer is `ui::Unrenderable`, which draws NOTHING (every check
+/// runs before the `clear`), so the caller's refusal goes onto a clean frame.
+fn quiz_frame(
+    screen: coldsnap_firmware::quiz::Screen,
+    frame: &mut ui::Frame,
+    rng: &mut impl rand_core::RngCore,
+) -> bool {
+    use coldsnap_firmware::quiz::Screen;
+    match screen {
+        // The question. `quiz::Quiz` built the whole `ui::QuizWord` — the progress the
+        // human reads and the position the machine scores come from one value — and the
+        // options travel beside it rather than inside it, so the type that derives
+        // `Debug` holds no word. There is no arithmetic here to get wrong.
+        Screen::Word { question, options } => {
+            ui::backup_quiz_word(frame, question, options, rng).is_ok()
+        }
+        // The ending. Takes a COUNT and no `&str`, so this frame cannot carry a word
+        // even by mistake, and it says "n of 25 words matched / the rest were not
+        // checked" rather than "backup verified" — which is the honest claim, because
+        // `quiz::QUIZ_POSITIONS` is 8.
+        Screen::Passed { checked } => ui::backup_quiz_passed(frame, checked).is_ok(),
+    }
+}
+
+/// Which device-driven flow a `yes` to this prompt GRANTS, if any — permission for
+/// `Session::show_backup` to draw the whole share in plain, for
+/// `Session::entry_key` to take a keystroke, or for `Session::quiz_key` to score one.
+///
+/// Exactly three prompts in the protocol grant anything, they grant DIFFERENT things,
 /// and the match is exhaustive with no `_` arm so a new upstream variant is a compile
 /// error rather than a silent grant. That is worth more than it looks: `show_backup`
 /// draws all 25 words, so a variant wrongly routed to [`Grant::Reveal`] answers a
 /// request for something *else* with a full disclosure. `CheckBackup` is the live
-/// example — it is a quiz, it is refused by `Session::recv` today, and the day it is
-/// admitted it needs [`ui::backup_quiz_word`] and a `BackupChecked` ack, not this.
+/// example and it is now on the `Some` side of this match — but on
+/// [`Grant::Check`]'s side of it, which draws one question of three candidates through
+/// [`ui::backup_quiz_word`] and acks `BackupChecked`. Routing it to [`Grant::Reveal`]
+/// is the catastrophic mutation this arm exists to make loud, and it is what
+/// `only_a_display_backup_prompt_grants_a_reveal` fails on.
 ///
-/// **One function and not two predicates**, which is the whole reason the reveal's
-/// `bool` became an `Option`: two booleans over the same five variants can both be
+/// **One function and not three predicates**, which is the whole reason the reveal's
+/// `bool` became an `Option`: three booleans over the same five variants can all be
 /// true, and "grant a reveal" plus "grant an entry" at once is 25 plain words drawn
 /// over a screen that asked to type them in. An `Option<Grant>` cannot say that.
 ///
@@ -904,10 +1135,11 @@ fn entry_frame(
 /// `entry_screen().is_some()` would resurrect an abandoned entry on the next unrelated
 /// consent. The prompt that was answered is the fact; the grant is its consequence.
 ///
-/// Three gates already stand in front of this one — `Session::recv` refuses
-/// `CheckBackup`, `prompt_screen_at` draws no screen for `BackupSaved`, and
-/// `confirm_at` refuses both — so this is the fourth, and it is the one that stays
-/// correct when a *future* change opens the first three for a different variant.
+/// Two gates already stand in front of this one — `prompt_screen_at` draws no screen
+/// for `BackupSaved`, and `confirm_at` refuses it — so this is the third, and it is the
+/// one that stays correct when a *future* change opens the first two for a different
+/// variant. It was the fourth until `Session::recv` admitted `CheckBackup`; the
+/// dispatch's refusal is gone and this arm is now load-bearing rather than redundant.
 fn grants(prompt: &DeviceToUserMessage) -> Option<Grant> {
     let DeviceToUserMessage::Restoration(restoration) = prompt else {
         return None;
@@ -915,9 +1147,8 @@ fn grants(prompt: &DeviceToUserMessage) -> Option<Grant> {
     match **restoration {
         ToUserRestoration::DisplayBackup { .. } => Some(Grant::Reveal),
         ToUserRestoration::EnterBackup { .. } => Some(Grant::Entry),
-        ToUserRestoration::CheckBackup { .. }
-        | ToUserRestoration::BackupSaved { .. }
-        | ToUserRestoration::ConsolidateBackup(_) => None,
+        ToUserRestoration::CheckBackup { .. } => Some(Grant::Check),
+        ToUserRestoration::BackupSaved { .. } | ToUserRestoration::ConsolidateBackup(_) => None,
     }
 }
 
@@ -934,6 +1165,15 @@ enum Grant {
     /// Permission for `Session::entry_key` to accept a keystroke — the one flow on
     /// this device that INGESTS a secret.
     Entry,
+    /// Permission for `Session::quiz_key` to score a keypress against the check quiz.
+    ///
+    /// **Reveal-class, not the cheap one.** One of every three candidates on every
+    /// question is the true word at that position and a second is a real word from
+    /// elsewhere in the same share, so this grant is taken behind the same randomised
+    /// digit, over the same warning, as [`Grant::Reveal`]. What it is NOT is a reveal:
+    /// `Session` keeps two separate grant fields with no assignment between them, so
+    /// this buys eight questions and never `Session::show_backup`.
+    Check,
 }
 
 /// The vector table: `SP`, the entry, then 14 fault trampolines.
@@ -1084,7 +1324,8 @@ pub unsafe extern "C" fn entry_point() -> ! {
 #[cfg(target_arch = "arm")]
 fn boot() -> ! {
     use coldsnap_firmware::{
-        firmware_digest, prompt_screen_at, DebugFlash, Fault, Outbox, Session, Shown, Typed,
+        firmware_digest, prompt_screen_at, quiz, Checked, DebugFlash, Fault, Outbox, Session,
+        Shown, Typed,
     };
     use coldsnap_hal::panic::{bump_counter, clear_counter, BootHealth, Counter};
     use coldsnap_hal::{comms, display, flash, identity, rng, usb};
@@ -1414,6 +1655,61 @@ fn boot() -> ! {
         }
         let _ = panel.show(frame.as_bytes());
         true
+    }
+
+    /// Draw one screen of a granted check quiz. `None` means nothing quiz-shaped is on
+    /// the glass any more and something else has already been drawn over it.
+    ///
+    /// **The only producer of [`Flow::Check`]**, which is what makes requirement 6
+    /// control flow rather than a rule to remember: every leg that returns `None` has
+    /// redrawn the panel first, so there is no way to end this flow with three
+    /// candidates still lit and no way to keep a cursor alive without a frame behind it.
+    ///
+    /// The screen is an ARGUMENT rather than read from the session, because the two
+    /// screens come from different places and only one of them is the library's:
+    /// `session.quiz_screen()` is the question, and the passed screen is drawn AFTER
+    /// `Session::quiz_key` has dropped the quiz (so `quiz_screen()` is already `None` by
+    /// then — the pass is what dropped it). One producer for both is worth an argument;
+    /// two producers would be two places to forget to redraw.
+    ///
+    /// `&Session` and not `&mut`: this cannot advance the quiz, only draw what it says
+    /// is current. The composing is [`quiz_frame`], a module item with host tests, so
+    /// what is ARM-only here is the panel and nothing else.
+    ///
+    /// `None` from `quiz_screen` is the quiz having ended underneath us — a coordinator
+    /// `Cancel` drops the grant and draws nothing (`Session::recv`'s `Cancel` arm) — and
+    /// it draws standby, so the candidates come off the glass on that iteration rather
+    /// than on the next keypress.
+    ///
+    /// `quiz_frame` returning `false` is `ui::Unrenderable`, which is unreachable
+    /// (`quiz::Quiz` refuses at construction anything its own screens could not render)
+    /// and draws nothing, so the refusal goes onto a clean frame and the flow ends.
+    /// Never a panic: this runs inside the event loop.
+    fn show_quiz<F: NorFlash + core::fmt::Debug>(
+        session: &Session<'_, F>,
+        screen: Option<quiz::Screen>,
+        panel: &mut display::Panel,
+        rng: &mut rng::Entropy,
+    ) -> Option<Check> {
+        let Some(screen) = screen else {
+            idle(session, panel);
+            return None;
+        };
+        let mut frame = ui::Frame::new();
+        if !quiz_frame(screen, &mut frame, rng) {
+            ui::refusal(&mut frame);
+            let _ = panel.show(frame.as_bytes());
+            return None;
+        }
+        let _ = panel.show(frame.as_bytes());
+        // Read off the screen that was just drawn rather than passed in beside it, so
+        // the cursor and the pixels cannot describe different things — `Check` decides
+        // what the next keypress MEANS, and a `Passed` screen routed as `Asking` would
+        // hand its dismissal to `Session::quiz_key`, which refuses a quiz that is over.
+        Some(match screen {
+            quiz::Screen::Word { .. } => Check::Asking,
+            quiz::Screen::Passed { .. } => Check::Passed,
+        })
     }
 
     // --- Step 6: read the counters BEFORE anything clears one. --------------
@@ -1993,6 +2289,29 @@ fn boot() -> ! {
                                     glass = show_entry_page(&session, panel, &mut entropy)
                                         .then_some(Flow::Entry);
                                 }
+                                // THE QUIZ STARTS HERE, and only here. `prompts` is
+                                // empty on this leg for the same library reason as the
+                                // other two: `confirm_at`'s `CheckBackup` arm builds the
+                                // `quiz::Quiz` and sends nothing, because
+                                // `CommsMisc::BackupChecked` belongs to the moment the
+                                // last question is answered and not to the moment
+                                // someone agrees to be asked.
+                                //
+                                // Unlike the reveal, the FIRST screen already carries a
+                                // real word — one of the three candidates is the true
+                                // word at the position being asked — so there is no
+                                // index page in front of it to soften the start. That is
+                                // why this grant is issued on the same digit, over the
+                                // same "SECRET on glass" warning, as `Grant::Reveal`.
+                                Some(Grant::Check) => {
+                                    glass = show_quiz(
+                                        &session,
+                                        session.quiz_screen(),
+                                        panel,
+                                        &mut entropy,
+                                    )
+                                    .map(Flow::Check);
+                                }
                                 None => {
                                     if let Some(next) =
                                         draw_batch(panel, &mut entropy, prompts, &mut glass)
@@ -2163,6 +2482,100 @@ fn boot() -> ! {
                         }
                     }
                 }
+                // THE CHECK QUIZ. Same shape as the entry and for the same reasons, with
+                // one difference: the cancel guard applies to the QUESTION only. The
+                // passed screen has no quiz behind it — the pass is what dropped it — so
+                // gating it on `quiz_screen()` would blank "Quiz passed" on the very next
+                // iteration, before a human could read it.
+                Flow::Check(state) => {
+                    let step = match state {
+                        // The coordinator can take the grant away without drawing
+                        // anything: `recv`'s `Cancel` arm drops the `quiz::Quiz` and
+                        // returns no prompt, so without this the three candidates would
+                        // sit lit on the panel until the next keypress. Requirement 6
+                        // says a flow ends on a keypress or a coordinator message, and a
+                        // `Cancel` is the second kind.
+                        Check::Asking if session.quiz_screen().is_none() => CheckStep::Done,
+                        _ => check_step(state, verdict),
+                    };
+                    match step {
+                        // Nothing pressed. Same frame, NOT redrawn — three rows of this
+                        // screen go through `mark_sensitive` and one of them holds a true
+                        // word of the share, so a redraw re-samples the noise over the
+                        // pixels that matter most.
+                        CheckStep::Park => glass = Some(Flow::Check(state)),
+                        // The whole point of the branch: a live key reaches the pure
+                        // state machine, and the only impure halves — the grant and the
+                        // wire — are `Session::quiz_key`'s. `1`/`2`/`3` are answers and
+                        // `x` is the give-up; every other byte is `Checked::Unchanged`.
+                        CheckStep::Key(key) => {
+                            match session.quiz_key(key, &mut entropy, &mut outbox) {
+                                // The key did nothing: a byte the footer does not
+                                // advertise, which is nine of the pad's twelve. DO NOT
+                                // REDRAW, same reason as `Park`. (A key on a quiz that is
+                                // already over cannot reach here — `check_step` produces
+                                // `Key` only from `Check::Asking`, and `quiz_key` answers
+                                // a dropped quiz with `Err` rather than this.)
+                                Ok(Checked::Unchanged) => glass = Some(Flow::Check(state)),
+                                // The state moved — a correct answer advanced to the next
+                                // question, or a WRONG one re-asked this one with three
+                                // freshly drawn candidates and the "No - try again"
+                                // banner. Both are one redraw and neither sends anything:
+                                // there is no failure message in the protocol, no attempt
+                                // counter and no lockout.
+                                Ok(Checked::Redraw) => {
+                                    if let Some(panel) = panel.as_mut() {
+                                        glass = show_quiz(
+                                            &session,
+                                            session.quiz_screen(),
+                                            panel,
+                                            &mut entropy,
+                                        )
+                                        .map(Flow::Check);
+                                    }
+                                }
+                                // Over. A PASS draws "n of 25 words matched" — the ack is
+                                // already in `outbox` and reaches the wire at the bottom
+                                // of this iteration — and holds the glass until a key or a
+                                // coordinator prompt, because that screen's footer says
+                                // `(x)done` and because it carries no word to leave lit.
+                                // Giving up draws standby and sends NOTHING. Both legs
+                                // redraw, so the candidates are off the glass either way,
+                                // which is requirement 6.
+                                Ok(Checked::Ended { checked }) => {
+                                    if let Some(panel) = panel.as_mut() {
+                                        match checked {
+                                            Some(checked) => {
+                                                glass = show_quiz(
+                                                    &session,
+                                                    Some(quiz::Screen::Passed { checked }),
+                                                    panel,
+                                                    &mut entropy,
+                                                )
+                                                .map(Flow::Check);
+                                            }
+                                            None => idle(&session, panel),
+                                        }
+                                    }
+                                }
+                                // No grant (the quiz ended underneath us), or the ack
+                                // would not frame. NOT a panic, for the loop's usual
+                                // reason, and the refusal takes the candidates off the
+                                // glass through `take_glass`.
+                                Err(_fault) => refuse(panel.as_mut(), &mut glass),
+                            }
+                        }
+                        // Two contacts, an unreadable scan, a pad that never opened, the
+                        // coordinator having cancelled underneath us, or any key on the
+                        // passed screen. The candidates come off the glass and the cursor
+                        // is already gone, so no further keystroke is delivered.
+                        CheckStep::Done => {
+                            if let Some(panel) = panel.as_mut() {
+                                idle(&session, panel);
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -2288,11 +2701,12 @@ mod tests {
     extern crate std;
 
     use super::*;
+    use coldsnap_firmware::quiz;
     use coldsnap_firmware::wordentry::Screen;
     use coldsnap_hal::keypad::{Event, KeypadError, DECODER, KEY_CANCEL, KEY_OK};
     use coldsnap_hal::ui::{
         ConfirmDigit, BACK_KEY, CONFIRM_CHARSET, ENTRY_DELETE_KEY, ENTRY_LETTER_KEYS, ENTRY_OK_KEY,
-        ENTRY_PAGE_KEY, NEXT_KEY,
+        ENTRY_PAGE_KEY, NEXT_KEY, QUIZ_KEYS,
     };
     use frostsnap_core::schnorr_fun::frost::{ShareImage, ShareIndex};
     use frostsnap_core::schnorr_fun::fun::Point;
@@ -3063,18 +3477,20 @@ mod tests {
         }
     }
 
-    /// **Only a `DisplayBackup` prompt buys permission to draw 25 plain words, and
-    /// only an `EnterBackup` prompt buys permission to type one in.**
+    /// **Only a `DisplayBackup` prompt buys permission to draw 25 plain words, only an
+    /// `EnterBackup` prompt buys permission to type one in, and a `CheckBackup` prompt
+    /// buys a QUIZ and never either of the other two.**
     ///
     /// The flag used to be `matches!(prompt, Restoration(_))`, i.e. the whole family —
     /// four variants of which are not reveals, and one of which (`CheckBackup`) is a
     /// QUIZ that shows one true word among three. A family-wide `true` answers a quiz
-    /// request with a full disclosure. Three gates in `firmware/src/lib.rs` stand in
-    /// front of that today; [`grants`] is the one that stays correct when a future
-    /// change opens them for a different variant.
+    /// request with a full disclosure. That is no longer a hypothetical: `CheckBackup` is
+    /// admitted by `Session::recv` now and is on the `Some` side of this match, so
+    /// [`grants`] is the arm standing between "a quiz was requested" and "all 25 words
+    /// were drawn". It is the mutation to try first.
     ///
-    /// The `Option<Grant>` is what makes the two grants EXCLUSIVE: two booleans over
-    /// the same five variants can both be true, and "reveal" plus "enter" at once is 25
+    /// The `Option<Grant>` is what makes the three grants EXCLUSIVE: three booleans over
+    /// the same five variants can all be true, and "reveal" plus "enter" at once is 25
     /// plain words drawn over a screen that asked to type them in.
     #[test]
     fn only_a_display_backup_prompt_grants_a_reveal() {
@@ -3113,17 +3529,25 @@ mod tests {
             src.contains("ToUserRestoration::EnterBackup { .. } => Some(Grant::Entry),"),
             "the one variant that grants an ingest must be named, and be the only one"
         );
-        // And the quiz is on the `None` side of the same match, which is the arm that
-        // would answer a request for one word of three with all 25 in plain.
+        // THE ARM THAT MATTERS MOST. `CheckBackup` grants a QUIZ, and the value it
+        // grants is spelled here so that the copy-paste — `Some(Grant::Reveal)`, one
+        // token away — cannot pass. That mutation answers a request for one word of
+        // three with all 25 in plain, on a consent screen that said "check".
+        assert!(
+            src.contains("ToUserRestoration::CheckBackup { .. } => Some(Grant::Check),"),
+            "the quiz must grant a quiz, and must be named so it cannot grant a reveal"
+        );
         assert!(
             src.contains(
-                "ToUserRestoration::CheckBackup { .. }\n        | ToUserRestoration::BackupSaved { .. }\n        | ToUserRestoration::ConsolidateBackup(_) => None,"
+                "ToUserRestoration::BackupSaved { .. } | ToUserRestoration::ConsolidateBackup(_) => None,"
             ),
-            "the quiz, the reply and the consolidation must grant no flow at all"
+            "the reply and the consolidation must grant no flow at all"
         );
-        // The two grants are different values, so no arm can accidentally hand a
-        // reveal's screen to an entry.
+        // The three grants are different values, so no arm can accidentally hand a
+        // reveal's screen to an entry or to a quiz.
         assert_ne!(Grant::Reveal, Grant::Entry);
+        assert_ne!(Grant::Reveal, Grant::Check);
+        assert_ne!(Grant::Entry, Grant::Check);
     }
 
     /// **Every exit from the reveal takes the words off the glass** — the leak this
@@ -3155,16 +3579,17 @@ mod tests {
             2,
             "two call sites: the start, and every step of the flow"
         );
-        // EIGHT assignments to the one cursor, and every one of them is either the
+        // THIRTEEN assignments to the one cursor, and every one of them is either the
         // result of a function that redrew, the re-park of a frame that is still up, or
         // the drop that sits beside a `panel.show`. There is no fourth shape: two
-        // `show_backup_page` results, two `show_entry_page` results, three re-parks (a
-        // reveal page, an entry that saw nothing pressed, an entry whose key did
-        // nothing) and the `take_glass` drop.
+        // `show_backup_page` results, two `show_entry_page` results, three `show_quiz`
+        // results (the grant, a redraw, the passed screen), five re-parks (a reveal page,
+        // an entry that saw nothing pressed, an entry whose key did nothing, a quiz that
+        // saw nothing pressed, a quiz whose key did nothing) and the `take_glass` drop.
         assert_eq!(
             src.matches("glass =").count(),
-            8,
-            "four redraw results, three re-parks, one `take_glass` drop"
+            13,
+            "seven redraw results, five re-parks, one `take_glass` drop"
         );
         // THE FAIL-OPEN THIS CLOSED. The cursor is dropped in exactly one place, and
         // that place is `take_glass`, one line above the `panel.show` that replaces
@@ -3187,10 +3612,10 @@ mod tests {
         );
         assert_eq!(
             src.matches("panel.show(").count(),
-            8,
-            "eight places put pixels on the glass: `hold`, `take_glass`, `idle`, \
-             `show_backup_page`'s three legs and `show_entry_page`'s two. A ninth must \
-             say what it does to the flow cursor"
+            10,
+            "ten places put pixels on the glass: `hold`, `take_glass`, `idle`, \
+             `show_backup_page`'s three legs, `show_entry_page`'s two and `show_quiz`'s \
+             two. An eleventh must say what it does to the flow cursor"
         );
         // Both callers of `take_glass` are the ones that used to draw for themselves:
         // a prompt's own screen (or `ui::refusal` for one it cannot draw) and the
@@ -3218,15 +3643,17 @@ mod tests {
         // And the ending is `idle`, drawn from one place, shared with standby.
         assert_eq!(
             src.matches("idle(session, panel)").count(),
-            2,
-            "one screen ends a reveal and the same one ends an entry whose grant went \
-             away; `show_backup_page` and `show_entry_page` draw it"
+            3,
+            "one screen ends a reveal and the same one ends an entry or a quiz whose \
+             grant went away; `show_backup_page`, `show_entry_page` and `show_quiz` draw \
+             it"
         );
         assert_eq!(
             src.matches("idle(&session, panel)").count(),
-            5,
-            "step 8c, both answers to the recorded question, and both endings of an \
-             entry draw the same screen; a second definition of it would drift"
+            7,
+            "step 8c, both answers to the recorded question, both endings of an entry \
+             and both endings of a quiz that is not a pass draw the same screen; a \
+             second definition of it would drift"
         );
     }
 
@@ -3348,6 +3775,15 @@ mod tests {
             1,
             "one screen in this image answers keystrokes, and it carries no digit either"
         );
+        // And the quiz's two screens are the second pairing that answers keystrokes with
+        // no digit — the one where the overlap is total, because all three of
+        // `ui::QUIZ_KEYS` are `ui::CONFIRM_CHARSET` members.
+        assert_eq!(
+            src.matches("Flow::Check(_) => (Consent::Quiz, true),")
+                .count(),
+            1,
+            "the quiz screens must be answered as a quiz, with no digit and no prompt"
+        );
         // And the two flows start from that same `Ok` and from nowhere else — each
         // behind the one prompt VARIANT whose consent grants it. Every half is pinned
         // because losing any of them is silent: without the call the grant is a
@@ -3367,6 +3803,13 @@ mod tests {
             "the entry must start behind that grant, and not behind a library fact: \
              `session.entry_screen().is_some()` here would resurrect an abandoned entry \
              on the next unrelated consent"
+        );
+        assert!(
+            src.contains("Some(Grant::Check) => {"),
+            "the quiz must start behind that grant, for the entry's reason: a quiz grant \
+             read out of the library would resurrect an abandoned quiz — three candidates \
+             of a share the coordinator has stopped asking about — on the next unrelated \
+             consent"
         );
         // And the reveal starts at page 0, which is the SHARE INDEX page. Starting at 1
         // would show every word and never the index, and a backup written down without
@@ -3560,6 +4003,12 @@ mod tests {
                 "the entry step printed the key {:?} that was pressed",
                 key as char
             );
+            assert_eq!(
+                std::format!("{:?}", CheckStep::Key(key)),
+                "Key(<press>)",
+                "the quiz step printed the key {:?} that was pressed",
+                key as char
+            );
         }
         // Not a blanket string: every other variant still names itself, or the
         // `assert_eq!`s throughout this module would be diagnosing nothing.
@@ -3570,6 +4019,8 @@ mod tests {
         assert_eq!(std::format!("{:?}", Answer::Back), "Back");
         assert_eq!(std::format!("{:?}", EntryStep::Park), "Park");
         assert_eq!(std::format!("{:?}", EntryStep::End), "End");
+        assert_eq!(std::format!("{:?}", CheckStep::Park), "Park");
+        assert_eq!(std::format!("{:?}", CheckStep::Done), "Done");
     }
 
     // -----------------------------------------------------------------------
@@ -4077,6 +4528,603 @@ mod tests {
                 "if !entry_frame(screen, &mut frame, rng) {\n            ui::refusal(&mut frame);\n            let _ = panel.show(frame.as_bytes());\n            return false;"
             ),
             "an unrenderable entry screen must draw the refusal before it returns"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Backup CHECK QUIZ. The flow where the overlap is TOTAL: `ui::QUIZ_KEYS` is
+    // `123` and every one of those three bytes is in `ui::CONFIRM_CHARSET`
+    // (`12346`), so a keypress alone cannot say whether a human meant "candidate 2"
+    // or "confirm". There is no const-assert to fall back on — `hal::ui` asserts
+    // only that a quiz key is not a paging, cancel or OK key — so `Consent::Quiz`
+    // is the whole of it, and these tests drive both directions over all 256 bytes.
+    // -----------------------------------------------------------------------
+
+    /// A question of a quiz, as [`quiz::Quiz`] would hand it out: a real
+    /// `ui::QuizWord` and three BIP39-shaped candidates.
+    ///
+    /// Built here rather than by running a `quiz::Quiz`, because what these tests are
+    /// about is the ROUTING — `quiz.rs` drives the machine itself over all 256 bytes at
+    /// every state, and this file must not grow a second copy of that.
+    fn quiz_question() -> quiz::Screen {
+        quiz::Screen::Word {
+            question: ui::QuizWord {
+                number: 7,
+                asked: 2,
+                total: quiz::QUIZ_POSITIONS,
+                retry: false,
+            },
+            options: ["ABANDON", "ZOO", "ACTUAL"],
+        }
+    }
+
+    /// **Every byte is a keystroke while a quiz is on the glass, and no byte confirms
+    /// anything.** Requirement 1, the direction that must not fail open.
+    ///
+    /// All 256, at both values of `last`, because `last` must be irrelevant here:
+    /// [`answer`]'s guarded arm sits above every arm that reads it, and if it did not,
+    /// `last: false` would turn every answer into a refusal and end the quiz on question
+    /// one. The `Answer::Yes` assertion is the security half — [`Consent::Quiz`] is a
+    /// unit variant, so there is nothing to accept and nothing to hand
+    /// `Session::confirm_at`.
+    ///
+    /// The three answer keys are named separately because they are the trap this whole
+    /// variant exists for: they are `1`, `2`, `3`, and all three are confirm digits.
+    #[test]
+    fn the_quiz_screen_answers_every_byte_as_a_keystroke() {
+        for last in [false, LAST] {
+            for key in 0..=u8::MAX {
+                let got = answer(Ok(Event::Down(key)), Consent::Quiz, last);
+                assert_eq!(
+                    got,
+                    Answer::Key(key),
+                    "key {:?} on a quiz screen (last: {last})",
+                    key as char
+                );
+                assert_ne!(
+                    got,
+                    Answer::Yes,
+                    "key {:?} confirmed something while three candidates were on the glass",
+                    key as char
+                );
+            }
+            // THE OVERLAP, stated as a value: all three answer keys are confirm digits,
+            // and on this screen all three are keystrokes.
+            for key in QUIZ_KEYS {
+                assert!(
+                    CONFIRM_CHARSET.contains(&key),
+                    "the overlap this variant exists for is gone; simplify it"
+                );
+                assert_eq!(
+                    answer(Ok(Event::Down(key)), Consent::Quiz, last),
+                    Answer::Key(key),
+                    "a quiz answer key was not delivered as a keystroke"
+                );
+            }
+            // And the two paging keys are not eaten by an arm ordered ahead of this one.
+            // They do nothing in the quiz — `quiz::Quiz::key` ignores them — but they
+            // must arrive as keystrokes so that the ONE place deciding which keys are
+            // live is the pure machine and not this file.
+            for key in [NEXT_KEY, BACK_KEY] {
+                assert_eq!(
+                    answer(Ok(Event::Down(key)), Consent::Quiz, last),
+                    Answer::Key(key),
+                    "a paging arm ate a byte the quiz machine should have seen"
+                );
+            }
+        }
+        // Nothing pressed parks, undrawn. NO TIMEOUT: this is the only thing that
+        // happens for as long as a human takes to find word 7 on paper.
+        for event in [Event::AllUp, Event::Unsettled] {
+            assert_eq!(
+                answer(Ok(event), Consent::Quiz, LAST),
+                Answer::Wait,
+                "{event:?}"
+            );
+        }
+        // Two contacts, an unreadable scan and a pad that never opened are refusals,
+        // which `check_step` turns into the ending — fail-closed in the direction that
+        // takes the candidates off the glass.
+        assert_eq!(answer(Ok(Event::MultiKey), Consent::Quiz, LAST), Answer::No);
+        for error in [
+            KeypadError::NotOnThisTarget,
+            KeypadError::ColumnsStuckLow { idr: 0 },
+        ] {
+            assert_eq!(
+                answer(Err(error), Consent::Quiz, LAST),
+                Answer::No,
+                "{error:?}"
+            );
+        }
+        assert_eq!(
+            ask(None, &mut Counter(0), Consent::Quiz, LAST),
+            Answer::No,
+            "a missing pad must end the quiz, not answer it"
+        );
+    }
+
+    /// **A quiz answer key cannot answer a signing or revealing screen, and a signing
+    /// digit cannot be produced by a quiz screen.** Requirement 3, both directions.
+    ///
+    /// This is the sharper twin of
+    /// `an_entry_key_cannot_answer_a_signing_or_revealing_screen`: the entry's overlap
+    /// with [`ui::CONFIRM_CHARSET`] is five of twelve, and the quiz's is **three of
+    /// three** — every key its screen advertises is a key a signing screen might ask
+    /// for. So what is checked is that the two alphabets are separated by the
+    /// [`Consent`] variant and by nothing else:
+    ///
+    /// * on a PROMPT, a quiz key is [`Answer::Yes`] if and only if it is the digit that
+    ///   screen rendered — the pre-existing rule, restated over the quiz alphabet so the
+    ///   overlap cannot creep in as a special case;
+    /// * on a prompt, this function never returns [`Answer::Key`], so a keystroke cannot
+    ///   reach `Session::confirm_at` even by an arm being added in the wrong place;
+    /// * on a reveal page or the recorded question, a quiz key answers nothing it did
+    ///   not already answer.
+    ///
+    /// MUTATION-VERIFY: make [`answer`]'s digit arm `confirm.accepts(key) ||
+    /// ui::QUIZ_KEYS.contains(&key)` — the shape a "just make the quiz keys work" patch
+    /// takes — and the first loop fails on two keys per rendered digit.
+    #[test]
+    fn a_quiz_answer_key_cannot_answer_a_signing_or_revealing_screen() {
+        let prompt = signing_shaped();
+        for rendered in CONFIRM_CHARSET {
+            let confirm = digit(rendered);
+            for key in QUIZ_KEYS.iter().copied().chain([KEY_CANCEL, KEY_OK]) {
+                let got = answer(
+                    Ok(Event::Down(key)),
+                    Consent::Prompt(&prompt, confirm),
+                    LAST,
+                );
+                // Not a hole when it IS the rendered digit: a human reading that screen
+                // pressed the key it printed. The overlap is a UI fact, not a gate
+                // weakness — what would be a weakness is the other two answering too.
+                let want = if key == rendered {
+                    Answer::Yes
+                } else {
+                    Answer::No
+                };
+                assert_eq!(
+                    got, want,
+                    "quiz key {:?} against a prompt printing {:?}",
+                    key as char, rendered as char
+                );
+            }
+            // At most ONE of the three answer keys can ever confirm, because at most one
+            // of them is the rendered digit. This is the "1 in 3 becomes 1 in 12" claim
+            // that makes the separation worth anything.
+            let confirming = QUIZ_KEYS
+                .iter()
+                .filter(|key| {
+                    answer(
+                        Ok(Event::Down(**key)),
+                        Consent::Prompt(&prompt, confirm),
+                        LAST,
+                    ) == Answer::Yes
+                })
+                .count();
+            assert!(
+                confirming <= 1,
+                "more than one quiz key confirmed a prompt printing {:?}",
+                rendered as char
+            );
+        }
+        // A quiz key on a reveal page still pages or ends, and on the recorded question
+        // it still only acks the digit. Both are covered exhaustively elsewhere; these
+        // are the named regression for the ordering change in `answer`.
+        for key in QUIZ_KEYS {
+            assert!(
+                !matches!(
+                    answer(Ok(Event::Down(key)), Consent::Pages, false),
+                    Answer::Yes | Answer::Key(_)
+                ),
+                "quiz key {:?} did something new while a share was on the glass",
+                key as char
+            );
+        }
+        let confirm = digit(b'4');
+        for key in QUIZ_KEYS {
+            let got = answer(Ok(Event::Down(key)), Consent::Question(confirm), LAST);
+            assert!(
+                !matches!(got, Answer::Key(_)),
+                "the recorded question produced a keystroke for {:?}",
+                key as char
+            );
+            assert_eq!(
+                got,
+                Answer::No,
+                "quiz key {:?} answered a recorded question printing '4'",
+                key as char
+            );
+        }
+        // And the parked-prompt arm keeps refusing a keystroke. Unreachable, so it is a
+        // source pin — the same one the entry leans on, and it covers both flows because
+        // there is one `Answer::Key` and one arm.
+        assert!(
+            production_source().contains(
+                "Answer::Back | Answer::Key(_) | Answer::No => refuse(panel.as_mut(), &mut glass),"
+            ),
+            "a keystroke arriving at a prompt must be a refusal, never a confirm"
+        );
+    }
+
+    /// **Every live quiz key reaches the quiz machine, and nothing else can end the flow
+    /// by accident.**
+    ///
+    /// The whole pipeline `boot` runs for one pad event on a question — [`flow_consent`],
+    /// [`answer`], [`check_step`] — composed in the same order and from the same
+    /// functions, which is the point of them being module items.
+    ///
+    /// The give-up key is checked here as a *delivery*, not as an abort: `x` must arrive
+    /// at `Session::quiz_key` as a byte, because `coldsnap_firmware::quiz::Quiz::key` is
+    /// the one place that decides what it means. A `CheckStep::Done` for `x` here would
+    /// be a second decision free to disagree with that one.
+    #[test]
+    fn every_live_quiz_key_reaches_the_quiz_machine() {
+        let (consent, last) = flow_consent(Flow::Check(Check::Asking));
+        assert!(
+            matches!(consent, Consent::Quiz),
+            "the quiz screen must be answered as a quiz, with no digit"
+        );
+        for key in QUIZ_KEYS.iter().copied().chain([KEY_CANCEL]) {
+            assert!(
+                DECODER.contains(&key),
+                "the quiz asks for a key {:?} the pad cannot send",
+                key as char
+            );
+            assert_eq!(
+                check_step(Check::Asking, answer(Ok(Event::Down(key)), consent, last)),
+                CheckStep::Key(key),
+                "live key {:?} never reached `Session::quiz_key`",
+                key as char
+            );
+        }
+        // Every one of the pad's twelve keys is delivered, so the decision about which
+        // ones are live is entirely the pure machine's.
+        for key in DECODER {
+            assert_eq!(
+                check_step(Check::Asking, answer(Ok(Event::Down(key)), consent, last)),
+                CheckStep::Key(key),
+                "pad key {:?} never reached the quiz machine",
+                key as char
+            );
+        }
+        // Nothing pressed parks. NO TIMEOUT, chosen: eight questions is minutes of
+        // comparing words against paper, and a screen that blanked mid-quiz would cost
+        // the quiz AND a second consent — at which point three more real words are drawn.
+        for event in [Event::AllUp, Event::Unsettled] {
+            assert_eq!(
+                check_step(Check::Asking, answer(Ok(event), consent, last)),
+                CheckStep::Park,
+                "{event:?}"
+            );
+        }
+        // Two contacts, an unreadable scan and a pad that never opened all END the quiz,
+        // which is what takes the candidates off the glass.
+        for verdict in [
+            answer(Ok(Event::MultiKey), consent, last),
+            answer(Err(KeypadError::ColumnsStuckLow { idr: 0 }), consent, last),
+            ask(None, &mut Counter(0), consent, last),
+        ] {
+            assert_eq!(
+                check_step(Check::Asking, verdict),
+                CheckStep::Done,
+                "a pad that cannot be read left three candidates on the glass"
+            );
+        }
+        // And the three verdicts a quiz can never produce end it rather than doing
+        // something creative. `Answer::Yes` is the one that matters: it cannot occur
+        // (there is no digit in a `Consent::Quiz`), and if it did, the only thing it buys
+        // is standby — never `Session::confirm_at`, which is not reachable from
+        // `check_step` at all.
+        for verdict in [Answer::Yes, Answer::Next, Answer::Back] {
+            assert_eq!(
+                check_step(Check::Asking, verdict),
+                CheckStep::Done,
+                "{verdict:?} must not be able to do anything but end a quiz"
+            );
+        }
+    }
+
+    /// **The passed screen is dismissed by any key, and it acks nothing.**
+    ///
+    /// Two properties in one, because they are the same shape. The screen exists at all
+    /// because `ui::backup_quiz_passed`'s footer prints `(x)done`
+    /// (`hal/src/ui.rs:2457`), and a legend naming a key that does nothing is the failure
+    /// mode this file's const asserts exist to prevent. It is generous — every byte
+    /// dismisses, not just `x` — because there is nothing on it a further press could
+    /// change: the words are already off the glass (that screen takes a `usize` and
+    /// cannot be handed a `&str`) and `CommsMisc::BackupChecked` is already in the
+    /// outbox, sent by `Session::quiz_key` at the moment the last question was answered.
+    ///
+    /// So the ack cannot be sent twice from here: [`CheckStep`] has no `Ack` variant, and
+    /// the source pin below is the half that lives in `boot`.
+    #[test]
+    fn the_passed_quiz_screen_is_dismissed_by_any_key_and_acks_nothing() {
+        let (consent, last) = flow_consent(Flow::Check(Check::Passed));
+        assert!(
+            matches!(consent, Consent::Quiz),
+            "the passed screen must carry no digit either — it authorises nothing"
+        );
+        for key in 0..=u8::MAX {
+            assert_eq!(
+                check_step(Check::Passed, answer(Ok(Event::Down(key)), consent, last)),
+                CheckStep::Done,
+                "key {:?} did not dismiss the passed screen",
+                key as char
+            );
+        }
+        // Nothing pressed leaves it up, undrawn. A human is entitled to read it, and
+        // there is no timer.
+        for event in [Event::AllUp, Event::Unsettled] {
+            assert_eq!(
+                check_step(Check::Passed, answer(Ok(event), consent, last)),
+                CheckStep::Park,
+                "{event:?}"
+            );
+        }
+        // A pad fault dismisses it too, which costs nothing: the screen carries no word.
+        assert_eq!(
+            check_step(Check::Passed, ask(None, &mut Counter(0), consent, last)),
+            CheckStep::Done
+        );
+        // No key on this screen can deliver a keystroke, so `Session::quiz_key` — which
+        // refuses a quiz that is over — is never called from it.
+        for key in 0..=u8::MAX {
+            assert!(
+                !matches!(
+                    check_step(Check::Passed, answer(Ok(Event::Down(key)), consent, last)),
+                    CheckStep::Key(_)
+                ),
+                "the passed screen sent {:?} to a quiz that no longer exists",
+                key as char
+            );
+        }
+        // The two states are distinct, so no arm can route one as the other — which
+        // would hand the passed screen's dismissal to `Session::quiz_key`.
+        assert_ne!(Check::Asking, Check::Passed);
+        // And there is exactly one ack site in the image, and it is the reveal's. The
+        // quiz's lives in `Session::quiz_key` where the pass is scored, so nothing this
+        // file can press acks a quiz.
+        assert_eq!(
+            production_source().matches("session.quiz_key(").count(),
+            1,
+            "one place delivers a quiz keystroke, so only it can ack a quiz"
+        );
+        assert_eq!(
+            production_source().matches("CheckStep::Ack").count(),
+            0,
+            "the quiz ack belongs to `Session::quiz_key`, not to a pad verdict"
+        );
+    }
+
+    /// **Both quiz screens come from `hal::ui`'s own renderers**, so the noise over the
+    /// three option rows, the 12-cell sensitive budget and the footer legends are the
+    /// ones `hal`'s pixel gate covers.
+    ///
+    /// Checked by rendering the same screen twice from the same seed and comparing every
+    /// pixel: if [`quiz_frame`] composed an option row itself instead of delegating to
+    /// [`ui::backup_quiz_word`], the frames would differ and that row would have missed
+    /// [`ui::Frame::mark_sensitive`] — the one defence a share word on the glass has, and
+    /// one of these three rows IS a share word.
+    #[test]
+    fn the_quiz_screens_are_the_ones_hal_draws() {
+        let quiz::Screen::Word { question, options } = quiz_question() else {
+            panic!("the fixture is a question");
+        };
+        let mut mine = ui::Frame::new();
+        assert!(quiz_frame(quiz_question(), &mut mine, &mut Counter(11)));
+        let mut theirs = ui::Frame::new();
+        ui::backup_quiz_word(&mut theirs, question, options, &mut Counter(11))
+            .expect("a renderable question");
+        assert_eq!(
+            mine.as_bytes(),
+            theirs.as_bytes(),
+            "the question must be `ui::backup_quiz_word` and not a copy of it"
+        );
+        // The options are on the glass in the order the machine shuffled them, which is
+        // what makes the answer's slot uniform. A frame drawn from a permutation must
+        // differ, or this file could be reordering them.
+        let mut swapped = ui::Frame::new();
+        assert!(quiz_frame(
+            quiz::Screen::Word {
+                question,
+                options: [options[2], options[1], options[0]],
+            },
+            &mut swapped,
+            &mut Counter(11)
+        ));
+        assert_ne!(
+            mine.as_bytes(),
+            swapped.as_bytes(),
+            "the three candidates must reach the glass in the order they were drawn"
+        );
+
+        // The passed screen, likewise — and it takes a COUNT, so there is nothing on it
+        // to noise and nothing for a word to hide in.
+        let mut mine = ui::Frame::new();
+        assert!(quiz_frame(
+            quiz::Screen::Passed {
+                checked: quiz::QUIZ_POSITIONS
+            },
+            &mut mine,
+            &mut Counter(5)
+        ));
+        let mut theirs = ui::Frame::new();
+        ui::backup_quiz_passed(&mut theirs, quiz::QUIZ_POSITIONS).expect("a renderable pass");
+        assert_eq!(
+            mine.as_bytes(),
+            theirs.as_bytes(),
+            "the passed screen must be `ui::backup_quiz_passed` and not a copy of it"
+        );
+        // It says what was CHECKED and not that the backup is good: 8 of 25, with the
+        // rest named as unchecked. A screen reading "backup verified" would be a claim
+        // about 17 words nobody looked at.
+        let rows: Vec<String> = (0..ui::ROWS).map(|r| row_text(&mine, r)).collect();
+        let all = rows.join("\n");
+        assert!(
+            all.contains("8 of 25") && all.contains("not checked"),
+            "the passed screen must claim only what was checked: {all}"
+        );
+        // A BUILD failure and not an assertion, because both inputs are `const`: a quiz
+        // over every position would make that screen's caveat ("the rest were not
+        // checked") a lie, and would also mean a whole quiz could put the whole share on
+        // the glass. `firmware/src/lib.rs` asserts the same thing; it costs nothing to
+        // fail the build in the file that draws the screen too.
+        const _: () = assert!(quiz::QUIZ_POSITIONS < ui::BACKUP_WORDS);
+        // No candidate of the question is anywhere on the passed screen: it is the frame
+        // that goes OVER the words.
+        for word in options {
+            assert!(
+                !all.contains(word),
+                "the passed screen carries the candidate {word:?}"
+            );
+        }
+
+        // The `false` leg exists and is reachable, so `show_quiz`'s refusal is not dead
+        // code: `ui::backup_quiz_word` refuses a word number outside 1..=25 and draws
+        // NOTHING when it does, which is why the caller can put `ui::refusal` on the same
+        // frame.
+        let mut untouched = ui::Frame::new();
+        assert!(
+            !quiz_frame(
+                quiz::Screen::Word {
+                    question: ui::QuizWord {
+                        number: 0,
+                        ..question
+                    },
+                    options,
+                },
+                &mut untouched,
+                &mut Counter(0)
+            ),
+            "an unrenderable question must be refused, not half-drawn"
+        );
+        assert_eq!(
+            untouched.as_bytes(),
+            ui::Frame::new().as_bytes(),
+            "a refused screen must leave the frame clean"
+        );
+        // And the same for the pass: `0 of 25 matched` under a passed header is a false
+        // assurance, so it is a refusal rather than a frame.
+        let mut untouched = ui::Frame::new();
+        assert!(!quiz_frame(
+            quiz::Screen::Passed { checked: 0 },
+            &mut untouched,
+            &mut Counter(0)
+        ));
+        assert_eq!(untouched.as_bytes(), ui::Frame::new().as_bytes());
+    }
+
+    /// **Every exit from the quiz takes the three candidates off the glass** —
+    /// requirement 6, pinned as the shape that keeps it.
+    ///
+    /// One of those three rows is the true word at the position being asked and a second
+    /// is a real word from elsewhere in the same share, so a panel left showing them
+    /// after a human walks away is the leak this flow's consent screen warned about. It
+    /// is control flow first — [`show_quiz`] is the only producer of [`Flow::Check`] and
+    /// both of its `None` legs draw first — but the endings live in `boot`, which no gate
+    /// in this tree compiles (PLAN.md §9 item 22), so the loop's own arms are pinned
+    /// textually.
+    ///
+    /// The fifth ending is anything that takes the glass — a coordinator prompt, a
+    /// refusal, an undisplayable prompt — and that is `take_glass`, which drops the whole
+    /// [`Flow`] in the same statement as the `panel.show`. [`Flow`] being one enum is why
+    /// that needed no third line for the quiz.
+    #[test]
+    fn every_exit_from_the_quiz_takes_the_candidates_off_the_glass() {
+        let src = production_source();
+        // ONE writer of a keystroke into the machine, and it sits directly behind the
+        // step that carries the byte.
+        assert!(
+            src.contains(
+                "CheckStep::Key(key) => {\n                            match session.quiz_key(key, &mut entropy, &mut outbox) {"
+            ),
+            "the keystroke must sit directly behind `CheckStep::Key` and carry that key"
+        );
+        // THE ONE PRODUCER, at its three call sites: the grant, a redraw, and the passed
+        // screen. A fourth would have to say what it draws first.
+        assert_eq!(
+            src.matches("show_quiz(").count(),
+            3,
+            "three call sites: the start, every redraw, and the ending that passed"
+        );
+        // The two re-parks, and they are the only two: nothing pressed, and a key that
+        // did nothing. Both leave the frame that is already up alone — a redraw would
+        // re-sample `mark_sensitive`'s noise over the row holding the true word.
+        assert_eq!(
+            src.matches("glass = Some(Flow::Check(state))").count(),
+            2,
+            "`CheckStep::Park` and `Checked::Unchanged` re-park without redrawing, and \
+             nothing else may"
+        );
+        assert!(
+            src.contains("CheckStep::Park => glass = Some(Flow::Check(state)),")
+                && src.contains("Ok(Checked::Unchanged) => glass = Some(Flow::Check(state)),"),
+            "an unchanged quiz screen must not be redrawn"
+        );
+        // BOTH ENDINGS DRAW. A pass draws the "8 of 25 words matched" screen over the
+        // candidates and keeps the glass for it; giving up draws standby. Neither leaves
+        // a question up, and the ONLY thing that keeps a `Flow::Check` alive past an
+        // ending is the passed screen, which carries no word.
+        assert!(
+            src.contains(
+                "Some(checked) => {\n                                                glass = show_quiz(\n                                                    &session,\n                                                    Some(quiz::Screen::Passed { checked }),"
+            ),
+            "a passed quiz must draw the passed screen over the candidates"
+        );
+        assert!(
+            src.contains("None => idle(&session, panel),"),
+            "a quiz the human gave up on must draw standby, and send nothing"
+        );
+        assert!(
+            src.contains(
+                "CheckStep::Done => {\n                            if let Some(panel) = panel.as_mut() {\n                                idle(&session, panel);"
+            ),
+            "a pad fault, a coordinator cancel or a dismissed pass must take the \
+             candidates off the glass"
+        );
+        // And a fault on the keypress draws the refusal, through `take_glass`, which
+        // drops the cursor in the same statement.
+        assert_eq!(
+            src.matches("Err(_fault) => refuse(panel.as_mut(), &mut glass),")
+                .count(),
+            3,
+            "a fault on a consent, mid-entry and mid-quiz must all three refuse on the \
+             glass and drop the cursor in the same statement"
+        );
+        // The cancel guard: the coordinator can drop the grant without drawing anything,
+        // so the loop asks the library whether the quiz is still live BEFORE routing the
+        // verdict — and asks it for the QUESTION only, because the passed screen has no
+        // quiz behind it and gating that on a grant would blank it on the next iteration.
+        assert!(
+            src.contains(
+                "Check::Asking if session.quiz_screen().is_none() => CheckStep::Done,\n                        _ => check_step(state, verdict),"
+            ),
+            "a cancelled quiz must end on the next iteration, not on the next keypress — \
+             and the passed screen must not be gated on a grant it does not need"
+        );
+        // `show_quiz`'s own two `None` legs, which is the control-flow half: there is no
+        // way to return "nothing quiz-shaped is on the glass" without having drawn
+        // something.
+        assert!(
+            src.contains(
+                "let Some(screen) = screen else {\n            idle(session, panel);\n            return None;"
+            ),
+            "a quiz whose grant went away must draw standby before it returns"
+        );
+        assert!(
+            src.contains(
+                "if !quiz_frame(screen, &mut frame, rng) {\n            ui::refusal(&mut frame);\n            let _ = panel.show(frame.as_bytes());\n            return None;"
+            ),
+            "an unrenderable quiz screen must draw the refusal before it returns"
+        );
+        // And the cursor is read off the screen that was drawn, so the pixels and the
+        // gate cannot describe different screens.
+        assert!(
+            src.contains(
+                "Some(match screen {\n            quiz::Screen::Word { .. } => Check::Asking,\n            quiz::Screen::Passed { .. } => Check::Passed,\n        })"
+            ),
+            "the cursor must be read off the screen that reached the panel"
         );
     }
 }

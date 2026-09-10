@@ -286,11 +286,23 @@ is the practical budget.
 | 4 | Test-message sign confirm | yes | yes |
 | 5 | **Backup display** — 25 words | no: 7 screens at 4 rows, 3 at `FontTiny` | yes |
 | 6 | **Backup entry** — 25 words + share index | no, paginate | yes |
-| 7 | Backup check quiz | yes | no |
+| 7 | **Backup check quiz** — 8 of 25 words, three candidates each | yes | **yes** |
 | 8 | Address verification — 62-char bech32m | no: 4 lines `FontSmall`, 2 at `FontTiny` | **yes** |
 
-Three security requirements that the renderer must not quietly drop:
+Four security requirements that the renderer must not quietly drop:
 
+- **The check quiz is reveal-class and is treated as such.** One candidate in three
+  is the true word at the position being asked and a second is a real word from
+  elsewhere in the same share, so a clean 8-question pass puts up to **16 of the 25
+  words** on the glass (measured worst case over 300 passes; ceiling
+  `2 × QUIZ_POSITIONS`, enforced by `const _: () = assert!(quiz::QUIZ_POSITIONS <
+  ui::BACKUP_WORDS)`). It therefore has the same consent screen, the same `SECRET on
+  glass` warning, the same randomised `ConfirmDigit`, and `mark_sensitive` on every
+  candidate row as `DisplayBackup`. This row read "not security-load-bearing" until
+  2026-09-10; that was wrong. It is still *less* exposing than a reveal — 8 renders
+  against 7, but ≤16 words against 25, no positional certainty, and 17 positions
+  never drawn — which is the whole reason it is a subset quiz and not upstream's
+  26-screen shape.
 - **Sign approval must show, per foreign recipient, both amount and the full
   destination address, plus the network fee** — otherwise the device is a blind
   signer. Frostsnap's own decomposition is
@@ -359,6 +371,23 @@ PIN validation, rate limiting, the brick counter, trick PINs and fast wipe
 (`shared/callgate.py` wraps ~25 methods). Discarding it forfeits the entire
 dual-secure-element rationale for choosing this hardware — which is presumably
 why the hardware was chosen.
+
+**PIN is PUNTED — decided 2026-09-10, and it has one hard consequence.** The
+callgate bindings and the entry screens exist but are gc-sectioned out for want of
+a caller, and the SE1 sequencing they need cannot be written without a bench
+session (slot 11 is writable **once per PIN** because the AES-CTR keystream repeats
+from offset 0, a stale slot decrypts to silent garbage with `rv = 0` so the 72
+bytes must be self-tagging, and selector 18/2 is deliberately left unbound because
+it can brick the unit). Punting is a schedule choice, not a reversal of decision 3
+— the callgate stays, and nothing here forecloses adding a PIN later.
+
+What it does foreclose is **recovery**. Installing cold-snap on a unit is
+ONE-WAY: `sdcard_recovery` restores only the image already installed, because
+`sdcard_try_file` needs an SE1 CHECKMAC against `KEYNUM_firmware` that only a
+PIN-authorised upgrade writes, and `enter_dfu` is skipped outright at RDP=2
+(`main.c:174-182`). **A PIN is the thing that would make a unit re-flashable**, so
+until one exists, any unit that receives this firmware is committed to it. That is
+the argument for keeping the dev unit on the bench and not flashing a second.
 
 This is where the trust position in §1 is knowingly compromised: the retained
 bootloader and SE code are Coinkite-authored. The alternative is a device with
@@ -1909,8 +1938,13 @@ catalogued on the device side, sitting on the host side of the same protocol.
     quiz. **Substantially closed 2026-08-25:** a real `FrostSigner` in `boot()` took
     the image to **282,080 B = 19.79%**, a 2.78× jump, with `rust-bitcoin` going 1 → 14
     symbols. Proof it is `boot()` that pulls it in: deleting the single `session.recv`
-    call drops `.text` by 142,916 B and `bitcoin` back to 1. What is still dropped is
-    only the UI screens no dispatch arm reaches yet.
+    call drops `.text` by 142,916 B and `bitcoin` back to 1. **Fully closed
+    2026-09-10 at 376,752 B = 26.43%:** every §4.2 screen now has an honest caller,
+    the quiz included, so nothing in `ui` is gc-sectioned out any more. `quiz.rs` is
+    the cleanest illustration of the trap in this file — its author measured it at
+    **+0 B** while it compiled and tested but nothing called it, then it cost
+    **+2,304 B** the moment a dispatch arm referenced it, without one line changing.
+    Measure after wiring, never before.
 
 ---
 
@@ -1925,8 +1959,8 @@ catalogued on the device side, sitting on the host side of the same protocol.
 | Rust toolchain | 1.88.0 (upstream pin) + `thumbv7em-none-eabihf` |
 | C cross-compiler | clang 21 (`/opt/homebrew/opt/llvm/bin/clang`) — still required, decision 4 |
 | Decisions record | [DECISIONS.md](DECISIONS.md), dated 2026-08-12 |
-| Flash, as built | 860,898 B = **60.4%** of `FLASH_TEXT`, re-measured in a clean target dir 2026-08-19 (844,229 at phase 0; +5,101 panic sites, +253 for §8.1 defects 10–12, **+15,873 `coldsnap_hal` rlib** — of which +3,461 is phase 3's `comms.rs` + `usb.rs` — less −4,482 instantiations that moved between rlibs; all with LTO off, so upper bounds). **This row read 893,099 B = 62.7% until 2026-08-19**, on the strength of a +32,513 B growth attributed to `comms::decode_body`; that does not reproduce clean and is retracted — see README "Flash budget". The live `./target` glob measures 1,311,110 B = 92.0% from 131 rlibs against a clean 48, which is the artefact to suspect first.  **The linked image is measured, and the rlib sum above overestimates it by ~2.9×:** `firmware/` links at **372,688 B = 26.15%** of `FLASH_TEXT` (`llvm-objdump -h`, 2026-09-10), because LTO plus `--gc-sections` keeps only what is reachable. `llvm-nm` finds **267** frostsnap/secp/schnorr/bitcoin symbols and **17** `coldsnap_hal::ui` symbols. The trajectory, each step a real caller appearing rather than a code addition: 11,604 B when `boot()` polled USB but touched no `comms` · 94,304 B with `Link::poll` + `decode_body` · 99,684 B with `identity` · 101,416 B once the identity-hold screen gave `ui`/`display` a caller · 282,080 B once a real `FrostSigner` was constructed and dispatched to · 297,064 B once the remaining §4.2 consent screens got honest callers · 331,116 B with the keypad driver and real consent · 362,288 B once `DisplayBackup`, `mark_sensitive` and the persistent share store landed · **372,688 B** once 25-word entry made restore possible. Still not the ceiling: `EnterPhysicalBackup`, `SavePhysicalBackup`, `SavePhysicalBackup2`, `Consolidate`, `CheckBackup` and the naming flows are refused rather than implemented (§9), so their code is absent — and a PIN would add the SE1 paths that are currently bound but gc-sectioned out. Read the rlib rows for the MARGINAL cost of a change, never as a prediction of image size. |
-| Host tests passing | **530** (357 before the gap-closing pass; 355 before the signing pipeline; 344 on 2026-08-25 before `FrostSigner`; the firmware gate is now a SUM of two `test result` lines, 11 lib + 14 bin; 341 on 2026-08-24, +40 for `ui.rs`; 268 until 2026-08-24, which never counted `coldsnap_firmware`'s 14; +19 for `identity`; 204 at the phase-2 gate, 253 at the end of phase 3, 261 before §9 item 7(c)'s three outer-leg tests, 264 before the three inner-leg `decode_body` tests, 267 before the pin on the vendored `MAX_MESSAGE_ALLOC_SIZE`; `frostsnap_core` no longer needs an allowlist, `frost_backup` still does — §7) |
+| Flash, as built | 860,898 B = **60.4%** of `FLASH_TEXT`, re-measured in a clean target dir 2026-08-19 (844,229 at phase 0; +5,101 panic sites, +253 for §8.1 defects 10–12, **+15,873 `coldsnap_hal` rlib** — of which +3,461 is phase 3's `comms.rs` + `usb.rs` — less −4,482 instantiations that moved between rlibs; all with LTO off, so upper bounds). **This row read 893,099 B = 62.7% until 2026-08-19**, on the strength of a +32,513 B growth attributed to `comms::decode_body`; that does not reproduce clean and is retracted — see README "Flash budget". The live `./target` glob measures 1,311,110 B = 92.0% from 131 rlibs against a clean 48, which is the artefact to suspect first.  **The linked image is measured, and the rlib sum above overestimates it by ~2.9×:** `firmware/` links at **376,752 B = 26.43%** of `FLASH_TEXT` (`llvm-objdump -h`, 2026-09-10), because LTO plus `--gc-sections` keeps only what is reachable. `llvm-nm` finds **267** frostsnap/secp/schnorr/bitcoin symbols and **17** `coldsnap_hal::ui` symbols. The trajectory, each step a real caller appearing rather than a code addition: 11,604 B when `boot()` polled USB but touched no `comms` · 94,304 B with `Link::poll` + `decode_body` · 99,684 B with `identity` · 101,416 B once the identity-hold screen gave `ui`/`display` a caller · 282,080 B once a real `FrostSigner` was constructed and dispatched to · 297,064 B once the remaining §4.2 consent screens got honest callers · 331,116 B with the keypad driver and real consent · 362,288 B once `DisplayBackup`, `mark_sensitive` and the persistent share store landed · 372,688 B once 25-word entry made restore possible · **376,752 B** once `CheckBackup` became a real 8-question quiz behind its own consent digit (+4,064 B: +32 B of `ui.rs` screens, +2,232 B when `firmware/src/quiz.rs` first acquired a caller and its generics were instantiated, +1,800 B for the `main.rs` event-loop arm). `.bss` is byte-identical across all of it at `0x2000_8034..0x2001_8058`, and nothing on the quiz path allocates, so the ~5,024 B arena margin is unchanged. Still not the ceiling: `EnterPhysicalBackup`, `SavePhysicalBackup`, `SavePhysicalBackup2`, `Consolidate` and the naming flows are refused rather than implemented (§9), so their code is absent — and a PIN would add the SE1 paths that are currently bound but gc-sectioned out. Read the rlib rows for the MARGINAL cost of a change, never as a prediction of image size. |
+| Host tests passing | **565** = hal 284 + firmware 165 + vendored 116 (`frostsnap_core` 63 + `comms` 10 + `embedded` 17 + `frost_backup` 19 + `macros` 7), re-measured 2026-09-10; **530** before the `CheckBackup` quiz (+6 hal, +29 firmware); 357 before the gap-closing pass; 355 before the signing pipeline; 344 on 2026-08-25 before `FrostSigner`; the firmware gate is now a SUM of two `test result` lines, 11 lib + 14 bin; 341 on 2026-08-24, +40 for `ui.rs`; 268 until 2026-08-24, which never counted `coldsnap_firmware`'s 14; +19 for `identity`; 204 at the phase-2 gate, 253 at the end of phase 3, 261 before §9 item 7(c)'s three outer-leg tests, 264 before the three inner-leg `decode_body` tests, 267 before the pin on the vendored `MAX_MESSAGE_ALLOC_SIZE`; `frostsnap_core` no longer needs an allowlist, `frost_backup` still does — §7) |
 
 Vendored crates live in `vendor/frostsnap/` with upstream commit recorded in
 `vendor/README.md`, which also carries the local-modifications table. Changes are

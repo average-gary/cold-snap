@@ -683,14 +683,51 @@ fn main() {
     // The WORD form takes the RNG on the same mandatory terms as the backup
     // display, because CheckBackup draws all 25 words and the share index — the
     // same decrypted phase DisplayBackup uses, over 26 screens instead of 8.
-    ui::backup_quiz_word(&mut f, 7, ["account", "accuse", "acid"], &mut Counter(0))
+    let asked = ui::QuizWord {
+        number: 7,
+        asked: 2,
+        total: 8,
+        retry: false,
+    };
+    ui::backup_quiz_word(&mut f, asked, ["account", "accuse", "acid"], &mut Counter(0))
         .expect("renderable");
     out.emit(
         "7 backup check quiz — the WORD question (all three rows noised)",
-        "word 7, options [account, accuse, acid]. The distractors must be drawn \
+        "word 7, question 3 of 8, options [account, accuse, acid]. Eight and not \
+         twenty-five because both references quiz a THIRD (shared/backups.py:442 \
+         limited=num_pw_words//3), which is why `pg 3/8` is on the glass at all: the \
+         user cannot infer how many questions are left. The distractors must be drawn \
          UNIFORMLY from rng::Entropy: upstream's nearest-neighbour rule is a pure \
          function of the answer and identifies it for 1,288 of 2,048 words",
         "quiz-word",
+        &f,
+    );
+    ui::backup_quiz_word(
+        &mut f,
+        ui::QuizWord { retry: true, ..asked },
+        ["absorb", "acid", "accuse"],
+        &mut Counter(0),
+    )
+    .expect("renderable");
+    out.emit(
+        "7 backup check quiz — the SAME position re-asked after a wrong answer",
+        "retry: true, and the three options RESHUFFLED by the caller (a re-ask with \
+         the same three in the same slots turns the second guess into a 1-in-2). The \
+         banner is about the answer and says nothing about the backup — no lockout \
+         and no failure message, because CheckBackup has no failure counterpart and \
+         upstream's feedback is local UI state (check_backup.rs:592-600). Coldcard's \
+         `y = show me all the words again` is deliberately NOT here: that would be a \
+         full reveal reached from a screen whose consent was for a quiz",
+        "quiz-retry",
+        &f,
+    );
+    ui::backup_quiz_passed(&mut f, 8).expect("renderable");
+    out.emit(
+        "7 backup check quiz — passed",
+        "checked: 8. It claims 8 of 25 and says the rest were not checked, because a \
+         third of the words answered is not a verified backup. Takes no &str and no \
+         RNG, so it structurally cannot carry a word",
+        "quiz-passed",
         &f,
     );
     ui::backup_quiz(&mut f, "index was?", ["1", "2", "3"], None);
