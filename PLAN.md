@@ -1085,7 +1085,7 @@ Each phase ends at a testable artifact. No hardware until Phase 5.
 | 1b | Close the residual test gaps | odd-y/`lift_x` assertion; device-path vector; clippy at `bitcoin_transaction.rs:524` | tests fail on mutating `tweak.rs:342` | 🟡 **two of three closed; this row read "⬜ pending" until 2026-09-10.** The odd-y assertion shipped as `odd_y_internal_keys_tweak_to_the_same_output` (`frostsnap_core/src/tweak.rs:583`), which pins the *property* — `P` and `-P` must tweak to the same output key — touches no `bitcoin` type, and so survives decision 4 being revisited (DECISIONS.md residual gap 1, marked FIXED there). The clippy finding is fixed too (residual gap 4); `bitcoin_transaction.rs:524` is now `pub fn spk`, so that citation no longer locates anything. **Still open: the device-path vector** — every shipped test exercises `TweakableKey for Point`, while production signs through `SharedKey` and `PairedSecretShare` (residual gap 2). |
 | 2 | STM32 HAL substrate | `NorFlash` for STM32 flash, **2-source** `RngCore` (§5.1 — not three), **panic → `NVIC_SystemReset`** (§6.2), plus removal of the §6.3 panic sites | host tests; handler disassembly; **§8.1 defect register empty** | 🟡 **written, all 12 review defects fixed, host-verified; hardware claims unverified** — see **§8.1**. Device build links; clippy and rustdoc clean; **204 tests** and **857,125 B = 60.1%** at the gate (now 268 / 860,898 with phase 3 and 4 on top). What remains is §8.1 items 3–5 — the real `DBANK`, `.ramfunc`, ECC/NMI — all bench work. Every on-silicon claim is still an assumption (§9); nothing has run on hardware. |
 | 3 | Transport | USB CDC carrying `frostsnap_comms` framing, within the **4,096 B** ceiling (§7, raised from 2,060 — DECISIONS.md 7) | coordinator handshake | 🟡 **written and host-verified; no enumeration has been attempted.** `hal/src/comms.rs` (framing, +18 tests) and `hal/src/usb.rs` (OTG_FS device mode + CDC-ACM, +31 tests, **23/23 mutations caught**) — see **§8.2**. The bound is structural, not a comparison: the accumulator *is* `[u8; FRAME_LIMIT]`, and it costs 2 × that in SRAM. The gate is **not** met **on silicon**, which is what it means here — a real unmodified coordinator *has* handshaked with this framing on the host over a pty (§9 item 6, phase 4's row below); what has never happened is enumeration on the device. §7's census is what raised the bound: at 2,060 the transport refused a real `SignatureShare`, a real 11-input `RequestSign`, 9-of-9 keygen and a 14-share `HeldShares2`; at 4,096 it refuses none of them, and the **three device-side construction caps are now implemented** in `Outbox::push` (§7; this cell said they "remain UNIMPLEMENTED" until 2026-09-10). |
-| 4 | Protocol on host | keygen + sign, Tier 2 simulator first, then Tier 3 stub `Serial` against real `frostsnap_coordinator` | end-to-end on host | 🟡 **gate MET on host 2026-08-18; not signed off.** `hostcheck/` + `firmware/examples/stub.rs` complete a **9-of-9 keygen, nonce replenishment and a signature that VERIFIES** (`Schnorr::verify_only()` against the coordinator's own derived x-only key) over a pty in two processes, against an **unmodified** sibling `frostsnap_coordinator`, at both `STUB_CHUNK=64` and `=1`, plus a third **DECLINE** pass. The two §7 size crossovers are **closed** by decision 7 (`FRAME_LIMIT` 2,060 → 4,096), validated on the wire: largest coordinator→device frame actually written is **2,179 B**, above the old bound, so this keygen was previously refused. Tier 1 **565** tests green. **This cell listed five uncovered items until 2026-09-10 and FOUR of them had already closed** — it read: *"the stub auto-acks `SignatureRequest`, so the approval policy — the actual security property — is untested; … but only CORE-to-CORE — nothing yet asserts the four bytes the screen renders are the coordinator's; restoration, backup consolidation, physical-backup entry and naming flows have never been driven at all; the three device-side caps (§7) are unimplemented; the allocator is sized and chosen but not registered (§9 item 7)."* Corrected: `SignatureRequest` **is** gated, on the randomised digit read back off the rendered frame (`stub.rs:499`), and a DECLINE pass fails the run if a refused prompt yields a share (`hostcheck/src/main.rs:776,1520`); the four rendered bytes **are** compared against the coordinator's session-hash prefix (`:1465-1481`, closed 2026-08-31, §9 item 12); the three caps **are** implemented (`firmware/src/lib.rs:422`, §7); and the allocator **is** registered (`firmware/src/alloc.rs:238`, §9 item 7). **THE RESTORATION FLOWS ARE NOW COORDINATOR-DRIVEN — this cell said they were "driven by unit tests but not by a real coordinator" until 2026-09-11, and that was the largest remaining phase-4 gap.** `hostcheck` gained the five-call `UiProtocol` lifecycle and drives **four of the five** flows from UPSTREAM's own drivers, unmodified and by path — `DisplayBackupProtocol`, `CheckBackupProtocol`, `EnterPhysicalBackup`, plus consolidation through the same `queue` the keygen frames use (upstream has no driver for it). One boxed protocol at a time; no `UiStack`. Ordered AFTER the verified signature, because at t = n = 9 every device is needed to sign and `Consolidate` REPLACES the one share record the store keeps. What each asserts: the **25 words read back off the device's own framebuffer** with `ui::Frame::cell` re-encode through upstream's `ShareBackup::from_words` to this coordinator's own `expected_share_image`; the check quiz passes in **exactly 8 answers** taken only from what that reveal drew (the stub's picker is handed no `quiz::Quiz` and no option list); those same words go back in through the letter picker — whose candidate letters are a function of the secret prefix, so the typing is off the pixels too — and `check_physical_backup` accepts the result; and after the destructive consolidation the device's re-reported share **image** matches. MEASURED cost: **+1.4 s at chunk 64, +2.4 s at chunk 1**. Seventeen mutations RUN, each file restored and `diff`ed byte-identical, including three that remove one lifecycle leg each and all die on the new `DEADLINE (95s)` in the right state; plus `COLDSNAP_GLASS_KEYS=yy9`, which shows with NO source change that a hardcoded key cannot authorise a reveal, an ingest or a consolidation. See §9 item 12 for the three upstream facts this turned up, and for what did NOT get demonstrated. **What the gate STILL does NOT cover:** `CheckKeyGen` is gated on the fixed `1=match` key the screen advertises rather than on a randomised digit, so a hardcoded script can answer it; **naming** — `SetName` is sent by the device but no harness ever sends `NameCommand`; ingest onto a device with **no share at all** (all nine hold one, so M7d re-ingests the device's own backup — see the tenth-device note in §9 item 12); and nothing has run on silicon. |
+| 4 | Protocol on host | keygen + sign, Tier 2 simulator first, then Tier 3 stub `Serial` against real `frostsnap_coordinator` | end-to-end on host | 🟡 **gate MET on host 2026-08-18; not signed off.** `hostcheck/` + `firmware/examples/stub.rs` complete a **9-of-9 keygen, nonce replenishment and a signature that VERIFIES** (`Schnorr::verify_only()` against the coordinator's own derived x-only key) over a pty in two processes, against an **unmodified** sibling `frostsnap_coordinator`, at both `STUB_CHUNK=64` and `=1`, plus a third **DECLINE** pass. The two §7 size crossovers are **closed** by decision 7 (`FRAME_LIMIT` 2,060 → 4,096), validated on the wire: largest coordinator→device frame actually written is **2,179 B**, above the old bound, so this keygen was previously refused. Tier 1 **565** tests green. **This cell listed five uncovered items until 2026-09-10 and FOUR of them had already closed** — it read: *"the stub auto-acks `SignatureRequest`, so the approval policy — the actual security property — is untested; … but only CORE-to-CORE — nothing yet asserts the four bytes the screen renders are the coordinator's; restoration, backup consolidation, physical-backup entry and naming flows have never been driven at all; the three device-side caps (§7) are unimplemented; the allocator is sized and chosen but not registered (§9 item 7)."* Corrected: `SignatureRequest` **is** gated, on the randomised digit read back off the rendered frame (`stub.rs:499`), and a DECLINE pass fails the run if a refused prompt yields a share (`hostcheck/src/main.rs:776,1520`); the four rendered bytes **are** compared against the coordinator's session-hash prefix (`:1465-1481`, closed 2026-08-31, §9 item 12); the three caps **are** implemented (`firmware/src/lib.rs:422`, §7); and the allocator **is** registered (`firmware/src/alloc.rs:238`, §9 item 7). **THE RESTORATION FLOWS ARE NOW COORDINATOR-DRIVEN — this cell said they were "driven by unit tests but not by a real coordinator" until 2026-09-11, and that was the largest remaining phase-4 gap.** `hostcheck` gained the five-call `UiProtocol` lifecycle and drives **four of the five** flows from UPSTREAM's own drivers, unmodified and by path — `DisplayBackupProtocol`, `CheckBackupProtocol`, `EnterPhysicalBackup`, plus consolidation through the same `queue` the keygen frames use (upstream has no driver for it). One boxed protocol at a time; no `UiStack`. Ordered AFTER the verified signature, because at t = n = 9 every device is needed to sign and `Consolidate` REPLACES the one share record the store keeps. What each asserts: the **25 words read back off the device's own framebuffer** with `ui::Frame::cell` re-encode through upstream's `ShareBackup::from_words` to this coordinator's own `expected_share_image`; the check quiz passes in **exactly 8 answers** taken only from what that reveal drew (the stub's picker is handed no `quiz::Quiz` and no option list); those same words go back in through the letter picker — whose candidate letters are a function of the secret prefix, so the typing is off the pixels too — and `check_physical_backup` accepts the result; and after the destructive consolidation the device's re-reported share **image** matches. MEASURED cost: **+1.4 s at chunk 64, +2.4 s at chunk 1**. Seventeen mutations RUN, each file restored and `diff`ed byte-identical, including three that remove one lifecycle leg each and all die on the new `DEADLINE (95s)` in the right state; plus `COLDSNAP_GLASS_KEYS=yy9`, which shows with NO source change that a hardcoded key cannot authorise a reveal, an ingest or a consolidation. See §9 item 12 for the three upstream facts this turned up, and for what did NOT get demonstrated. **NAMING AND `erase_device` CLOSED THE SAME DAY.** A coordinator-previewed name — 14 chars and 56 bytes at once, i.e. simultaneously the `FixedString<14>` wire bound and `DEVICE_NAME_MAX_BYTES` — reaches FLASH on all nine devices and comes back byte-exact as `SetName`, with a `NeedName` required first so an announce-time echo cannot be mistaken for a commit. It needed no device change: the preview must ride with the `AnnounceAck` because `commit_name` fires during keygen, and a mutation sending it post-keygen yields zero `SetName` lines. And upstream's own `EraseDevice` driver is now proven NEVER to complete against this device: `is_complete()` stays `None` for the whole grace window AND the device reports `refused=DataErase` — both halves, because silence alone is what a dead device looks like. **AND `CheckKeyGen` NOW ASKS FOR THE RANDOMISED DIGIT.** This cell said until 2026-09-11 that it was "gated on the fixed `1=match` key the screen advertises … so a hardcoded script can answer it". `ui::keygen_check` now prints `press_legend(confirm)` like the signing screens, `KEYGEN_MATCH_KEY` is deleted, and `answer` has one rule for every prompt. **No literal answers any consent screen on this device now**, shown with no source mutation: `COLDSNAP_GLASS_KEYS=1yy` exits 1 with 8 of 9 devices declining (the ninth drew `1`, which is the 1-in-5 made visible) and `=9yy` exits 1 with 9/9. Cost +440 B of flash, and the 2x code rows deliberately did not move because `glass_code` reads them back from those exact cells. **What the gate STILL does NOT cover:** ingest onto a device with **no share at all** (all nine hold one, so M7d re-ingests the device's own backup — see the tenth-device note in §9 item 12); and nothing has run on silicon. |
 | 5 | Mono UI | **8 screens** (§4.2), mono `DrawTarget`, ~850 LOC ported from `frostsnap_widgets` | manual, on hardware | 🟡 **written and host-verified; the manual-on-hardware gate is untouched.** **This row read "⬜ pending — largest single item" until 2026-09-10**, by which time `hal/src/ui.rs` was 5,541 lines rendering all eight screens with real callers (§9 item 16, closed the same day) and `tools/pixel-check.py` was checking them against an independent framebuffer decoder. Nothing was ported from `frostsnap_widgets` in the end — the ~850 LOC estimate was never drawn on; the screens are written against `ui::Frame` directly, and the one upstream artefact reused is the idea of a distractor quiz, deliberately **not** its implementation (§7 cap notes). What the gate still means here is the part a host cannot do: whether 16 px is legible on a physical OLED, and whether the keypad's hold-to-confirm feels right (§9 item 15). It inherits §8.1 defect 12: `user_prompt()`'s `None` is a **refusal**, not a rendering fallback — now enforced, since `SignPages`/`prompt_screen` funnel through one renderability gate. |
 | 6 | Callgate integration | SE1/SE2 identity, PIN, rate limiting; ABI already determined (§5, DECISIONS.md decision 2) | hardware | ⬜ pending |
 | 7 | Nonce durability | read-back-verified writes as `Result` not `assert!`, power-loss testing | fault injection | ⬜ pending — `TestNorFlash` does **not** model power loss (§7) |
@@ -1737,14 +1737,38 @@ catalogued on the device side, sitting on the host side of the same protocol.
     reached the coordinator`. The stub's own log line still says "auto-ack" for both
     consent arms, which is where this claim came from — the log is wrong, not the gate.
 
-    **What is genuinely still weaker, stated precisely.** `CheckKeyGen` is gated on the
-    key the screen *advertises* rather than on a randomised digit: `ui::keygen_check`
-    prints `1=match` and `stub.rs:495` accepts `key == b'1'`. That is deliberate —
-    accepting the signing digit there would accept a key the screen never showed — and
-    `advertised_key` does read the legend off the glass, but the byte it finds is a
-    **constant**, so a hardcoded `1` answers it too. For `SignatureRequest` no literal
-    can: `COLDSNAP_GLASS_KEYS=y9` and `=y2` are refusals by construction, which is what
-    makes that read structural rather than an extra check.
+    **CLOSED 2026-09-11 — `CheckKeyGen` now asks for the randomised digit like every
+    other consent screen, and the paragraph this replaces is the withdrawn reasoning.**
+    It read: *"`CheckKeyGen` is gated on the key the screen advertises rather than on a
+    randomised digit: `ui::keygen_check` prints `1=match` and `stub.rs:495` accepts
+    `key == b'1'`. That is deliberate — accepting the signing digit there would accept a
+    key the screen never showed — and `advertised_key` does read the legend off the
+    glass, but the byte it finds is a **constant**, so a hardcoded `1` answers it too."*
+
+    The last clause was the whole problem, and the justification was wrong in a way
+    worth naming: it ranked the screens by how much money moves on the press, so the
+    signing screens got the strong gesture and the anti-MITM screen got a fixed key.
+    But the measure that picks a confirm key is **how much a script can fake**, not how
+    much a press is worth — and by that measure the keygen check was the weakest screen
+    on the device while being the one whose whole purpose is defeating a lying
+    coordinator.
+
+    `ui::keygen_check` now takes a `ConfirmDigit` and prints `press_legend(confirm)` +
+    `" x=no"`, the same legend the signing screens use; `KEYGEN_MATCH_KEY` is deleted
+    and `answer`'s per-prompt arm went with it, so `Consent::Prompt` has exactly one
+    rule for every prompt. **The 2x code rows did NOT move** — `((COLS-8)/2, 2)` and
+    `(.., 4)` — because `stub.rs::glass_code` reads them back from those cells and that
+    read is the anti-MITM gate; a mutation moving the low half to row 3 fails three hal
+    tests AND `hostcheck` with `GLASS CODE MISMATCH: … RENDERED UNREADABLE`.
+
+    Proven with NO source mutation, which is the point: `COLDSNAP_GLASS_KEYS=1yy` —
+    a hardcoded `1` at the keygen screen — now exits 1 with **8 of 9 devices declining**
+    (one happened to draw `1`, which is the 1-in-5 made visible and is deterministic
+    under the stub's fixed seed), and `=9yy` exits 1 with 9/9 declining because `9` is
+    not in `CONFIRM_CHARSET` at all. Before the change `1yy` completed both signature
+    passes in full. Cost: **+440 B of flash** (376,752 → 377,192 B, 26.43% → 26.46%).
+
+    So no literal answers any consent screen on this device now.
 
     And note a constraint found while designing the fix: **the vendored protocol has no
     "decline" message**, so a refusal is expressible only as *not confirming* plus a
@@ -1861,12 +1885,66 @@ catalogued on the device side, sitting on the host side of the same protocol.
     `index != share_index` guard in `Phase::Ingest`. The upgrade path is a tenth blank
     session plus a `KEYGEN_DEVICES`/`ALL_DEVICES` split in `hostcheck`.
 
-    **What is left of this item: NAMING only.** `SetName` is sent by the device but no
-    harness ever sends `NameCommand::Preview`, so `Session::recv`'s naming arm and
-    `commit_name`'s persist-before-ack ordering are still unit-tested and never
-    coordinator-driven. Note the honest limit already recorded at `commit_name`: the
-    shipped Flutter app will not offer to name this device whatever the device side
-    does, because cold-snap's digest can never be `UpToDate`.
+    **NAMING CLOSED 2026-09-11 too, so this item's protocol half is now complete.**
+    The paragraph this replaces said `SetName` is sent by the device but no harness
+    ever sends `NameCommand::Preview`, so `Session::recv`'s naming arm and
+    `commit_name`'s persist-before-ack ordering were unit-tested and never
+    coordinator-driven. `hostcheck` now sends the preview and asserts the round trip.
+
+    It needed NO device change — the flow was already whole. `Session::recv` handles
+    `Naming(NameCommand::Preview)` by setting `pending_name` (no flash write, no
+    prompt: the app previews once per typed *character*), and `Session::run`'s
+    `FinalizeKeyGen` arm calls `commit_name`, which persists through `NameStore::save`
+    and only THEN pushes `SetName`. The whole gap was that `hostcheck` printed
+    `ignoring NeedName` 27 times a run and never answered. It is 0 now.
+
+    **The preview must ride with the `AnnounceAck`, and that is forced rather than
+    chosen:** `commit_name` fires from the `FinalizeKeyGen` prompt, i.e. DURING keygen,
+    so a preview sent after the signature — where the M7 phases above live — arrives
+    too late to be committed. A mutation that sends the identical frame post-keygen
+    produces ZERO `SetName` lines: a late preview is indistinguishable from no preview.
+
+    The name is **14 chars and 56 bytes at once**, which is the widest input the wire
+    admits and is the point of choosing it: `DeviceName` is `FixedString<14>` counted
+    in CHARS (`fixed_string.rs:31-40`), so 14 chars can be 56 UTF-8 bytes, and 56 is
+    exactly `DEVICE_NAME_MAX_BYTES` (`4 * DEVICE_NAME_MAX_LENGTH`) — the byte bound
+    re-applied at the flash boundary precisely because `FixedString`'s own `Decode`
+    truncates on chars and would otherwise let a 56-byte name through a 14-byte
+    expectation. Constructed with `DeviceName::new`, never `truncate`, so an over-long
+    name is a harness failure rather than a silently cut one.
+
+    Asserted: all nine devices report it, the round trip is byte-exact, and a `SetName`
+    must have been preceded by a `NeedName` — otherwise it is an announce-time echo of
+    a name already on flash and not evidence that this run committed one.
+
+    **HONEST LIMIT: this proves persist-before-ack, NOT durability.** The stub restarts
+    immediately after *announcing* and before keygen, so there is no restart after the
+    name is persisted; nothing here shows the name survives a power cycle. And the
+    limit already recorded at `commit_name` still stands: the shipped Flutter app will
+    not offer to name this device whatever the device side does, because cold-snap's
+    digest can never be `UpToDate`.
+
+    **ALSO CLOSED 2026-09-11 — `erase_device` is now proven never to complete.**
+    Upstream's `erase_device::EraseDevice` reaches `Completion::Success` only on
+    `CommsMisc::EraseConfirmed`, which this device deliberately never sends
+    (`Session::recv` returns `Err(Fault::Refused(Refusal::DataErase))`). Nothing
+    asserted that. It is now driven through the same seam and BOTH halves are required
+    over a 1 s grace window: `is_complete()` stays `None`, AND the device reports
+    `refused=DataErase` on the wire. Either alone is ambiguous — silence is also what a
+    dead device looks like.
+
+    Distinct from the forged raw `DataErase` this harness has sent since M6: that one is
+    a hand-rolled frame, this drives upstream's own driver, and the claim is that its
+    completion path is unreachable here. The refusals are counted PER PHASE rather than
+    read off the existing `refused_erase` set, which is already full from the forged
+    frame and so could not have failed.
+
+    Two mutations SURVIVED GREEN here and are recorded rather than buried: a 15-char
+    name pushed through `DeviceName::truncate` instead of `new` (upstream cuts it, the
+    device round-trips the cut value exactly, and only the input bound catches it), and
+    omitting `connected()` on `EraseDevice` — which unlike `EnterPhysicalBackup`'s trap
+    4 does not override the empty default and whose `poll` sends unconditionally, so
+    the call is decoration there.
 
 13. **The identity record's false-refusal rate on a *converted* Mk4, and it is the
     one item here that a single bench read retires for free.** `identity.rs` refuses

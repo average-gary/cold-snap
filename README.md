@@ -57,15 +57,15 @@ a declined prompt ever yields a signature share (`:1520`, `A DECLINED PROMPT
 PRODUCED A SIGNATURE`). Measured this session: `all 9/9 device(s) pressed \`x\` at
 the signing screen and NOT ONE signature share reached the coordinator`.
 
-What is genuinely weaker is narrower than the old sentence and worth stating
-exactly: `CheckKeyGen` is gated on the key the screen *advertises* rather than on a
-randomised digit. `ui::keygen_check` prints `1=match` and `stub.rs:495` accepts
-`key == b'1'`, deliberately — accepting the signing digit there would accept a key
-the screen never showed — so `advertised_key` does read that legend off the glass,
-but the byte it finds is a constant, and a hardcoded `1` would answer it too. The
-stub's own log line still calls both arms "auto-ack", which is where the retired
-claim came from. The other half no host test can supply is a *person* reading the
-screen.
+Since 2026-09-11 **every** consent screen asks for the randomised digit, including
+the keygen check. It used to print `1=match` and accept a fixed `key == b'1'`, on the
+reasoning that the strong gesture belonged to the screens that move money — which had
+it backwards, because the measure that picks a confirm key is how much a script can
+fake, and by that measure the anti-MITM screen was the weakest one on the device.
+`ui::keygen_check` now takes a `ConfirmDigit`; `KEYGEN_MATCH_KEY` is gone. Shown with
+no source change: `COLDSNAP_GLASS_KEYS=1yy` now exits 1 with 8 of 9 devices declining
+(the ninth happened to draw `1` — the 1-in-5, made visible), and `=9yy` with 9/9. The
+one half no host test can supply is still a *person* reading the screen.
 
 The session hash **is** compared, and this paragraph claimed otherwise until
 2026-08-27: `hostcheck/src/main.rs:1414-1444` checks every device's computed hash
@@ -268,7 +268,14 @@ and the consolidation — with the assertions taken off the device's FRAMEBUFFER
 than off its say-so: the 25 words its reveal draws are read back with the shipped
 `ui::Frame::cell` and re-encoded through upstream's `ShareBackup::from_words` to be
 compared against the coordinator's own expected share image, and the quiz is answered
-only from what that reveal showed. See PLAN.md §9 item 12.
+only from what that reveal showed.
+
+The same day it also closed **naming** — a coordinator-previewed name, 14 chars and 56
+bytes at once so it sits on the wire bound and the flash bound simultaneously, reaches
+flash on all nine devices and comes back byte-exact as `SetName` — and **`erase_device`**,
+where upstream's own driver is now proven never to complete against a device that
+refuses `DataErase` outright. Every flow the device implements is now driven by a real
+coordinator. See PLAN.md §9 item 12 for what each one does and does not prove.
 
 ```sh
 cargo build --target $T -p coldsnap_firmware --example stub
