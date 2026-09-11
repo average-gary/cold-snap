@@ -317,6 +317,122 @@
 //!  around, because forking the constructor to fix it would mean this harness stopped
 //!  driving upstream's own code, which is the only thing it is for.
 //!
+//!  M8 (THE NAMING FLOW -- the last protocol body nothing drove). The device
+//!  implemented naming end to end and no coordinator had ever exercised it: this file
+//!  printed `hostcheck: ignoring NeedName` nine times a pass, and that count is now
+//!  ZERO. The announce those `NeedName`s arrive in is answered with
+//!  `CoordinatorSendBody::Naming(NameCommand::Preview)` beside the existing
+//!  `AnnounceAck`.
+//!
+//!  WHERE IT IS SENT IS FORCED, not chosen: `commit_name` fires from `Session::run`'s
+//!  `FinalizeKeyGen` arm, i.e. DURING keygen, so the preview must be on the device
+//!  BEFORE the coordinator's `Finalize`. A post-signature phase like M7's cannot work,
+//!  and the second mutation below is what trying looks like.
+//!
+//!  WHAT IT ASSERTS: all 9 devices answer `DeviceSendBody::SetName` and the name is
+//!  byte-exact. `commit_name` writes flash through `NameStore::save` and pushes
+//!  `SetName` only if that returned `Ok` -- persist strictly before ack -- so
+//!  **`SetName` ARRIVING IS the evidence the flash write succeeded**; a device that
+//!  could not store the name returns before the outbox is touched. The input is bounded
+//!  at the corner that matters: `DeviceName` is `FixedString<14>` counted in CHARS, so
+//!  the name is 14 four-byte codepoints = **56 bytes = exactly
+//!  `DEVICE_NAME_MAX_BYTES`**, the byte bound the device re-applies at the flash
+//!  boundary. One char more is truncated on the wire, one byte more is refused
+//!  `TooBig`. MEASURED: the preview frame is **97 B** downstream against
+//!  `AnnounceAck`'s 37 B, and the aggregate signature is byte-identical to the
+//!  pre-M8 run (`sig = 81b118f3dcf2ac15..`), so naming perturbs nothing.
+//!
+//!  HONEST LIMIT, because the log line reads stronger than the fact: the stub restarts
+//!  -- drops every session and rebuilds from the same flash bytes -- immediately after
+//!  ANNOUNCING and BEFORE keygen, so there is NO restart after this name is persisted.
+//!  This proves the write landed before the ack. It does **not** prove the name survives
+//!  a power cycle, and no line of this file should be read as claiming it does. (Nor is
+//!  the flow reachable from the shipped app at all: its name field sits behind
+//!  `firmwareUpgradeEligibility == upToDate`, which cold-snap's digest can never be. This
+//!  harness is the only thing that drives naming anywhere.)
+//!
+//!  All RUN, each one restored and `diff`ed byte-identical after:
+//!  - The preview never sent, i.e. the pre-M8 state in one line: **`only 0/9 device(s)
+//!    reported a NAME (SetName: {})`**, exit 1.
+//!  - THE SEQUENCING CONSTRAINT, demonstrated rather than merely asserted: the SAME frame
+//!    moved to the post-keygen seam the forged `DataErase` uses. Same failure, **`only 0/9
+//!    device(s) reported a NAME`**, exit 1, with zero `SetName` lines in the whole run --
+//!    a LATE preview is indistinguishable from no preview, because `commit_name` runs once
+//!    and takes an empty `pending_name`.
+//!  - A 14-char PLAIN ASCII name previewed instead: **`NAME ROUND TRIP IS NOT EXACT: <id>
+//!    stored and reported "cold-snap-mk4x" (14 chars, 14 bytes), the coordinator previewed
+//!    "..." (14 chars, 56 bytes)`**, exit 1. Same CHAR count, different bytes -- so the
+//!    assertion is over bytes, which is the whole distinction the two constants exist for
+//!    and the reason the name is not ASCII.
+//!  - `DEVICE_NAME` lengthened to 15 chars: **`DEVICE_NAME "..." is not a valid
+//!    DeviceName: String too long: max length is 14 but got 15`**, exit 1, before a byte
+//!    moves.
+//!  - The `NeedName` trigger not recorded: **`<id> reported the name "..." without ever
+//!    having sent NeedName -- ... this SetName is an announce-time echo of a name that was
+//!    already on flash and NOT evidence that this run committed one`**, exit 1.
+//!
+//!  WHAT SURVIVED, stated rather than hidden:
+//!  - a 15-char name pushed through `DeviceName::truncate` instead of `new` passes
+//!    **GREEN**. Upstream's `FixedString::decode` cuts it to 14 chars, the device stores
+//!    and reports the cut value, and the round trip is then exact -- so the round-trip
+//!    assertion CANNOT see a truncation the harness asked for itself. That is why the
+//!    construction uses `new` and bails: bounding the INPUT is the only thing that catches
+//!    it, and the 15-char mutation above is the proof that it does.
+//!
+//!  M9 (`erase_device` MUST NEVER COMPLETE). The one flow whose CORRECT behaviour is to
+//!  hang, which is exactly why it needs an explicit assertion: an unasserted hang is
+//!  indistinguishable from a harness that forgot to drive anything. Runs as a new
+//!  `Phase::Erase` through the same five-call seam M7 uses, FIRST of the phases -- if this
+//!  device had obeyed, the share the four backup flows read would be gone and all four
+//!  would fail too, so the refusal is corroborated by the rest of the pass.
+//!
+//!  `EraseDevice::poll` sends `CoordinatorSendBody::DataErase` on its first poll and
+//!  reaches `Completion::Success` only on `CommsMisc::EraseConfirmed`. This device answers
+//!  `Err(Fault::Refused(Refusal::DataErase))` and never sends that, so upstream's
+//!  completion path is UNREACHABLE here. BOTH halves are asserted, because either alone is
+//!  ambiguous:
+//!   1. `is_complete()` stays `None` for the whole of `ERASE_GRACE` (1 s, scaled by
+//!      `timeout_scale()` like every other budget). MEASURED **1.0005 s** at both chunk
+//!      sizes.
+//!   2. the device reports `Debug{refused=DataErase}` for the frame THIS DRIVER sent,
+//!      counted per phase rather than read off the existing `refused_erase` set -- that
+//!      set is already full from the forged frame long before, so a `contains` there
+//!      would be an assertion that cannot fail.
+//!
+//!  DIFFERENT from the forged `DataErase` this file already sends, and the comment at the
+//!  site says so: that frame is HAND-ROLLED here, so it proves the DEVICE refuses the
+//!  body; this drives UPSTREAM'S OWN DRIVER, so it proves the COORDINATOR-side flow cannot
+//!  complete -- an app offering "erase this device" sits on that dialog forever. MEASURED,
+//!  the driver's frame is the same **41 B** on the wire as the forged one: identical body,
+//!  different author.
+//!
+//!  The new `State::EraseRefusal` shares `RESTORE_DEADLINE`'s cumulative budget, so
+//!  `State::longest()` is still 95 s and the stub's own 240 s `DEADLINE` keeps its ~2.5x
+//!  contract -- CHECKED, not assumed, and nothing in `firmware/examples/stub.rs` had to
+//!  move. Cost is the fixed grace window and nothing else: over 3 runs a signature pass
+//!  goes **1.92 s -> 2.51-2.96 s at chunk 64 and 4.14 s -> 5.10-5.14 s at chunk 1**, i.e.
+//!  the 1 s window plus this loop's usual run-to-run noise.
+//!
+//!  Both RUN, each restored and `diff`ed byte-identical after:
+//!  - The driver fed a forged `CommsMisc::EraseConfirmed`, i.e. a device that confirms:
+//!    **`ERASE COMPLETED: upstream's EraseDevice reached Completion::Success at <id>,
+//!    which it only does on CommsMisc::EraseConfirmed`**, exit 1.
+//!  - The driver built but never installed in `ui`, so its `DataErase` never reaches the
+//!    wire: **`<id> left upstream's EraseDevice open for 1.000026709s without ever
+//!    reporting `refused=DataErase` -- silence is not a refusal, it is what a dead device
+//!    looks like`**, exit 1. That is the half that makes the hang evidence.
+//!
+//!  WHAT SURVIVED:
+//!  - `connected()` not called on this driver at all: **GREEN**. `EraseDevice` does not
+//!    override `UiProtocol::connected`'s empty default and its `poll` sends
+//!    unconditionally, so unlike M7d's trap 4 the call is decoration -- kept only so all
+//!    five arms drive the identical lifecycle. This measurement is why the comment there
+//!    says "no-op" instead of implying it is required.
+//!  - dropping the `phase == Phase::Erase` half of the refusal guard: **GREEN**, count
+//!    still 1. `Restore` does not exist until a signature does, which is already past the
+//!    forged frame, so `restore.as_mut()` alone scopes it today. Kept as belt, and said so
+//!    at the field.
+//!
 //! Usage: `hostcheck [path-to-stub-binary]`. Build the stub FIRST and pass the
 //! artifact -- never `cargo run`: the child's stdout IS the wire, and one stray
 //! byte of cargo progress output desynchronises the magic scan permanently.
@@ -339,9 +455,11 @@ use frost_backup::ShareBackup;
 use frostsnap_coordinator::check_backup::CheckBackupProtocol;
 use frostsnap_coordinator::display_backup::{DisplayBackupProtocol, DisplayBackupState};
 use frostsnap_coordinator::enter_physical_backup::{EnterPhysicalBackup, EnterPhysicalBackupState};
+use frostsnap_coordinator::erase_device::EraseDevice;
 use frostsnap_coordinator::frostsnap_comms::{
-    CommsMisc, CoordinatorSendBody, CoordinatorSendMessage, DeviceSendBody, Downstream, MagicBytes,
-    ReceiveSerial, Sha256Digest, Upstream, BINCODE_CONFIG, MAGIC_BYTES_PERIOD,
+    CommsMisc, CoordinatorSendBody, CoordinatorSendMessage, DeviceName, DeviceSendBody, Downstream,
+    MagicBytes, NameCommand, ReceiveSerial, Sha256Digest, Upstream, BINCODE_CONFIG,
+    MAGIC_BYTES_PERIOD,
 };
 use frostsnap_coordinator::frostsnap_core::coordinator::restoration::{
     PhysicalBackupPhase, ToUserRestoration,
@@ -553,6 +671,22 @@ const RESTORE_KEY_NAME: &str = "cold-snap M7";
 /// duplicated part, and it is what the run would fail on if the device ever changed it.
 const QUIZ_POSITIONS: usize = frost_backup::NUM_WORDS / 3;
 
+/// M8: the name this coordinator PREVIEWS, and it is deliberately not ASCII.
+///
+/// `DeviceName` is `FixedString<DEVICE_NAME_MAX_LENGTH>` and that 14 counts **chars**,
+/// not bytes (`fixed_string.rs:31-40` and `:155`), so the widest name the wire admits
+/// is 14 four-byte codepoints = **56 bytes** — which is exactly
+/// `coldsnap_firmware::DEVICE_NAME_MAX_BYTES` (`4 * DEVICE_NAME_MAX_LENGTH`), the bound
+/// `NameStore::save` re-applies at the flash boundary because upstream's `Decode`
+/// builds an unbounded `String` first.
+///
+/// This name IS that corner: 14 chars, 56 bytes, and every codepoint 4 bytes wide. One
+/// CHAR more and upstream's `Decode` silently truncates it on the way in; one BYTE more
+/// and the flash write is refused `StoreFault::TooBig`. A plain-ASCII name crosses
+/// neither bound and would leave the char-vs-byte distinction those two constants exist
+/// for completely untested — 14 ASCII chars are 14 bytes, a quarter of the record.
+const DEVICE_NAME: &str = "🧊🔐🧊🔐🧊🔐🧊🔐🧊🔐🧊🔐🧊🔐";
+
 /// The LAST-RESORT bound: a wall-clock watchdog for a stall anywhere in the main
 /// loop that is not a read and not a write (both of which are bounded above).
 ///
@@ -663,6 +797,21 @@ enum Expect {
 /// human-latency run does not shorten it relative to the rest.
 const DECLINE_GRACE: Duration = Duration::from_secs(1);
 
+/// M9: how long upstream's `EraseDevice` is left OPEN before the absence of a
+/// `Completion::Success` is believed.
+///
+/// [`DECLINE_GRACE`]'s shape, and its reason run over a different message: the device's
+/// `refused=DataErase` `Debug` and a `CommsMisc::EraseConfirmed` it wrongly sent anyway
+/// would be pushed to the SAME `Outbox` and cross in the same write, so by the time this
+/// process has decoded the refusal a confirmation is either already decoded or the next
+/// thing in the pty buffer. One second is ~500 laps of this loop. Scaled with everything
+/// else so a human-latency run does not shorten it relative to the rest.
+///
+/// A separate constant rather than reusing [`DECLINE_GRACE`] because the number is the
+/// cheap half: the doc is the argument, and these are arguments about two different
+/// messages arriving late.
+const ERASE_GRACE: Duration = Duration::from_secs(1);
+
 /// Coordinator-side states. `NAMES` is the single source of truth for the
 /// spelling, because both the loop's own error and the watchdog thread (which
 /// has only an integer) print from it.
@@ -697,9 +846,18 @@ enum State {
     /// M7e: `Consolidate` sent — the DESTRUCTIVE one — waiting for
     /// `FinishedConsolidation` and then for the device to report what it holds again.
     BackupConsolidate,
+    /// M9: upstream's `EraseDevice` is open at one device and MUST NOT complete.
+    /// Waiting out [`ERASE_GRACE`] with `is_complete() == None`, plus the device's
+    /// `refused=DataErase` on the wire.
+    ///
+    /// Shares [`RESTORE_DEADLINE`]'s cumulative budget with the four `Backup*` states
+    /// above rather than adding one of its own, which is what keeps [`State::longest`]
+    /// — and therefore the stub's own `DEADLINE`, whose contract is being ~2.5x this
+    /// harness's 95 s bound — exactly where it was.
+    EraseRefusal,
 }
 
-const NAMES: [&str; 13] = [
+const NAMES: [&str; 14] = [
     "WaitingForMagic",
     "WaitingForAnnounces",
     "KeygenAwaitingShares",
@@ -713,6 +871,7 @@ const NAMES: [&str; 13] = [
     "BackupQuiz",
     "BackupIngest",
     "BackupConsolidate",
+    "EraseRefusal",
 ];
 
 impl State {
@@ -737,7 +896,8 @@ impl State {
             State::BackupReveal
             | State::BackupQuiz
             | State::BackupIngest
-            | State::BackupConsolidate => {
+            | State::BackupConsolidate
+            | State::EraseRefusal => {
                 HANDSHAKE_DEADLINE + KEYGEN_DEADLINE + SIGN_DEADLINE + RESTORE_DEADLINE
             }
             _ => HANDSHAKE_DEADLINE + KEYGEN_DEADLINE,
@@ -753,6 +913,9 @@ impl State {
     /// A named function rather than the last variant spelled at the call site, because
     /// spelling it there is how the watchdog got set from `SigningAwaitingShares` and
     /// then silently fired 30 s early the moment a later phase existed.
+    ///
+    /// [`State::EraseRefusal`] TIES with this one — it shares the restoration budget on
+    /// purpose — so this is still the true maximum and the number is unmoved at 95 s.
     fn longest() -> Duration {
         State::BackupConsolidate.budget()
     }
@@ -906,8 +1069,16 @@ struct Sign {
 /// dependency and not merely tidiness: the device answers the quiz and drives the
 /// letter picker from the 25 words its own REVEAL drew, so those two flows have
 /// nothing to work from until the reveal has happened.
+/// M9's addition, [`Phase::Erase`], is the exception to the paragraph above: upstream's
+/// `EraseDevice` needs no keygen state, no share and no reveal, so its position is a
+/// choice rather than a dependency. It goes FIRST, and that is the choice: if this device
+/// ever DID obey a `DataErase`, the share every phase below reads would be gone and all
+/// four of them would fail too — so the refusal gets corroborated by the rest of the pass
+/// and not only by the `Debug` line it prints.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Phase {
+    /// M9: upstream's `EraseDevice`, which must NEVER reach `Completion::Success`.
+    Erase,
     /// M7b: `DisplayBackupProtocol`.
     Reveal,
     /// M7c: `CheckBackupProtocol`.
@@ -926,6 +1097,7 @@ enum Phase {
 impl Phase {
     fn state(self) -> State {
         match self {
+            Phase::Erase => State::EraseRefusal,
             Phase::Reveal => State::BackupReveal,
             Phase::Quiz => State::BackupQuiz,
             Phase::Ingest => State::BackupIngest,
@@ -987,6 +1159,23 @@ struct Restore {
     reheld: bool,
     /// M7d, for the log: how many keypresses the letter picker took.
     typed: Option<usize>,
+    /// M9: when upstream's `EraseDevice` was opened, i.e. when [`ERASE_GRACE`] starts.
+    erase_at: Option<Instant>,
+    /// M9: `refused=DataErase` frames from [`Restore::device`] seen **while
+    /// [`Phase::Erase`] is live**, and the scoping is the whole point.
+    ///
+    /// The `refused_erase` SET in `one_pass` cannot be used for this: every device is
+    /// already in it from the forged frame sent long before the signature exists, so a
+    /// `contains` here would be an assertion that cannot fail — coverage-shaped and
+    /// worth nothing. Counting only what arrives during this phase makes it a fact about
+    /// the frame UPSTREAM'S DRIVER sent.
+    ///
+    /// The `phase == Phase::Erase` half of that guard is BELT, and measured to be: this
+    /// whole struct is `None` until a signature exists, which is already after the forged
+    /// frame, so dropping the phase test leaves the run green and the count at 1. It is
+    /// kept because it is what makes the scoping true by construction rather than by the
+    /// current position of one other block.
+    erase_refusals: usize,
 }
 
 impl Restore {
@@ -995,7 +1184,7 @@ impl Restore {
             device,
             share_index,
             digest,
-            phase: Phase::Reveal,
+            phase: Phase::Erase,
             started: false,
             glass_index: None,
             glass_words: BTreeMap::new(),
@@ -1007,6 +1196,8 @@ impl Restore {
             consolidated: false,
             reheld: false,
             typed: None,
+            erase_at: None,
+            erase_refusals: 0,
         }
     }
 
@@ -1144,6 +1335,86 @@ fn restore_step(
     };
 
     match r.phase {
+        // ============================== M9 ==============================
+        // THE ONE FLOW WHOSE CORRECT BEHAVIOUR IS TO HANG, which is exactly why it needs
+        // an explicit assertion: without one it proves nothing, because a driver that
+        // never completes is indistinguishable from a harness that forgot to drive it.
+        //
+        // `EraseDevice::poll` sends `CoordinatorSendBody::DataErase` on its FIRST poll
+        // and reaches `Completion::Success` only on `CommsMisc::EraseConfirmed`
+        // (`erase_device.rs:44-48`, `:66-73`). This device never sends that:
+        // `Session::recv` answers `Err(Fault::Refused(Refusal::DataErase))`. So
+        // upstream's completion path is UNREACHABLE here — an app offering "erase this
+        // device" would sit on that dialog forever, which is the correct outcome for a
+        // unit whose shares cannot be reconstructed on this port.
+        //
+        // DIFFERENT from the forged `DataErase` in the loop above, and the difference is
+        // the claim: that frame is HAND-ROLLED here and pushed straight through
+        // `send_frame`, so it proves the DEVICE refuses the body. This drives UPSTREAM'S
+        // OWN DRIVER through the same five-call seam M7 uses, so it proves the
+        // COORDINATOR-side flow cannot complete against this device. Neither subsumes
+        // the other: a device could refuse a raw frame and still confirm one that
+        // arrived from the real driver, and the driver could have a completion path this
+        // device satisfies some other way.
+        Phase::Erase => {
+            if !r.started {
+                r.started = true;
+                // `()` for the sink: `EraseDeviceState` only ever says what this process
+                // already knows by having polled — `WaitingForConfirmation` is pushed by
+                // `poll` itself — and the two facts this phase asserts are
+                // `is_complete()` and what came back on the wire.
+                *ui = Some(Box::new(EraseDevice::new(r.device, ())));
+                // A documented no-op for THIS driver (`UiProtocol::connected`'s default
+                // body is empty and `EraseDevice` does not override it), unlike M7d
+                // where trap 4 bites. Kept so all five arms drive the identical
+                // lifecycle, which is the seam being tested.
+                if let Some(p) = ui.as_mut() {
+                    p.connected(r.device, DeviceMode::Ready);
+                }
+                r.erase_at = Some(Instant::now());
+                eprintln!(
+                    "hostcheck: M9 -- driving UPSTREAM's EraseDevice at {}; it must NEVER \
+                     complete",
+                    r.device
+                );
+            }
+            // HALF ONE. Nothing but `CommsMisc::EraseConfirmed` can produce this, and the
+            // `Completion::Abort` arm at the top of this function covers the other half
+            // of `is_complete()`.
+            if done(ui) {
+                bail!(
+                    "ERASE COMPLETED: upstream's EraseDevice reached Completion::Success at \
+                     {}, which it only does on CommsMisc::EraseConfirmed -- this device \
+                     answered a DataErase it is supposed to refuse outright",
+                    r.device
+                );
+            }
+            let waited = r
+                .erase_at
+                .expect("set on the same lap the driver is built")
+                .elapsed();
+            if waited > ERASE_GRACE * timeout_scale() {
+                // HALF TWO, and BOTH halves are load-bearing: "never completed" is also
+                // what a DEAD device looks like, and a refusal line on its own does not
+                // prove the driver stayed open.
+                if r.erase_refusals == 0 {
+                    bail!(
+                        "{} left upstream's EraseDevice open for {waited:?} without ever \
+                         reporting `refused=DataErase` -- silence is not a refusal, it is \
+                         what a dead device looks like, so this proves nothing about the \
+                         erase path",
+                        r.device
+                    );
+                }
+                eprintln!(
+                    "hostcheck: M9 PASS -- {} REFUSED the driver's DataErase ({} time(s)) and \
+                     EraseDevice stayed at is_complete()==None for {waited:?}",
+                    r.device, r.erase_refusals
+                );
+                r.advance(ui, Phase::Reveal);
+            }
+        }
+
         // ============================== M7b ==============================
         Phase::Reveal => {
             if !r.started {
@@ -1486,7 +1757,7 @@ fn main() -> Result<()> {
     eprintln!("--- pass: DECLINE (every device presses x at the signing screen) ---");
     one_pass(&stub, 64, &t0, Expect::Decline).context("pass DECLINE")?;
     println!(
-        "M1+M2+M3+M5+M7 PASS: real {THRESHOLD}-of-{N_DEVICES} keygen, nonce replenishment and a \
+        "M1+M2+M3+M5+M7+M8+M9 PASS: real {THRESHOLD}-of-{N_DEVICES} keygen, nonce replenishment and a \
          signature that VERIFIES against the group key, across the pty at both chunk sizes, \
          including the 1-byte case that forces reassembly; the 4-byte code ON THE GLASS equals the \
          coordinator's session hash on every device; a declined signing prompt yields no signature \
@@ -1495,7 +1766,10 @@ fn main() -> Result<()> {
          expected share image, the check quiz passes in exactly {QUIZ_POSITIONS} answers taken \
          only from what that reveal drew, those same words go back in through the letter picker and \
          `check_physical_backup` accepts them, and the destructive consolidation leaves a record \
-         the device can still describe"
+         the device can still describe; a coordinator-previewed 14-char/56-byte name reaches FLASH \
+         on all {N_DEVICES} devices and comes back byte-exact as `SetName`; and upstream's own \
+         `EraseDevice` driver NEVER completes against this device, which refuses its `DataErase` on \
+         the wire"
     );
     Ok(())
 }
@@ -1574,6 +1848,17 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
     coordinator.keygen_fingerprint = TEST_FINGERPRINT;
     let mut rng = ChaCha20Rng::from_seed(RNG_SEED);
 
+    // M8: built with `new` and NOT `truncate`, deliberately. `truncate` would silently
+    // cut a mis-edited [`DEVICE_NAME`] to 14 chars, the device would round-trip the cut
+    // value faithfully, and the assertion below would pass on it — the exact "pretend the
+    // truncation did not happen" failure. This fails by name instead, before a byte moves.
+    let preview_name = DeviceName::new(DEVICE_NAME.to_string()).map_err(|e| {
+        anyhow::anyhow!(
+            "DEVICE_NAME {DEVICE_NAME:?} is not a valid DeviceName: {e} -- 14 CHARS is the \
+             wire bound, and its Decode would truncate silently"
+        )
+    })?;
+
     let started = Instant::now();
     let mut state = State::WaitingForMagic;
     state.publish();
@@ -1601,6 +1886,16 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
     // sent as `glass=<8 hex>`. Compared at PASS against our own session hash's
     // first four bytes — see the block by that name.
     let mut device_glass: std::collections::BTreeMap<DeviceId, String> = Default::default();
+    // M8: the name each device reported STORING, off `DeviceSendBody::SetName`. Not a
+    // back-channel: this is the real protocol body the app's `device_names` entry comes
+    // from, so the assertion is over the same message a coordinator would act on.
+    let mut device_names: std::collections::BTreeMap<DeviceId, String> = Default::default();
+    // M8: devices that ANNOUNCED having no stored name. `Session::announce` sends exactly
+    // one of `SetName` (a name is on flash) or `NeedName` (none is), so this is what makes
+    // the `SetName` below evidence of a commit IN THIS RUN rather than an echo of a name
+    // that was already there — without it the M8 assertions would also pass on a device
+    // whose flash arrived pre-named, and `commit_name` need never have run at all.
+    let mut need_name: std::collections::BTreeSet<DeviceId> = Default::default();
     // Devices that DECLINED the signing prompt. Arrives on the same intercepted
     // `Debug` channel, because the protocol has no decline variant — that is a
     // finding of this work, not a shortcut.
@@ -1768,6 +2063,33 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
                                 break Err(e.context("AnnounceAck"));
                             }
                             writes_queued += 1;
+                            // ============================ M8 ============================
+                            // THE NAMING FLOW, and this is the only place it can start.
+                            // The device commits a previewed name from `Session::run`'s
+                            // `FinalizeKeyGen` arm (`firmware/src/lib.rs` `commit_name`),
+                            // i.e. DURING keygen — so the preview must be on the device
+                            // BEFORE the coordinator's `Finalize`, and a post-signature
+                            // phase like M7's would be far too late. Beside the ack is
+                            // the earliest lap on which this device's id is known, and
+                            // the announce is also what told us it has no name yet: this
+                            // arm is what used to print `ignoring NeedName` nine times a
+                            // pass.
+                            //
+                            // A preview commits NOTHING on the device — no flash write,
+                            // no prompt, no keypress (the real app calls it once per
+                            // typed character) — which is why sending it unprompted is
+                            // safe here and why it is not a consent event over there.
+                            let preview = CoordinatorSendMessage::to(
+                                from,
+                                CoordinatorSendBody::Naming(NameCommand::Preview(
+                                    preview_name.clone(),
+                                )),
+                            );
+                            if let Err(e) = send_frame(&wtx, ReceiveSerial::Message(preview.into()))
+                            {
+                                break Err(e.context("Naming(Preview)"));
+                            }
+                            writes_queued += 1;
                             if announced.len() == N_DEVICES && keygen.is_none() {
                                 let begin = BeginKeygen::new(
                                     announced.clone(),
@@ -1923,6 +2245,17 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
                                     );
                                     if what == "DataErase" {
                                         refused_erase.insert(from);
+                                        // M9's second half. Scoped to the phase and the
+                                        // device on purpose — see
+                                        // [`Restore::erase_refusals`]: the set above is
+                                        // already full from the forged frame, so only a
+                                        // refusal that arrives WHILE the driver is open
+                                        // says anything about the driver.
+                                        if let Some(r) = restore.as_mut() {
+                                            if r.phase == Phase::Erase && from == r.device {
+                                                r.erase_refusals += 1;
+                                            }
+                                        }
                                     }
                                 }
                                 // M7b's raw material: the share index and the 25 words
@@ -2017,6 +2350,57 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
                                     misc.gist()
                                 );
                             }
+                        }
+                        // ============================== M8 ==============================
+                        // `SetName` ARRIVING IS THE EVIDENCE THE FLASH WRITE SUCCEEDED,
+                        // and that is a property of the device's ordering rather than an
+                        // inference: `commit_name` calls `NameStore::save` and pushes
+                        // this body only if that returned `Ok`, persist strictly before
+                        // ack (`firmware/src/lib.rs`, and the same ordering the share
+                        // uses). A device that acked a name it could not store has no way
+                        // to send this at all — the `?` on the save returns first and the
+                        // outbox stays empty.
+                        //
+                        // HONEST LIMIT, stated here because the log line reads stronger
+                        // than the fact: the stub restarts — drops every session and
+                        // rebuilds them from the same flash bytes — immediately after
+                        // ANNOUNCING and BEFORE keygen, so there is no second restart
+                        // after this name is persisted. So this proves the write landed
+                        // before the ack; it does NOT prove the name survives a power
+                        // cycle. That would need a restart the stub does not do, and this
+                        // harness may not add one.
+                        // M8's trigger, and it stopped being ignored: this is the device
+                        // saying it has NO durable name, sent from `Session::announce` in
+                        // the same burst as the `Announce` itself.
+                        DeviceSendBody::NeedName => {
+                            need_name.insert(from);
+                        }
+                        DeviceSendBody::SetName { name } => {
+                            // The device announced `SetName` instead of `NeedName`, i.e.
+                            // it read a name off flash at boot. Then this frame is an
+                            // announce-time echo and says nothing about `commit_name`, so
+                            // the assertions below would be measuring a pre-seeded flash
+                            // image. Impossible with today's stub (its `FakeFlash` holds
+                            // only the identity), which is exactly why it is worth
+                            // pinning: the whole M8 claim rests on it.
+                            if !need_name.contains(&from) {
+                                break Err(anyhow::anyhow!(
+                                    "{from} reported the name {:?} without ever having sent \
+                                     NeedName -- `Session::announce` sends one or the other, so \
+                                     this SetName is an announce-time echo of a name that was \
+                                     already on flash and NOT evidence that this run committed \
+                                     one",
+                                    name.as_str()
+                                ));
+                            }
+                            eprintln!(
+                                "hostcheck: {from} says its NAME is now {:?} ({} chars, {} bytes) \
+                                 -- so NameStore::save returned Ok before this frame",
+                                name.as_str(),
+                                name.as_str().chars().count(),
+                                name.as_str().len()
+                            );
+                            device_names.insert(from, name.as_str().to_string());
                         }
                         other => eprintln!("hostcheck: ignoring {other:?}"),
                     }
@@ -2443,6 +2827,46 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
                 );
             }
 
+            // ========== M8: THE PREVIEWED NAME REACHED FLASH AND CAME BACK ==========
+            // Asserted here, before the decline pass returns, so all THREE passes carry
+            // it: keygen completes in every one of them, and keygen is where a name is
+            // committed.
+            //
+            // Two independent facts, neither made true by control flow — nothing above
+            // waits for a `SetName` and the run completes a keygen, a signature and four
+            // restoration flows without one:
+            //  1. every device sent one, i.e. every `NameStore::save` returned `Ok`;
+            //  2. the name it stored is EXACTLY the one previewed, all 14 chars and 56
+            //     bytes of it. `DeviceName` counts chars, `DEVICE_NAME_MAX_BYTES` counts
+            //     bytes, and a name at the byte edge is the only input that can tell a
+            //     truncation at either bound from a correct round trip.
+            if device_names.len() != N_DEVICES {
+                bail!(
+                    "only {}/{N_DEVICES} device(s) reported a NAME (SetName: {device_names:?}) \
+                     -- `commit_name` pushes SetName only after NameStore::save returned Ok, so \
+                     a device missing here either never took the preview or could not persist it",
+                    device_names.len()
+                );
+            }
+            for (id, got) in &device_names {
+                if got != DEVICE_NAME {
+                    bail!(
+                        "NAME ROUND TRIP IS NOT EXACT: {id} stored and reported {got:?} ({} \
+                         chars, {} bytes), the coordinator previewed {DEVICE_NAME:?} ({} chars, \
+                         {} bytes) -- a name is coordinator-chosen and this one is at the byte \
+                         edge, so a difference is a truncation at the 14-CHAR wire bound or at \
+                         the {}-BYTE flash bound",
+                        got.chars().count(),
+                        got.len(),
+                        DEVICE_NAME.chars().count(),
+                        DEVICE_NAME.len(),
+                        // The device's own `DEVICE_NAME_MAX_BYTES`, re-derived from the
+                        // shared char bound rather than restated as a literal.
+                        4 * DeviceName::max_length()
+                    );
+                }
+            }
+
             // ============ ASSERTION 2: A DECLINED PROMPT YIELDS NO SIGNATURE ============
             // Everything above still had to hold -- keygen completed, the hashes
             // agreed, the glass matched, the forged erase was refused -- so the
@@ -2484,11 +2908,15 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
                      {}/{N_DEVICES} devices, then all {}/{N_DEVICES} device(s) pressed `x` at \
                      the signing screen and NOT ONE signature share reached the coordinator\
                      \n    so `x` genuinely refuses: the only thing that changed from the \
-                     passes above is the key pressed at the glass",
+                     passes above is the key pressed at the glass\
+                     \n    M8 also holds here: {}/{N_DEVICES} device(s) persisted the previewed \
+                     name and reported it back (a name is committed during keygen, which this \
+                     pass still completes)",
                     kg.id,
                     started.elapsed(),
                     device_glass.len(),
                     declined.len(),
+                    device_names.len(),
                 );
                 reap(&mut child);
                 return Ok(());
@@ -2593,7 +3021,13 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
                  {} keypresses, `check_physical_backup` ACCEPTED the resulting share image, and \
                  `PhysicalBackupSaved` completed `EnterPhysicalBackup`\
                  \n      M7e CONSOLIDATE -- the DESTRUCTIVE write landed, and the device described \
-                 the record it wrote when asked again",
+                 the record it wrote when asked again\
+                 \n      M9  ERASE     -- upstream's own EraseDevice driver stayed at \
+                 is_complete()==None for the whole grace window and the device REFUSED its \
+                 DataErase on the wire, so its completion path is unreachable here\
+                 \n    M8 NAME: all {}/{N_DEVICES} device(s) persisted and reported {:?} \
+                 ({} chars, {} bytes -- the widest name the wire admits), previewed before \
+                 keygen and acked only after NameStore::save returned Ok",
                 kg.id,
                 started.elapsed(),
                 found.threshold(),
@@ -2613,6 +3047,10 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
                 r.glass_words.len(),
                 QUIZ_POSITIONS,
                 r.typed.map_or("?".to_string(), |n| n.to_string()),
+                device_names.len(),
+                DEVICE_NAME,
+                DEVICE_NAME.chars().count(),
+                DEVICE_NAME.len(),
             );
             // Reap on SUCCESS too. This was missing, and the effect was measured:
             // `break Ok(())` above happens before the loop's `try_wait`, so a
