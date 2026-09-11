@@ -42,5 +42,20 @@ anyhow = "1"
 # no crate to the graph. Wanted for one thing only: a FIXED-SEED rng, so a keygen
 # failure replays byte for byte instead of being a new random run each time.
 rand_chacha = "0.3.1"
+# Also already in this lockfile, as a non-optional path dependency of
+# `frostsnap_core` — the SAME path, so this names the crate that is already in the
+# graph rather than adding one. `frostsnap_core` does not re-export it and
+# `frostsnap_coordinator` does not either, so a direct dependency is the only way to
+# reach `ShareBackup::from_words`, which is what turns the 25 words the DEVICE's glass
+# drew into a `share_image` this process can compare against its own
+# `expected_share_image`. That comparison is M7b's assertion; without this crate the
+# words would only ever be spell-checked.
+#
+# `default-features = false` is NOT tidiness: `frost_backup`'s default feature is
+# `cli`, which pulls clap, miniscript, bitcoin and rand — MEASURED at 15 extra
+# packages in this lockfile. `frostsnap_core` takes it with defaults off, so matching
+# that is what keeps this a naming of an existing node instead of a second
+# configuration of it.
+frost_backup = { path = "../../frostsnap/frost_backup", default-features = false }
 
 [workspace]

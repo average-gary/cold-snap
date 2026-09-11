@@ -658,6 +658,7 @@ name = "hostcheck"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "frost_backup",
  "frostsnap_coordinator",
  "rand_chacha",
 ]

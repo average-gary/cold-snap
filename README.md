@@ -2,15 +2,24 @@
 
 A Frostsnap signing device on COLDCARD Mk4 hardware.
 
-**Status: phases 0 and 1 complete; phases 2, 3 and 4 written and host-verified,
-all still unproven on silicon. Architecture decided 2026-08-12.** Frostsnap's
-hardware-independent crates are vendored and verified to cross-compile for the
-Mk4's exact target, Frostsnap's own crypto path no longer routes through C
+**Status: phases 0 and 1 complete; phases 2, 3, 4 and the mono UI written and
+host-verified, all still unproven on silicon. Architecture decided 2026-08-12.**
+Frostsnap's hardware-independent crates are vendored and verified to cross-compile
+for the Mk4's exact target, Frostsnap's own crypto path no longer routes through C
 libsecp256k1, and `hal/` supplies the STM32L4S5 substrate: `NorFlash` over
 `FLASH_FS`, a fail-closed **2-source** `RngCore`, the bootloader callgate, a
-panic handler that resets rather than halts, and — new — USB CDC over OTG_FS
-carrying the `frostsnap_comms` framing. **No hardware has been touched** — the
-on-silicon assumptions are listed in PLAN.md §9 and DECISIONS.md. No UI.
+panic handler that resets rather than halts, USB CDC over OTG_FS carrying the
+`frostsnap_comms` framing, the 4×3 membrane keypad, and all eight PLAN.md §4.2
+screens over a 1,024-byte `MONO_VLSB` framebuffer. `firmware/` is the bin target
+that links them: a vector table, a reset entry that sets `VTOR`, a registered
+`#[global_allocator]`, and an event loop. **No hardware has been touched** — the
+on-silicon assumptions are listed in PLAN.md §9 and DECISIONS.md.
+
+**This paragraph ended "No UI." until 2026-09-10.** That was wrong, and had been
+for weeks: `hal/src/ui.rs` is 5,541 lines rendering every §4.2 screen, and PLAN.md
+§9 item 16 recorded the UI as fully linked — all eight screens with real callers —
+on 2026-09-10. The status line also said "phases 2, 3 and 4", omitting the UI,
+the keypad and the bin target entirely.
 
 **The transport is written; it has never enumerated.** `hal/src/usb.rs` is a
 hand-rolled OTG_FS device-mode + CDC-ACM driver and `hal/src/comms.rs` is the
@@ -31,24 +40,70 @@ SHIPPING dispatch (`coldsnap_firmware::Session`) over a `FakeFlash` at the shipp
 geometry, with the keypair from `identity::load_or_create` and the nonce slots on
 flash -- and mid-run it drops every signer and rebuilds them from those flash bytes,
 so the coordinator finishes the keygen and the signature with devices whose
-`DeviceId` was read back out of flash. What this does **not** cover
-is *consent*: the stub auto-acks `SignatureRequest`, so the approval policy — the
-only thing between a coordinator and a signature — has never been exercised on the
-gate path.
+`DeviceId` was read back out of flash.
+
+**Consent is exercised on the gate path, and this paragraph denied it until
+2026-09-10.** It read "the stub auto-acks `SignatureRequest`, so the approval
+policy — the only thing between a coordinator and a signature — has never been
+exercised". Both halves are false. `firmware/examples/stub.rs:499` gates
+`SignatureRequest` on `digit.accepts(key)`, where the digit is a fresh randomised
+`ui::ConfirmDigit` drawn on the very frame the consent answered (`stub.rs:466-489`)
+and the key comes back from `advertised_key()` reading it out of the rendered
+pixels (`stub.rs:405-417`) — so a script cannot answer without having read the
+screen correctly, which is what makes the check structural rather than bolted on.
+And `hostcheck` runs a **third pass** on every invocation in which every device
+presses `x` at the signing screen (`hostcheck/src/main.rs:776`), failing the run if
+a declined prompt ever yields a signature share (`:1520`, `A DECLINED PROMPT
+PRODUCED A SIGNATURE`). Measured this session: `all 9/9 device(s) pressed \`x\` at
+the signing screen and NOT ONE signature share reached the coordinator`.
+
+What is genuinely weaker is narrower than the old sentence and worth stating
+exactly: `CheckKeyGen` is gated on the key the screen *advertises* rather than on a
+randomised digit. `ui::keygen_check` prints `1=match` and `stub.rs:495` accepts
+`key == b'1'`, deliberately — accepting the signing digit there would accept a key
+the screen never showed — so `advertised_key` does read that legend off the glass,
+but the byte it finds is a constant, and a hardcoded `1` would answer it too. The
+stub's own log line still calls both arms "auto-ack", which is where the retired
+claim came from. The other half no host test can supply is a *person* reading the
+screen.
 
 The session hash **is** compared, and this paragraph claimed otherwise until
-2026-08-27: `hostcheck/src/main.rs:1188-1217` checks every device's computed hash
+2026-08-27: `hostcheck/src/main.rs:1414-1444` checks every device's computed hash
 against the coordinator's across two OS processes and two *different builds* of
-`frostsnap_core`, and bails on a mismatch by name. What is still open is one level up
-and easy to conflate with it — the comparison is **core-to-core, not
-screen-to-coordinator**. Nothing asserts that the four bytes `ui::keygen_check`
-actually draws are the coordinator's, and those four bytes are what a human compares.
-See PLAN.md §8 phase 4 and §9 item 12.
+`frostsnap_core`, and bails `SESSION HASH MISMATCH` by name. **The
+screen-to-coordinator half is closed too, since 2026-08-31, and this paragraph
+denied that until 2026-09-10** — it claimed "nothing asserts that the four bytes
+`ui::keygen_check` actually draws are the coordinator's". `stub.rs::glass_code()`
+reads those four bytes back off the same `ui::Frame` the consent answered, using the
+shipped `ui::Frame::cell_2x` rather than a second copy of the mapping, and reports
+them on the existing wire as a `Debug` line; `hostcheck/src/main.rs:1465-1481`
+requires all nine devices to have reported and bails `GLASS CODE MISMATCH: <id>
+RENDERED <x> on the screen a human reads aloud, but this coordinator's session hash
+starts <y>`. See PLAN.md §8 phase 4 and §9 item 12.
 
-**This firmware requires a global allocator, and does not register one.** A library
-must not — registering one would silently override the future `main`'s choice. The
-requirement was proven by a `staticlib` link, which is the only build shape that
-surfaces it (PLAN.md §9 item 7). Both `frostsnap_comms` decode legs are now bounded:
+Also asserted, and previously undocumented here: `hostcheck` forges a
+`CoordinatorSendBody::DataErase` at every device mid-run and fails unless all nine
+**refuse** it and can still sign (`hostcheck/src/main.rs:1239-1265,1484-1490`).
+
+**This firmware requires a global allocator and registers exactly one, in the bin
+crate.** `firmware/src/alloc.rs:238` is `#[cfg_attr(target_os = "none",
+global_allocator)]` over `linked_list_allocator` 0.10.6 on a 64 KiB static arena,
+brought up by `alloc::init()` at boot step 5 (`firmware/src/main.rs:1269`), after
+`.bss` and `.data`. It is target-gated so the host test build keeps the harness's
+own allocator. The arena is measured into `.bss`, not `.uninit`: `llvm-nm` puts
+`ALLOCATOR` at `0x2000_8038`, 65,564 B, which is all but 8 bytes of the 65,572-byte
+`.bss` — so it costs zero flash and its ready-sentinel is zeroed by the entry's
+`.bss` loop for free. `hal/src/heap.rs` stays constants-only; a *library* must not
+register one, because that would override the binary's choice.
+
+**This paragraph read "and does not register one" until 2026-09-10**, as did
+README's own Layout block entry for `heap.rs`, while the Layout block eleven lines
+further down already credited `firmware/` with "the only registered
+`#[global_allocator]`" — the same file asserting both. Verified by mutation:
+deleting the attribute fails `cargo build --release` at exit 101, `error: no global
+memory allocator found but one is required`. The original requirement was proven by
+a `staticlib` link, which is the only build shape that surfaces it for a library
+(PLAN.md §9 item 7). Both `frostsnap_comms` decode legs are now bounded:
 **8,192 B outer** and **20,480 B inner**, against the vendored 32 KiB that governed
 both before — and the vendored constant itself has since come down to the same
 20,480, so one number bounds both.
@@ -77,11 +132,21 @@ and ≥3 nonce segments are out of scope and are refused. Both pinning tests wer
 updated to the new number rather than deleted — one of them now asserts the
 opposite of what its old name said, so it was renamed — and the four newly-admitted
 sizes are pinned by a test, so the reversal's justification is executable rather
-than prose. **4,096 is necessary but not sufficient:** three device-side
-construction caps (one nonce segment per frame, a `HeldShares2` cap, `Debug`
-truncation) are **REQUIRED and UNIMPLEMENTED**, because they live in
-message-construction code that does not exist yet — without them the device can
-still build a frame over any bound. PLAN.md §7.
+than prose.
+
+**All three device-side construction caps are implemented, and this paragraph
+called them "REQUIRED and UNIMPLEMENTED" until 2026-09-10.** They live in
+`Outbox::push` (`firmware/src/lib.rs:422`), which is the message-construction code
+the old text said "does not exist yet" — it does, along with the event loop and the
+bin target it claimed were absent. Cap (a): a multi-segment `NonceResponse` is split
+one frame per segment, so the four streams the flutter coordinator asks for come
+back as four frames instead of one ~8 KB frame the encoder would refuse. Cap (b): an
+over-large `HeldShares2` is refused **whole** as `CommsError::FrameTooLong`, never
+truncated — dropping shares from a restoration reply would tell the coordinator a
+share does not exist, which is a data-loss-shaped lie. Cap (c): `Debug` is cut to
+`DEBUG_MESSAGE_LIMIT` = 256 B on a UTF-8 boundary, because `String::truncate` off a
+boundary panics and a panic here is a brick. All three are mutation-tested — see
+PLAN.md §7.
 
 **Phase 2 is not signed off.** An adversarial review of the substrate found 9
 defects, including two that a passing test suite could not have caught: a
@@ -101,8 +166,10 @@ since `overflow-checks = false` in the shipped profile made the wrap silent whil
 device's only arithmetic validation of it, pre-consent. A second would have made
 phase 5's sign-approval screen reset-loop on an ordinary OP_RETURN output.
 
-All 12 are now addressed, and as of 2026-08-17 the whole tree **compiles and its
-268 host tests pass** — the flash fixes and the vendored ones were written in
+All 12 are now addressed, and the whole tree **compiles and its 565 host tests
+pass** (re-measured 2026-09-10; **this read 268 until then**, which was the
+2026-08-19 figure and never counted `coldsnap_firmware` at all) — the flash fixes
+and the vendored ones were written in
 sessions with no working shell, so until then they were verified by reading only.
 The full register is **PLAN.md §8.1**, with phase 3's mutation register at §8.2.
 What still blocks the gate is now hardware, not the toolchain: nothing here has run
@@ -153,8 +220,12 @@ features because the vendored manifests set `default = []`. **`cargo test
 (`frost_backup/tests/descriptor_match.rs`) wants `frostsnap_coordinator` and
 `miniscript`, neither vendored.
 
-Measured 2026-08-19 after bounding both decode legs and pinning the vendored
-budget, all passing, **268 total**:
+Re-measured 2026-09-10, all passing, **565 total** = `coldsnap_hal` 284 +
+`coldsnap_firmware` 165 + vendored 116. **This headline read "268 total" until
+2026-09-10** while the per-crate lines beneath it had been updated in place and
+already summed to 565 — a stale headline over a current breakdown, in one paragraph,
+which is the exact shape README's "Flash budget" section carried a `372,688 B`
+headline in:
 
 ```sh
 T=aarch64-apple-darwin
@@ -189,11 +260,19 @@ Beyond the unit tests, `hostcheck/` (its own workspace) runs a real
 `frostsnap_coordinator` against real `comms.rs` framing over a pty in two
 processes — the coordinator holds the pty SLAVE, `firmware/examples/stub.rs` the
 MASTER as its fd 0/fd 1. Build the stub binary first; `cargo run` exits 0 only if
-the coordinator itself verified the signature and every device's held share:
+the coordinator itself verified the signature and every device's held share.
+
+Since 2026-09-11 it also drives the **restoration flows** from upstream's own
+`UiProtocol` drivers — the backup reveal, the check quiz, the physical-backup ingest
+and the consolidation — with the assertions taken off the device's FRAMEBUFFER rather
+than off its say-so: the 25 words its reveal draws are read back with the shipped
+`ui::Frame::cell` and re-encoded through upstream's `ShareBackup::from_words` to be
+compared against the coordinator's own expected share image, and the quiz is answered
+only from what that reveal showed. See PLAN.md §9 item 12.
 
 ```sh
 cargo build --target $T -p coldsnap_firmware --example stub
-(cd hostcheck && cargo run)   # prints "M1+M2+M3+M5 PASS: ..."; failures name the state
+(cd hostcheck && cargo run)   # prints "M1+M2+M3+M5+M7 PASS: ..."; failures name the state
 ```
 
 One more gate, and it is the last one before a bench: `firmware/examples/checkfw.rs`
@@ -224,8 +303,11 @@ or intra-doc links into the test double and the entropy seam dangle, and `cargo 
 frostsnap_core --features coordinator` needs `--target $T` for the same
 `build.target` reason the tests do.
 
-Both of those run for the HOST, so neither ever sees the 169
-`cfg(target_arch = "arm")` blocks (measured 2026-09-08; the count moves, the gate
+Both of those run for the HOST, so neither ever sees the 181
+`cfg(target_arch = "arm")` blocks (re-measured 2026-09-10 — usb 88, flash 22,
+`firmware/src/main.rs` 15, panic 13, callgate 11, keypad 8, display 8, rng 6,
+`firmware/src/lib.rs` 4, `firmware/src/entry.rs` 4, `hal/src/lib.rs` 1, `ui.rs` 1;
+**this read 169** on the 2026-09-08 count. The count moves, the gate
 does not care — it is a whole-target compile). These two do (PLAN.md §9 item 22). They are the
 cheapest gates in the project — measured 2026-09-08: **8.2 s** from a genuinely empty
 `CARGO_TARGET_DIR`, **2.5 s** after touching `hal/` or `firmware/`, **0.21 s** warm —
@@ -283,9 +365,12 @@ Three things about the two `--release` lines, each of which cost a run to learn:
   intra-doc links as the host line above. Without them you get 6 spurious
   `unresolved link to fake::FakeFlash` — a feature artifact, not a device finding.
 - No `--lib` is needed and no allocator problem arises. Clippy stops at
-  `--emit=metadata`, so `main.rs`'s `#![no_main]`, the vector table, the absent
-  `#[global_allocator]` and `.cargo/config.toml`'s `-Tfirmware/link.x` never reach
-  a linker. Cargo prints one status line per package, so you may see
+  `--emit=metadata`, so `main.rs`'s `#![no_main]`, the vector table,
+  `alloc.rs:238`'s `#[global_allocator]` and `.cargo/config.toml`'s
+  `-Tfirmware/link.x` never reach
+  a linker. (This bullet said "the **absent** `#[global_allocator]`" until
+  2026-09-10; one is registered — the point about `--emit=metadata` is unaffected.)
+  Cargo prints one status line per package, so you may see
   `Compiling coldsnap_firmware` (its build script) and no second `Checking` line;
   the bin **is** checked — a planted defect is what proves that, not the log.
 
@@ -416,7 +501,7 @@ be linked into firmware.
 that broke it wholesale were moved to `tools/research-scratch/` (see
 `vendor/README.md`). `frost_backup` still does, for `descriptor_match.rs`.
 
-`coldsnap_hal`'s 214 are 197 lib + 5 in `tests/host_smoke.rs` (target shape and
+`coldsnap_hal`'s 284 are 267 lib + 5 in `tests/host_smoke.rs` (target shape and
 link-time invariants) + 12 in `tests/integration_frostsnap_over_hal.rs` — the only
 tests in the tree that wire the **real** `frostsnap_embedded::AbSlot` /
 `frostsnap_core::device_nonces` stack to the HAL's flash geometry and `Entropy`.
@@ -472,18 +557,29 @@ Current state against Mk4's 1,425,408-byte `FLASH_TEXT`
 |---|---|---|
 | C `secp256k1-sys` (`secp-lowmemory` tables) | 96,947 | 6.8% |
 | `rust-bitcoin` + encodings | 327,408 | 23.0% |
-| Frostsnap + pure-Rust crypto + `coldsnap_hal` | 436,543 | 30.6% |
-| **All, as built** | **860,898** | **60.4% — fits** |
-| (without C `secp256k1-sys`) | 763,951 | 53.6% |
+| Frostsnap + pure-Rust crypto + `coldsnap_hal` + `coldsnap_firmware` | 475,045 | 33.3% |
+| **All, as built** | **899,400** | **63.1% — fits** |
+| (without C `secp256k1-sys`) | 802,453 | 56.3% |
+
+**Re-measured 2026-09-10 in a clean dedicated target dir. The rows read 436,543 /
+860,898 / 60.4% / 763,951 until then** — the 2026-08-19 measurement, taken before the
+UI, the keypad, the share store, 25-word entry, the quiz and the bin crate existed.
+Only the third row moved: the two C and rust-bitcoin rows are byte-identical, and the
+whole +38,502 is `libcoldsnap_hal.rlib` 15,873 → **30,627** (27,636 `.text` + 2,991
+`.rodata`) plus `libcoldsnap_firmware.rlib` **21,000** (18,912 + 2,088), a crate that
+did not exist at the previous measurement and appears in no earlier row.
 
 **Those are rlib sums with LTO off, i.e. upper bounds, and the gap to a real
 linked image is now measured and it is large.** `firmware/` links, and
 `target/thumbv7em-none-eabihf/release/coldsnap_firmware` is **376,752 B = 26.43%**
 flash-resident (`.vector_table` 64 + `.text` 318,640 + `.rodata` 58,012 + `.data`
 36, from `objdump -h`), re-measured 2026-09-10 with a real `FrostSigner`, 25-word
-entry and the `CheckBackup` quiz all linked. That is **2.3× smaller** than the
+entry and the `CheckBackup` quiz all linked. That is **2.4× smaller** than the
 rlib estimate, because LTO plus `--gc-sections` drops everything unreferenced.
-`.bss` is `0x2000_8034..0x2001_8058`.
+`.bss` is `0x2000_8034..0x2001_8058`, i.e. 65,572 B, of which 65,564 is the
+allocator arena (`ALLOCATOR` at `0x2000_8038`) — so `.bss` is the heap plus eight
+bytes, and `.uninit` is empty. (The ratio read **2.3×** against the 860,898 rlib
+sum; at the re-measured 899,400 it is 2.39×.)
 
 **Read the components, not just the headline.** Until 2026-09-10 this paragraph
 carried a `372,688 B` headline over a breakdown that summed to `282,080` and a
@@ -493,9 +589,12 @@ and the prose beneath it was not. Every figure here is now re-measured together.
 
 It remains a **floor, not the budget**, but the margin is much smaller than it was
 and the reason has changed: `boot()` now constructs a real `FrostSigner`, so the EC
-math *is* linked — `llvm-nm` finds **267** frostsnap/secp/schnorr/bitcoin symbols
-and **17** `coldsnap_hal::ui` symbols. What is still absent is refused, not
-unreferenced (see PLAN.md §9). The trajectory, each step a real caller appearing
+math *is* linked — `llvm-nm` finds **190** frostsnap/secp/schnorr/bitcoin symbols
+(frostsnap 118, bitcoin 34, schnorr 28, secp256k1 22) and **22**
+`coldsnap_hal::ui` symbols, re-measured 2026-09-10. **These read 267 and 17 until
+then**, and neither reproduced: the pair is quoted identically in PLAN.md §10, so
+both were carried forward rather than re-derived. What is still absent is refused,
+not unreferenced (see PLAN.md §9). The trajectory, each step a real caller appearing
 rather than a code addition: 11,604 B with `boot()` polling USB but never touching
 `comms` — at which point `--gc-sections` had dropped the entire workload and the
 figure was bring-up overhead only — then 94,304 B once `comms::Link::poll` and
@@ -513,11 +612,15 @@ persistent share store landed · 372,688 B once 25-word entry made restore possi
 consent digit (+4,064 B, of which +2,232 B is `firmware/src/quiz.rs` acquiring its
 first caller rather than any new code).
 
-That is **+16,669 (+1.2 pt) over the 844,229 phase-0 baseline**: +5,101 for the
-first round of panic-site work in the vendored crates, +15,873 for the
-`coldsnap_hal` rlib, and **+253 for the three `Option`-returning fixes** in
-`bitcoin_transaction.rs` plus one `saturating_sub` in `flash.rs` — less −4,482 of
-generic instantiations that moved out of the frostsnap rlibs into `coldsnap_hal`'s.
+That is **+55,171 (+3.87 pt) over the 844,229 phase-0 baseline**: +5,101 for the
+first round of panic-site work in the vendored crates, +30,627 for the
+`coldsnap_hal` rlib, +21,000 for the `coldsnap_firmware` rlib, and **+253 for the
+three `Option`-returning fixes** in `bitcoin_transaction.rs` plus one
+`saturating_sub` in `flash.rs` — less −4,482 of generic instantiations that moved
+out of the frostsnap rlibs into `coldsnap_hal`'s, and −1,328 of other net movement.
+**This read "+16,669 (+1.2 pt)" with a "+15,873 `coldsnap_hal` rlib" term and no
+`coldsnap_firmware` term at all until 2026-09-10**; that breakdown was the
+2026-08-19 one, and its sum has been re-derived rather than adjusted.
 Every number is measured with LTO **off**, so they are upper bounds — `lto =
 "fat"` collapses the duplicated monomorphisations. See `vendor/README.md` for the
 per-change split.
@@ -525,9 +628,15 @@ per-change split.
 **The whole phase-3 transport cost +3,461 bytes** (857,125 → 860,586, +0.3 pt),
 which is the entire delta: `libcoldsnap_hal.rlib` went 12,098 → **15,559**
 (14,606 `.text` + 953 `.rodata`) and nothing else moved. That buys `comms.rs` +
-`usb.rs`, descriptors and all. The 4,096-byte reassembly buffer is not part of it:
-it is SRAM, held inline in a `Link` the caller places, and nothing in this tree
-places one yet. Note the real cost is **2 × `FRAME_LIMIT`**, not one: `encode_frame`
+`usb.rs`, descriptors and all. (Both rlib figures are the phase-3-era ones and are
+kept as the marginal cost of that change; the rlib is **30,627 B** today.) The
+4,096-byte reassembly buffer is not part of it: it is SRAM, held inline in a `Link`
+the caller places — and **`boot()` places one**, in the event loop's own frame
+(`firmware/src/main.rs:1950`), where its `[u8; FRAME_LIMIT]` is the largest single
+object on a stack with **548,776 B** of runway (`ESTACK_TOP 0x2009_e000 − _end
+0x2001_8058`). **This sentence read "nothing in this tree places one yet" until
+2026-09-10**, and DECISIONS.md 7 carried the same denial.
+Note the real cost is **2 × `FRAME_LIMIT`**, not one: `encode_frame`
 takes a `&mut [u8; FRAME_LIMIT]` as well, so the raise from 2,060 paid twice —
 4,120 → **8,192 B, 1.25% of 640 KiB** (DECISIONS.md 7).
 
@@ -552,9 +661,12 @@ two different types, and the entire `CoordinatorSendBody` decode tree was
 monomorphised **twice** — once per limit, ~32 KB each. Making the two constants equal
 collapses them into one instantiation.
 
-Reproduce it in one step: set `MAX_MESSAGE_ALLOC_SIZE` back to `32_768`, rebuild into
-a clean target dir, and the image returns to 893,099 with the hal rlib at 48,062;
-restore 20,480 and it returns to 860,898 / 15,873.
+Reproduce the *mechanism* in one step: set `MAX_MESSAGE_ALLOC_SIZE` back to `32_768`,
+rebuild into a clean target dir, and the duplicate monomorphisation comes back. The
+**absolute** figures above (893,099 / 48,062 / 860,898 / 15,873) are the 2026-08-19
+tree's and will not reproduce today — the baseline is now 899,400 with the hal rlib at
+30,627, so expect ~+32 KB from that baseline rather than a return to 893,099. Read the
+delta, not the endpoints.
 
 Two consequences worth carrying. **Aligning that constant is worth 32,201 bytes of
 flash**, which is a second and previously unstated argument for the change beyond the
@@ -571,7 +683,9 @@ retraction has itself been retracted.
 What survives the retraction is the *generalisation*, which was sound and is worth
 keeping on its own evidence (the allocator discovery, PLAN.md §9 item 7): **an
 rlib-only build hides a cost until something concrete calls it.** What does not
-survive is this instance of it. Headroom is **564,510 B**.
+survive is this instance of it. Headroom on the rlib sum is **526,008 B**
+(1,425,408 − 899,400); on the linked image it is **1,048,656 B**. **This read
+564,510 B until 2026-09-10**, against the stale 860,898 total.
 
 **It fits.** `bitcoin`'s `secp-lowmemory` feature sets `ECMULT_WINDOW_SIZE=4`
 and `ECMULT_GEN_PREC_BITS=2`, shrinking the C library 92% (1,177,733 → 96,947)
@@ -595,12 +709,19 @@ python3 tools/pack-signed.py                     # re-execs into that venv itsel
 ```
 
 One command, every byte printed. Writes `target/pack/firmware-signed.bin`
-(299,008 B, raw image at `0x08020000`) and `target/pack/coldsnap-6.0.0cs.dfu`
-(299,317 B). **It flashes nothing** and writes only under `--out`.
-Numbers below are from a real run against the release ELF (551,260 B).
+(393,216 B, raw image at `0x08020000`) and `target/pack/coldsnap-6.0.0cs.dfu`
+(393,525 B). **It flashes nothing** and writes only under `--out`.
+Numbers below are from a real run against the release ELF (650,592 B), re-run
+2026-09-10, exit 0, `rerun: byte-identical to the previous firmware-signed.bin`.
+
+**Every figure in this section was one image stale until 2026-09-10**: it read
+299,008 / 299,317 / 551,260 / 282,016 and derived the whole padding chain from
+them. 282,016 is 282,080 − 64, i.e. the 2026-08-25 trajectory step this file's own
+"Flash budget" section lists — the block was internally consistent (73 × 4096 =
+299,008, 96 + 512 = 608), which is exactly what made it read as freshly measured.
 
 **Two `llvm-objcopy` runs, never one.** `-j .vector_table` → 64 B;
-`-j .text -j .rodata -j .data` → 282,016 B. A single whole-ELF dump zero-fills the
+`-j .text -j .rodata -j .data` → 376,688 B. A single whole-ELF dump zero-fills the
 16 KiB hole between `.vector_table` and `.text`, where signit's own padding is
 `0xff`. The tool proves no fill happened by comparing each flat file against the
 sum of its section sizes — widening the `-j` list to span the gap aborts with
@@ -609,13 +730,17 @@ flash-resident section it does not know about, since objcopy would drop it
 silently.
 
 **The 256 KiB floor is already cleared, so padding is alignment-only.** Body
-282,016 B ≥ `FW_MIN_LENGTH` 262,144 B by 19,872 B. `align_to(282016, 512)` =
-282,112 (+96), then `align_to(282112, 4096)` = 282,624 (+512) — Mk4/Mk5 take the
+376,688 B ≥ `FW_MIN_LENGTH` 262,144 B by 114,544 B. `align_to(376688, 512)` =
+376,832 (+144), then `align_to(376832, 4096)` = 376,832 (**+0**) — Mk4/Mk5 take the
 4 K branch (`cli/signit.py:302-306`, `verify.c:106`), *not* the 512 that
-`memmap::FW_BODY_ALIGN` records. 608 B of `0xff` in total, plus 16,192 B of `0xff`
-after the vectors. `firmware_length = 16,256 + 128 + 282,624 = 299,008 (0x49000)`
-= 73 × 4096 — a **total** measured from `0x08020000`, header and vector region
-included, not a body length.
+`memmap::FW_BODY_ALIGN` records, and this body happens to land on 92 × 4096 already,
+so the two branches agree and the 4 K step costs nothing. That is a coincidence of
+the current image, not a property — do not read it as the 4 K branch being
+irrelevant. 144 B of `0xff` in total, plus 16,192 B of `0xff`
+after the vectors. `firmware_length = 16,256 + 128 + 376,832 = 393,216 (0x60000)`
+= 96 × 4096 — a **total** measured from `0x08020000`, header and vector region
+included, not a body length. 393,152 B are hashed (`firmware_length − 64`,
+`verify.c:92`).
 
 **The header is not emitted by our build, and must not be.** `link.x` shrinks
 `FLASH_ISR` to `0x3F80` so nothing can grow into the slot, and
@@ -681,40 +806,85 @@ hal/src/              coldsnap_hal — the entire hardware surface:
   identity.rs           the durable device secret in FLASH_FS: generated once from
                         `Entropy`, never regenerated; corrupt or ambiguous REFUSES
                         rather than re-identifying (a new DeviceId orphans shares)
-  heap.rs               the measured heap budget: consts only, no allocator
-                        registered and no placement yet (PLAN.md §9 item 7)
+  keypad.rs             the Mk4 4x3 membrane matrix (cols PB0-PB2, rows PD8-PD11,
+                        pins.csv:74-80). Row scan order is reshuffled per scan from
+                        `Entropy` — the Tempest defence — and that call site is
+                        pinned by a source-reading test, not just by review
+  heap.rs               the measured heap budget and the four forbidden SRAM
+                        regions: consts only. The allocator itself is registered in
+                        the bin crate (firmware/src/alloc.rs), never here, so no
+                        library can dictate it to its consumers (PLAN.md §9 item 7)
+  lib.rs                pub mod memmap — every flash and RAM address, mirrored by
+                        link.x's ASSERTs so the two cannot drift
   panic.rs              panic -> NVIC_SystemReset, RTC-backed reset counter
   rng.rs                fail-closed 2-source RngCore
-  singleton.rs          the take-once guard flash/rng/usb share
+  singleton.rs          the take-once guard flash/rng/usb/keypad/display share
   usb.rs                OTG_FS device mode + CDC-ACM (no protocol knowledge)
   examples/heap_profile.rs  the heap measurement behind heap.rs; host-only
+  examples/heap_lifo.rs     the LIFO probe that disqualified a bump arena, and the
+                            wrapper shape firmware/src/alloc.rs ships
   examples/ui_render.rs     every screen and page as ASCII + BMP, for layout review
                             with no hardware: cargo run -p coldsnap_hal --example ui_render
-firmware/             coldsnap_firmware — the bin crate that LINKS. Owns the vector
-                      table, the entry point, `link.x` (11 live ASSERTs) and the
-                      only registered `#[global_allocator]`. ARM-only; `boot()` is
-                      `cfg(target_arch = "arm")`, so its 14 tests cover the host-
-                      testable half only.
-hostcheck/            the harness's COORDINATOR side. Its OWN workspace, and it
-                      Its module header is the harness's measurement + mutation record.
-                      must stay that way: one cargo graph cannot hold both
+hal/tests/            host_smoke.rs (target shape and link-time invariants) and
+                      integration_frostsnap_over_hal.rs — the only place the real
+                      frostsnap_embedded::AbSlot / device_nonces stack runs against
+                      the HAL's own geometry and Entropy
+firmware/             coldsnap_firmware — the bin crate that LINKS. ARM-only; boot()
+                      is cfg(target_arch = "arm"), so its 165 host tests cover the
+                      host-testable half only:
+  main.rs               the 16-entry vector table, entry_point, boot() and the event
+                        loop. Owns the Outbox that applies the three §7 caps
+  entry.rs              the reset path: SCB->VTOR first, then CPACR, .bss, .data
+  lib.rs                Session — the coordinator dispatch, the consent gate, the
+                        page cursor, and Outbox::push's three construction caps
+  alloc.rs              the tree's ONLY #[global_allocator]: linked_list_allocator
+                        over a 64 KiB static arena in .bss, plus a dealloc bounds
+                        check and an init sentinel that is not 0xdeadbeef
+  store.rs              the keygen triple persisted as one 512 B record in a
+                        vendored AbSlot; commit word last, so a tear reads Damaged
+  wordentry.rs          25-word share INGEST — the only path that takes a secret in
+  quiz.rs               the CheckBackup quiz: 8 of 25 positions, three candidates,
+                        distractors chosen so the triple does not identify its answer
+  link.x                the memory map and 10 link-time ASSERTs
+  examples/stub.rs      the harness's DEVICE side: the shipping Session over a
+                        FakeFlash, with consent read back off the framebuffer
+  examples/simulator.rs a live coordinator session on a rendered panel
+  examples/checkfw.rs   would the Mk4 bootloader's verify_firmware() ACCEPT this
+                        artifact? 12 checkable rules, 4 it names as uncheckable
+  examples/heap_session.rs  the firmware-side heap probe behind heap.rs's figures
+hostcheck/            the harness's COORDINATOR side. Its module header is the
+                      harness's measurement + mutation record. Its OWN workspace,
+                      and it must stay that way: one cargo graph cannot hold both
                       coldsnap_hal and upstream frostsnap_coordinator (lockfile
                       package collision on frost_backup). Needs a sibling
                       ../frostsnap checkout. 133 std crates that the ARM build
                       never sees.
 vendor/frostsnap/     upstream crates @ 0bbc18be (MIT), see vendor/README.md
-tools/measure-flash.py
+tools/measure-flash.py   the rlib sums in "Flash budget"; needs LTO off
 tools/pack-signed.py  ELF -> signed, bootloader-acceptable artifact, one command.
                       Prints every step and byte count, verifies what it produced,
                       flashes nothing. See "Packaging" above.
+tools/pixel-check.py  an independent decoder for the framebuffer, so ui.rs's own
+                      cell()/cell_2x() readback cannot agree with itself and be wrong
+tools/qemu-boot.sh    a DIAGNOSTIC, never a gate. See its section above
+tools/sim-window.sh   drives examples/simulator.rs
 tools/research-scratch/  wire-size and decode-allocation measurements; not part of
                       any build. Each file carries its own copy-in/run/delete
                       commands and provenance caveats -- read those before quoting.
 ```
 
-There is no bin target, no entry point and no linker script yet: the workspace
-builds rlibs only. The `usb.rs` ⇄ `comms.rs` composition is three lines and lives
-in a test rather than in an event loop for that reason.
+**This block ended with "There is no bin target, no entry point and no linker script
+yet: the workspace builds rlibs only. The `usb.rs` ⇄ `comms.rs` composition is three
+lines and lives in a test rather than in an event loop for that reason." until
+2026-09-10.** All three exist, and the same block twenty lines above already called
+`firmware/` "the bin crate that LINKS" that "owns the vector table, the entry point,
+`link.x`" — the file contradicted itself across one page. `usb.rs` ⇄ `comms.rs` is
+composed in `boot()`'s event loop, which places the `Link` at
+`firmware/src/main.rs:1950` and drives it at `:1995-2008`. The same pass added
+`keypad.rs`, `hal/src/lib.rs`, `hal/examples/heap_lifo.rs`, `hal/tests/`, all seven
+`firmware/src/` modules, all four `firmware/examples/`, and three `tools/` entries,
+none of which this "layout" had ever listed; corrected `link.x`'s ASSERT count from
+11 to the measured **10**; and corrected `firmware/`'s test count from 14 to **165**.
 
 ## Licensing
 

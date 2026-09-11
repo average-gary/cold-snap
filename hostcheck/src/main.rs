@@ -192,6 +192,131 @@
 //!    exactly. At `=2` the same mutation reads `DEADLINE (70s) ...
 //!    elapsed=70.000580875s`, and `=10` passes all three passes normally.
 //!
+//!  M7 (THE RESTORATION, BACKUP AND CONSOLIDATION FLOWS, from REAL coordinator
+//!  drivers). The device already implemented all four and unit-tested them; no
+//!  harness had ever driven one from a coordinator. All four now run inside the two
+//!  signature passes, AFTER the signature exists -- at t = n = 9 every device is
+//!  needed to sign, and M7e REPLACES the one share record the store keeps.
+//!
+//!  The coordinator half is UPSTREAM's, unmodified and by path:
+//!  `DisplayBackupProtocol`, `CheckBackupProtocol` and `EnterPhysicalBackup`, driven
+//!  through the five-call `UiProtocol` lifecycle (`connected` / `poll` /
+//!  `process_to_user_message` / `process_comms_message` / `is_complete`). ONE boxed
+//!  protocol at a time and deliberately no `UiStack`. Consolidation has no upstream
+//!  driver at all, so it goes through the same `queue` the keygen frames do.
+//!
+//!  1. THE 25 WORDS ON THE GLASS ARE THE SHARE THE DEVICE HOLDS. The device walks its
+//!     own reveal, reads all 25 words back OUT OF THE FRAMEBUFFER with the shipped
+//!     `ui::Frame::cell`, and reports them; this process re-encodes them with
+//!     UPSTREAM's `ShareBackup::from_words` and compares the share image against its
+//!     own `expected_share_image`. Two processes, two builds of `frost_backup`.
+//!  2. THE QUIZ AND THE REVEAL AGREE, and the quiz is answered ONLY from what the
+//!     reveal drew -- never by asking `Session` which candidate is right. A wrong
+//!     answer re-asks the same position, so the pass is asserted at EXACTLY 8 answers.
+//!  3. THOSE SAME WORDS GO BACK IN through the letter picker, whose candidate letters
+//!     are a function of the secret prefix -- so the typing is driven off the pixels
+//!     too -- and the coordinator's own `check_physical_backup` accepts the result.
+//!  4. THE DESTRUCTIVE WRITE LEAVES A READABLE RECORD: after `Consolidate`, the
+//!     device is asked what it holds AGAIN and the reported share IMAGE is compared,
+//!     not just the access-structure ref.
+//!
+//!  All RUN, each file restored and `diff`ed byte-identical after. Wall clock for the
+//!  whole M7 phase, MEASURED: **1.4 s at chunk 64, 2.4 s at chunk 1** on top of M5.
+//!  - One reveal word replaced with a DIFFERENT valid BIP39 word: **`the 25 words on
+//!    <id>'s glass do not decode: Words checksum verification failed`**, exit 1.
+//!    `from_words` binds index + scalar + poly checksum under an 11-bit words
+//!    checksum, so it catches this before the share-image comparison does.
+//!  - A NON-word (`QQQQ`): **`word 3 on <id>'s glass reads "QQQQ", which is not one of
+//!    the 2048 BIP39 words -- a layout or font defect, not a crypto one`**, exit 1.
+//!  - Word-number labels off by one (`first + i + 1`): **`the reveal put 25 word(s) on
+//!    <id>'s glass, not 25: positions [1] were never drawn (got [2, ..., 26])`**, exit 1.
+//!  - `BackupPages::len` with `/` for `div_ceil`, i.e. one page short: **`the reveal at
+//!    <id> ran off the end of its pages and armed no recorded question, so not every
+//!    page was composed`**, exit 1. That is `Session::show_backup`'s `seen_pages ==
+//!    all_pages` gate, over a real transport for the first time.
+//!  - Word pages draw NO paging legend: **`backup page 1 footer is "" -- it does not
+//!    advertise ui::NEXT_KEY ('9')`**, exit 1 -- the `5=next 8=back` class, closed on
+//!    the harness side as well as by `hal`'s const asserts.
+//!  - `mark_sensitive`'s noise widened by 8 px so it reaches the word gutter:
+//!    **`backup page 1 has no legible `NN: WORD` rows`**, exit 1. This is the first
+//!    assertion in the tree that the side-channel noise does not destroy legibility.
+//!  - Every quiz option labelled with `QUIZ_KEYS[0]`: **`quiz option 2 is labelled "1"
+//!    but ui::QUIZ_KEYS says '2', so the key a human presses is not the option they
+//!    read`**, exit 1.
+//!  - `quiz::Quiz::truth` offset by one position, so the header and the candidates
+//!    disagree: **`the reveal's glass drew "ONLY" at word 7 and the quiz offers
+//!    ["PROMOTE", "LIFE", "FINAL"] -- two flows over the same share disagree about
+//!    it`**, exit 1.
+//!  - `quiz::QUIZ_POSITIONS` changed to `BACKUP_WORDS / 5`: **`M7c: <id> reported
+//!    Some(5) quiz answer(s), not exactly 8`**, exit 1 -- and note it fails AFTER the
+//!    run, because the phase gate does not check the count. That is the one M7
+//!    assertion the control flow does not already make.
+//!  - `WordEntry::letter_for_key` mis-based by one, so the ruler names a key that types
+//!    a different letter: **`the entry screen has "E" typed for word 1, which is not a
+//!    prefix of the "FITNESS" the reveal's glass drew`**, exit 1.
+//!  - The entry footer stops offering `(y)ok`: **`word 1 reads "FITNESS" in full and
+//!    the footer is "(x)del" -- the screen does not offer the key that accepts it`**,
+//!    exit 1.
+//!  - `prompt_screen_at`'s `ConsolidateBackup` arm made unreachable, i.e. the
+//!    destructive flow's consent screen deleted: **`confirm(Consolidate, <id>):
+//!    NotConfirmable`**, exit 1, reported here as `stub exited 2 in BackupConsolidate`.
+//!  - THE HARDCODED-KEY SCRIPT, with NO source mutation at all:
+//!    `COLDSNAP_GLASS_KEYS=yy9` (and `=yy1`) presses a literal key at the restoration
+//!    screens instead of the randomised digit the glass printed: **`<id> DECLINED
+//!    Reveal`** then `1 prompt(s) DECLINED but STUB_EXPECT_DECLINES=0`, exit 1. So the
+//!    reveal, the quiz, the ingest and the consolidation are all behind a digit that
+//!    can only be answered by reading the screen.
+//!  - AND THREE ON THE SEAM ITSELF, one per lifecycle leg, because a seam nothing
+//!    proves is load-bearing is a seam that will be simplified away:
+//!      * `poll()` never drained -> `DEADLINE (95s) in state BackupReveal ...
+//!        elapsed=95.002023708s`;
+//!      * `process_comms_message` never called -> `WARNING no live UiProtocol claimed
+//!        BackupRecorded from <id>` then the same 95 s deadline in `BackupReveal`;
+//!      * `process_to_user_message` never called -> `DEADLINE (95s) in state
+//!        BackupIngest`.
+//!
+//!    95 s is `HANDSHAKE + KEYGEN + SIGN + RESTORE` exactly, so the new budget lands
+//!    to the millisecond like M3's 35 s and M5's 65 s.
+//!  - TRAP 4, upstream's, demonstrated by deleting one line: `EnterPhysicalBackup::poll`
+//!    returns an EMPTY vec until `connected()` has been called, so without it the
+//!    device is never asked to type anything -> `DEADLINE (95s) in state BackupIngest
+//!    -- ... elapsed=95.001349792s`.
+//!  - TRAP 2, upstream's, made a decision instead of an accident: `CHECK_BACKUP_SINCE`
+//!    lowered to 0.2.0 -> **`declared firmware v0.2.0 does not have the check_backup
+//!    feature, so CheckBackupProtocol would silently drive the LEGACY physical-backup
+//!    path and the quiz would never run`**, exit 1.
+//!
+//!  WHAT SURVIVED, stated rather than hidden:
+//!  - the share-IMAGE comparison in `check_glass_words` is REACHABLE but not
+//!    independently demonstrable in this tree. `ShareBackup::from_words` already binds
+//!    the index, the scalar and the polynomial checksum under an 11-bit words
+//!    checksum, so every single-field corruption of the glass fails THERE first, with a
+//!    better message. What the image check catches is the residual: a self-consistent
+//!    backup for a DIFFERENT share (another device's 25 words drawn on this glass) and
+//!    an 11-bit checksum collision (p = 2^-11). No one-line mutation of this tree
+//!    produces either.
+//!  - the same is true of M7e's share-image check on the RE-REPORTED record, for a
+//!    different reason: this flow consolidates the device's OWN share back onto itself,
+//!    so the write is content-preserving and a record that survived is indistinguishable
+//!    from one that was never replaced. Provoking it needs a second share to
+//!    consolidate, i.e. the tenth-device configuration.
+//!  - `restore_step`'s `Completion::Abort` arm is a fail-closed guard, not a
+//!    demonstrated assertion: all three drivers abort only from `cancel()` or
+//!    `disconnected()`, and this harness calls neither. It converts a 95 s hang into an
+//!    instant named failure if a future driver ever does.
+//!  - `entry_press`'s `ruler.len() != letters.len()` check likewise: `WordEntry::render`
+//!    builds both rows from one `letter_for_key` and stops at the same key, so they
+//!    cannot differ today.
+//!
+//!  ONE DETERMINISM LOSS, and it is upstream's: `EnterPhysicalBackup::new` calls
+//!  `EnterPhysicalId::new(&mut rand::thread_rng())` inside the constructor
+//!  (`enter_physical_backup.rs:23`), so those 16 bytes are NOT reproducible and the
+//!  M7d frame differs byte-for-byte between runs. Nothing downstream derives from
+//!  them -- the device echoes the id back and the driver matches on it -- so no
+//!  assertion, no signature and no share image moves. Accepted rather than worked
+//!  around, because forking the constructor to fix it would mean this harness stopped
+//!  driving upstream's own code, which is the only thing it is for.
+//!
 //! Usage: `hostcheck [path-to-stub-binary]`. Build the stub FIRST and pass the
 //! artifact -- never `cargo run`: the child's stdout IS the wire, and one stray
 //! byte of cargo progress output desynchronises the magic scan permanently.
@@ -199,19 +324,27 @@
 //!   cargo build --target aarch64-apple-darwin -p coldsnap_firmware --example stub
 //!   cargo run -p hostcheck        # from hostcheck/, default path below
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::Write;
 use std::os::fd::{AsFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use frost_backup::bip39_words::BIP39_WORDS;
+use frost_backup::ShareBackup;
+use frostsnap_coordinator::check_backup::CheckBackupProtocol;
+use frostsnap_coordinator::display_backup::{DisplayBackupProtocol, DisplayBackupState};
+use frostsnap_coordinator::enter_physical_backup::{EnterPhysicalBackup, EnterPhysicalBackupState};
 use frostsnap_coordinator::frostsnap_comms::{
-    CoordinatorSendBody, CoordinatorSendMessage, DeviceSendBody, Downstream, MagicBytes,
-    ReceiveSerial, Upstream, BINCODE_CONFIG, MAGIC_BYTES_PERIOD,
+    CommsMisc, CoordinatorSendBody, CoordinatorSendMessage, DeviceSendBody, Downstream, MagicBytes,
+    ReceiveSerial, Sha256Digest, Upstream, BINCODE_CONFIG, MAGIC_BYTES_PERIOD,
+};
+use frostsnap_coordinator::frostsnap_core::coordinator::restoration::{
+    PhysicalBackupPhase, ToUserRestoration,
 };
 use frostsnap_coordinator::frostsnap_core::coordinator::{
     BeginKeygen, CoordinatorSend, CoordinatorToUserKeyGenMessage, CoordinatorToUserMessage,
@@ -221,11 +354,11 @@ use frostsnap_coordinator::frostsnap_core::device::KeyPurpose;
 use frostsnap_coordinator::frostsnap_core::message::{
     DeviceRestoration, DeviceToCoordinatorMessage, EncodedSignature,
 };
-use frostsnap_coordinator::frostsnap_core::schnorr_fun::frost::Fingerprint;
+use frostsnap_coordinator::frostsnap_core::schnorr_fun::frost::{Fingerprint, ShareIndex};
 use frostsnap_coordinator::frostsnap_core::schnorr_fun::{Schnorr, Signature};
 use frostsnap_coordinator::frostsnap_core::{
-    sha2, AccessStructureRef, DeviceId, KeygenId, SessionHash, SignSessionId, SymmetricKey,
-    WireSignTask,
+    sha2, AccessStructureRef, DeviceId, KeygenId, RestorationId, SessionHash, SignSessionId,
+    SymmetricKey, WireSignTask,
 };
 // Not a direct dependency either: `frostsnap_core` re-exports the one `bincode`
 // the coordinator decodes with, so the error matched in `is_read_timeout` is the
@@ -233,7 +366,9 @@ use frostsnap_coordinator::frostsnap_core::{
 use frostsnap_coordinator::frostsnap_core::bincode;
 use frostsnap_coordinator::frostsnap_core::Gist;
 use frostsnap_coordinator::serialport::{SerialPort, TTYPort};
-use frostsnap_coordinator::FramedSerialPort;
+use frostsnap_coordinator::{
+    Completion, DeviceMode, FirmwareVersion, FramedSerialPort, Sink, UiProtocol, VersionNumber,
+};
 use rand_chacha::rand_core::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
@@ -358,6 +493,65 @@ const KEYGEN_DEADLINE: Duration = Duration::from_secs(30);
 /// one byte per write, plus 30 nonce derivations per stream per device in a debug
 /// build.
 const SIGN_DEADLINE: Duration = Duration::from_secs(30);
+
+/// M7's budget, on top of the three above, covering all four restoration flows: the
+/// backup reveal, the check quiz, the ingest and the consolidation.
+///
+/// One number for all four, for [`SIGN_DEADLINE`]'s reason: the deadline message names
+/// the state, so splitting it buys a tighter clock and no extra diagnosis.
+///
+/// The device-side cost dominates and is not on the wire at all — eight page renders,
+/// eight quiz renders, and roughly 200 letter-picker presses each of which composes a
+/// 1,024-byte frame and reads two dozen cells back out of it with a 96-glyph linear
+/// scan. Wire traffic is a dozen small frames; nothing here approaches the 1 KB point
+/// where an undrained pty blocks a write, so `STUB_CHUNK` barely moves it. 30 s is the
+/// same shape as the two budgets above: it exists to turn a hang into a named failure,
+/// not to be a performance assertion.
+///
+/// **The stub's own watchdog is derived from the sum of all four**, so raising this
+/// without raising `DEADLINE` in `firmware/examples/stub.rs` would put the stub in
+/// charge of killing a slow run and throw the diagnosis away. See the note there.
+const RESTORE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The firmware version this harness DECLARES to `CheckBackupProtocol`, and the one
+/// decision trap 2 of the M7 brief demands be made explicitly.
+///
+/// `CheckBackupProtocol::new` branches on `firmware.features().check_backup`, which is
+/// `version >= 0.3.0` (`frostsnap_comms/src/firmware_version.rs:57-61`). This device
+/// announces a firmware DIGEST and never a `FirmwareVersion`, so upstream's
+/// `FirmwareVersion::new(digest)` leaves `version: None`, and `features()` then FAILS
+/// OPEN to `FirmwareFeatures::all()` — which happens to select the modern path, by
+/// accident of the digest being unknown rather than by anybody's decision.
+///
+/// Stating the version instead makes it a decision, and [`Restore`]'s `Phase::Quiz`
+/// arm ASSERTS `features().check_backup` before it builds the driver. Without that
+/// assert an upstream that moved the threshold would silently drive the LEGACY path —
+/// `tell_device_to_load_physical_backup` plus a share-image comparison — which is
+/// M7d's flow wearing M7c's name, and the quiz would never run at all.
+const CHECK_BACKUP_SINCE: VersionNumber = VersionNumber::new(0, 3, 0);
+
+/// The name of the throwaway restoration M7d opens purely to obtain a
+/// [`RestorationId`].
+///
+/// `EnterPhysicalBackup::is_complete()` is `Success` only on `PhysicalBackupSaved`,
+/// which only `tell_device_to_save_physical_backup` can produce, and that call needs a
+/// `RestorationId` from `start_restoring_key`. So a coordinator that already HOLDS the
+/// key still has to open a restoration to save a physical backup — this is upstream's
+/// shape (`frostsnapp/rust/src/coordinator.rs`), not a workaround, and the cost is one
+/// `RestorationProgress2` mutation in a coordinator this process throws away at the
+/// end of the pass.
+const RESTORE_KEY_NAME: &str = "cold-snap M7";
+
+/// How many positions the device's check quiz asks, and therefore how many correct
+/// answers a pass must take.
+///
+/// `coldsnap_firmware::quiz::QUIZ_POSITIONS` is `ui::BACKUP_WORDS / 3` — Coldcard's
+/// `limited = len(words) // 3` (`shared/backups.py:442`) — and this process cannot
+/// import it: the whole point of the two workspaces is that nothing here may reach a
+/// `coldsnap_*` crate. Derived from `frost_backup::NUM_WORDS`, which IS shared, so the
+/// two arithmetics are over one 25 rather than over two literals; the `/ 3` is the
+/// duplicated part, and it is what the run would fail on if the device ever changed it.
+const QUIZ_POSITIONS: usize = frost_backup::NUM_WORDS / 3;
 
 /// The LAST-RESORT bound: a wall-clock watchdog for a stall anywhere in the main
 /// loop that is not a read and not a write (both of which are bounded above).
@@ -489,9 +683,23 @@ enum State {
     /// M5: `RequestSign` sent to the threshold subset, waiting for their
     /// `SignatureShare`s and the coordinator's aggregation.
     SigningAwaitingShares,
+    /// M7b: upstream's `DisplayBackupProtocol` is driving one device's reveal, and
+    /// this process is waiting for the 25 words its GLASS drew plus
+    /// `CommsMisc::BackupRecorded`.
+    BackupReveal,
+    /// M7c: upstream's `CheckBackupProtocol` is driving the check quiz, answered by
+    /// the device from what the reveal showed. Waiting for
+    /// `CommsMisc::BackupChecked`.
+    BackupQuiz,
+    /// M7d: upstream's `EnterPhysicalBackup` is driving the letter picker. Waiting
+    /// for `PhysicalBackupEntered`, then `PhysicalBackupSaved`.
+    BackupIngest,
+    /// M7e: `Consolidate` sent — the DESTRUCTIVE one — waiting for
+    /// `FinishedConsolidation` and then for the device to report what it holds again.
+    BackupConsolidate,
 }
 
-const NAMES: [&str; 9] = [
+const NAMES: [&str; 13] = [
     "WaitingForMagic",
     "WaitingForAnnounces",
     "KeygenAwaitingShares",
@@ -501,6 +709,10 @@ const NAMES: [&str; 9] = [
     "KeygenAwaitingHeldShares",
     "NonceReplenish",
     "SigningAwaitingShares",
+    "BackupReveal",
+    "BackupQuiz",
+    "BackupIngest",
+    "BackupConsolidate",
 ];
 
 impl State {
@@ -522,11 +734,27 @@ impl State {
             State::NonceReplenish | State::SigningAwaitingShares => {
                 HANDSHAKE_DEADLINE + KEYGEN_DEADLINE + SIGN_DEADLINE
             }
+            State::BackupReveal
+            | State::BackupQuiz
+            | State::BackupIngest
+            | State::BackupConsolidate => {
+                HANDSHAKE_DEADLINE + KEYGEN_DEADLINE + SIGN_DEADLINE + RESTORE_DEADLINE
+            }
             _ => HANDSHAKE_DEADLINE + KEYGEN_DEADLINE,
         };
         // Step 6. `* 1` by default, so every number above and every measurement in
         // the header stands.
         base * timeout_scale()
+    }
+
+    /// The largest cumulative budget any state has, i.e. what the once-per-pass
+    /// watchdog is set from.
+    ///
+    /// A named function rather than the last variant spelled at the call site, because
+    /// spelling it there is how the watchdog got set from `SigningAwaitingShares` and
+    /// then silently fired 30 s early the moment a later phase existed.
+    fn longest() -> Duration {
+        State::BackupConsolidate.budget()
     }
 }
 
@@ -662,6 +890,489 @@ struct Sign {
     signatures: Option<Vec<Signature>>,
 }
 
+// ===========================================================================
+// M7 — the restoration, backup and consolidation flows, from a REAL coordinator
+// ===========================================================================
+
+/// M7's phases, in the only order they can run.
+///
+/// The order is NOT a preference and is the first of the five traps the M7 brief
+/// names: at `t == n == 9` every device is needed to sign, so [`Phase::Ingest`] and
+/// [`Phase::Consolidate`] cannot precede the signature — consolidation REPLACES the
+/// one share record this device keeps, and a signing pass needs the share that record
+/// holds. So the whole of this enum runs after `Sign::signatures` is `Some`.
+///
+/// [`Phase::Quiz`] after [`Phase::Reveal`] and [`Phase::Ingest`] after both is a data
+/// dependency and not merely tidiness: the device answers the quiz and drives the
+/// letter picker from the 25 words its own REVEAL drew, so those two flows have
+/// nothing to work from until the reveal has happened.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Phase {
+    /// M7b: `DisplayBackupProtocol`.
+    Reveal,
+    /// M7c: `CheckBackupProtocol`.
+    Quiz,
+    /// M7d: `EnterPhysicalBackup`, then `SavePhysicalBackup2`.
+    Ingest,
+    /// M7e: `Consolidate`. DESTRUCTIVE, hence last.
+    Consolidate,
+    /// M7e's proof: the device reports what it holds, AGAIN, after the write that
+    /// replaced its record. A `FinishedConsolidation` on its own says the device
+    /// applied the mutation; this says the record it wrote is one it can read back.
+    Reheld,
+    Done,
+}
+
+impl Phase {
+    fn state(self) -> State {
+        match self {
+            Phase::Reveal => State::BackupReveal,
+            Phase::Quiz => State::BackupQuiz,
+            Phase::Ingest => State::BackupIngest,
+            Phase::Consolidate | Phase::Reheld | Phase::Done => State::BackupConsolidate,
+        }
+    }
+}
+
+/// M7 state. Separate from [`Sign`] for [`Sign`]'s own reason: the signature is done
+/// and VERIFIED before any of this starts, and nothing here can move it.
+struct Restore {
+    /// The one device all four flows are driven at. One and not nine, deliberately:
+    /// these flows are about the device's dispatch, consent gate and UI, and running
+    /// them nine times would multiply the wall clock without adding a claim.
+    device: DeviceId,
+    /// That device's share index in the finished access structure, out of the
+    /// coordinator's own `device_to_share_indicies`. `CheckBackupProtocol` matches its
+    /// ack against it, and M7b's `ShareBackup::from_words` needs it.
+    share_index: ShareIndex,
+    /// The digest that device ANNOUNCED, for the `FirmwareVersion` handed to
+    /// `CheckBackupProtocol`. See [`CHECK_BACKUP_SINCE`].
+    digest: Sha256Digest,
+    phase: Phase,
+    /// Has this phase's driver been constructed and `connected()` yet? Trap 4:
+    /// `EnterPhysicalBackup` sends NOTHING until `connected()` has been called on it.
+    started: bool,
+    /// M7b, off the `Debug` back-channel: the share index the device's page 0 DREW.
+    glass_index: Option<u32>,
+    /// M7b: 1-based position -> the word the device's glass drew at it, recovered over
+    /// there with the shipped `ui::Frame::cell`.
+    glass_words: BTreeMap<usize, String>,
+    /// M7b's completion, and the reason this is an `Arc<AtomicBool>` rather than a
+    /// read of the driver.
+    ///
+    /// **`DisplayBackupProtocol::is_complete()` NEVER returns `Completion::Success`**
+    /// — it is `Some` only on `abort` (`display_backup.rs:60-68`). On
+    /// `CommsMisc::BackupRecorded` it only pushes `DisplayBackupState { confirmed:
+    /// true, close_dialog: true }` into its sink, and every field of that driver is
+    /// private with no accessor. So the sink is the ONLY observable, and the M7 brief's
+    /// "pass `()` and read state off the concrete protocol type" cannot be done for
+    /// this one driver. This is upstream's own `Sink::inspect` combinator over the `()`
+    /// blanket impl, which is the whole adapter — no new trait impl, no new type.
+    recorded: Arc<AtomicBool>,
+    /// M7c: the device's own count of quiz answers, off the `Debug` channel. A pass in
+    /// exactly `quiz::QUIZ_POSITIONS` answers means every one was right first time.
+    quiz_answers: Option<usize>,
+    /// M7c: `CommsMisc::BackupChecked` arrived AND `CheckBackupProtocol` claimed it,
+    /// which it only does when the ack's `(access_structure_ref, share_index)` pair is
+    /// the one it asked about (`check_backup.rs:136-156`).
+    checked: bool,
+    /// M7d: `EnterPhysicalBackup`'s sink, which is where its `PhysicalBackupPhase`
+    /// comes from — its fields are private, but `EnterPhysicalBackupState`'s are not.
+    ingest: Arc<Mutex<Option<EnterPhysicalBackupState>>>,
+    /// M7d: the phase the device answered with, once seen.
+    entered: Option<PhysicalBackupPhase>,
+    /// M7e: `FinishedConsolidation` reached the user layer.
+    consolidated: bool,
+    /// M7e: the device reported holding the access structure again, after the write.
+    reheld: bool,
+    /// M7d, for the log: how many keypresses the letter picker took.
+    typed: Option<usize>,
+}
+
+impl Restore {
+    fn new(device: DeviceId, share_index: ShareIndex, digest: Sha256Digest) -> Self {
+        Restore {
+            device,
+            share_index,
+            digest,
+            phase: Phase::Reveal,
+            started: false,
+            glass_index: None,
+            glass_words: BTreeMap::new(),
+            recorded: Arc::new(AtomicBool::new(false)),
+            quiz_answers: None,
+            checked: false,
+            ingest: Arc::new(Mutex::new(None)),
+            entered: None,
+            consolidated: false,
+            reheld: false,
+            typed: None,
+        }
+    }
+
+    /// Retire the current driver and move on.
+    fn advance(&mut self, ui: &mut Option<Box<dyn UiProtocol>>, next: Phase) {
+        *ui = None;
+        self.started = false;
+        self.phase = next;
+    }
+}
+
+/// The 25 words the device's GLASS drew, checked three ways.
+///
+/// This is M7b's assertion and the strongest one in the phase, because it closes a
+/// loop through two processes and two independent builds of `frost_backup`:
+///
+///  1. the device decrypted its own stored share, `frost_backup::ShareBackup::to_words`
+///     packed it, `ui::BackupPages::render` drew it, and
+///     `ui::Frame::mark_sensitive` noised the same rows;
+///  2. the stub read the words back OUT OF THE PIXELS with `ui::Frame::cell` — the
+///     exact inverse of the `text` that drew them, not a second implementation of the
+///     font — and put them on the `Debug` back-channel;
+///  3. this process re-packs them with UPSTREAM's `ShareBackup::from_words` and
+///     compares the resulting `share_image` against its own
+///     `expected_share_image`, which comes from the coordinator's `root_shared_key`
+///     and never from anything the device said.
+///
+/// Note what the coordinator cannot do and this therefore does not claim: it holds no
+/// copy of the device's secret share (`root_shared_key` is the PUBLIC point
+/// polynomial, and the coordinator sends only a decryption *contribution*), so it
+/// cannot compute the 25 words itself and compare them word for word. The share IMAGE
+/// is the strongest thing it can check — and it is enough: a single wrong word fails
+/// `from_words`' 11-bit word checksum, and a word list that passes the checksum but
+/// encodes a different scalar produces a different image.
+///
+/// The two weaker checks run first because they NAME the failure: "word 17 is not a
+/// BIP39 word" localises a font or layout defect that "the share image does not match"
+/// only reports.
+fn check_glass_words(
+    coordinator: &FrostCoordinator,
+    r: &Restore,
+    as_ref: AccessStructureRef,
+) -> Result<()> {
+    // 1. Twenty-five words, at positions 1..=25 and no others.
+    let missing: Vec<usize> = (1..=frost_backup::NUM_WORDS)
+        .filter(|n| !r.glass_words.contains_key(n))
+        .collect();
+    if !missing.is_empty() || r.glass_words.len() != frost_backup::NUM_WORDS {
+        bail!(
+            "the reveal put {} word(s) on {}'s glass, not {}: positions {missing:?} were never \
+             drawn (got {:?})",
+            r.glass_words.len(),
+            r.device,
+            frost_backup::NUM_WORDS,
+            r.glass_words.keys().collect::<Vec<_>>()
+        );
+    }
+    // 2. Every one of them a word of the vendored list, NAMED on failure. `BIP39_WORDS`
+    //    is uppercase and `to_words()` returns entries of it, so this is also the check
+    //    that the glyphs came back in the case they were drawn in.
+    for (number, word) in &r.glass_words {
+        if !BIP39_WORDS.contains(&word.as_str()) {
+            bail!(
+                "word {number} on {}'s glass reads {word:?}, which is not one of the {} BIP39 \
+                 words -- a layout or font defect, not a crypto one",
+                r.device,
+                BIP39_WORDS.len()
+            );
+        }
+    }
+    // 3. THE SHARE IMAGE. Upstream's own decoder, on the words the pixels gave up,
+    //    against the coordinator's own polynomial.
+    let index = r.glass_index.with_context(|| {
+        format!("{}'s reveal never drew a `#N` share index page", r.device)
+    })?;
+    let ordered: Vec<&str> = r.glass_words.values().map(String::as_str).collect();
+    let words: [&str; frost_backup::NUM_WORDS] = ordered
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("exactly {} words, just checked", frost_backup::NUM_WORDS))?;
+    let backup = ShareBackup::from_words(index, words)
+        .map_err(|e| anyhow::anyhow!("the 25 words on {}'s glass do not decode: {e}", r.device))?;
+    let want = coordinator
+        .expected_share_image(as_ref, r.share_index, ENCRYPTION_KEY)
+        .with_context(|| format!("no expected share image for {:?}", r.share_index))?;
+    if backup.share_image() != want {
+        bail!(
+            "SHARE IMAGE MISMATCH: the 25 words {} put ON THE GLASS re-encode to share image {:?} \
+             at index {index}, but this coordinator's root shared key says {want:?} -- the device \
+             drew a backup that is not the share it holds",
+            r.device,
+            backup.share_image(),
+
+        );
+    }
+    Ok(())
+}
+
+/// One lap of the M7 drive: build the phase's driver if it has none, then check
+/// whether the phase has proven itself and move on.
+///
+/// One boxed [`UiProtocol`] at a time and deliberately no `UiStack`: the stack exists
+/// so a real app can have a keygen and a firmware upgrade in flight at once, and it
+/// routes every message to every protocol until one claims it. Here exactly one flow
+/// is live at any moment, so a stack would add a dispatch layer between the wire and
+/// the driver under test and prove nothing about either.
+///
+/// `poll()`'s frames are NOT sent from here — the caller owns `wtx` — so this function
+/// is where the phase logic lives and nowhere else.
+fn restore_step(
+    coordinator: &mut FrostCoordinator,
+    queue: &mut VecDeque<CoordinatorSend>,
+    rng: &mut ChaCha20Rng,
+    ui: &mut Option<Box<dyn UiProtocol>>,
+    r: &mut Restore,
+    as_ref: AccessStructureRef,
+) -> Result<()> {
+    // A driver that ABORTED is a failure of the phase and not a quiet ending: every
+    // one of the three aborts on `disconnected`, which for this harness means the pty
+    // closed under it.
+    if let Some(Completion::Abort {
+        send_cancel_to_all_devices,
+    }) = ui.as_ref().and_then(|p| p.is_complete())
+    {
+        bail!(
+            "the {:?} driver ABORTED (send_cancel_to_all_devices={send_cancel_to_all_devices}) -- \
+             it only does that on `cancel()` or `disconnected()`, and this harness calls neither",
+            r.phase
+        );
+    }
+    let done = |p: &Option<Box<dyn UiProtocol>>| {
+        matches!(
+            p.as_ref().and_then(|p| p.is_complete()),
+            Some(Completion::Success)
+        )
+    };
+
+    match r.phase {
+        // ============================== M7b ==============================
+        Phase::Reveal => {
+            if !r.started {
+                r.started = true;
+                let recorded = Arc::clone(&r.recorded);
+                let proto = DisplayBackupProtocol::new(
+                    coordinator,
+                    r.device,
+                    as_ref,
+                    ENCRYPTION_KEY,
+                    // Upstream's own combinator over the `()` blanket impl. See
+                    // `Restore::recorded` for why a sink is unavoidable here.
+                    Sink::<DisplayBackupState>::inspect((), move |state: &DisplayBackupState| {
+                        if state.confirmed {
+                            recorded.store(true, Ordering::Relaxed);
+                        }
+                    }),
+                )
+                .context("DisplayBackupProtocol::new")?;
+                eprintln!(
+                    "hostcheck: M7b -- asking {} to REVEAL its backup (share index {:?})",
+                    r.device, r.share_index
+                );
+                *ui = Some(Box::new(proto));
+                // Trap 4's rule applied uniformly rather than only where it bites:
+                // `EnterPhysicalBackup` will not send without it, and for the other two
+                // it is what the real driver does anyway (`should_send = true`).
+                if let Some(p) = ui.as_mut() {
+                    p.connected(r.device, DeviceMode::Ready);
+                }
+            }
+            if r.recorded.load(Ordering::Relaxed) {
+                check_glass_words(coordinator, r, as_ref)?;
+                eprintln!(
+                    "hostcheck: M7b PASS -- {} words off {}'s GLASS re-encode to this \
+                     coordinator's own expected share image, and `BackupRecorded` closed the \
+                     driver's dialog",
+                    r.glass_words.len(),
+                    r.device
+                );
+                r.advance(ui, Phase::Quiz);
+            }
+        }
+
+        // ============================== M7c ==============================
+        Phase::Quiz => {
+            if !r.started {
+                r.started = true;
+                // TRAP 2, made a decision instead of an accident. See CHECK_BACKUP_SINCE.
+                let firmware = FirmwareVersion {
+                    digest: r.digest,
+                    version: Some(CHECK_BACKUP_SINCE),
+                };
+                if !firmware.features().check_backup {
+                    bail!(
+                        "declared firmware {} does not have the check_backup feature, so \
+                         CheckBackupProtocol would silently drive the LEGACY physical-backup path \
+                         and the quiz would never run",
+                        firmware.version_name()
+                    );
+                }
+                let proto = CheckBackupProtocol::new(
+                    coordinator,
+                    r.device,
+                    as_ref,
+                    r.share_index,
+                    ENCRYPTION_KEY,
+                    firmware,
+                    // `()`: this driver's completion IS `is_complete() == Success`
+                    // (`check_backup.rs:108-118`), so there is nothing to read off a
+                    // sink and no adapter to write.
+                    (),
+                )
+                .context("CheckBackupProtocol::new")?;
+                eprintln!(
+                    "hostcheck: M7c -- asking {} to sit the CHECK QUIZ on the same share, \
+                     declared firmware {}",
+                    r.device,
+                    firmware.version_name()
+                );
+                *ui = Some(Box::new(proto));
+                if let Some(p) = ui.as_mut() {
+                    p.connected(r.device, DeviceMode::Ready);
+                }
+            }
+            if done(ui) {
+                if !r.checked {
+                    bail!(
+                        "CheckBackupProtocol completed but this loop never saw \
+                         CommsMisc::BackupChecked from {} -- the driver was fed something else",
+                        r.device
+                    );
+                }
+                r.advance(ui, Phase::Ingest);
+            }
+        }
+
+        // ============================== M7d ==============================
+        Phase::Ingest => {
+            if !r.started {
+                r.started = true;
+                let state = Arc::clone(&r.ingest);
+                let proto = EnterPhysicalBackup::new(
+                    // A sink again, and for a different reason than M7b's: this
+                    // driver's `is_complete()` DOES report success, but the
+                    // `PhysicalBackupPhase` it saw is private, and
+                    // `check_physical_backup` needs it. `EnterPhysicalBackupState`'s
+                    // fields are public, so the sink hands it over.
+                    Sink::<EnterPhysicalBackupState>::inspect(
+                        (),
+                        move |seen: &EnterPhysicalBackupState| {
+                            *state.lock().expect("sink mutex") = Some(seen.clone());
+                        },
+                    ),
+                    r.device,
+                );
+                *ui = Some(Box::new(proto));
+                // TRAP 4, and this is the one it bites on: `EnterPhysicalBackup::poll`
+                // returns an EMPTY vec until `connected()` has been called
+                // (`enter_physical_backup.rs:71-85`), so without this line the device
+                // is never asked for anything and the phase hangs to its deadline.
+                if let Some(p) = ui.as_mut() {
+                    p.connected(r.device, DeviceMode::Ready);
+                }
+                eprintln!(
+                    "hostcheck: M7d -- asking {} to TYPE the same 25 words back in through the \
+                     letter picker",
+                    r.device
+                );
+            }
+            let seen = r.ingest.lock().expect("sink mutex").clone();
+            if let Some(abort) = seen.as_ref().and_then(|s| s.abort.clone()) {
+                bail!("the EnterPhysicalBackup driver aborted: {abort}");
+            }
+            if r.entered.is_none() {
+                if let Some(phase) = seen.and_then(|s| s.entered) {
+                    // THE COORDINATOR'S OWN SHARE-IMAGE COMPARISON. `Ok` means the
+                    // point the device derived from the 25 words a human typed equals
+                    // the one this coordinator's root shared key implies at that index;
+                    // `Err(ShareImageIsWrong)` is the whole failure mode this flow
+                    // exists to catch.
+                    let index = coordinator
+                        .check_physical_backup(as_ref, phase, ENCRYPTION_KEY)
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "check_physical_backup on the share {} TYPED BACK IN: {e:?} -- the \
+                                 letter picker and the reveal disagree, or the words are not this \
+                                 device's share",
+                                r.device
+                            )
+                        })?;
+                    if index != r.share_index {
+                        bail!(
+                            "{} typed in a share at index {index:?}, not the {:?} it holds",
+                            r.device,
+                            r.share_index
+                        );
+                    }
+                    eprintln!(
+                        "hostcheck: M7d -- the share {} TYPED matches this coordinator's expected \
+                         image at index {index:?}; telling it to save",
+                        r.device
+                    );
+                    r.entered = Some(phase);
+                    // See RESTORE_KEY_NAME: `PhysicalBackupSaved` -- and therefore this
+                    // driver's only route to `Completion::Success` -- needs a
+                    // RestorationId, and only `start_restoring_key` makes one usable.
+                    let restoration_id = RestorationId::new(rng);
+                    coordinator.start_restoring_key(
+                        RESTORE_KEY_NAME.to_string(),
+                        Some(THRESHOLD),
+                        KeyPurpose::Test,
+                        restoration_id,
+                    );
+                    queue.extend(
+                        coordinator.tell_device_to_save_physical_backup(phase, restoration_id),
+                    );
+                }
+            }
+            if done(ui) {
+                eprintln!(
+                    "hostcheck: M7d PASS -- {} saved the typed share and the driver completed",
+                    r.device
+                );
+                r.advance(ui, Phase::Consolidate);
+            }
+        }
+
+        // ============================== M7e ==============================
+        // NOT a `UiProtocol`: upstream has none for consolidation, so this goes
+        // through the same `queue` every keygen frame does.
+        // `TellDeviceConsolidateBackup` is `IntoIterator<Item = CoordinatorSend>`.
+        Phase::Consolidate => {
+            if !r.started {
+                r.started = true;
+                let phase = r
+                    .entered
+                    .context("Consolidate reached with no entered physical backup")?;
+                let sends = coordinator
+                    .tell_device_to_consolidate_physical_backup(phase, as_ref, ENCRYPTION_KEY)
+                    .map_err(|e| {
+                        anyhow::anyhow!("tell_device_to_consolidate_physical_backup: {e:?}")
+                    })?;
+                queue.extend(sends);
+                eprintln!(
+                    "hostcheck: M7e -- asking {} to CONSOLIDATE, which REPLACES the one share \
+                     record it keeps",
+                    r.device
+                );
+            }
+            if r.consolidated {
+                // Ask again what it holds. A `FinishedConsolidation` says the device
+                // applied the mutation; this says the record it wrote is one it can
+                // read back and describe, which is the half a destructive write owes.
+                queue.extend(coordinator.request_held_shares(r.device));
+                r.advance(ui, Phase::Reheld);
+            }
+        }
+
+        Phase::Reheld => {
+            if r.reheld {
+                r.phase = Phase::Done;
+            }
+        }
+        Phase::Done => {}
+    }
+    Ok(())
+}
+
 /// Refuse to certify a stub binary older than the sources it is built from.
 ///
 /// The harness reports on the binary it spawns, not on the working tree, so a stale
@@ -775,11 +1486,16 @@ fn main() -> Result<()> {
     eprintln!("--- pass: DECLINE (every device presses x at the signing screen) ---");
     one_pass(&stub, 64, &t0, Expect::Decline).context("pass DECLINE")?;
     println!(
-        "M1+M2+M3+M5 PASS: real {THRESHOLD}-of-{N_DEVICES} keygen, nonce replenishment and a signature that \
-         VERIFIES against the group key, across the pty at both chunk sizes, including the \
-         1-byte case that forces reassembly; the 4-byte code ON THE GLASS equals the \
-         coordinator's session hash on every device; and a declined signing prompt yields no \
-         signature at all"
+        "M1+M2+M3+M5+M7 PASS: real {THRESHOLD}-of-{N_DEVICES} keygen, nonce replenishment and a \
+         signature that VERIFIES against the group key, across the pty at both chunk sizes, \
+         including the 1-byte case that forces reassembly; the 4-byte code ON THE GLASS equals the \
+         coordinator's session hash on every device; a declined signing prompt yields no signature \
+         at all; and all four restoration flows run from their REAL upstream coordinator drivers -- \
+         the 25 words read back off the device's own framebuffer re-encode to this coordinator's \
+         expected share image, the check quiz passes in exactly {QUIZ_POSITIONS} answers taken \
+         only from what that reveal drew, those same words go back in through the letter picker and \
+         `check_physical_backup` accepts them, and the destructive consolidation leaves a record \
+         the device can still describe"
     );
     Ok(())
 }
@@ -820,9 +1536,14 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
     if expect == Expect::Decline {
         // `y` at the keygen check (so assertion 1 still runs in this pass), `x` at
         // every signing screen. `COLDSNAP_GLASS_KEYS` is deliberately NOT set for a
-        // signature pass: unset is the stub's default `yy`, which keeps the
+        // signature pass: unset is the stub's default `yyy`, which keeps the
         // automated gate on the default path AND lets a human run e.g.
-        // `COLDSNAP_GLASS_KEYS=y9 cargo run` to watch a hardcoded-key script fail.
+        // `COLDSNAP_GLASS_KEYS=y9 cargo run` to watch a hardcoded-key script fail at
+        // the signing screen, or `=yy9` to watch one fail at the BACKUP REVEAL.
+        //
+        // Two characters and not three, because this pass never reaches the M7
+        // restoration flows: it breaks out at `DECLINE_GRACE`, long before a signature
+        // exists. The stub's missing third character defaults to `y`.
         cmd.env("COLDSNAP_GLASS_KEYS", "yx")
             .env("STUB_EXPECT_DECLINES", N_DEVICES.to_string());
     }
@@ -857,8 +1578,7 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
     let mut state = State::WaitingForMagic;
     state.publish();
     WATCHDOG_AT_MS.store(
-        (t0.elapsed() + State::SigningAwaitingShares.budget() + WATCHDOG_SLACK).as_millis()
-            as u64,
+        (t0.elapsed() + State::longest() + WATCHDOG_SLACK).as_millis() as u64,
         Ordering::Relaxed,
     );
     let mut last_wrote: Option<Instant> = None;
@@ -891,6 +1611,17 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
     let mut keygen: Option<Keygen> = None;
     let mut sign = Sign::default();
     let mut queue: VecDeque<CoordinatorSend> = VecDeque::new();
+    // The firmware digest each device ANNOUNCED, for the `FirmwareVersion` M7c hands
+    // `CheckBackupProtocol`. See [`CHECK_BACKUP_SINCE`].
+    let mut digests: BTreeMap<DeviceId, Sha256Digest> = BTreeMap::new();
+    // ============================= M7a: THE SEAM =============================
+    // ONE boxed `UiProtocol` at a time and deliberately no `UiStack`. The five-call
+    // lifecycle is wired as: `poll()` -> the existing `send_frame`; the existing decode
+    // loop -> `process_to_user_message` / `process_comms_message`; `connected()` at
+    // construction; and `is_complete()` as the pass criterion -- except for
+    // `DisplayBackupProtocol`, which has none (see [`Restore::recorded`]).
+    let mut ui: Option<Box<dyn UiProtocol>> = None;
+    let mut restore: Option<Restore> = None;
 
     let outcome = loop {
         state.publish();
@@ -1015,6 +1746,11 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
                     };
                     match body {
                         DeviceSendBody::Announce { firmware_digest } => {
+                            // Kept for M7c, which has to hand `CheckBackupProtocol` a
+                            // `FirmwareVersion`. The DIGEST is the real thing this
+                            // device says about its firmware; the version beside it is
+                            // the harness's declaration. See [`CHECK_BACKUP_SINCE`].
+                            digests.insert(from, firmware_digest);
                             if !announced.contains(&from) {
                                 announced.push(from);
                                 eprintln!(
@@ -1088,6 +1824,45 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
                                             shares.len()
                                         );
                                         held.insert(from);
+                                        // ================== M7e's TEETH ==================
+                                        // The device describing the record it wrote
+                                        // AFTER the consolidation replaced it -- and
+                                        // this time the SHARE IMAGE is compared, not
+                                        // just the access structure ref.
+                                        //
+                                        // That distinction is the whole point of asking
+                                        // twice. `FinishedConsolidation` says the device
+                                        // applied the mutation; the ref alone says it
+                                        // wrote a record for the right wallet. Only the
+                                        // image says it wrote THIS DEVICE'S share at
+                                        // THIS index -- and consolidation is the one
+                                        // flow that re-encrypts a share under a fresh
+                                        // derivation and overwrites the single record
+                                        // the store keeps, so a swap here is a silently
+                                        // unspendable wallet with no second copy.
+                                        if let Some(r) = restore.as_mut() {
+                                            if r.phase == Phase::Reheld && from == r.device {
+                                                let expect_image = coordinator
+                                                    .expected_share_image(
+                                                        want,
+                                                        r.share_index,
+                                                        ENCRYPTION_KEY,
+                                                    );
+                                                if expect_image != Some(s.share_image) {
+                                                    break Err(anyhow::anyhow!(
+                                                        "M7e: after CONSOLIDATING, {from} reports \
+                                                         holding share image {:?}, but this \
+                                                         coordinator's root shared key says index \
+                                                         {:?} is {expect_image:?} -- the \
+                                                         destructive write replaced the record \
+                                                         with the wrong share",
+                                                        s.share_image,
+                                                        r.share_index
+                                                    ));
+                                                }
+                                                r.reheld = true;
+                                            }
+                                        }
                                     }
                                     None => {
                                         break Err(anyhow::anyhow!(
@@ -1150,7 +1925,97 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
                                         refused_erase.insert(from);
                                     }
                                 }
+                                // M7b's raw material: the share index and the 25 words
+                                // the device's BACKUP PAGES actually drew, recovered
+                                // over there from the framebuffer with the shipped
+                                // `ui::Frame::cell` — the exact inverse of the `text`
+                                // that drew them. Not trusted here: `check_glass_words`
+                                // re-encodes them with UPSTREAM's
+                                // `ShareBackup::from_words` and compares the resulting
+                                // share image against this coordinator's own.
+                                Some(("glassindex", value)) => {
+                                    if let Some(r) = restore.as_mut() {
+                                        match value.parse::<u32>() {
+                                            Ok(index) => r.glass_index = Some(index),
+                                            Err(e) => {
+                                                break Err(anyhow::anyhow!(
+                                                    "{from} drew share index {value:?} on its \
+                                                     backup page: {e}"
+                                                ))
+                                            }
+                                        }
+                                    }
+                                }
+                                Some(("glasswords", value)) => {
+                                    eprintln!("hostcheck: {from} GLASS drew {value}");
+                                    if let Some(r) = restore.as_mut() {
+                                        for pair in value.split_whitespace() {
+                                            let Some((number, word)) = pair.split_once(':') else {
+                                                break;
+                                            };
+                                            match number.parse::<usize>() {
+                                                Ok(n) => {
+                                                    r.glass_words.insert(n, word.to_string());
+                                                }
+                                                // Not fatal here on purpose: the
+                                                // position count is checked whole by
+                                                // `check_glass_words`, which names the
+                                                // gap. A bail here would report a
+                                                // parse error where the fact is "the
+                                                // reveal did not draw word 17".
+                                                Err(_) => eprintln!(
+                                                    "hostcheck: {from} drew an unparseable word \
+                                                     label {number:?}"
+                                                ),
+                                            }
+                                        }
+                                    }
+                                }
+                                // M7c: the device's own count of quiz answers. A pass
+                                // in exactly `quiz::QUIZ_POSITIONS` means every
+                                // question was right FIRST TIME, because a wrong
+                                // answer re-asks the same position.
+                                Some(("quiz", value)) => {
+                                    eprintln!("hostcheck: {from} answered {value} quiz question(s)");
+                                    if let Some(r) = restore.as_mut() {
+                                        r.quiz_answers = value.parse().ok();
+                                    }
+                                }
+                                // M7d, for the log: how many keypresses the letter
+                                // picker took. A property of the picker, not a claim.
+                                Some(("typed", value)) => {
+                                    eprintln!(
+                                        "hostcheck: {from} typed the share back in in {value} \
+                                         keypress(es)"
+                                    );
+                                    if let Some(r) = restore.as_mut() {
+                                        r.typed = value.parse().ok();
+                                    }
+                                }
                                 _ => eprintln!("hostcheck: device debug from {from}: {message}"),
+                            }
+                        }
+                        // M7a: `CommsMisc` is the only body upstream's `UiProtocol`
+                        // takes through `process_comms_message`, and until now this
+                        // loop dropped it into the `other` arm below. Both flows that
+                        // need it complete on one of these — `BackupRecorded` for the
+                        // reveal, `BackupChecked` for the quiz — so an unclaimed one is
+                        // a `CommsMisc` no live driver wanted, which is worth a line
+                        // rather than a silent drop.
+                        DeviceSendBody::Misc(misc) => {
+                            eprintln!("hostcheck: {from} MISC {}", misc.gist());
+                            if let (Some(r), CommsMisc::BackupChecked { .. }) = (restore.as_mut(), &misc)
+                            {
+                                r.checked = true;
+                            }
+                            let claimed = ui
+                                .as_mut()
+                                .is_some_and(|p| p.process_comms_message(from, misc.clone()));
+                            if !claimed {
+                                eprintln!(
+                                    "hostcheck: WARNING no live UiProtocol claimed {} from {from}",
+                                    misc.gist()
+                                );
                             }
                         }
                         other => eprintln!("hostcheck: ignoring {other:?}"),
@@ -1176,6 +2041,27 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
             },
         }
 
+        // M7a: the `poll()` leg of the five-call lifecycle, fed into the SAME
+        // `send_frame` every keygen and signing frame goes through — so a driver's
+        // messages are bounded by the same `WRITE_STALL_LIMIT` and counted by the same
+        // `writes_queued`. Drained every lap because that is the contract: `poll` is
+        // how a `UiProtocol` reaches the wire at all, and two of the three only send on
+        // the lap after `connected()`.
+        let mut poll_err: Option<anyhow::Error> = None;
+        if let Some(p) = ui.as_mut() {
+            for msg in p.poll() {
+                eprintln!("hostcheck: -> {} (UiProtocol)", msg.gist());
+                if let Err(e) = send_frame(&wtx, ReceiveSerial::Message(msg.into())) {
+                    poll_err = Some(e);
+                    break;
+                }
+                writes_queued += 1;
+            }
+        }
+        if let Some(e) = poll_err {
+            break Err(e.context(format!("UiProtocol frame in {}", state.name())));
+        }
+
         // Drain whatever the coordinator wants to say, then re-derive the state
         // from what it has told the user. Derived in ONE place on purpose: the
         // ordering of `ReceivedShares`/`CheckKeyGen`/`KeyGenAck` is the
@@ -1189,6 +2075,8 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
                 &mut rng,
                 kg,
                 &mut sign,
+                &mut ui,
+                &mut restore,
             ) {
                 break Err(e.context(format!("pump in {}", state.name())));
             }
@@ -1316,9 +2204,66 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
             // The coordinator has aggregated. Verification happens below, OUTSIDE
             // the loop, and the pass hinges on it -- not on getting here.
             match expect {
+                // ============================ M7 ============================
+                // The signature EXISTS, so trap 1 is satisfied: the 64 bytes are
+                // already fixed and nothing below can change them. Only now may the
+                // restoration flows run, because M7e REPLACES the one share record this
+                // device keeps and at t == n == 9 the signing pass needed it.
+                //
+                // The signature is still VERIFIED below, outside the loop, on the same
+                // `sign.signatures` -- so the pass still hinges on the verification and
+                // not on the arrival of `Signed`, exactly as before.
                 Expect::Signature => {
                     if sign.signatures.is_some() {
-                        break Ok(());
+                        if restore.is_none() {
+                            // One device, and the FIRST to announce -- deterministic,
+                            // because the stub writes its announces in `DeviceId`
+                            // order out of a `BTreeMap`.
+                            let device = match announced.first() {
+                                Some(id) => *id,
+                                None => break Err(anyhow::anyhow!("a signature with no devices")),
+                            };
+                            let want = match kg.finished {
+                                Some(want) => want,
+                                None => {
+                                    break Err(anyhow::anyhow!("a signature with no access structure"))
+                                }
+                            };
+                            let share_index = coordinator
+                                .iter_access_structures()
+                                .find(|a| a.access_structure_ref() == want)
+                                .and_then(|a| a.device_to_share_indicies().get(&device).copied());
+                            let share_index = match share_index {
+                                Some(index) => index,
+                                None => {
+                                    break Err(anyhow::anyhow!(
+                                        "{device} has no share index in {want:?}"
+                                    ))
+                                }
+                            };
+                            let digest = match digests.get(&device) {
+                                Some(digest) => *digest,
+                                None => {
+                                    break Err(anyhow::anyhow!("{device} announced no digest"))
+                                }
+                            };
+                            restore = Some(Restore::new(device, share_index, digest));
+                        }
+                        let r = restore.as_mut().expect("just set");
+                        state = r.phase.state();
+                        if let Err(e) = restore_step(
+                            &mut coordinator,
+                            &mut queue,
+                            &mut rng,
+                            &mut ui,
+                            r,
+                            kg.finished.expect("a signature implies an access structure"),
+                        ) {
+                            break Err(e.context(format!("M7 {:?}", r.phase)));
+                        }
+                        if r.phase == Phase::Done {
+                            break Ok(());
+                        }
                     }
                 }
                 Expect::Decline => {
@@ -1349,10 +2294,17 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
                     }
                 }
             }
-            if sign.session_id.is_some() {
-                state = State::SigningAwaitingShares;
-            } else if sign.requested_nonces {
-                state = State::NonceReplenish;
+            // `restore` is `Some` only past a verified-able signature, and it owns the
+            // state name from then on — the arm above set it from `Phase`. Without this
+            // guard the two writers race and the deadline message says
+            // `SigningAwaitingShares` for a stall inside the check quiz, which is the
+            // wrong diagnosis with the right timestamp.
+            if restore.is_none() {
+                if sign.session_id.is_some() {
+                    state = State::SigningAwaitingShares;
+                } else if sign.requested_nonces {
+                    state = State::NonceReplenish;
+                }
             }
 
             // A stub that dies before the run is done is still a failure, and must
@@ -1583,6 +2535,35 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
                 );
             }
 
+            // ================ M7: THE ONE ASSERTION LEFT TO MAKE ================
+            // Reaching here already proves most of M7, and proves it as CONTROL FLOW
+            // rather than as a check: `Phase` only advances on the fact each phase is
+            // about, and the loop only breaks `Ok` at `Phase::Done`. So
+            // `recorded` / `checked` / `entered` / `consolidated` / `reheld` are
+            // preconditions of standing here, and a `bail!` on any of them would be an
+            // assertion that cannot fail — which is worse than none, because it reads
+            // like coverage. `expect` says the same thing without pretending otherwise,
+            // and it is the convention this file already uses for the keygen's own
+            // structural facts a few lines up.
+            //
+            // What the phase gate does NOT check is the quiz COUNT, and that is the one
+            // fact left. A wrong answer re-asks the same position, so a pass in exactly
+            // `QUIZ_POSITIONS` answers means every question was right FIRST TIME. The
+            // number comes off the device's own `Debug` channel and is compared against
+            // arithmetic over `frost_backup::NUM_WORDS` here, so a device that answered
+            // nine questions to pass eight fails by name.
+            let r = restore.as_ref().expect("PASS implies M7 ran to Phase::Done");
+            if r.quiz_answers != Some(QUIZ_POSITIONS) {
+                bail!(
+                    "M7c: {} reported {:?} quiz answer(s), not exactly {QUIZ_POSITIONS} -- MORE \
+                     means a correct answer read off the REVEAL's glass was scored wrong (a wrong \
+                     answer re-asks the same position), and FEWER means the device quizzes a \
+                     different number of positions than `frost_backup::NUM_WORDS / 3`",
+                    r.device,
+                    r.quiz_answers
+                );
+            }
+
             std::io::stderr().flush().ok();
             eprintln!(
                 "  pass ok: keygen {} FINISHED in {:?}\n    access_structure_ref = {as_ref:?}\
@@ -1600,7 +2581,19 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
                  coordinator's session-hash prefix\
                  \n    forged DataErase REFUSED by {}/{N_DEVICES} devices, and they still signed\
                  \n    largest coordinator->device frame actually written: {} B \
-                 (old FRAME_LIMIT was 2060, so this keygen was previously REFUSED)",
+                 (old FRAME_LIMIT was 2060, so this keygen was previously REFUSED)\
+                 \n    M7 at {}, share index {:?}, all four flows from a REAL coordinator driver:\
+                 \n      M7b REVEAL  -- {} words read back OFF THE GLASS with `Frame::cell` \
+                 re-encode through upstream's `ShareBackup::from_words` to this coordinator's own \
+                 `expected_share_image`; `BackupRecorded` closed `DisplayBackupProtocol`\
+                 \n      M7c QUIZ    -- passed in exactly {} answers, every one taken from what \
+                 the REVEAL drew and never from asking the device; `BackupChecked` completed \
+                 `CheckBackupProtocol`\
+                 \n      M7d INGEST  -- the same 25 words typed back through the letter picker in \
+                 {} keypresses, `check_physical_backup` ACCEPTED the resulting share image, and \
+                 `PhysicalBackupSaved` completed `EnterPhysicalBackup`\
+                 \n      M7e CONSOLIDATE -- the DESTRUCTIVE write landed, and the device described \
+                 the record it wrote when asked again",
                 kg.id,
                 started.elapsed(),
                 found.threshold(),
@@ -1615,6 +2608,11 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
                 device_glass.len(),
                 refused_erase.len(),
                 MAX_DOWN_B.load(Ordering::Relaxed),
+                r.device,
+                r.share_index,
+                r.glass_words.len(),
+                QUIZ_POSITIONS,
+                r.typed.map_or("?".to_string(), |n| n.to_string()),
             );
             // Reap on SUCCESS too. This was missing, and the effect was measured:
             // `break Ok(())` above happens before the loop's `try_wait`, so a
@@ -1643,6 +2641,12 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
 /// harness deliberately skips. Drive order mirrors
 /// `frostsnap_coordinator/src/keygen.rs` (`process_to_user_message`) and the
 /// vendored tier-2 `Env::user_react_to_coordinator`.
+// Nine collaborators, and splitting them would be worse: this is one drain of one
+// queue, and every parameter is something the drain has to be able to reach on the lap
+// it runs. `ui` and `restore` are the M7a seam's `process_to_user_message` leg, which
+// has to sit inside the drain because the messages it routes are the ones the drain
+// pops.
+#[allow(clippy::too_many_arguments)]
 fn pump(
     queue: &mut VecDeque<CoordinatorSend>,
     wtx: &Sender<ReceiveSerial<Upstream>>,
@@ -1651,8 +2655,41 @@ fn pump(
     rng: &mut ChaCha20Rng,
     kg: &mut Keygen,
     sign: &mut Sign,
+    ui: &mut Option<Box<dyn UiProtocol>>,
+    restore: &mut Option<Restore>,
 ) -> Result<()> {
     while let Some(send) = queue.pop_front() {
+        // M7a: the `process_to_user_message` leg. Offered to the live driver FIRST and
+        // in the same shape `UiStack::process_to_user_message` uses -- `true` means it
+        // claimed the message -- so the arms below stay the coordinator's own
+        // keygen/signing accounting and nothing has to know which flow is live.
+        //
+        // `FinishedConsolidation` is read on the way past rather than after, because no
+        // driver claims it: upstream has no `UiProtocol` for consolidation at all.
+        if let CoordinatorSend::ToUser(message) = &send {
+            if let (
+                Some(r),
+                CoordinatorToUserMessage::Restoration(ToUserRestoration::FinishedConsolidation {
+                    device_id,
+                    share_index,
+                    ..
+                }),
+            ) = (restore.as_mut(), message)
+            {
+                if *device_id == r.device {
+                    eprintln!(
+                        "hostcheck: {device_id} FINISHED CONSOLIDATION at share index \
+                         {share_index:?}"
+                    );
+                    r.consolidated = true;
+                }
+            }
+            if let Some(p) = ui.as_mut() {
+                if p.process_to_user_message(message.clone()) {
+                    continue;
+                }
+            }
+        }
         match send {
             CoordinatorSend::ToDevice { .. } => {
                 let msg: CoordinatorSendMessage = send

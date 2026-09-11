@@ -80,6 +80,31 @@
 //! parked-progress property `spawn_reader` exists for. The coordinator's own write
 //! path stays bounded by its `WRITE_STALL_LIMIT`, which is its business, not ours.
 //!
+//! M7 — THE SCRIPTED HUMAN, and it can only answer what the GLASS says. The four
+//! restoration flows (`DisplayBackup`, `CheckBackup`, `EnterPhysicalBackup` +
+//! `SavePhysicalBackup2`, `Consolidate`) are driven here by a walk that reads its own
+//! framebuffer back with the shipped `ui::Frame::cell` and presses only keys the
+//! footer advertises:
+//!
+//!  - the reveal pages with `ui::NEXT_KEY`, checking each page's footer offers it, and
+//!    recovers all 25 words plus the share index from the pixels into [`Sheet`] — this
+//!    process's stand-in for the sheet of paper a human writes them on;
+//!  - the check quiz is answered from [`Sheet`] and NOTHING else. [`quiz_answer`] is
+//!    handed no `quiz::Quiz`, no `quiz::Screen` and no option list; it reads the
+//!    position off row 0 and the three candidates off rows 2/4/6;
+//!  - the letter picker is driven by [`entry_press`], which reads the prefix, the
+//!    candidate letters and the ruler of keys above them off the pixels. **The
+//!    candidate letters are a function of the secret prefix**, so a script that did
+//!    not read this screen could not type a word at all;
+//!  - all four consent screens are answered by [`advertised_key`] on the randomised
+//!    digit `consent_screen` printed, which `COLDSNAP_GLASS_KEYS=yy9` demonstrates is
+//!    structural rather than decorative.
+//!
+//! [`Sheet`] holds a PLAINTEXT share in a harness variable. Deliberate — a human holds
+//! one too — and it reaches no flash, no signer and no wire body but the `Debug`
+//! back-channel `hostcheck` intercepts and compares against its own
+//! `expected_share_image`.
+//!
 //! Run it via the harness, not by hand:
 //!   cargo build --target aarch64-apple-darwin -p coldsnap_firmware --example stub
 //!   (then `hostcheck` spawns the built artifact)
@@ -91,7 +116,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 
-use coldsnap_firmware::{firmware_digest, prompt_screen, DebugFlash, Fault, Outbox, Session};
+use coldsnap_firmware::{
+    firmware_digest, prompt_screen, quiz, wordentry, Checked, DebugFlash, Fault, Outbox, Session,
+    Typed,
+};
 use coldsnap_hal::comms::{decode_body, CoordinatorSendBody, Link, MAGIC_REPLY};
 use coldsnap_hal::flash::fake::FakeFlash;
 use coldsnap_hal::flash::ERASE_SIZE;
@@ -99,7 +127,7 @@ use coldsnap_hal::rng::{mix_sources, Entropy, ProvenSeed, SE1_BYTES, SE2_BYTES, 
 use coldsnap_hal::{identity, memmap, ui};
 use frostsnap_comms::{DeviceSendBody, ReceiveSerial, Upstream};
 use frostsnap_core::device::keys::KeyMutation;
-use frostsnap_core::device::{DeviceToUserMessage, Mutation};
+use frostsnap_core::device::{restoration::ToUserRestoration, DeviceToUserMessage, Mutation};
 use frostsnap_core::schnorr_fun::frost::Fingerprint;
 use frostsnap_core::{AccessStructureRef, DeviceId};
 
@@ -145,16 +173,22 @@ static DECLINES: AtomicUsize = AtomicUsize::new(0);
 /// a stub run BY HAND cannot hang forever. If it fires during a `hostcheck` run,
 /// the news is that the harness's bound is broken.
 ///
-/// 90 s: a 9-of-9 certpedpop keygen is real elliptic-curve work in a DEBUG build,
+/// 240 s: a 9-of-9 certpedpop keygen is real elliptic-curve work in a DEBUG build,
 /// nine signers deep, and at `STUB_CHUNK=1` every byte of every frame costs a
-/// syscall. The harness's own budget is 35 s, so this is ~2.5x its bound —
-/// deliberately, so that when both fire it is the harness's message you read.
+/// syscall. The harness's own cumulative budget is now 95 s — handshake 5 s + keygen
+/// 30 s + signing 30 s + the M7 restoration phase's 30 s — so this is ~2.5x its
+/// bound, deliberately, so that when both fire it is the harness's message you read.
+///
+/// It was 90 s against a 65 s harness bound until the restoration phase landed. That
+/// ratio is the whole contract of this constant, so adding a phase to `hostcheck`
+/// without moving this number would have put the stub in charge of killing a slow run
+/// and thrown away the diagnosis.
 ///
 /// SCALED by [`timeout_scale`], and that is why it is not used raw: `hostcheck`
 /// scales its budgets by the same variable, so leaving this fixed would invert the
 /// ~2.5x relationship above the first time a human took ten seconds per screen —
 /// the stub would kill the run and the harness's diagnosis would never print.
-const DEADLINE: Duration = Duration::from_secs(90);
+const DEADLINE: Duration = Duration::from_secs(240);
 
 /// The tier-2 test fingerprint (`frostsnap_core/tests/common/mod.rs`), NOT the
 /// shipped `Fingerprint::FROST_V0`, and `hostcheck` sets the identical value.
@@ -204,10 +238,10 @@ fn timeout_scale() -> u32 {
         .unwrap_or(1)
 }
 
-/// The SCRIPTED KEY SOURCE: what to press at each of the two consent screens
-/// (`COLDSNAP_GLASS_KEYS`, default `yy`, i.e. exactly today's behaviour).
+/// The SCRIPTED KEY SOURCE: what to press at each consent screen
+/// (`COLDSNAP_GLASS_KEYS`, default `yyy`, i.e. exactly today's behaviour).
 ///
-/// Two characters, `<CheckKeyGen><SignatureRequest>`:
+/// Three characters, `<CheckKeyGen><SignatureRequest><Restoration>`:
 ///  - `y` — press whatever the GLASS advertises, read back out of the rendered
 ///    pixels by [`advertised_key`]. The ONLY way to answer a signing screen
 ///    correctly, because step 0 made that digit random.
@@ -216,13 +250,22 @@ fn timeout_scale() -> u32 {
 ///    refusal), which is how a hardcoded-key script is demonstrated to fail.
 ///
 /// A missing character is `y`, so `COLDSNAP_GLASS_KEYS=y` also means "approve
-/// both".
+/// everything", and the old two-character form still means what it used to.
 ///
 /// KEYED BY PROMPT KIND, not positional, and that is deliberate: `N_DEVICES`
 /// devices produce 2xN interleaved prompts, so a positional list would encode the
 /// device count in an env var and start answering the wrong screen the moment n
-/// changed. There are exactly two consent screens, so two characters is the whole
+/// changed. There are three consent-screen KINDS, so three characters is the whole
 /// vocabulary.
+///
+/// The THIRD slot covers all four M7 restoration screens together — reveal, check
+/// quiz, ingest, consolidation — and not one each, for that same reason: they are one
+/// class (`consent_screen`'s randomised legend, [`approved`]'s
+/// `digit.accepts(key)` arm), and `COLDSNAP_GLASS_KEYS=yy9` is what shows the class is
+/// structural. `9` is never in `ui::CONFIRM_CHARSET`, so a script that pressed a
+/// hardcoded key at a reveal declines, and a decline the run did not declare is a
+/// nonzero exit. That is the whole demonstration; a slot per screen would buy four
+/// identical ones.
 ///
 /// LIVE-GLASS-PLAN §6 wrote this as `COLDSNAP_GLASS_KEYS=11`. That is no longer
 /// expressible and the reason is the point of the whole step: with a randomised
@@ -230,7 +273,7 @@ fn timeout_scale() -> u32 {
 /// the confirm key" has to mean now, and it can only be answered by reading the
 /// screen.
 fn glass_keys() -> String {
-    std::env::var("COLDSNAP_GLASS_KEYS").unwrap_or_else(|_| "yy".into())
+    std::env::var("COLDSNAP_GLASS_KEYS").unwrap_or_else(|_| "yyy".into())
 }
 
 /// WHEN the device throws away its keygen scratch state, i.e. where firmware
@@ -443,6 +486,573 @@ fn glass_code(frame: &ui::Frame) -> Option<String> {
     Some(code)
 }
 
+// ===========================================================================
+// M7 — the restoration flows, driven OFF THE PIXELS
+// ===========================================================================
+
+/// One device's reveal as this process read it **off the glass**: the share index
+/// page 0 drew, and the 25 words the word pages drew, each recovered cell by cell
+/// with the shipped `ui::Frame::cell`.
+///
+/// This is the sheet of paper a human writes a reveal down on, and it is the whole
+/// point of the M7b -> M7c -> M7d chain: the check quiz is answered from here and the
+/// letter picker is driven from here, so nothing downstream ever asks `Session` which
+/// candidate is right or which letter comes next. A plaintext share in a harness
+/// variable, deliberately — a human holds one too — and it reaches no flash, no
+/// signer and no wire body except the `Debug` back-channel `hostcheck` intercepts
+/// before the `FrostCoordinator` state machine and compares against its own
+/// `expected_share_image`.
+#[derive(Default)]
+struct Sheet {
+    /// What page 0 of the reveal printed as `#N`. Public: it is on the
+    /// coordinator's own screen and `ui::BackupPages` does not even noise it.
+    index: Option<u32>,
+    /// 1-based position -> the word drawn at it.
+    words: BTreeMap<usize, String>,
+}
+
+/// Cells of a **noised** row that hold text rather than
+/// `ui::Frame::mark_sensitive`'s noise: the `NN: ` label plus one `ui::MAX_WORD_LEN`
+/// word.
+///
+/// Derived from `hal`'s own public bound rather than written as `12`, because `hal`'s
+/// `SENSITIVE_TEXT_CELLS` is private and the number is load-bearing here. The noise
+/// runs end at `WIDTH - 1` and are up to 31 px long, so pixel 97 — which is inside
+/// cell 12 — can be noise, and [`row_text`] on that cell is then `None`. Reading
+/// exactly this many cells is what makes the read deterministic; reading one more
+/// would fail on roughly one row in four.
+const CLEAR_CELLS: usize = "NN: ".len() + ui::MAX_WORD_LEN;
+
+/// The most keypresses the letter picker is allowed for one whole 25-word share.
+///
+/// Bounded because an unbounded typing loop is a hang, and a hang here is
+/// indistinguishable from a device that stopped answering. The real worst case is
+/// `BACKUP_WORDS * MAX_WORD_LEN * pages` = 25 x 8 x 3 page-or-letter presses plus one
+/// `y` per word and a handful for the share index; this is comfortably past it, so
+/// hitting it means the picker is not converging rather than that a word was long.
+const ENTRY_PRESS_CAP: usize = 1024;
+
+/// `cells` cells of row `row`, read back through the shipped reverse glyph lookup and
+/// right-trimmed.
+///
+/// `None` if **any** cell in the range is not a glyph of the shipped font. A partial
+/// read must be a failure and never a shorter string that might still parse — the
+/// same rule [`glass_code`] follows, and the reason `mark_sensitive`'s noise cannot
+/// be mistaken here for a legible screen.
+fn row_text(frame: &ui::Frame, row: usize, cells: usize) -> Option<String> {
+    let mut text = String::new();
+    for col in 0..cells {
+        text.push(char::from(frame.cell(col, row)?.0));
+    }
+    Some(text.trim_end().to_string())
+}
+
+/// The footer of whatever is on `frame`. Never noised (`FOOTER_ROW` carries legends,
+/// not share material), so all `ui::COLS` of it are readable.
+fn footer(frame: &ui::Frame) -> String {
+    row_text(frame, ui::ROWS - 1, ui::COLS).unwrap_or_default()
+}
+
+/// `(k)` — the parenthesised form every legend in `hal::ui` spells a live key with.
+///
+/// Built from the key byte rather than typed out, so a screen that advertises a key
+/// the firmware does not compare cannot pass. That is the `5=next 8=back` class of
+/// defect, which has shipped in this tree once (see `hal/src/ui.rs`'s
+/// `BACKUP_NEXT_LEGEND`), closed on the harness side too.
+fn offers(frame: &ui::Frame, key: u8) -> bool {
+    let mut want = String::from("(");
+    want.push(char::from(key));
+    want.push(')');
+    footer(frame).contains(&want)
+}
+
+/// The share index page 0 of a reveal **drew**, off the pixels: `#N` on row 4.
+fn glass_share_index(frame: &ui::Frame) -> Option<u32> {
+    let row = row_text(frame, 4, ui::COLS)?;
+    row.strip_prefix('#')?.parse().ok()
+}
+
+/// The `NN: WORD` rows of one word page of a reveal, off the pixels.
+///
+/// Rows `2..2 + ui::WORDS_PER_PAGE`, which is where `ui::BackupPages::render` puts
+/// them. A blank row ENDS the page rather than failing it — the last page holds one
+/// word, because 25 is not a multiple of 4.
+fn glass_words(frame: &ui::Frame) -> Option<Vec<(usize, String)>> {
+    let mut found = Vec::new();
+    for i in 0..ui::WORDS_PER_PAGE {
+        let row = row_text(frame, 2 + i, CLEAR_CELLS)?;
+        if row.is_empty() {
+            break;
+        }
+        let (number, word) = row.split_once(": ")?;
+        found.push((number.parse().ok()?, word.to_string()));
+    }
+    (!found.is_empty()).then_some(found)
+}
+
+/// The key to press for the check-quiz question **on the glass**: the option row
+/// whose word is the word the REVEAL drew at the position this screen is asking
+/// about.
+///
+/// It is handed no [`quiz::Quiz`], no `quiz::Screen` and no option list. The position
+/// comes off row 0 and the three candidates off rows 2/4/6, both through
+/// `ui::Frame::cell`, so the answer comes from what a different flow put on the glass
+/// and never from asking the device which candidate is right. That is the whole of
+/// M7c: it makes the reveal and the quiz agree about one share across two OS
+/// processes and two independent builds of `frostsnap_core`.
+///
+/// It also checks that the digit drawn beside each option is the [`ui::QUIZ_KEYS`]
+/// entry this function would press for it, so a renderer that labelled option 2 with
+/// a `3` fails by name here rather than answering a question other than the one on
+/// the glass.
+fn quiz_answer(frame: &ui::Frame, sheet: &Sheet) -> Result<u8, String> {
+    let head = row_text(frame, 0, ui::COLS).ok_or("the quiz question row is not legible")?;
+    // `ui::backup_quiz_word` draws `word NN was?`.
+    let number: usize = head
+        .strip_prefix("word ")
+        .and_then(|rest| rest.strip_suffix(" was?"))
+        .and_then(|n| n.parse().ok())
+        .ok_or_else(|| format!("the quiz question row reads {head:?}, not `word NN was?`"))?;
+    let want = sheet.words.get(&number).ok_or_else(|| {
+        format!("the quiz asks about word {number}, which the reveal's glass never drew")
+    })?;
+    let mut offered = Vec::new();
+    for (i, key) in ui::QUIZ_KEYS.iter().enumerate() {
+        let row = 2 + i * 2;
+        let text = row_text(frame, row, CLEAR_CELLS)
+            .ok_or_else(|| format!("quiz option row {row} is not legible"))?;
+        let (label, word) = text
+            .split_once(") ")
+            .ok_or_else(|| format!("quiz option row {row} reads {text:?}, not `N) WORD`"))?;
+        if label.as_bytes() != [*key] {
+            return Err(format!(
+                "quiz option {} is labelled {label:?} but ui::QUIZ_KEYS says {:?}, so the key a \
+                 human presses is not the option they read",
+                i + 1,
+                char::from(*key)
+            ));
+        }
+        if word == want {
+            return Ok(*key);
+        }
+        offered.push(word.to_string());
+    }
+    Err(format!(
+        "the reveal's glass drew {want:?} at word {number} and the quiz offers {offered:?} -- two \
+         flows over the same share disagree about it"
+    ))
+}
+
+/// The next key to press to type `sheet`'s word into the entry screen **on the
+/// glass**.
+///
+/// Everything it decides from is pixels: the word number (row 0), the prefix typed so
+/// far (row 4), the candidate letters (row 6) and the ruler of keys printed above them
+/// (row 5). **The candidate letters are a function of the secret prefix**, so a script
+/// that did not read this screen could not type a word at all — the same structural
+/// property that makes the randomised confirm digit meaningful.
+///
+/// The rule is deliberately the SLOW one: type every letter of the target and only
+/// then press [`ui::ENTRY_OK_KEY`]. `wordentry::Entry::accept` also commits at
+/// uniqueness (`ABA` commits `ABANDON`), which is where its measured 5.69 presses per
+/// word come from — but a script that pressed `y` the moment the footer offered it
+/// would commit `ACT` where the paper said `ACTION`, and 49 BIP39 words are proper
+/// prefixes of longer ones. Typing it out costs about one extra press per word and
+/// cannot commit the wrong word.
+fn entry_press(frame: &ui::Frame, sheet: &Sheet) -> Result<u8, String> {
+    let head = row_text(frame, 0, ui::COLS).ok_or("the entry header row is not legible")?;
+    // `ui::WordEntry::render` draws `word N of 25`.
+    let number: usize = head
+        .strip_prefix("word ")
+        .and_then(|rest| rest.split_once(' '))
+        .and_then(|(n, _)| n.parse().ok())
+        .ok_or_else(|| format!("the entry header row reads {head:?}, not `word N of 25`"))?;
+    let want = sheet.words.get(&number).ok_or_else(|| {
+        format!("the entry asks for word {number}, which the reveal's glass never drew")
+    })?;
+    // Row 4 is `NN: <prefix>_`. The trailing `_` cursor is what gives way on a full
+    // 8-letter field (`SENSITIVE_TEXT_CELLS` is `NN: ` plus `MAX_WORD_LEN`), so it is
+    // stripped only when it is there.
+    let field = row_text(frame, 4, CLEAR_CELLS).ok_or("the entry prefix row is not legible")?;
+    let typed = field
+        .split_once(": ")
+        .map(|(_, rest)| rest.strip_suffix('_').unwrap_or(rest))
+        .ok_or_else(|| format!("the entry prefix row reads {field:?}, not `NN: PREFIX_`"))?;
+    if !want.starts_with(typed) {
+        return Err(format!(
+            "the entry screen has {typed:?} typed for word {number}, which is not a prefix of the \
+             {want:?} the reveal's glass drew"
+        ));
+    }
+    let Some(next) = want.as_bytes().get(typed.len()).copied() else {
+        // Every letter is in. `ui::ENTRY_OK_KEY` commits it -- and the footer has to
+        // be offering that key, or the press is one the screen never advertised.
+        if !offers(frame, ui::ENTRY_OK_KEY) {
+            return Err(format!(
+                "word {number} reads {want:?} in full and the footer is {:?} -- the screen does \
+                 not offer the key that accepts it",
+                footer(frame)
+            ));
+        }
+        return Ok(ui::ENTRY_OK_KEY);
+    };
+    // The two rows the pad reads: the letters this page offers, and the key printed
+    // above each of them. `ui::WordEntry::render` builds BOTH from `letter_for_key`
+    // and stops at the first key with no letter under it, so they are the same length
+    // by construction -- checked rather than assumed, because a digit printed over
+    // the wrong letter is exactly the defect that array is built from the key list to
+    // prevent.
+    let ruler = row_text(frame, 5, CLEAR_CELLS).ok_or("the entry ruler row is not legible")?;
+    let letters = row_text(frame, 6, CLEAR_CELLS).ok_or("the entry letter row is not legible")?;
+    if ruler.len() != letters.len() {
+        return Err(format!(
+            "the entry ruler {ruler:?} and its letters {letters:?} are different lengths, so a key \
+             is printed over the wrong letter"
+        ));
+    }
+    if let Some(slot) = letters.find(char::from(next)) {
+        return ruler.as_bytes().get(slot).copied().ok_or_else(|| {
+            format!(
+                "letter {:?} is on the glass with no key printed above it",
+                char::from(next)
+            )
+        });
+    }
+    // Not on this page. `ui::ENTRY_PAGE_KEY` WRAPS, so paging terminates -- and the
+    // footer has to be advertising it, which `render` only does when there is more
+    // than one page.
+    if !offers(frame, ui::ENTRY_PAGE_KEY) {
+        return Err(format!(
+            "word {number} needs letter {:?} after {typed:?}, the glass offers {letters:?} and the \
+             footer is {:?} -- there is no page to turn to",
+            char::from(next),
+            footer(frame)
+        ));
+    }
+    Ok(ui::ENTRY_PAGE_KEY)
+}
+
+/// The next key for the entry's **share-index** page: a digit, or
+/// [`ui::ENTRY_OK_KEY`] once the accumulator equals the index the reveal drew.
+///
+/// The index is the one field here that is NOT read back off the glass, and that is a
+/// decision rather than a shortcut: it is public — it is on the coordinator's own
+/// screen, and `ui::BackupPages::render` is the one share screen that does not noise
+/// it — so there is no claim to make about reading it. The WORDS are the claim, and
+/// [`entry_press`] takes every one of them off the pixels.
+///
+/// `None` when the accumulator has diverged from the target, which is a machine that
+/// did not take the digit it was handed.
+fn index_press(typed: Option<u32>, want: u32) -> Option<u8> {
+    let want = want.to_string();
+    let typed = typed.map(|t| t.to_string()).unwrap_or_default();
+    if typed == want {
+        return Some(ui::ENTRY_OK_KEY);
+    }
+    want.as_bytes().get(typed.len()).copied()
+}
+
+/// Which restoration consent screen is on the glass, and therefore what a `yes` to it
+/// buys.
+///
+/// `main.rs`'s `grants` is the device's own version of this decision; it is private to
+/// the `#![no_main]` bin and has its own host tests, so this is the harness's. An enum
+/// and not three predicates for `grants`' reason: three booleans over five variants
+/// can all be true, and "draw 25 words in plain" plus "accept 25 typed in" at once is
+/// not a state any screen asked for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Grant {
+    /// M7b. `Session::show_backup` may draw the whole share.
+    Reveal,
+    /// M7c. `Session::quiz_key` may score a keypress.
+    Check,
+    /// M7d. `Session::entry_key` may accept a keystroke.
+    Enter,
+    /// M7e. `confirm_at` performs the flash write itself and nothing lands on the
+    /// glass, so there is no walk for this one.
+    Consolidate,
+    /// Informational: `prompt_screen_at` draws no screen and `confirm_at` refuses it.
+    Nothing,
+}
+
+fn grants(inner: &ToUserRestoration) -> Grant {
+    match inner {
+        ToUserRestoration::DisplayBackup { .. } => Grant::Reveal,
+        ToUserRestoration::CheckBackup { .. } => Grant::Check,
+        ToUserRestoration::EnterBackup { .. } => Grant::Enter,
+        ToUserRestoration::ConsolidateBackup(_) => Grant::Consolidate,
+        ToUserRestoration::BackupSaved { .. } => Grant::Nothing,
+    }
+}
+
+/// M7b: walk every page of a granted reveal, recover the words from the FRAMEBUFFER,
+/// and answer `ui::backup_recorded`'s digit.
+///
+/// The paging key is checked rather than assumed: every page's footer has to be
+/// advertising [`ui::NEXT_KEY`] before the cursor advances, so a screen naming a key
+/// the firmware does not compare fails here. The `+1` itself is `main.rs`'s
+/// `reveal_step`, which is private to the `#![no_main]` bin and has its own host
+/// tests; this is the same arithmetic over the same `Session::show_backup`.
+///
+/// Every page is reported on the wire as it is read, so a reveal that dies half way
+/// still tells `hostcheck` how far it got. `Outbox` caps a `Debug` at 256 B and one
+/// page is at most four `NN: WORD` pairs, so nothing here can be truncated.
+fn reveal(
+    session: &mut Session<'_, Flash>,
+    rng: &mut Entropy,
+    out: &mut Outbox,
+    sheet: &mut Sheet,
+) {
+    let id = session.device_id();
+    let mut frame = ui::Frame::new();
+    let mut page = 0usize;
+    // One page per word page plus the index page plus the ending, doubled: a reveal
+    // that does not end is a hang, and this names it instead.
+    let cap = 2 * (2 + ui::BACKUP_WORDS.div_ceil(ui::WORDS_PER_PAGE));
+    loop {
+        if page > cap {
+            die(2, &format!("the reveal at {id} did not end within {cap} pages"));
+        }
+        match session.show_backup(page, &mut frame, rng) {
+            Ok(true) => {
+                if !offers(&frame, ui::NEXT_KEY) {
+                    die(
+                        2,
+                        &format!(
+                            "backup page {page} footer is {:?} -- it does not advertise \
+                             ui::NEXT_KEY ({:?}), so the key this walk presses is not the key the \
+                             screen showed",
+                            footer(&frame),
+                            char::from(ui::NEXT_KEY)
+                        ),
+                    );
+                }
+                let report = if page == 0 {
+                    let index = glass_share_index(&frame).unwrap_or_else(|| {
+                        die(
+                            2,
+                            &format!(
+                                "backup page 0 row 4 reads {:?}, not the `#N` share index",
+                                row_text(&frame, 4, ui::COLS)
+                            ),
+                        )
+                    });
+                    sheet.index = Some(index);
+                    format!("glassindex={index}")
+                } else {
+                    let words = glass_words(&frame).unwrap_or_else(|| {
+                        die(
+                            2,
+                            &format!("backup page {page} has no legible `NN: WORD` rows"),
+                        )
+                    });
+                    let mut report = String::from("glasswords=");
+                    for (number, word) in words {
+                        if !report.ends_with('=') {
+                            report.push(' ');
+                        }
+                        report.push_str(&format!("{number}:{word}"));
+                        sheet.words.insert(number, word);
+                    }
+                    report
+                };
+                if let Err(e) = out.push(DeviceSendBody::Debug { message: report }) {
+                    die(2, &format!("Debug(glass reveal) refused by framing: {e:?}"));
+                }
+                // `ui::NEXT_KEY`, as `main.rs`'s `reveal_step` turns it into.
+                page += 1;
+            }
+            // The pages ran out. `Session::show_backup` has dropped the grant and,
+            // on this leg only, armed the recorded question.
+            Ok(false) => break,
+            Err(e) => die(2, &format!("show_backup(page {page}, {id}): {e:?}")),
+        }
+    }
+
+    // THE "DID YOU WRITE IT DOWN?" QUESTION. Same shape as `main.rs`'s
+    // `show_backup_page` `Ok(false) if record_pending()` leg: the digit is drawn
+    // here, rendered here, and read back out of these very pixels, so the key this
+    // process presses is the key the screen showed and nothing else. A hardcoded
+    // byte cannot answer it.
+    if !session.record_pending() {
+        die(
+            2,
+            &format!(
+                "the reveal at {id} ran off the end of its pages and armed no recorded question, \
+                 so not every page was composed"
+            ),
+        );
+    }
+    let confirm = ui::ConfirmDigit::draw(rng);
+    ui::backup_recorded(&mut frame, confirm);
+    match advertised_key(&frame) {
+        Some(key) if confirm.accepts(key) => {
+            if let Err(e) = session.backup_recorded(out) {
+                die(2, &format!("backup_recorded({id}): {e:?}"));
+            }
+            eprintln!(
+                "stub: {id} read all {} words off its own glass and answered the recorded question \
+                 on the digit it printed",
+                sheet.words.len()
+            );
+        }
+        other => die(
+            2,
+            &format!(
+                "the recorded question advertised {:?}, which the ConfirmDigit it was drawn with \
+                 does not accept",
+                other.map(char::from)
+            ),
+        ),
+    }
+}
+
+/// M7c: sit the whole check quiz, answering every question from what the REVEAL
+/// showed.
+///
+/// Returns how many questions were answered. A wrong answer re-asks the same
+/// position, so the count is also the assertion: a pass in exactly
+/// [`quiz::QUIZ_POSITIONS`] answers means every one of them was right first time,
+/// and anything more means the reveal and the quiz disagree about the same share.
+fn check_quiz(
+    session: &mut Session<'_, Flash>,
+    rng: &mut Entropy,
+    out: &mut Outbox,
+    sheet: &Sheet,
+) -> usize {
+    let id = session.device_id();
+    let mut answers = 0usize;
+    loop {
+        let Some(screen) = session.quiz_screen() else {
+            die(2, &format!("the quiz at {id} ended without a pass"));
+        };
+        let quiz::Screen::Word { question, options } = screen else {
+            // Unreachable: `quiz_key` DROPS the quiz on a pass, so `quiz_screen` is
+            // already `None` by the time the passed screen exists. Named rather than
+            // `unreachable!()` so a vendored change that broke it says so.
+            die(
+                2,
+                "quiz_screen offered the passed screen while the quiz was still live",
+            );
+        };
+        let mut frame = ui::Frame::new();
+        if let Err(e) = ui::backup_quiz_word(&mut frame, question, options, rng) {
+            die(2, &format!("backup_quiz_word({id}): {e:?}"));
+        }
+        let key = quiz_answer(&frame, sheet).unwrap_or_else(|why| die(2, &why));
+        answers += 1;
+        if answers > quiz::QUIZ_POSITIONS {
+            die(
+                2,
+                &format!(
+                    "the quiz has asked {answers} questions for {} positions, so an answer read \
+                     off the reveal's glass was scored WRONG",
+                    quiz::QUIZ_POSITIONS
+                ),
+            );
+        }
+        match session.quiz_key(key, rng, out) {
+            Ok(Checked::Redraw) => {}
+            Ok(Checked::Ended { checked: Some(n) }) => {
+                if n != quiz::QUIZ_POSITIONS || answers != quiz::QUIZ_POSITIONS {
+                    die(
+                        2,
+                        &format!(
+                            "the quiz passed claiming {n} checked words after {answers} answers, \
+                             not {} of each",
+                            quiz::QUIZ_POSITIONS
+                        ),
+                    );
+                }
+                return answers;
+            }
+            Ok(Checked::Ended { checked: None }) => {
+                die(2, "the quiz ABORTED on a key read off its own glass")
+            }
+            // A `QUIZ_KEYS` byte on a live quiz cannot do nothing, so this is a
+            // machine that stopped scoring. Named rather than looped on, because
+            // looping on it is a hang.
+            Ok(Checked::Unchanged) => die(
+                2,
+                &format!(
+                    "quiz key {:?} -- read off the glass, and one of ui::QUIZ_KEYS -- did nothing",
+                    char::from(key)
+                ),
+            ),
+            Err(e) => die(2, &format!("quiz_key({id}): {e:?}")),
+        }
+    }
+}
+
+/// M7d: type all 25 words back in through the letter picker.
+///
+/// Returns how many keys were pressed, for the log — it is a property of the picker,
+/// not an assertion. The assertion is the coordinator's: the `share_image` the device
+/// derives from these 25 words has to equal its own `expected_share_image`.
+fn type_backup(
+    session: &mut Session<'_, Flash>,
+    rng: &mut Entropy,
+    out: &mut Outbox,
+    sheet: &Sheet,
+) -> (usize, Vec<DeviceToUserMessage>) {
+    let id = session.device_id();
+    let index = sheet
+        .index
+        .unwrap_or_else(|| die(2, "no share index was ever read off a reveal page"));
+    let mut presses = 0usize;
+    loop {
+        let key = {
+            let Some(screen) = session.entry_screen() else {
+                die(2, &format!("the entry at {id} ended without a share"));
+            };
+            match screen {
+                wordentry::Screen::ShareIndex { typed } => index_press(typed, index)
+                    .unwrap_or_else(|| {
+                        die(
+                            2,
+                            &format!("the entry has index {typed:?} typed, not a prefix of {index}"),
+                        )
+                    }),
+                wordentry::Screen::Word(word) => {
+                    let mut frame = ui::Frame::new();
+                    if let Err(e) = word.render(&mut frame, rng) {
+                        die(2, &format!("WordEntry::render({id}): {e:?}"));
+                    }
+                    entry_press(&frame, sheet).unwrap_or_else(|why| die(2, &why))
+                }
+                wordentry::Screen::Failed => die(
+                    2,
+                    &format!(
+                        "the 25 words read off {id}'s own reveal DID NOT CHECKSUM when typed back \
+                         in -- the reveal and `ShareBackup::from_words` disagree"
+                    ),
+                ),
+            }
+        };
+        presses += 1;
+        if presses > ENTRY_PRESS_CAP {
+            die(
+                2,
+                &format!("the letter picker at {id} took over {ENTRY_PRESS_CAP} presses"),
+            );
+        }
+        match session.entry_key(key, out) {
+            Ok(Typed::Ended(prompts)) => return (presses, prompts),
+            Ok(Typed::Redraw) => {}
+            // Every key here came off the glass, so a no-op press is a picker that
+            // stopped accepting what it advertises. Looping on it is a hang.
+            Ok(Typed::Unchanged) => die(
+                2,
+                &format!(
+                    "entry key {:?}, read off the glass, did nothing",
+                    char::from(key)
+                ),
+            ),
+            Err(e) => die(2, &format!("entry_key({id}): {e:?}")),
+        }
+    }
+}
+
 /// Render `prompt`, ask `consent` for a keypress, and decide. `true` means
 /// confirm it.
 ///
@@ -497,8 +1107,19 @@ fn approved(
         // inverted. Only the digit that is ON THE SCREEN signs; `x`, another
         // charset digit and a key that is not on the pad are all refusals.
         DeviceToUserMessage::SignatureRequest { .. } => digit.accepts(key),
-        // Not a consent prompt. Unreachable from the two call sites in `drive`,
-        // and a decline — which fails the run — if that ever stops being true.
+        // THE FOUR RESTORATION CONSENT SCREENS. Every one of them prints the same
+        // randomised legend the signing screen does — `consent_screen`'s
+        // `"Press (N) x=no"`, composed from the very `ConfirmDigit` drawn above — so
+        // the same rule applies and for the same reason: only the digit that is ON
+        // THE SCREEN grants, and `x`, another charset digit and a key that is not on
+        // the pad are all refusals. This is `main.rs`'s `answer` arm for
+        // `Consent::Prompt`, whose `_ => confirm.accepts(key)` covers exactly these.
+        //
+        // `BackupSaved` never reaches here: `prompt_screen_at` draws no screen for
+        // it, so the `Ok(true)` gate above has already returned.
+        DeviceToUserMessage::Restoration(_) => digit.accepts(key),
+        // Not a consent prompt. Unreachable from the call sites in `drive`, and a
+        // decline — which fails the run — if that ever stops being true.
         _ => false,
     }
 }
@@ -652,6 +1273,7 @@ fn drive(
     consent: Consent,
     wire: &mut Vec<u8>,
     saved: &mut BTreeMap<DeviceId, AccessStructureRef>,
+    paper: &mut BTreeMap<DeviceId, Sheet>,
 ) {
     let id = session.device_id();
     // The shipped outbox: it applies the three framing caps (one nonce segment
@@ -701,7 +1323,14 @@ fn drive(
                 if !approved(&p, rng, &mut *consent, &mut out) {
                     decline(id, "CheckKeyGen", &mut out);
                 } else {
-                    eprintln!("stub: {id} CheckKeyGen -> auto-ack (a real device asks a human)");
+                    // NOT an auto-ack: `approved` above required the key the screen
+                    // ADVERTISES, read back out of the rendered pixels. It is the
+                    // fixed `1=match` legend rather than a randomised digit, which is
+                    // the one respect in which this arm is weaker than the signing
+                    // one -- a hardcoded `1` would also answer it. Saying "auto-ack"
+                    // here is what put "the stub auto-acks" into PLAN.md and README
+                    // for weeks; do not put it back.
+                    eprintln!("stub: {id} CheckKeyGen -> approved on the key the glass advertises");
                     match session.confirm(p, rng, &mut out) {
                         Ok(more) => prompts.extend(more),
                         Err(e) => die(2, &format!("confirm(CheckKeyGen, {id}): {e:?}")),
@@ -716,8 +1345,14 @@ fn drive(
                 if !approved(&p, rng, &mut *consent, &mut out) {
                     decline(id, "SignatureRequest", &mut out);
                 } else {
+                    // NOT an auto-ack either, and this one is structural: `approved`
+                    // required `digit.accepts(key)` against a RANDOMISED
+                    // `ui::ConfirmDigit` drawn on the frame the consent answered, so
+                    // no hardcoded key can reach here (`COLDSNAP_GLASS_KEYS=y9`
+                    // and `=y2` are refusals by construction). What a host cannot
+                    // supply is a human who actually read the screen.
                     eprintln!(
-                        "stub: {id} SignatureRequest -> auto-ack (a real device asks a human)"
+                        "stub: {id} SignatureRequest -> approved on the randomised digit read off the glass"
                     );
                     match session.confirm(p, rng, &mut out) {
                         Ok(more) => {
@@ -748,6 +1383,78 @@ fn drive(
                 // purpose: passing the superset is the stronger evidence.
                 if clear {
                     session.signer.clear_tmp_data();
+                }
+            }
+            // =============================== M7 ===============================
+            // THE RESTORATION FLOWS. Every one of them is a consent screen with the
+            // randomised digit on it — `approved` answers all four with
+            // `digit.accepts(key)`, read off the pixels — and what the digit BUYS
+            // differs per flow, which is `Session::confirm_at`'s business and not this
+            // file's. What is this file's is the scripted human afterwards: a walk
+            // that pages, answers or types using only what the glass drew.
+            DeviceToUserMessage::Restoration(restoration) => {
+                let inner = *restoration;
+                let grant = grants(&inner);
+                if grant == Grant::Nothing {
+                    // `BackupSaved`, the device's own note that `SavePhysicalBackup2`
+                    // landed. `prompt_screen_at` draws no screen for it and
+                    // `confirm_at` refuses it, so there is nothing to consent to; the
+                    // coordinator learns the same fact from
+                    // `DeviceRestoration::PhysicalSaved`, which `Session::run` has
+                    // already put in the outbox.
+                    eprintln!("stub: {id} Restoration({inner:?}) is informational");
+                    continue;
+                }
+                let p = DeviceToUserMessage::Restoration(Box::new(inner));
+                if !approved(&p, rng, &mut *consent, &mut out) {
+                    decline(id, &format!("{grant:?}"), &mut out);
+                    continue;
+                }
+                eprintln!(
+                    "stub: {id} {grant:?} -> approved on the randomised digit read off the glass"
+                );
+                match session.confirm(p, rng, &mut out) {
+                    Ok(more) => prompts.extend(more),
+                    Err(e) => die(2, &format!("confirm({grant:?}, {id}): {e:?}")),
+                }
+                let sheet = paper.entry(id).or_default();
+                match grant {
+                    // M7b. Nothing is on the wire until the last page has been drawn
+                    // and the recorded question answered — that is what
+                    // `Session::backup_recorded`'s `record_pending` gate means.
+                    Grant::Reveal => reveal(session, rng, &mut out, sheet),
+                    // M7c. Answered ONLY from what M7b's reveal showed.
+                    Grant::Check => {
+                        let answers = check_quiz(session, rng, &mut out, sheet);
+                        if let Err(e) = out.push(DeviceSendBody::Debug {
+                            message: format!("quiz={answers}"),
+                        }) {
+                            die(2, &format!("Debug(quiz) refused by framing: {e:?}"));
+                        }
+                    }
+                    // M7d. `entry_key` sends `PhysicalEntered` itself, and only when
+                    // 25 words pass their checksum.
+                    Grant::Enter => {
+                        let (presses, more) = type_backup(session, rng, &mut out, sheet);
+                        eprintln!(
+                            "stub: {id} typed all {} words back in through the letter picker in \
+                             {presses} presses",
+                            ui::BACKUP_WORDS
+                        );
+                        if let Err(e) = out.push(DeviceSendBody::Debug {
+                            message: format!("typed={presses}"),
+                        }) {
+                            die(2, &format!("Debug(typed) refused by framing: {e:?}"));
+                        }
+                        prompts.extend(more);
+                    }
+                    // M7e. `confirm_at` -> `finish_consolidation` -> `run` has already
+                    // persisted the keygen triple and put `FinishedConsolidation` in
+                    // the outbox. Nothing lands on the glass, so there is no walk.
+                    Grant::Consolidate => eprintln!(
+                        "stub: {id} CONSOLIDATED -- the typed share REPLACED the stored record"
+                    ),
+                    Grant::Nothing => {}
                 }
             }
             // Debug is not derived on every inner phase type, so no {other:?}.
@@ -790,6 +1497,10 @@ fn main() {
     let digest = synthetic_digest();
     let mut saved: BTreeMap<DeviceId, AccessStructureRef> = BTreeMap::new();
     let mut announced_save = false;
+    // THE PAPER. Outside the restart on purpose: it is filled by M7b's reveal, which
+    // happens long after it, and it must survive between the four restoration flows
+    // because the quiz and the letter picker are answered from it. See [`Sheet`].
+    let mut paper: BTreeMap<DeviceId, Sheet> = BTreeMap::new();
 
     // THE SCRIPTED GATE'S CONSENT, and the default is the automated gate's: press
     // whatever the SCREEN advertises.
@@ -809,12 +1520,16 @@ fn main() {
     // digit reliably (`9` never can).
     let keys = glass_keys();
     eprintln!(
-        "stub: consent keys = {keys:?} (y = press what the glass advertises; anything else is \
-         that literal key, whatever the screen says)"
+        "stub: consent keys = {keys:?} <CheckKeyGen><SignatureRequest><Restoration> (y = press \
+         what the glass advertises; anything else is that literal key, whatever the screen says)"
     );
     let mut consent = |prompt: &DeviceToUserMessage, frame: &ui::Frame| -> u8 {
         let scripted = match prompt {
             DeviceToUserMessage::CheckKeyGen { .. } => keys.as_bytes().first(),
+            // The four M7 restoration screens share the third slot. See `glass_keys`:
+            // `COLDSNAP_GLASS_KEYS=yy9` is what demonstrates that no hardcoded key can
+            // authorise a reveal, an ingest or a consolidation.
+            DeviceToUserMessage::Restoration(_) => keys.as_bytes().get(2),
             _ => keys.as_bytes().get(1),
         };
         match scripted.copied().unwrap_or(b'y') {
@@ -917,6 +1632,7 @@ fn main() {
                                 &mut consent,
                                 &mut wire,
                                 &mut saved,
+                                &mut paper,
                             );
                         }
                     }
