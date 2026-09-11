@@ -1673,21 +1673,59 @@ fn refuse_if_stale(stub: &str) -> Result<()> {
             }
         }
     };
-    // Only what the stub is actually BUILT FROM. Scanning all of
-    // `firmware/examples/` was wrong and made this refuse forever: a sibling example
-    // like `simulator.rs` is not a dependency of the stub, so cargo correctly does not
-    // relink the stub when it changes, its mtime stays put, and the check then blocks
-    // the harness with nothing to rebuild. Narrow beats loud — an over-strict staleness
-    // check that cannot be satisfied gets disabled by whoever hits it next, which costs
-    // the real protection.
-    for dir in ["../firmware/src", "../hal/src"] {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for e in entries.flatten() {
-                consider(e.path());
+    // CARGO'S OWN ANSWER, not a guess at which directories matter: the depfile beside
+    // the artifact lists every source that went into it. Guessing was wrong in BOTH
+    // directions, and both were live on 2026-09-11:
+    //
+    //  - FAIL-CLOSED BUT UNSATISFIABLE. The scan walked all of `../firmware/src`, which
+    //    includes `main.rs` — the ARM bin. No example links it (`stub.d` does not list
+    //    it), so cargo correctly does not relink the stub when it changes, its mtime
+    //    stays put, and the check then refuses with NOTHING TO REBUILD. Editing one doc
+    //    comment in `main.rs` blocked this harness. That is the same defect the comment
+    //    here already described for `firmware/examples/simulator.rs` and fixed by
+    //    narrowing to two directories — narrowing to the wrong two.
+    //  - FAIL-OPEN, AND THIS ONE IS THE EXPENSIVE DIRECTION. It never looked at
+    //    `../vendor/` at all. The stub has **37 vendored source dependencies** of its 56
+    //    total, `frost_backup/src/share_backup.rs` among them — which is the exact code
+    //    M7b's share-image assertion rests on. Editing a vendored source and not
+    //    rebuilding produced a GREEN run certifying code that is not in the binary,
+    //    which is precisely what this function's own doc calls "the most expensive kind".
+    //
+    // The depfile is one line, `<artifact>: <src> <src> ...`, absolute paths. It is
+    // written by cargo at build time and lists the sources of the artifact that is
+    // actually there, so it cannot disagree with the binary being run.
+    //
+    // ponytail: ceiling named. Cargo escapes a space in a path as `\ ` and this splits on
+    // whitespace, so a repo checked out under a path containing a space would silently
+    // consider two half-paths, both unreadable, both SKIPPED — i.e. it degrades to the
+    // `WARNING ... UNCHECKED` case rather than to a false pass. Upgrade path is a real
+    // unescape; not worth it until someone has such a path.
+    let depfile = format!("{stub}.d");
+    match std::fs::read_to_string(&depfile) {
+        Ok(text) => {
+            let deps = text.split_once(':').map_or("", |(_, rest)| rest);
+            for dep in deps.split_whitespace() {
+                consider(std::path::PathBuf::from(dep));
             }
         }
+        // No depfile: fall back to the old directory scan. Over-strict beats blind —
+        // this is the fail-closed direction, and the `main.rs` false refusal it can
+        // still produce is recoverable by a human, where a missed vendored edit is not.
+        Err(_) => {
+            eprintln!(
+                "hostcheck: WARNING no depfile at {depfile}; falling back to a directory \
+                 scan, which does NOT cover ../vendor/"
+            );
+            for dir in ["../firmware/src", "../hal/src"] {
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for e in entries.flatten() {
+                        consider(e.path());
+                    }
+                }
+            }
+            consider(std::path::PathBuf::from("../firmware/examples/stub.rs"));
+        }
     }
-    consider(std::path::PathBuf::from("../firmware/examples/stub.rs"));
     if let Some((t, which)) = newest {
         if t > built {
             bail!(
