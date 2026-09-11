@@ -853,6 +853,22 @@ fn ui_scenes() -> Vec<Scene> {
         .expect("p2tr has an address form")
         .to_string();
 
+    // THE KEYGEN CHECK'S CONFIRM DIGIT, AND IT HAS TO BE THE SAME BYTE IN EVERY
+    // PROCESS. `ui::keygen_check` stopped printing a fixed `1=match` on 2026-09-11 and
+    // now prints a randomised `ui::ConfirmDigit` like every other consent screen, so
+    // this fixture needs one — and `tools/pixel-check.py` picks scene "2 keygen check"
+    // BY NAME and spawns this binary **three times** (menu, terminal art, display fd),
+    // comparing frames across those processes. A digit that varied per process would
+    // fail that gate on the legend row alone.
+    //
+    // Drawn through the real `ConfirmDigit::draw` off the same deterministic
+    // `entropy` seam the rest of this file uses, with a salt of its own so it does not
+    // consume from the noise stream below. NOT a constructor and NOT a cfg-gated
+    // bypass: `ConfirmDigit`'s field is private and `draw` is its only constructor
+    // precisely so no out-of-crate caller can forge one, and a fixture is not a good
+    // enough reason to open that.
+    let keygen_fix = ui::ConfirmDigit::draw(&mut entropy(0x2c));
+
     let mut scenes = vec![
         // -- screen 1 -------------------------------------------------------
         Scene::shown(
@@ -879,12 +895,28 @@ fn ui_scenes() -> Vec<Scene> {
             "real ui::keygen_check; the 4 bytes would be the first 4 of a real \
              KeyGenPhase3 session hash, which needs a coordinator",
             vec![
-                frame(|f| ui::keygen_check(f, 2, 3, [0xde, 0xad, 0xbe, 0xef], "family funds")),
                 frame(|f| {
-                    ui::keygen_check(f, 15, 15, [0x00, 0x0f, 0xf0, 0xff], "fifteen of fifteen")
+                    ui::keygen_check(f, 2, 3, [0xde, 0xad, 0xbe, 0xef], "family funds", keygen_fix)
                 }),
                 frame(|f| {
-                    ui::keygen_check(f, 1, 2, [0x12, 0x34, 0x56, 0x78], "\u{fc}nicode key name")
+                    ui::keygen_check(
+                        f,
+                        15,
+                        15,
+                        [0x00, 0x0f, 0xf0, 0xff],
+                        "fifteen of fifteen",
+                        keygen_fix,
+                    )
+                }),
+                frame(|f| {
+                    ui::keygen_check(
+                        f,
+                        1,
+                        2,
+                        [0x12, 0x34, 0x56, 0x78],
+                        "\u{fc}nicode key name",
+                        keygen_fix,
+                    )
                 }),
             ],
         ),

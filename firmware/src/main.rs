@@ -201,44 +201,25 @@ use frostsnap_core::device::{restoration::ToUserRestoration, DeviceToUserMessage
 // them. The only thing left ARM-only is reading a register.
 // ---------------------------------------------------------------------------
 
-/// The key [`ui::keygen_check`](coldsnap_hal::ui::keygen_check)'s legend asks
-/// for.
-///
-/// That screen prints a literal `"1=match x=no"` (`hal/src/ui.rs:833`) and **not**
-/// a [`ui::ConfirmDigit`]: the randomised digit belongs to the two screens that
-/// authorise a *signature*, which was the pre-existing split in
-/// [`prompt_screen`](coldsnap_firmware::prompt_screen) and is deliberate.
-///
-/// So this is the one fact about a screen that is spelled twice in this tree, and
-/// the duplicate is the lesser evil. Demanding the digit here instead would
-/// refuse four honest keygens in five while the glass says `1` — a legend that
-/// lies, which is the failure mode the randomised digit exists to remove. The day
-/// `keygen_check` prints a `ConfirmDigit`, delete this constant and the arm of
-/// [`answer`] that reads it; nothing else changes.
-///
-/// Not a guess, and not only mine: `firmware/examples/stub.rs:493-499` reached the
-/// same two arms independently (`CheckKeyGen => key == b'1'`,
-/// `SignatureRequest => digit.accepts(key)`), and `hostcheck` drives them over a
-/// pty against a real coordinator through a 9-of-9 keygen and a signature that
-/// verifies. That is the closest thing this tree has to a bench for the arm below.
-/// It also means the fact is now spelled in three places (`ui::keygen_check` draws
-/// it, the stub checks it, this checks it), which is two too many: the right home
-/// is one function beside `prompt_screen` in `firmware/src/lib.rs` that all three
-/// call. That file is not mine to edit today.
-const KEYGEN_MATCH_KEY: u8 = b'1';
-
 /// The pad half of the paging-key claim, as a **build failure** rather than a test.
 ///
 /// `hal::ui` already asserts that neither paging key is in `CONFIRM_CHARSET`
-/// (`hal/src/ui.rs:881-903`) but it is a pure module and cannot see the decode
-/// table, and it does not know about [`KEYGEN_MATCH_KEY`] — which is the *other*
-/// key [`answer`] accepts. Both halves belong wherever the two are visible
-/// together, which is here.
+/// (`hal/src/ui.rs:1113-1123`) but it is a pure module and cannot see the decode
+/// table, so the pad half belongs wherever the two are visible together, which is
+/// here.
 ///
 /// If [`ui::NEXT_KEY`] were not on the pad, the advance arm would be dead code and
-/// a multi-page transaction would be unreachable past page 0. If it collided with
-/// [`KEYGEN_MATCH_KEY`], turning a page and matching a keygen code would be the
-/// same press. Both inputs are `const`, so neither has to be a test.
+/// a multi-page transaction would be unreachable past page 0. The input is `const`,
+/// so this does not have to be a test.
+///
+/// # This block asserted a second thing until 2026-09-11
+///
+/// `ui::NEXT_KEY != KEYGEN_MATCH_KEY` — because [`answer`] used to accept a FIXED
+/// `b'1'` on the keygen check screen, a byte `hal::ui` knew nothing about, so the
+/// charset assert over there could not cover it. `ui::keygen_check` now prints a
+/// [`ui::ConfirmDigit`] like every other consent screen, the constant is gone, and
+/// the claim is subsumed by `hal`'s own `CONFIRM_CHARSET[i] != NEXT_KEY`: there is
+/// no longer any key a screen can ask for that is not in that charset.
 const _: () = {
     let mut on_the_pad = false;
     let mut i = 0;
@@ -249,10 +230,6 @@ const _: () = {
         i += 1;
     }
     assert!(on_the_pad, "the advance key is not a key this pad can send");
-    assert!(
-        ui::NEXT_KEY != KEYGEN_MATCH_KEY,
-        "the advance key must not also match a keygen code"
-    );
 };
 
 /// What the pad said about the prompt currently on the glass.
@@ -348,6 +325,27 @@ enum Consent<'a> {
     /// A coordinator prompt and the digit its screen printed. [`Answer::Yes`] here
     /// is the one route to
     /// [`Session::confirm_at`](coldsnap_firmware::Session::confirm_at).
+    ///
+    /// The prompt is a **construction-site obligation, not a value [`answer`]
+    /// reads** — and since 2026-09-11 nothing reads it, because that was the day the
+    /// keygen check stopped having a key of its own and `answer` stopped matching on
+    /// the prompt kind at all. It stays, and `#[expect]` rather than `#[allow]`, for
+    /// two reasons. Dropping it would make this variant structurally identical to
+    /// [`Consent::Question`] — one `ConfirmDigit` each — and the direction that
+    /// matters is that a `Prompt` could then be built with no prompt in hand, which is
+    /// precisely the value whose [`Answer::Yes`] is the one route to `confirm_at`.
+    /// (The converse confusion is NOT prevented either way: naming the wrong variant
+    /// compiles whichever shape they have. Only "you may not claim a prompt you do not
+    /// hold" is enforced here.) And `#[expect]` rather than `#[allow]` fires if the
+    /// field ever IS read, which is the direction worth being told about: a per-prompt
+    /// key rule is exactly what this change removed. MEASURED: reading it warns
+    /// `this lint expectation is unfulfilled` on the release ARM build, and 0 warnings
+    /// is a gate, so the marker cannot rot into an `#[allow]`.
+    #[expect(
+        dead_code,
+        reason = "type-level: only this variant can be built from a prompt, so it \
+                  cannot be confused with Consent::Question"
+    )]
     Prompt(&'a DeviceToUserMessage, ui::ConfirmDigit),
     /// A question this DEVICE is asking, and the digit its screen printed. There is
     /// no prompt, so [`Answer::Yes`] cannot reach `confirm_at` at all — it can only
@@ -463,9 +461,11 @@ enum Consent<'a> {
 /// clamps page-down with `min()`), so an over-press at the end of a 67-page
 /// transaction costs nothing instead of killing a ceremony the coordinator would
 /// have to re-issue. It cannot fail open: `Wait` authorises nothing, and
-/// `NEXT_KEY` is const-asserted out of `CONFIRM_CHARSET` (`hal/src/ui.rs:891-902`)
-/// and off [`KEYGEN_MATCH_KEY`] (above), so it is not a key any screen can ask
-/// for.
+/// `NEXT_KEY` is const-asserted out of `CONFIRM_CHARSET`
+/// (`hal/src/ui.rs:1113-1123`), and since 2026-09-11 that charset is the WHOLE set
+/// of keys a screen can ask for — the keygen check's fixed `b'1'` was the one
+/// exception and it is gone — so `NEXT_KEY` is not a key any screen can ask for.
+/// This used to add "and off `KEYGEN_MATCH_KEY` (above)" because of that exception.
 fn answer(
     event: Result<keypad::Event, keypad::KeypadError>,
     consent: Consent<'_>,
@@ -546,25 +546,30 @@ fn answer(
                     Answer::No
                 }
             }
-            Consent::Prompt(prompt, confirm) => {
-                let asked_for = match prompt {
-                    // The screen for this one prints `1=match x=no`. See
-                    // [`KEYGEN_MATCH_KEY`].
-                    DeviceToUserMessage::CheckKeyGen { .. } => key == KEYGEN_MATCH_KEY,
-                    // Every other prompt that got as far as being parked printed the
-                    // randomised digit, so the digit is the only key that authorises
-                    // it. `accepts`, not a comparison spelled here: the value that
-                    // was RENDERED and the value that is ACCEPTED are the same
-                    // `ConfirmDigit`, so they cannot disagree.
-                    //
-                    // A non-consent prompt cannot reach this line — `draw_batch`
-                    // parks only what `prompt_screen_at` drew a `Shown::Page` for, and
-                    // `last` being true narrows that to the page that printed the digit
-                    // — and if one somehow did, `Session::confirm_at` refuses it with
-                    // `Fault::NotConfirmable`. Two gates, both fail-closed.
-                    _ => confirm.accepts(key),
-                };
-                if asked_for {
+            // EVERY prompt that got as far as being parked printed the randomised
+            // digit, so the digit is the only key that authorises it. `accepts`, not a
+            // comparison spelled here: the value that was RENDERED and the value that
+            // is ACCEPTED are the same `ConfirmDigit`, so they cannot disagree.
+            //
+            // A non-consent prompt cannot reach this line — `draw_batch` parks only
+            // what `prompt_screen_at` drew a `Shown::Page` for, and `last` being true
+            // narrows that to the page that printed the digit — and if one somehow
+            // did, `Session::confirm_at` refuses it with `Fault::NotConfirmable`. Two
+            // gates, both fail-closed.
+            //
+            // THE PROMPT IS NOT LOOKED AT, and that is the change of 2026-09-11. This
+            // was a `match prompt` whose `CheckKeyGen` arm read `key ==
+            // KEYGEN_MATCH_KEY`, a fixed `b'1'`, because `ui::keygen_check` printed a
+            // fixed `1=match` legend. That made the ANTI-MITM screen — the one screen
+            // whose whole purpose is that a human read four bytes off it — the one a
+            // hardcoded script could answer blind. `keygen_check` now prints the same
+            // `ConfirmDigit` this arm already held, so there is nothing left to
+            // special-case and no per-prompt rule to drift: one screen kind, one key.
+            // `the_keygen_prompt_is_answered_by_the_same_rule_as_every_other_prompt`
+            // pins the absence, because the arm itself is unreachable from a test (a
+            // `CheckKeyGen` needs a `KeyGenPhase3`, which needs a coordinator).
+            Consent::Prompt(_, confirm) => {
+                if confirm.accepts(key) {
                     Answer::Yes
                 } else {
                     Answer::No
@@ -2750,16 +2755,19 @@ mod tests {
         }
     }
 
-    /// A prompt that is NOT `CheckKeyGen`, so [`answer`] takes its digit arm —
-    /// the one the two signing screens use and the one that must be exact.
+    /// A prompt that reaches [`answer`]'s digit arm — since 2026-09-11 the ONLY arm
+    /// [`Consent::Prompt`] has, and the one that must be exact.
     ///
-    /// It has to be this variant: `CheckKeyGen` and `SignatureRequest` both wrap
-    /// a phase whose only constructor is a real coordinator, and
+    /// It has to be a variant like this one: `CheckKeyGen` and `SignatureRequest`
+    /// both wrap a phase whose only constructor is a real coordinator, and
     /// `frostsnap_core/coordinator` is deliberately not in this test gate's
-    /// feature set (it drags a C SQLite build — see `firmware/Cargo.toml`). The
-    /// arm that cannot be exercised from a test is therefore the *keygen* one,
-    /// and that arm is a comparison against a constant; the arm that carries the
-    /// randomised digit is the one covered here.
+    /// feature set (it drags a C SQLite build — see `firmware/Cargo.toml`). That
+    /// used to matter, because the keygen prompt had an arm of its own comparing a
+    /// fixed constant, and it was the arm no test could reach. It has none now:
+    /// `answer` does not bind the prompt under `Consent::Prompt` at all, so whatever
+    /// variant this returns exercises the same three lines every prompt gets —
+    /// which is what `the_keygen_prompt_is_answered_by_the_same_rule_as_every_other_prompt`
+    /// pins as source.
     fn signing_shaped() -> DeviceToUserMessage {
         DeviceToUserMessage::FinalizeKeyGen {
             key_name: String::from("k"),
@@ -2969,24 +2977,42 @@ mod tests {
         }
     }
 
-    /// `KEYGEN_MATCH_KEY` is the byte `ui::keygen_check`'s legend actually prints,
-    /// and it is a key this pad has.
+    /// **THE ANTI-MITM SCREEN HAS NO SPECIAL KEY.** `answer` under
+    /// `Consent::Prompt` does not look at the prompt at all.
     ///
-    /// The keygen arm of `answer` cannot be reached from a test (no coordinator,
-    /// so no `KeyGenPhase3`), so this pins the constant instead — including the
-    /// part that would silently break it: `1` must be on the pad at all.
+    /// This test replaces `the_keygen_match_key_is_the_legend_and_is_on_the_pad`,
+    /// which asserted `KEYGEN_MATCH_KEY == b'1'` and that `1` was on the pad. That
+    /// constant is gone: `ui::keygen_check` printed a fixed `1=match x=no` until
+    /// 2026-09-11, so a hardcoded script could clear the ONE screen whose entire
+    /// purpose is that a human read four bytes off it and compared them aloud.
+    ///
+    /// Source-pinned rather than driven, and for the same reason the old test was:
+    /// the keygen arm cannot be reached from a test (a `CheckKeyGen` carries a
+    /// `KeyGenPhase3` whose only constructor is a real coordinator, and
+    /// `frostsnap_core/coordinator` is deliberately out of this gate's feature set).
+    /// The same device is driven end to end by `hostcheck` over a pty, where
+    /// `COLDSNAP_GLASS_KEYS=1yy` — a script pressing a literal `1` at the keygen
+    /// check — fails with no source mutation at all. What a test CAN do is refuse to
+    /// let the special case come back, which is what this is.
     #[test]
-    fn the_keygen_match_key_is_the_legend_and_is_on_the_pad() {
-        assert_eq!(
-            KEYGEN_MATCH_KEY, b'1',
-            "hal/src/ui.rs:833, \"1=match x=no\""
-        );
+    fn the_keygen_prompt_is_answered_by_the_same_rule_as_every_other_prompt() {
+        let src = production_source();
+        // `_`, not a binding, is the whole assertion: a per-screen key needs the
+        // prompt, and this arm does not have it. Behaviour is covered by
+        // `only_the_rendered_digit_confirms`, which drives this very arm over all 256
+        // bytes; what a behavioural test cannot see is a `CheckKeyGen` special case
+        // added back for a variant no test can construct.
         assert!(
-            DECODER.contains(&KEYGEN_MATCH_KEY),
-            "the keygen screen asks for a key the pad cannot send"
+            src.contains("Consent::Prompt(_, confirm) => {"),
+            "the prompt arm must not bind the prompt: a `match prompt` here is how a \
+             per-screen key gets back in, and the keygen check is the screen it got in on"
         );
-        assert_ne!(KEYGEN_MATCH_KEY, KEY_CANCEL, "match must not be cancel");
-        assert_ne!(KEYGEN_MATCH_KEY, KEY_OK);
+        // The constant itself, by definition site. One that nothing reads would be
+        // harmless; one that something reads is this defect returning.
+        assert!(
+            !src.contains("const KEYGEN_MATCH_KEY"),
+            "the fixed keygen key is back; ui::keygen_check prints a ConfirmDigit"
+        );
     }
 
     /// **The page rule.** On a page that is not the last of its set, NOTHING
@@ -3062,10 +3088,12 @@ mod tests {
             Answer::Wait,
             "the last page has nowhere to advance to"
         );
-        // Never a confirmation, on either page. The const assert above this
-        // module's `answer` is the build-time half of the same claim.
+        // Never a confirmation, on either page. `hal`'s own const assert beside
+        // `CONFIRM_CHARSET` is the build-time half of the same claim, and since
+        // 2026-09-11 it is the WHOLE claim: this line was followed by
+        // `assert_ne!(NEXT_KEY, KEYGEN_MATCH_KEY)` while the keygen check accepted a
+        // fixed `b'1'` outside the charset. There is no such key any more.
         assert!(!CONFIRM_CHARSET.contains(&NEXT_KEY));
-        assert_ne!(NEXT_KEY, KEYGEN_MATCH_KEY);
     }
 
     /// `ui::BACK_KEY` is **not** a hidden command on a prompt. No prompt footer

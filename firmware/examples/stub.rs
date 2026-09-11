@@ -243,8 +243,9 @@ fn timeout_scale() -> u32 {
 ///
 /// Three characters, `<CheckKeyGen><SignatureRequest><Restoration>`:
 ///  - `y` — press whatever the GLASS advertises, read back out of the rendered
-///    pixels by [`advertised_key`]. The ONLY way to answer a signing screen
-///    correctly, because step 0 made that digit random.
+///    pixels by [`advertised_key`]. The ONLY way to answer ANY of the three
+///    correctly, because every one of them now prints a randomised digit — the
+///    keygen check joined them on 2026-09-11.
 ///  - anything else — press THAT byte, whatever the screen says. `x` declines; `9`
 ///    is a wrong digit (not in `ui::CONFIRM_CHARSET`, so it is *always* a
 ///    refusal), which is how a hardcoded-key script is demonstrated to fail.
@@ -267,11 +268,22 @@ fn timeout_scale() -> u32 {
 /// nonzero exit. That is the whole demonstration; a slot per screen would buy four
 /// identical ones.
 ///
+/// # The FIRST slot became a real demonstration on 2026-09-11
+///
+/// `ui::keygen_check` printed a fixed `1=match x=no` until then, and [`approved`]'s
+/// keygen arm compared `key == b'1'`. So `COLDSNAP_GLASS_KEYS=1yy` **passed**: the
+/// anti-MITM screen was the one consent screen in this tree a hardcoded script could
+/// clear, which is precisely backwards, because it is the screen whose whole purpose
+/// is that a human read four bytes off it and compared them aloud on every device.
+/// That screen now prints a randomised digit like all the others, so `1yy` fails and
+/// `=9yy` fails — `9` is never in the charset, and `1` is the drawn digit on at most
+/// one device in five, so over `N_DEVICES` devices a literal cannot carry a run.
+///
 /// LIVE-GLASS-PLAN §6 wrote this as `COLDSNAP_GLASS_KEYS=11`. That is no longer
 /// expressible and the reason is the point of the whole step: with a randomised
-/// digit there IS no fixed byte that authorises a signature. `y` is what "press
-/// the confirm key" has to mean now, and it can only be answered by reading the
-/// screen.
+/// digit there IS no fixed byte that authorises anything on this device. `y` is what
+/// "press the confirm key" has to mean now, and it can only be answered by reading
+/// the screen.
 fn glass_keys() -> String {
     std::env::var("COLDSNAP_GLASS_KEYS").unwrap_or_else(|_| "yyy".into())
 }
@@ -431,8 +443,8 @@ type Consent<'a> = &'a mut dyn FnMut(&DeviceToUserMessage, &ui::Frame) -> u8;
 const PRESS: &[u8] = b"Press (";
 
 /// The key the LAST ROW of `frame` advertises as its yes: the digit inside
-/// `Press (n)`, or the `1` of `1=match`. `None` when the screen advertises no yes
-/// key at all — which is a screen nothing may consent to.
+/// `Press (n)`. `None` when the screen advertises no yes key at all — which is a
+/// screen nothing may consent to.
 ///
 /// This reads the digit **off the pixels**, and it is the cheapest always-approve
 /// closure that can exist rather than an early down-payment on step 4: with a
@@ -442,9 +454,30 @@ const PRESS: &[u8] = b"Press (";
 /// font match, so nothing here re-implements the font — an independent second
 /// copy of that mapping would be a second thing to keep in sync.
 ///
-/// Both consent legends live on the last row and there are only two forms:
-/// `keygen_check` prints `1=match x=no`, `sign_test_message_confirm` prints
-/// `Press (n) x=no`.
+/// # There is now ONE consent legend, and the second recognizer below is unreached
+///
+/// Every consent screen in `hal::ui` composes its footer from the one private
+/// `press_legend`, so the `Press (n) x=no` branch is the only branch that fires
+/// today. It was two forms until 2026-09-11: `keygen_check` printed a fixed
+/// `1=match x=no`, and the `<key>=<what>` branch below existed FOR it.
+///
+/// **The `<key>=<what>` branch is KEPT, deliberately, and it is not dead
+/// scaffolding.** It is the recognizer four legends in `hal/src/ui.rs` are shaped to
+/// avoid — `NEXT_LEGEND` (`(9)next`, not `9=next`), `BACKUP_NEXT_LEGEND`,
+/// `BACKUP_BACK_LEGEND` and `PIN_FOOTER` — with the reason spelled out at each of
+/// them and enforced by a named test,
+/// `no_pin_screen_advertises_a_consent_key_to_the_stub_scraper`. Those decisions are
+/// live: retiring the recognizer would silently retire their reason, and the next
+/// person to write `9=next` on a page that cannot consent would have nothing telling
+/// them not to. It costs three lines and cannot fail open — a screen it matched by
+/// mistake yields a key `ConfirmDigit::accepts` refuses, i.e. a decline, i.e. a
+/// failed run.
+///
+/// It also cannot re-open the hole it used to serve. If `keygen_check` ever went
+/// back to `1=match`, this would find `1` and [`approved`] would hand it to
+/// `digit.accepts`, which is true for one drawn digit in five per device — so a
+/// nine-device `hostcheck` run fails at 1 - 5^-9. The fixed legend is refused by the
+/// acceptance rule now, not by the scraper.
 fn advertised_key(frame: &ui::Frame) -> Option<u8> {
     let row: Vec<u8> = (0..ui::COLS)
         .map(|col| frame.cell(col, ui::ROWS - 1).map_or(b' ', |(ch, _)| ch))
@@ -452,7 +485,9 @@ fn advertised_key(frame: &ui::Frame) -> Option<u8> {
     if let Some(i) = row.windows(PRESS.len()).position(|w| w == PRESS) {
         return row.get(i + PRESS.len()).copied();
     }
-    // `<key>=<what it does>`, the plain-press legend.
+    // `<key>=<what it does>`, the plain-press legend. UNREACHED since `keygen_check`
+    // started printing a `ConfirmDigit`; kept because it is the shape four `hal::ui`
+    // legends are deliberately NOT written in. See the doc above.
     if row.get(1) == Some(&b'=') {
         return row.first().copied();
     }
@@ -1098,11 +1133,15 @@ fn approved(
     }
     let key = consent(prompt, &frame);
     match prompt {
-        // `keygen_check` advertises `1=match`, NOT a digit: the stronger gesture
-        // belongs on the screens that authorise a signature (`prompt_screen`'s
-        // doc). Accepting the digit here would accept a key the screen never
-        // showed.
-        DeviceToUserMessage::CheckKeyGen { .. } => key == b'1',
+        // THE ANTI-MITM SCREEN, and as of 2026-09-11 it is gated exactly like the
+        // signing one. This arm read `key == b'1'` because `ui::keygen_check` printed a
+        // fixed `1=match x=no`; that made this the ONE consent screen in the tree a
+        // hardcoded script could clear, on the one screen whose entire purpose is that
+        // a human read four bytes off it and said them out loud. `keygen_check` now
+        // prints the same randomised `ui::ConfirmDigit` drawn above, so only the digit
+        // that is ON THE SCREEN acks — and `COLDSNAP_GLASS_KEYS=1yy`, which used to
+        // PASS, now fails with no source mutation at all.
+        DeviceToUserMessage::CheckKeyGen { .. } => digit.accepts(key),
         // FAIL CLOSED — `hsm_ux.py:58`'s `refused = (ch != confirm_char)`,
         // inverted. Only the digit that is ON THE SCREEN signs; `x`, another
         // charset digit and a key that is not on the pad are all refusals.
@@ -1323,14 +1362,18 @@ fn drive(
                 if !approved(&p, rng, &mut *consent, &mut out) {
                     decline(id, "CheckKeyGen", &mut out);
                 } else {
-                    // NOT an auto-ack: `approved` above required the key the screen
-                    // ADVERTISES, read back out of the rendered pixels. It is the
-                    // fixed `1=match` legend rather than a randomised digit, which is
-                    // the one respect in which this arm is weaker than the signing
-                    // one -- a hardcoded `1` would also answer it. Saying "auto-ack"
-                    // here is what put "the stub auto-acks" into PLAN.md and README
-                    // for weeks; do not put it back.
-                    eprintln!("stub: {id} CheckKeyGen -> approved on the key the glass advertises");
+                    // NOT an auto-ack, and as of 2026-09-11 not weaker than the signing
+                    // arm either: `approved` above required `digit.accepts(key)` against
+                    // a RANDOMISED `ui::ConfirmDigit`, read back out of the rendered
+                    // pixels. This note said the legend was "the fixed `1=match` ...
+                    // which is the one respect in which this arm is weaker than the
+                    // signing one -- a hardcoded `1` would also answer it". It no longer
+                    // is, and `COLDSNAP_GLASS_KEYS=1yy` is the demonstration. Saying
+                    // "auto-ack" here is what put "the stub auto-acks" into PLAN.md and
+                    // README for weeks; do not put that back either.
+                    eprintln!(
+                        "stub: {id} CheckKeyGen -> approved on the randomised digit read off the glass"
+                    );
                     match session.confirm(p, rng, &mut out) {
                         Ok(more) => prompts.extend(more),
                         Err(e) => die(2, &format!("confirm(CheckKeyGen, {id}): {e:?}")),

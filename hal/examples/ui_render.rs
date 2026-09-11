@@ -271,15 +271,35 @@ fn main() {
     );
 
     // --- screen 2: keygen check (anti-MITM) --------------------------------
-    ui::keygen_check(&mut f, 2, 3, [0xab, 0xcd, 0xef, 0x01], "family fund");
+    //
+    // The digit is drawn per fixture from `Counter`, exactly as `backup_recorded`'s
+    // page below does, so the catalogue stays byte-stable. This screen printed a
+    // FIXED `1=match` until 2026-09-11; it now prints the same randomised legend
+    // every other consent screen does, because a fixed key is one a script can press
+    // without reading the code it is supposed to be comparing.
+    ui::keygen_check(
+        &mut f,
+        2,
+        3,
+        [0xab, 0xcd, 0xef, 0x01],
+        "family fund",
+        ConfirmDigit::draw(&mut Counter(0)),
+    );
     out.emit(
         "2 keygen check — ordinary (SECURITY: anti-MITM)",
-        "2-of-3, code abcd ef01, key \"family fund\"",
+        "2-of-3, code abcd ef01, key \"family fund\", randomised confirm digit",
         "keygen-ordinary",
         &f,
     );
 
-    ui::keygen_check(&mut f, u16::MAX, u16::MAX, [0x00, 0x00, 0x00, 0x00], "\u{65e5}\u{672c}\u{8a9e}");
+    ui::keygen_check(
+        &mut f,
+        u16::MAX,
+        u16::MAX,
+        [0x00, 0x00, 0x00, 0x00],
+        "\u{65e5}\u{672c}\u{8a9e}",
+        ConfirmDigit::draw(&mut Counter(0)),
+    );
     out.emit(
         "2 keygen check — u16::MAX threshold, all-zero code, UTF-8 key name",
         "65535-of-65535 (14 of 16 cols), code 0000 0000, key \"<CJK x3>\"",

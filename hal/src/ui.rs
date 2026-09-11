@@ -945,7 +945,42 @@ pub fn keygen_code(code: [u8; 4]) -> Buf<9> {
 ///
 /// The instruction is drawn unconditionally and from a const, so removing it is
 /// a source edit that a named test catches rather than a configuration.
-pub fn keygen_check(frame: &mut Frame, threshold: u16, parties: u16, code: [u8; 4], key_name: &str) {
+///
+/// # Why this screen prints a [`ConfirmDigit`] like every other consent screen
+///
+/// It printed a fixed `"1=match x=no"` until 2026-09-11, and the argument for that
+/// was that "the stronger gesture belongs on the screens that authorise a
+/// signature". That argument was wrong, and wrong in the direction that matters: a
+/// FIXED byte means a script can answer the **anti-MITM** screen without reading
+/// it, and this is the screen whose whole job is to be read. It was the one consent
+/// screen on the device a hardcoded `1` could clear — `firmware/examples/stub.rs`
+/// demonstrates it, and `COLDSNAP_GLASS_KEYS=1yy` now fails there where it used to
+/// pass. There is no gesture *weaker* than a signature's here to justify a weaker
+/// key: a coordinator that lies about who is in the access structure is caught
+/// here or not at all.
+///
+/// So the last row is byte-for-byte the legend the other consent screens print,
+/// composed by the one private `press_legend` they all share, and the digit is the
+/// caller's — the same value it answers the keypress with. 14 columns of
+/// [`COLS`]'s 16, checked by
+/// [`keygen_check_renders_the_code_and_the_compare_instruction`](self).
+///
+/// # The 2x code rows are at fixed cells and must stay there
+///
+/// `((COLS - 8) / 2, 2)` and `((COLS - 8) / 2, 4)`.
+/// `firmware/examples/stub.rs`'s `glass_code` reads the four bytes back out of
+/// exactly those cells with [`Frame::cell_2x`] and puts them on the wire, where
+/// `hostcheck` compares them against the coordinator's own session-hash prefix.
+/// Moving either row does not break a layout, it breaks the only end-to-end
+/// assertion that the code on the GLASS is the coordinator's — PLAN.md §9 item 12.
+pub fn keygen_check(
+    frame: &mut Frame,
+    threshold: u16,
+    parties: u16,
+    code: [u8; 4],
+    key_name: &str,
+    confirm: ConfirmDigit,
+) {
     frame.clear();
     frame.text(0, 0, KEYGEN_COMPARE_1);
     frame.text(0, 1, KEYGEN_COMPARE_2);
@@ -979,7 +1014,14 @@ pub fn keygen_check(frame: &mut Frame, threshold: u16, parties: u16, code: [u8; 
         .push_str(" ");
     frame.text(0, 6, b.as_str());
     frame.text(b.as_str().chars().count().min(COLS), 6, key_name);
-    frame.text(0, 7, "1=match x=no");
+    // The shared consent legend, not a second wording of it: same `press_legend`,
+    // same ` x=no`, same `FOOTER_ROW` as `backup_recorded` and the last page of
+    // `SignPages`. A screen that worded it differently would be a screen
+    // `firmware/examples/stub.rs`'s `advertised_key` reads differently — and it is
+    // the only thing in the tree that can tell a human's press from a script's.
+    let mut legend = press_legend(confirm);
+    legend.push_str(" x=no");
+    frame.text(0, FOOTER_ROW, legend.as_str());
 }
 
 // ---------------------------------------------------------------------------
@@ -1158,8 +1200,21 @@ impl ConfirmDigit {
     }
 }
 
-/// `"Press (4)"` — the one place the confirm instruction is spelled, so the two
-/// signing screens cannot word it differently or print different digits.
+/// `"Press (4)"` — the one place the confirm instruction is spelled, so no consent
+/// screen can word it differently or print a different digit.
+///
+/// Every screen in THIS module that authorises anything goes through here:
+/// [`keygen_check`], [`sign_test_message_confirm`], [`SignPages`]'s last page,
+/// [`backup_recorded`] and `pin_last_try`. Said "the two signing screens" until
+/// 2026-09-11, which was the count on the day the digit landed and was already
+/// three short; `keygen_check` was the last one still spelling its own legend, and
+/// it spelled a FIXED key.
+///
+/// `firmware/src/lib.rs`'s `consent_screen` composes the same text by hand because
+/// this is private, and its own doc pins the wording against
+/// `sign_test_message_confirm`'s. That is the one copy, and it is deliberate: a
+/// `pub` legend builder is a legend an out-of-crate caller can compose without
+/// holding the digit it names.
 fn press_legend(confirm: ConfirmDigit) -> Buf<16> {
     let mut b = Buf::<16>::new();
     b.push_str("Press (")
@@ -3782,7 +3837,7 @@ mod tests {
         // The public path an out-of-crate gate uses: read the 2x keygen code back
         // out of the pixels one glyph at a time, no test helper involved.
         let mut f = Frame::new();
-        keygen_check(&mut f, 2, 3, [0xab, 0xcd, 0xef, 0x01], "wallet");
+        keygen_check(&mut f, 2, 3, [0xab, 0xcd, 0xef, 0x01], "wallet", confirm());
         let base = (COLS - 8) / 2;
         let read: Vec<u8> = [2usize, 4]
             .iter()
@@ -3805,8 +3860,9 @@ mod tests {
 
     #[test]
     fn keygen_check_renders_the_code_and_the_compare_instruction() {
+        let c = confirm();
         let mut f = Frame::new();
-        keygen_check(&mut f, 2, 3, [0xab, 0xcd, 0xef, 0x01], "wallet");
+        keygen_check(&mut f, 2, 3, [0xab, 0xcd, 0xef, 0x01], "wallet", c);
         let t = screen_text(&f);
         // The code is drawn at 2x per PLAN.md §4.2's FontLarge requirement, so it is
         // NOT in the 8x8 cell grid and `screen_text` cannot see it. Decode the 2x
@@ -3817,13 +3873,43 @@ mod tests {
         assert!(t.contains(KEYGEN_COMPARE_1), "no compare instruction: {t}");
         assert!(t.contains(KEYGEN_COMPARE_2), "no compare instruction: {t}");
         assert!(t.contains("2-of-3"), "no threshold: {t}");
+
+        // THE ANTI-MITM CONSENT GESTURE. This screen printed a FIXED `1=match` until
+        // 2026-09-11, which is a key a script can press without reading the glass —
+        // on the one screen whose entire purpose is to be read. It is now the shared
+        // randomised legend, byte-for-byte the one every other consent screen prints,
+        // and the byte-for-byte part is what `firmware/examples/stub.rs`'s
+        // `advertised_key` depends on to find the digit at all.
+        let mut want = press_legend(c);
+        want.push_str(" x=no");
+        assert_eq!(
+            row_text(&f, FOOTER_ROW),
+            want.as_str(),
+            "the anti-MITM screen must ask for the randomised digit, not a fixed key"
+        );
+        // 14 of 16 columns. Asserted rather than eyeballed: `Buf<16>` and
+        // `Frame::text` both truncate silently, so a longer legend would lose the
+        // `x=no` half — the refusal — without failing anything else.
+        assert_eq!(want.as_str().chars().count(), 14);
+        assert!(want.as_str().chars().count() <= COLS);
+        // And every drawable digit fits and lands in the same place, so the digit a
+        // caller happens to draw cannot be the one that clips.
+        for d in CONFIRM_CHARSET {
+            let c = ConfirmDigit::draw(&mut Counter(
+                CONFIRM_CHARSET.iter().position(|x| *x == d).unwrap() as u32,
+            ));
+            keygen_check(&mut f, 2, 3, [0xab, 0xcd, 0xef, 0x01], "wallet", c);
+            let row = row_text(&f, FOOTER_ROW);
+            assert!(row.contains(press_legend(c).as_str()), "{row}");
+            assert!(row.ends_with("x=no"), "no refusal on the row: {row}");
+        }
     }
 
     #[test]
     fn keygen_check_survives_a_hostile_key_name_and_extreme_threshold() {
         let mut f = Frame::new();
         let name: String = "\u{202e}".repeat(4096);
-        keygen_check(&mut f, u16::MAX, u16::MAX, [1, 2, 3, 4], &name);
+        keygen_check(&mut f, u16::MAX, u16::MAX, [1, 2, 3, 4], &name, confirm());
         let t = screen_text(&f);
         assert_eq!(text_2x_at(&f, (COLS - 8) / 2, 2, 4), "0102", "code high half");
         assert_eq!(text_2x_at(&f, (COLS - 8) / 2, 4, 4), "0304", "code low half");
@@ -5428,7 +5514,7 @@ mod tests {
         standby(&mut f, "coldsnap-01", "family fund", Some(2));
         show("1 standby", &f);
 
-        keygen_check(&mut f, 2, 3, [0xab, 0xcd, 0xef, 0x01], "family fund");
+        keygen_check(&mut f, 2, 3, [0xab, 0xcd, 0xef, 0x01], "family fund", confirm());
         show("2 keygen check", &f);
 
         let v = [(ADDR, 1_234_567u64), ("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2", 250_000u64)];

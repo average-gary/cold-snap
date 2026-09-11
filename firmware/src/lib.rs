@@ -2287,16 +2287,33 @@ fn sign_page(
 /// [`Session::confirm_at`] — so the screen that asks and the screen that shows are
 /// separated by a consent step that no caller can route around.
 ///
-/// `confirm` is the randomised digit the two **signing** screens print, drawn by
-/// the caller from its own RNG (on ARM `rng::Entropy`, never libngu — PLAN.md
-/// §1). One value flows from here into the legend, and the caller holds the same
-/// value to answer the keypress with
+/// `confirm` is the randomised digit **every** screen reached from here prints,
+/// drawn by the caller from its own RNG (on ARM `rng::Entropy`, never libngu —
+/// PLAN.md §1). One value flows from here into the legend, and the caller holds the
+/// same value to answer the keypress with
 /// [`ui::ConfirmDigit::accepts`](coldsnap_hal::ui::ConfirmDigit::accepts): the
 /// screen that DISPLAYS the digit and the logic that ACCEPTS it are the same
-/// `ConfirmDigit`, so they cannot disagree. `keygen_check` deliberately keeps its
-/// plain `1=match` — the stronger gesture belongs on the screens that authorise
-/// a signature, which was the pre-existing split and the only part of it that
-/// was wrong was that it asked for a *hold* the numpad cannot produce.
+/// `ConfirmDigit`, so they cannot disagree.
+///
+/// # `keygen_check` was the exception until 2026-09-11, and the split was wrong
+///
+/// This paragraph said `keygen_check` "deliberately keeps its plain `1=match`" and
+/// that "the stronger gesture belongs on the screens that authorise a signature,
+/// which was the pre-existing split". **That reasoning is withdrawn.** A FIXED byte
+/// means a script can answer the anti-MITM screen without reading it — and reading
+/// it is the entire defence, because comparing the four bytes aloud on every device
+/// is what catches a coordinator lying about who is in the access structure. It was
+/// the one consent screen on this device a hardcoded key could clear; every other
+/// one already demanded the digit. Ranking a signature above the keygen check
+/// mistook "how much money moves on this press" for "how much a script can fake",
+/// and it is the second measure that decides which key to ask for.
+///
+/// So `ui::keygen_check` now takes the same `confirm` this function already had in
+/// scope, prints `ui::press_legend`'s shared `Press (N) x=no`, and is answered by
+/// the same `accepts` as everything else — `main.rs`'s `answer` no longer has a
+/// keygen arm at all. Demonstrated with no source mutation:
+/// `COLDSNAP_GLASS_KEYS=1yy` in `hostcheck` used to PASS and now fails, because `1`
+/// is the drawn digit on at most one device in five.
 pub fn prompt_screen_at(
     frame: &mut ui::Frame,
     prompt: &DeviceToUserMessage,
@@ -2316,6 +2333,10 @@ pub fn prompt_screen_at(
                 parties,
                 [h[0], h[1], h[2], h[3]],
                 phase.key_name(),
+                // The digit this function was already handed. Nothing new is drawn
+                // here on purpose: the value on the glass has to be the value the
+                // caller answers with, and it is one `ConfirmDigit`.
+                confirm,
             );
             // One page, and the whole request is on it: `last` is what says "this
             // screen may authorise", and for a single-page screen that is page 0.
