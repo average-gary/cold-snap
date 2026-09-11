@@ -62,10 +62,37 @@
 //! `test-seam` both on, RNG seeded from fixed bytes. It bounds the budget; it does
 //! not flash anything.
 //!
-//! Run (release, because `overflow-checks` and `size_of::<Point>()` both differ in
-//! debug and release is what ships):
+//! RELEASE ONLY, AND THE EXAMPLE REFUSES TO RUN OTHERWISE (exit 2, before it prints
+//! a single row). `overflow-checks` and `size_of::<Point>()` both differ in debug,
+//! and release is what ships. A debug run does not measure a smaller margin, it
+//! measures a different arena: measured 2026-09-11 on this host, verbatim —
+//!
+//!   * `--release`: exit 0, `NULLS: 0`. Footprint high-water **60,512 B of 65,536
+//!     (5,024 B spare)**. Peak requested 54,496 B, largest single allocation
+//!     11,520 B.
+//!   * debug: exit 101, `NULLS: 4`, first in phase `keygen` requesting 2,304 B.
+//!     Footprint **65,048 B of 65,536 (488 B spare)**. Peak requested 61,148 B,
+//!     largest single 13,824 B.
+//!
+//! The two largest-single figures are consistent with one and the same vector of
+//! curve points — 11,520 = 96 x 120 B, 13,824 = 96 x 144 B — i.e. `Point` is 20%
+//! fatter in debug, which is where the 4,536 B of footprint gap comes from (derived
+//! from the figures above, not separately instrumented). That debug run was believed
+//! and reported as a live permanent-brick defect in this firmware. It is not one, and
+//! the cost of finding that out was a wrong severity-1 finding on a security-critical
+//! number — hence a refusal rather than a warning, and no override env var.
+//!
+//! The asymmetry only runs one way, which is why release is the figure to trust: on
+//! the real 32-bit device the per-block rounding overhead HALVES (16/8 min-block and
+//! round here, 8/4 there — the verdict block prints the difference), so the release
+//! host footprint is an upper bound on the device's. The debug footprint is neither
+//! conservative nor meaningful in either direction.
+//!
+//! Run (both features are mandatory — cargo refuses the target without them, which
+//! is why the older one-feature form in this doc did not work):
 //!   cargo run --release --target aarch64-apple-darwin -p coldsnap_firmware \
-//!       --features frostsnap_core/coordinator --example heap_session
+//!       --example heap_session \
+//!       --features="coldsnap_hal/test-seam,frostsnap_core/coordinator"
 //!
 //! Knobs: `HEAP_N` = group size (default 12, the declared envelope; t = n, which
 //! maximises per-device signing work), `HEAP_ROUNDS` = signing rounds (default 3 —
@@ -675,6 +702,33 @@ fn knob(name: &str, default: usize) -> usize {
 }
 
 fn main() {
+    // FIRST statement in the program on purpose: nothing below may print, because a
+    // partial debug trajectory reads exactly like a real brick and has already been
+    // believed once (module doc, 2026-09-11). A refusal, not a warning — a warning in
+    // a measurement tool is read as noise, and the number it would be hiding here is
+    // the one whose failure mode is unrecoverable. Exit 2, not the 101 an assert
+    // gives, so a caller can tell "wrong profile" from "the arena did not fit". No
+    // override env var: an escape hatch on this would be taken by the next person to
+    // hit it, which is the entire failure being fixed.
+    if cfg!(debug_assertions) {
+        eprintln!(
+            "heap_session: REFUSING to run under the debug profile — this measurement is only \
+             meaningful in release, which is what ships.\n  \
+             WHY: `secp256kfun`'s `Point` is larger in debug (144 B vs 120 B, derived from this \
+             example's own 2026-09-11 figures), so the arena over-fills and the NULLS a debug \
+             run reports are an artifact of the profile, NOT a defect in the firmware. \
+             Release: 60512 B footprint, 0 nulls. \
+             Debug: 65048 B, 4 nulls. On the 32-bit device the per-block rounding overhead \
+             halves, so the RELEASE figure is the conservative one; the debug figure is \
+             neither conservative nor meaningful.\n  \
+             FIX: re-run with --release:\n  \
+             cargo run --release --target aarch64-apple-darwin -p coldsnap_firmware \
+             --example heap_session \
+             --features=\"coldsnap_hal/test-seam,frostsnap_core/coordinator\""
+        );
+        std::process::exit(2);
+    }
+
     let n = knob("HEAP_N", 12).max(1);
     let rounds = knob("HEAP_ROUNDS", 3);
     let arena = knob("HEAP_ARENA", HEAP_BYTES);
