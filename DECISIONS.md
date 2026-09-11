@@ -204,8 +204,9 @@ rebase conflict surface, and to be deleted together with the `bitcoin` dep.
 **Decision.** Retain `bitcoin = "=0.32.8"`, features `["serde",
 "secp-lowmemory"]`.
 
-**Rationale.** 327,408 bytes **measured**, 23.0% of `FLASH_TEXT`, and it fits at
-59.2% total. It provides consensus-critical taproot sighash, which is the last
+**Rationale.** 327,408 bytes **measured** (re-confirmed unchanged 2026-09-10),
+23.0% of `FLASH_TEXT`, and it fits: **63.1%** as an rlib sum today, or 26.43% as the
+linked image. (This read "it fits at 59.2% total", the phase-0 figure.) It provides consensus-critical taproot sighash, which is the last
 thing worth reimplementing. `secp-lowmemory` already solved the flash problem
 that mattered — `ECMULT_WINDOW_SIZE=4`, `ECMULT_GEN_PREC_BITS=2`
 (`secp256k1-sys-0.10.1/build.rs:34-36`), shrinking the C library 92% from
@@ -240,9 +241,16 @@ there is no MicroPython in this design.
 material cost of the framing in `PLAN.md` §1. These are the substitutes that
 actually exist.
 
-**Consequences — what passes today (measured, this session).** 84 tests, but
-only with per-crate feature flags and a test allowlist. A plain
-`cargo test --workspace` does **not** compile.
+**Consequences — what passed when this decision was written (2026-08-12): 84 tests**,
+but only with per-crate feature flags and a test allowlist. A plain
+`cargo test --workspace` does **not** compile, and that part is still true.
+
+**The table below is the 2026-08-12 snapshot and is kept as such; it said "what passes
+today" until 2026-09-10, by which point every row had moved.** Current, re-verified
+2026-09-10: **565** = `coldsnap_hal` 284 + `coldsnap_firmware` 165 + vendored 116
+(`frostsnap_core` **63** across 13 targets, `frostsnap_comms` 10, `frostsnap_embedded`
+**17** with `--features std` / 15 without, `frost_backup` 19, `frostsnap_macros` 7).
+PLAN.md §7 Tier 1 is the maintained table; this one is history.
 
 | Crate | Invocation | Tests |
 |---|---|---|
@@ -335,12 +343,15 @@ it requires an SE1 checkmac against `KEYNUM_firmware` (`sdcard.c:248-251`;
 (`pins.c:1327`, gated on `PA_SUCCESSFUL` at `:1283-1286`). Installing a *new*
 build is PIN-gated; restoring the *same* build is not.
 
-### A HOLE, found 2026-08-20: this covers `panic!()` but NOT hardware faults
+### A HOLE, found 2026-08-20 and CLOSED: this covered `panic!()` but not hardware faults
 
 `hal/src/panic.rs` implements `#[panic_handler]`, so it catches `panic!()`,
-`assert!`, `unwrap` and arithmetic overflow traps. **It does not catch a HardFault,
-NMI, MemManage, BusFault or UsageFault**, because those are *exceptions*, not panics —
-and on this board, today, they do not reach any of our code at all.
+`assert!`, `unwrap` and arithmetic overflow traps. **On its own it does not catch a
+HardFault, NMI, MemManage, BusFault or UsageFault**, because those are *exceptions*,
+not panics. The paragraph below is the analysis that established that, and it ended
+"and on this board, today, they do not reach any of our code at all" — true when
+written, and no longer: the fix it prescribes has since shipped, see the Status note
+after it.
 
 The bootloader **never sets `SCB->VTOR`**. It is left at the reset value
 `0x0000_0000`, which aliases to the **bootloader's own** vector table, and every fault
@@ -362,10 +373,26 @@ before the allocator, because NMI is unmaskable and is reachable from a flash
 double-bit ECC error (PLAN.md §8.1 item 5), so the window before `VTOR` is set is a
 window in which any fault is unrecoverable.
 
-**Status: not yet implemented** — there is no entry point and no vector table in this
-tree. Recorded here because the decision as written above overstates its own coverage:
-"a panic must never leave the device spinning" is currently true of panics and false of
-faults. Do not treat decision 6 as satisfied until `VTOR` is set.
+**Status: IMPLEMENTED. This read "not yet implemented — there is no entry point and no
+vector table in this tree … Do not treat decision 6 as satisfied until `VTOR` is set"
+until 2026-09-10, and by then all three existed.** The one store is
+`firmware/src/entry.rs:220`, `SCB_VTOR.write_volatile(memmap::FLASH_ISR_BASE)`, and it
+is the **first** thing `init_hardware` does — before `.bss` zeroing and before the
+allocator, exactly as this section required, because NMI is unmaskable and reachable
+from a flash double-bit ECC error. `firmware/src/main.rs:1214-1221` is the full 16-entry
+table, `KEEP`-ed at `0x0802_0000` by `link.x` and asserted to start there, whose 14
+fault entries are all `fault_trampoline` (`main.rs:1238`) — which panics with a
+`&'static str` (deliberately unformatted, so the fault path cannot itself allocate) and
+so reaches the existing handler and the existing counted reset.
+
+So decision 6 now covers faults as well as panics, which is what it always claimed and
+for weeks did not. The residual caveat is narrower and unchanged: the window *before*
+the `VTOR` store is still a window in which any fault is unrecoverable, and nothing has
+run on silicon. `tools/qemu-boot.sh` is the closest evidence and it is not a gate — under
+a deliberately faked stack pointer the guest does execute the `VTOR` write and then
+dispatches a real fault *through the table just programmed* into `fault_trampoline`,
+which panics and resets forever (exit 124). That is evidence the mechanism is wired, on
+a memory map that is not ours.
 
 ### Amended mechanism (the decision's intent is unchanged)
 
@@ -377,7 +404,11 @@ effective on RDP≠2 dev units and a harmless no-op elsewhere. Ordering:
 1. `cpsid i` — stop reentrancy from interrupts.
 2. Bump a reboot-survivable panic counter.
 3. Under threshold → `NVIC_SystemReset`.
-4. Past threshold → attempt callgate `enter_dfu` (selector 2, `arg2` 0 then 2).
+4. Past threshold → attempt callgate `enter_dfu` (selector 2, **`arg2 = 0` only** —
+   this read "`arg2` 0 then 2" until 2026-09-10 and the code never did that;
+   `hal/src/panic.rs:877` bakes `arg2 = 0` in and is explicit that it is not a
+   parameter, because `arg2 = 2` is one of the sub-calls deliberately left unbound
+   for being able to brick the unit).
 5. Unconditional reset as the final fallback, so it can never halt.
 
 No display and no allocation in the handler: the OLED driver can itself panic,
@@ -461,10 +492,17 @@ implementations. The following survived as confirmed defects anyway:
    **FIXED.** `bitcoin_transaction.rs:524` raised `clippy::uninlined_format_args`
    from `alloc::format!("{:x}", spk)`; now `alloc::format!("{spk:x}")`. Neither
    changed file raises a clippy finding on the device or host+tests target.
-5. **Interop was not run.** Decision 5's second leg — a real
-   `frostsnap_coordinator` — has not been exercised against this change. The
-   vector tests and the rust-bitcoin differential are strong evidence of
-   consensus correctness; they are not evidence of wire-level interop.
+5. ~~**Interop was not run.**~~ **RUN, 2026-08-18; this item read "has not been
+   exercised against this change" until 2026-09-10.** Decision 5's second leg is
+   exercised on every `hostcheck` invocation: a real unmodified sibling
+   `frostsnap_coordinator` completes a 9-of-9 keygen, nonce replenishment and a
+   signature that **verifies** against the group key, over a pty in two processes, at
+   two chunk sizes, plus a DECLINE pass — and the signature verifying is precisely
+   evidence about the decision-3 tweak, because the coordinator derives the x-only
+   key with *its own* build of `frostsnap_core` while the device signs with the
+   vendored one. So the two builds agree on the taproot tweak across a process
+   boundary, which is a stronger check than either the vector tests or the
+   rust-bitcoin differential. What is still not evidence: anything on silicon.
 
 ---
 
@@ -515,8 +553,13 @@ argument about a Python constant.
 - **SRAM: 8,192 B, not 4,096.** The cost is **2 × `FRAME_LIMIT`** — the
   accumulator is `[u8; FRAME_LIMIT]` inline in `Link` *and* `encode_frame` takes
   a `&mut [u8; FRAME_LIMIT]`. The raise costs 4,120 → 8,192 B, **1.25% of
-  640 KiB**. Still SRAM nothing in this tree allocates yet, since nothing places
-  a `Link`.
+  640 KiB**. **This ended "Still SRAM nothing in this tree allocates yet, since
+  nothing places a `Link`" until 2026-09-10.** `boot()` places one:
+  `comms::Link::new()` in the event loop's own frame (`firmware/src/main.rs:1950`),
+  deliberately in `boot`'s frame and not a `static`, so it costs 4 KiB of the
+  **548,776 B** stack runway rather than `FRAME_LIMIT` bytes of `.bss` for the entry
+  to zero on every boot. It is the largest single object on that stack, ahead of
+  `ui::Frame` at 1,024 B and the signer at 272 B.
 - **Signing and keygen are no longer refused by the transport**, in either
   direction, anywhere inside the declared envelope below.
 - **Two pinning tests changed meaning rather than being deleted.**
@@ -566,14 +609,22 @@ decision:
   and no coordinator-side refusal site exists), and the conch (off: `Downstream`
   signals VERSION_SIGNAL 2, conch needs 1).
 
-**Three device-side caps are REQUIRED and UNIMPLEMENTED, so 4,096 is necessary
-but not sufficient.** Nothing bounds what the device *constructs*: one nonce
-segment per frame, a `HeldShares2` cap, and `Debug` string truncation. All three
-live in message-construction code that does not exist in this tree — no event
-loop, no bin target, no caller of `encode_frame` outside tests — so none was
-written, and no helper was added that nothing calls. Recorded in `comms.rs`'s
-module docs and PLAN.md §7 as phase-4 work. Without them the device can still
-build a frame over any bound and then have its own encoder refuse it.
+**Three device-side caps are IMPLEMENTED, so 4,096 is necessary and now
+sufficient for what the device constructs.** **This paragraph read "REQUIRED and
+UNIMPLEMENTED … All three live in message-construction code that does not exist in
+this tree — no event loop, no bin target, no caller of `encode_frame` outside tests
+— so none was written" until 2026-09-10, and every clause of that was false by
+then.** All three live in `Outbox::push` (`firmware/src/lib.rs:422`), the one funnel
+every device-bound body passes through: a multi-segment `NonceResponse` is split one
+frame per segment; `Debug` is cut to `DEBUG_MESSAGE_LIMIT` = 256 B on a UTF-8
+boundary; and an over-large `HeldShares2` is refused **whole** as
+`CommsError::FrameTooLong`, never truncated, because dropping shares from a
+restoration reply would tell the coordinator a share does not exist. There is an
+event loop (`firmware/src/main.rs` step 10), a bin target that links at 376,752 B,
+and a production caller of `encode_frame` (`Outbox::encode`, `lib.rs:445`). Each cap
+has a named test that fails when it is removed — four mutations, four caught,
+2026-09-10; see PLAN.md §7 for the list. The device no longer builds a frame over a
+bound and then has its own encoder refuse it.
 
 ---
 
@@ -585,5 +636,5 @@ build a frame over any bound and then have its own encoder refuse it.
 | Coldcard commit | `0431fd2b`, MIT (firmware); `hardware/` proprietary |
 | Rust toolchain | 1.88.0 (`rust-toolchain.toml`) + `thumbv7em-none-eabihf` |
 | C cross-compiler | clang 21, `/opt/homebrew/opt/llvm/bin/clang` (still required — decision 4) |
-| Flash, as built | **860,898 bytes = 60.4%** of `FLASH_TEXT` 1,425,408 (`stm32/COLDCARD_MK4/layout.ld:17`); 844,229 at phase 0, 857,125 at the phase-2 gate. Re-measured 2026-08-19. The 893,099 figure was NOT a bad measurement: it is correct for a tree where the vendored `MAX_MESSAGE_ALLOC_SIZE` (32,768) differed from `comms::ENCAPS_DECODE_LIMIT` (20,480), which made `BINCODE_CONFIG` and `ENCAPS_CONFIG` distinct types and monomorphised the whole `CoordinatorSendBody` decode tree twice. Aligning the two constants collapsed the duplicate, worth 32,201 B; net cost of bounding both decode legs is +312 B. Confirmed by reverting the constant and reproducing 893,099 exactly — PLAN.md §10 is the authority. |
-| Host tests passing | **268** (164 when this file was written; 204 at the phase-2 gate; 253 at the end of phase 3; 259 before decision 7 added two `comms` tests; 261 before PLAN.md §9 item 7(c) added three outer-leg decode-limit `comms` tests; 264 before the three inner-leg `decode_body` tests; 267 before the pin on the vendored `MAX_MESSAGE_ALLOC_SIZE`, 2026-08-19); only `frost_backup/tests/descriptor_match.rs` is excluded (decision 5) |
+| Flash, as built | **899,400 bytes = 63.1%** of `FLASH_TEXT` 1,425,408 (`stm32/COLDCARD_MK4/layout.ld:17`) as an rlib sum with LTO off, re-measured **2026-09-10**; the **linked image** is **376,752 bytes = 26.43%**, which is the number that decides fit and is 2.4× smaller because of LTO plus `--gc-sections`. Trail: 844,229 at phase 0, 857,125 at the phase-2 gate, 860,898 on 2026-08-19 — **this row read 860,898 = 60.4% until 2026-09-10**, i.e. before the UI, the keypad, the share store, 25-word entry, the quiz and the `coldsnap_firmware` crate existed. The 893,099 figure was NOT a bad measurement: it is correct for a tree where the vendored `MAX_MESSAGE_ALLOC_SIZE` (32,768) differed from `comms::ENCAPS_DECODE_LIMIT` (20,480), which made `BINCODE_CONFIG` and `ENCAPS_CONFIG` distinct types and monomorphised the whole `CoordinatorSendBody` decode tree twice. Aligning the two constants collapsed the duplicate, worth 32,201 B; net cost of bounding both decode legs is +312 B. Confirmed by reverting the constant and reproducing 893,099 exactly — PLAN.md §10 is the authority. |
+| Host tests passing | **565** = hal 284 + firmware 165 + vendored 116, re-verified 2026-09-10, every gate exit 0 (**this read 268 until then** — the 2026-08-19 figure, which never counted `coldsnap_firmware` at all; 164 when this file was written; 204 at the phase-2 gate; 253 at the end of phase 3; 259 before decision 7 added two `comms` tests; 261 before PLAN.md §9 item 7(c) added three outer-leg decode-limit `comms` tests; 264 before the three inner-leg `decode_body` tests; 267 before the pin on the vendored `MAX_MESSAGE_ALLOC_SIZE`, 2026-08-19); only `frost_backup/tests/descriptor_match.rs` is excluded (decision 5) |

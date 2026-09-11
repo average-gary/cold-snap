@@ -5686,10 +5686,11 @@ mod tests {
             quiz::QUIZ_POSITIONS,
             "the quiz did not ask the number of questions it says it asks"
         );
-        // A `const` assert and not a runtime one: a quiz that asks about every position
-        // is a reveal with extra steps, and that should be a BUILD failure rather than
-        // a test failure. (It is also what clippy's `assertions_on_constants` asks for.)
-        const _: () = assert!(quiz::QUIZ_POSITIONS < ui::BACKUP_WORDS);
+        // The `QUIZ_POSITIONS < BACKUP_WORDS` ceiling -- a quiz over every position is
+        // a reveal with extra steps -- is asserted at MODULE scope in `quiz.rs`, so it
+        // is a build failure on the device target rather than a test failure here. It
+        // used to be a `const _` in this test module, which is where a reader would
+        // reasonably have expected a build failure and not got one.
         let mut positions: StdVec<usize> = seen.iter().map(|(number, _)| *number).collect();
         positions.sort_unstable();
         positions.dedup();

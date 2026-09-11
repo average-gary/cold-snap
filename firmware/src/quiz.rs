@@ -139,6 +139,26 @@ const _: () = {
         ui::BACKUP_WORDS >= 2 && ui::BACKUP_WORDS <= u8::MAX as usize,
         "a backup position must fit a u8, and there must be one to exclude"
     );
+    // THE DISCLOSURE CEILING, and it is a strictly stronger bound than the `<=` above.
+    // A quiz that asks about EVERY position is a reveal with extra steps: it makes
+    // `ui::backup_quiz_passed`'s caveat ("the rest were not checked") a lie, and it
+    // lifts the worst-case disclosure from `2 * QUIZ_POSITIONS` capped at 16 words to
+    // the whole share. The `<=` above is about `ui::QuizWord`'s draw bounds and about
+    // `QUIZ_POSITIONS - 1` not underflowing in `draw_order`; this one is about how
+    // much of a secret can reach the glass, so it gets its own assert and its own
+    // reason.
+    //
+    // MODULE SCOPE, deliberately. This assertion lived inside the `#[cfg(test)]`
+    // modules of `firmware/src/lib.rs` and `firmware/src/main.rs` until 2026-09-10,
+    // where its own comment claimed it "should be a BUILD failure rather than a test
+    // failure" -- which its placement defeated, because a `const` item under
+    // `cfg(test)` is only const-evaluated for the test build. Here it is evaluated
+    // for `thumbv7em-none-eabihf` on every `cargo build --release` and both device
+    // clippy gates, which is what that comment always meant.
+    assert!(
+        QUIZ_POSITIONS < ui::BACKUP_WORDS,
+        "a quiz over every position is a reveal, not a check"
+    );
 };
 
 /// What to put on the glass.

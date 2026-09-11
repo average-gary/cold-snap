@@ -1940,8 +1940,10 @@ fn boot() -> ! {
     // frame rather than in a `static` on purpose: `boot` never returns, so the frame
     // is effectively permanent, and a `static` would put `FRAME_LIMIT` bytes in `.bss`
     // for the entry to zero on every boot for no benefit. The stack descends from
-    // `ESTACK_TOP` with 548,268 B of runway (MEASURED: `ESTACK_TOP - _end` in the
-    // linked ELF), so a 4 KiB inline buffer is affordable — but it IS the largest
+    // `ESTACK_TOP` with 548,776 B of runway (MEASURED 2026-09-10: `ESTACK_TOP`
+    // 0x2009_e000 - `_end` 0x2001_8058 in the linked ELF; this comment read 548,268,
+    // which was measured against a smaller `.bss`), so a 4 KiB inline buffer is
+    // affordable — but it IS the largest
     // single thing on this stack, ahead of `ui::Frame` at 1,024 B and the signer at
     // 272 B, so it is the first place to look if the runway ever gets tight. There
     // is no stack-depth tool in this tree to say when that is, and no guard page
@@ -4968,9 +4970,10 @@ mod tests {
         // A BUILD failure and not an assertion, because both inputs are `const`: a quiz
         // over every position would make that screen's caveat ("the rest were not
         // checked") a lie, and would also mean a whole quiz could put the whole share on
-        // the glass. `firmware/src/lib.rs` asserts the same thing; it costs nothing to
-        // fail the build in the file that draws the screen too.
-        const _: () = assert!(quiz::QUIZ_POSITIONS < ui::BACKUP_WORDS);
+        // the glass. That ceiling is asserted at MODULE scope in `quiz.rs` as of
+        // 2026-09-10, so it fails the BUILD for `thumbv7em-none-eabihf` -- both copies
+        // of it, here and in `lib.rs`, were `#[cfg(test)]`-only and so only ever failed
+        // the test build, which is not what their comments claimed.
         // No candidate of the question is anywhere on the passed screen: it is the frame
         // that goes OVER the words.
         for word in options {

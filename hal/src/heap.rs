@@ -265,8 +265,12 @@
 //! each other rather than chosen separately: widen either leg back toward the
 //! vendored `1 << 15` and 64 KiB stops being sufficient — the build fails instead of
 //! the device. (This relation read `+ 32,768 = 58,996, 6,540 B spare` until the
-//! inner leg was bounded on 2026-08-18. It is [`MEASURED_PEAK_BYTES`] = 48,166 that
-//! constrains [`HEAP_BYTES`] now, not the hostile ceiling.)
+//! inner leg was bounded on 2026-08-18. And this sentence read "It is
+//! [`MEASURED_PEAK_BYTES`] = 48,166 that constrains [`HEAP_BYTES`] now" until
+//! 2026-09-10, by which point that constant was **54,496** — and the real constraint
+//! is [`MEASURED_ARENA_FOOTPRINT_BYTES`] = 60,512, 5,024 B under [`HEAP_BYTES`],
+//! because it is the only figure measured *through* the allocator that actually
+//! ships. Not the hostile ceiling, either way.)
 //!
 //! Why an OOM must not be reachable at all, rather than merely survivable: on
 //! stable there is no `#[alloc_error_handler]`, so `handle_alloc_error` →

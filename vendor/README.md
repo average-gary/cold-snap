@@ -91,7 +91,7 @@ verbatim.
 | `frostsnap_embedded/src/nonce_slots.rs` | 3 new tests in a new `nonce_slots::test` module (`:75-210`) | round trip, refused write reports rather than panics, single-copy write reported as committed. Uses a local `CountingRng` (SplitMix64) rather than `rand_chacha`: this crate has no such dependency and a dev-dep added to a vendored manifest is a divergence to re-apply on every rebase. |
 | `frostsnap_core/src/bitcoin_transaction.rs` | `fee()` sums with `try_fold`/`checked_add` instead of `.sum::<u64>()` (`:252`) | **a validation *bypass*, not just a panic — and the only one of these the device executes today.** `fee()` is the device's sole arithmetic check on a sign request: `WireSignTask::check` rejects `fee().is_none()` (`sign_task.rs:88-90`) pre-consent, reached from `device.rs:331-333` → `message.rs:112` on a wire message with no user interaction. `overflow-checks = false` in the shipped profile (`../Cargo.toml:82`) made the overflow **silent**, so inputs summing past `u64::MAX` returned `Some(<wrapped>)` and the check passed a transaction it exists to reject. `[profile.dev]` omits the key, so it defaults to `true`: the same message *panicked* under `cargo test` and *wrapped* in firmware — the two profiles disagreed about what the bug was. PLAN.md §4.2 already flagged the weaker form ("the displayed fee is coordinator-controlled"); the wrap makes it forgeable rather than merely unverified. |
 | `frostsnap_core/src/bitcoin_transaction.rs` | `net_value() -> Option<BTreeMap<RootOwner, i64>>` (`:275`); both `i64::try_from(..).expect("input ridiciously large")` → `.ok()?`, and `-=`/`+=` → `checked_sub`/`checked_add` | two panics on wire-supplied `u64`. **The `fee()` guard does not protect these, and the distinction matters:** `fee()` bounds only the *difference* between the sums, never the magnitudes. One input of `2^63` and one output of `2^63` gives `fee() == Some(0)`, so `check` accepts it, and `i64::try_from(2^63)` still fails. Fixing `fee()` alone would have left this reachable. `Option` rather than saturating because this feeds the amounts shown for approval, and a saturated total is a plausible-looking wrong number on a consent screen. |
-| `frostsnap_core/src/bitcoin_transaction.rs` | `user_prompt() -> Option<PromptSignBitcoinTx>` (`:300`); both `expect`s → `?` | `Address::from_script` returns `Err(UnrecognizedScript)` for anything not p2pkh/p2sh/witness-program — OP_RETURN, bare/P2PK, bare multisig, the empty script (bitcoin 0.32.8 `address/mod.rs:567-590`) — and **nothing** validates a foreign output's spk. `WireSignTask::check` looks at owner keys, that something is ours to sign, and `fee()`; its own test asserts a `ScriptBuf::new()` output is *accepted* (`sign_task.rs:343-350`). Unreachable today only because `user_prompt` has zero callers (upstream's are the non-vendored display crates); the device hands the UI the raw `TransactionTemplate` (`device.rs:377-381`), so PLAN.md phase 5's sign-approval screen would have reset-looped on a legal transaction. Deliberately **not** fixed by rejecting such outputs in `check`: OP_RETURN is legitimate Bitcoin and refusing to sign it is a policy call, not a safety fix, and it would contradict `sign_task.rs:332-352`. One unrenderable recipient fails the whole prompt rather than being dropped from the list — a consent screen that omits a recipient is worse than one that refuses to appear. |
+| `frostsnap_core/src/bitcoin_transaction.rs` | `user_prompt() -> Option<PromptSignBitcoinTx>` (`:300`); both `expect`s → `?` | `Address::from_script` returns `Err(UnrecognizedScript)` for anything not p2pkh/p2sh/witness-program — OP_RETURN, bare/P2PK, bare multisig, the empty script (bitcoin 0.32.8 `address/mod.rs:567-590`) — and **nothing** validates a foreign output's spk. `WireSignTask::check` looks at owner keys, that something is ours to sign, and `fee()`; its own test asserts a `ScriptBuf::new()` output is *accepted* (`sign_task.rs:343-350`). **This row said "Unreachable today only because `user_prompt` has zero callers" until 2026-09-10; it HAS a caller and the path is live:** `coldsnap_firmware::sign_consent` calls it at `firmware/src/lib.rs:1926` and maps `None` to `Refusal::Undisplayable`, on the device's own `SignatureRequest` path. So this fix is what makes that screen a refusal instead of a reset loop, not a latent guard — and PLAN.md §8.1 defect 12 and §8's phase-5 row carried the same stale "no caller yet" wording. Deliberately **not** fixed by rejecting such outputs in `check`: OP_RETURN is legitimate Bitcoin and refusing to sign it is a policy call, not a safety fix, and it would contradict `sign_task.rs:332-352`. One unrenderable recipient fails the whole prompt rather than being dropped from the list — a consent screen that omits a recipient is worse than one that refuses to appear. |
 | `frostsnap_core/src/bitcoin_transaction.rs` | 12 new tests in a new `wire_value_bounds` module (`:600`) | Builds templates from **raw wire values**, bypassing the builder API: the builder derives `value` from a real `TxOut` and so cannot express these, but the wire format can, and the wire format is what an attacker controls. Includes the `2^63`/`2^63` case proving `fee()`'s guard does not cover `net_value`, positive controls so the bounds cannot be "fixed" by refusing everything, and `check_rejects_a_template_whose_fee_overflows` at the seam that actually protects signing today. |
 
 **Flash cost.** Re-measured the same way as the decision-3 table below
@@ -121,16 +121,23 @@ re-measure of the whole tree is **860,898**. PLAN.md §10 is the authority.) Spl
 | the same, after phase 3 (`comms.rs` + `usb.rs`) | **860,592** |
 | the same, clean re-measure 2026-08-19 (adds `decode_body`, the lowered `MAX_MESSAGE_ALLOC_SIZE`) | **860,898** |
 
-**Every row above is an rlib sum with LTO off, and as of 2026-08-24 the linked
-image says those rows overestimate by 8.6×.** `firmware/` links at **99,684 B =
-6.99%** of `FLASH_TEXT`, because LTO plus `--gc-sections` keeps only what is
-reachable. Read the table for what it is good for — the *marginal* cost of a change,
-which is why the +253 figure below is still the meaningful one — and not as a
-prediction of image size. The linked figure is itself a floor, not the budget: no
-`FrostSigner` is constructed yet, so keygen and signing are unreferenced and
-`llvm-nm` finds exactly **1** `rust-bitcoin` symbol against that crate's 327,408-byte
-rlib row. Neither number is the answer; the one measured after signing is reachable
-will be.
+**Every row above is an rlib sum with LTO off, and the linked image overestimates by
+~2.4×.** `firmware/` links at **376,752 B = 26.43%** of `FLASH_TEXT`, because LTO plus
+`--gc-sections` keeps only what is reachable. Read the table for what it is good for —
+the *marginal* cost of a change, which is why the +253 figure below is still the
+meaningful one — and not as a prediction of image size.
+
+**This paragraph read "as of 2026-08-24 the linked image says those rows overestimate by
+8.6× — `firmware/` links at 99,684 B = 6.99% … no `FrostSigner` is constructed yet, so
+keygen and signing are unreferenced and `llvm-nm` finds exactly 1 `rust-bitcoin` symbol"
+until 2026-09-10.** Every part of that has moved. A real `FrostSigner` **is** constructed
+and dispatched to (`firmware/src/lib.rs:796`), which is what took the image 101,416 →
+282,080 B in one step; `llvm-nm` now finds **190** frostsnap/secp/schnorr/bitcoin symbols
+(34 of them `bitcoin`) and **22** `coldsnap_hal::ui` symbols. The rlib total itself is
+**899,400 B** today, not the 860,898 the table above records — see PLAN.md §10, which is
+the authority; the rows here are the phase-3-era ledger and are deliberately not
+maintained. The old sentence's closing promise — "the one measured after signing is
+reachable will be [the answer]" — is now paid: it is 376,752 B.
 
 **The three `Option` returns cost +253 bytes** — 0.02 pt of `FLASH_TEXT`. Worth
 recording, because "it will bloat the image" is the usual argument for leaving an
@@ -243,14 +250,20 @@ Validation, all on `thumbv7em-none-eabihf` + `aarch64-apple-darwin`:
   new tests (3 in `tweak.rs` + `local_spk_regression`) and neither of the two
   pre-existing ones — 4 passed, 4 failed. The lib-test count went **4 → 8**.
 
-**Known gap in the surviving coverage.** All four hardcoded vectors are fed in
+**Gap in the surviving coverage — CLOSED.** All four hardcoded vectors are fed in
 already even-Y, so `tweak.rs:342`'s `into_point_with_even_y()` is a no-op for
 them: deleting BIP-341's `lift_x` leaves `output_keys_match_published_vectors`
-**passing**. Only `matches_rust_bitcoin_over_many_keys` and
-`local_spk_regression` catch it, and both depend on `bitcoin`. Both production
-`LocalSpk` vectors have odd-y internal keys, so this is the common path. Add an
-odd-y assertion before that dep is ever dropped. Also: `bitcoin_transaction.rs:524`
-now raises `clippy::uninlined_format_args` (test-only).
+**passing**. `matches_rust_bitcoin_over_many_keys` and `local_spk_regression` catch
+it, but both die with the `bitcoin` dep. **This ended "Add an odd-y assertion before
+that dep is ever dropped" until 2026-09-10; the assertion exists.**
+`odd_y_internal_keys_tweak_to_the_same_output` (`frostsnap_core/src/tweak.rs:583`)
+asserts the *property* rather than a fixture — `P` and `-P` share an x coordinate, so
+BIP-341 must tweak both to the same output key — and touches no `bitcoin` type, so the
+coverage survives decision 4 being revisited. DECISIONS.md residual gap 1 records it as
+FIXED and verified load-bearing. Also: `bitcoin_transaction.rs` **used to** raise
+`clippy::uninlined_format_args` from `format!("{:x}", spk)`; that is fixed too
+(DECISIONS.md residual gap 4), and `:524` is now `pub fn spk`, so the old citation
+locates nothing.
 
 **Corrections to `PLAN.md` §2.2, which overstated the benefit.** Measured with
 `CARGO_PROFILE_RELEASE_LTO=false` into clean target dirs:
@@ -276,5 +289,9 @@ git -C /path/to/frostsnap fetch && git -C /path/to/frostsnap checkout <new-rev>
 for c in frostsnap_core frostsnap_comms frostsnap_embedded frost_backup macros; do
   rsync -a --exclude target /path/to/frostsnap/$c/ vendor/frostsnap/$c/
 done
-# then re-apply the manifest changes in the table above
+# then re-apply EVERY row of the tables above, not just the manifest rows: the src
+# changes go too, and TWO of them fail silently if forgotten --
+# frostsnap_comms MAX_MESSAGE_ALLOC_SIZE = 20_480 (the build stays green and the
+# bound reverts to 32 KiB) and the device_nonces/ab_write panic-site fixes (the
+# build stays green and the panics come back).
 ```

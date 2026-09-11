@@ -128,11 +128,19 @@ struct Arena {
     /// Placement is **measured, not assumed**: the whole `ALLOCATOR` static is
     /// emitted into `.bss._ZN..ALLOCATOR..`, 65,564 B, which `link.x`'s
     /// `*(.bss .bss.*)` collects — so it costs **zero flash** and the `ready` word
-    /// gets zeroed by the entry's step-3 loop for free. (Read from the pre-LTO
-    /// object: `cargo rustc --release -p coldsnap_firmware -- --emit=obj=/tmp/fw.o`
-    /// then `llvm-readobj --syms`. It cannot be read from the linked image yet
-    /// because nothing allocates, so the linker discards it — even under `#[used]`,
-    /// which for ELF is an LLVM-level hint and does not stop section GC.)
+    /// gets zeroed by the entry's step-3 loop for free.
+    ///
+    /// **It IS in the linked image, and this doc said it could not be until
+    /// 2026-09-10.** `llvm-nm --print-size --defined-only` on the release ELF gives
+    /// `20008038 0001001c b _ZN17coldsnap_firmware5alloc9ALLOCATOR..`, i.e. 65,564 B
+    /// at `0x2000_8038` — all but 8 bytes of `.bss`'s 65,572. The old note ("it
+    /// cannot be read from the linked image yet because nothing allocates, so the
+    /// linker discards it") was written when `boot()` did not construct a
+    /// `FrostSigner`; it now does, so the heap has real callers and section GC keeps
+    /// the arena. Reading it from the pre-LTO object still works and is the way to
+    /// see it before anything allocates:
+    /// `cargo rustc --release -p coldsnap_firmware -- --emit=obj=/tmp/fw.o` then
+    /// `llvm-readobj --syms`.
     ///
     /// If 64 KiB of boot-time zeroing ever shows up in a measurement, `link.x`
     /// already places a `.uninit` (NOLOAD, after `_ebss`, before `_end`) that sits

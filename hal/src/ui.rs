@@ -108,8 +108,12 @@
 //!   the glass takes the RNG for it as a **required** argument —
 //!   [`BackupPages::render`] (reveal), [`WordEntry::render`] (entry, including the
 //!   candidate letters, which are a function of the secret prefix) and
-//!   [`backup_quiz_word`] (the check quiz, which draws all 25 words over 26
-//!   screens) — and all of them go through one private `sensitive_row`, so a row
+//!   [`backup_quiz_word`] (the check quiz, which puts at most **16 of the 25** words
+//!   on the glass over **8** questions — see [`backup_quiz_word`] itself; this said
+//!   "draws all 25 words over 26 screens" until 2026-09-10, which described
+//!   upstream's `check_backup.rs` `TOTAL_SCREENS = 26` widget and not this device's,
+//!   and is the exact mistake that kept `CheckBackup` refused for weeks) — and all
+//!   of them go through one private `sensitive_row`, so a row
 //!   cannot get the text without the noise. There is no opt-in variant, because an
 //!   opt-in fails open. The one screen that has no RNG, [`backup_quiz`], MASKS any
 //!   option that is a word rather than drawing it unprotected. Its one unclosed
