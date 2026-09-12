@@ -37,12 +37,27 @@
 //! 4. The nonce write path being panic-free end to end on a flash that refuses.
 
 use core::cell::RefCell;
+use std::collections::BTreeSet;
 
 use coldsnap_hal::flash::fake::FakeFlash;
 use coldsnap_hal::rng::{mix_sources, Entropy, ProvenSeed, SE1_BYTES, SE2_BYTES, TRNG_BYTES};
 use frostsnap_core::device::DeviceSecretDerivation;
-use frostsnap_core::device_nonces::{NonceStreamSlot, SecretNonceSlot};
+use frostsnap_core::device_nonces::{
+    NonceStreamSlot, NoncesUnavailable, SecretNonceSlot, SigningState,
+};
 use frostsnap_core::nonce_stream::{CoordNonceStreamState, NonceStreamId};
+// The curve reached through `frostsnap_core`'s own re-export
+// (`frostsnap_core/src/lib.rs:34`) rather than through hal's direct `schnorr_fun`
+// dev-dependency, for the reason `firmware/Cargo.toml` gives: no second entry
+// that can drift to a second version. It is also the only form that can work
+// here — `PartySignSession::sign` takes the `PairedSecretShare<EvenY>` that
+// `device_nonces`' own signature names, so a skewed copy would not typecheck.
+use frostsnap_core::schnorr_fun::frost::{
+    self, PairedSecretShare, PartySignSession, SecretShare, SignatureShare,
+};
+use frostsnap_core::schnorr_fun::fun::prelude::*;
+use frostsnap_core::schnorr_fun::Message;
+use frostsnap_core::SignSessionId;
 use frostsnap_embedded::{AbSlot, AbWriteOutcome, FlashPartition, NonceAbSlot, SECTOR_SIZE};
 use rand_core::RngCore;
 
@@ -77,6 +92,20 @@ fn proven_seed(salt: u8) -> ProvenSeed {
 /// gets passed to every `&mut impl RngCore` site below.
 fn entropy(salt: u8) -> Entropy {
     Entropy::from_proven_seed(proven_seed(salt))
+}
+
+/// A distinct, non-zero `SignatureShare` filler, `n` in the low byte.
+///
+/// Non-zero, and distinct per `n`, deliberately. `SignatureShare` is
+/// `Scalar<Public, Zero>` so the all-zero encoding *is* legal, but a filler
+/// vector of identical scalars cannot catch a decode that returns element 0
+/// repeatedly — and the round-trip test below is the only thing in the tree that
+/// reads a multi-element `signature_shares` back off flash. `from_bytes` is
+/// `Option` only because it rejects `>= n`; a 1-byte value cannot.
+fn filler_share(n: u8) -> SignatureShare {
+    let mut bytes = [0u8; 32];
+    bytes[31] = n;
+    Scalar::from_bytes(bytes).expect("a one-byte scalar is below the curve order")
 }
 
 /// `frostsnap_core` derives the actual nonce seed through a device HMAC it does
@@ -412,6 +441,18 @@ fn hostile_coordinator_index_over_hal_flash_stays_bounded() {
 /// unchanged, including the `Option<SigningState>` with a non-empty `Vec`. That is
 /// the largest thing the nonce path writes, and it is what crosses the 256-byte
 /// `AbSlot` buffer boundary where the doubleword padding matters.
+///
+/// THE `signing_state` USED TO BE `None` HERE, so the paragraph above was false:
+/// without it the encoded value is 65 B, padded to 72, against `BUFFER_SIZE = 256`
+/// (`ab_write.rs:163`) — one `nor_write` from `flush` and no second chunk, and no
+/// test in this file had ever entered `BincodeFlashWriter::write`'s multi-chunk
+/// branch (`partition.rs:292-315`). Derived: under Fixint the encoded value is
+/// `4 + 4 + 4 + 16 + 32 + 4 + 1 + 32 + 8 + 32n` bytes — in order,
+/// `SlotValue.index`, the `Versioned` tag, `index`, the stream id, the ratchet
+/// material, `last_used`, the `Option` tag, the session id, the `Vec` length,
+/// then `n` shares — so `n >= 5` exceeds 256. `n = 6` for margin, and the
+/// program count below is what proves the boundary was crossed rather than the
+/// arithmetic.
 #[test]
 fn a_full_secret_nonce_slot_survives_the_hal_flash_round_trip() {
     let flash = RefCell::new(FakeFlash::new(4));
@@ -426,19 +467,448 @@ fn a_full_secret_nonce_slot_survives_the_hal_flash_round_trip() {
         nonce_stream_id: stream_id,
         ratchet_prg_seed_material: material,
         last_used: 7,
-        signing_state: None,
+        signing_state: Some(SigningState {
+            session_id: SignSessionId([3u8; 32]),
+            signature_shares: (1..=6).map(filler_share).collect(),
+        }),
     };
 
     let slot = slots.get_or_create(stream_id, &mut rng);
+    let programs_before = flash.borrow().programs;
     slot.write_slot(&value);
     assert_eq!(slot.last_write_outcome(), Some(AbWriteOutcome::Committed));
     assert_eq!(slot.read_slot(), Some(value.clone()));
+
+    // The boundary claim, measured rather than derived. `FakeFlash` counts
+    // programs in DOUBLEWORDS (`bytes.len() / WRITE_SIZE`), not calls, so a full
+    // 256-byte chunk is 32 and the 41-byte tail padded to 48 is 6. MEASURED: 76
+    // for the two A/B copies (2 x 38); with `signing_state: None` it was 18
+    // (2 x 9), i.e. one short chunk each and no boundary. `> 2 * 32` is the
+    // claim itself: each copy programmed more than one whole buffer.
+    let programmed = flash.borrow().programs - programs_before;
+    assert!(
+        programmed > 2 * (256 / 8),
+        "{programmed} doublewords programmed: the value still fits one 256-byte \
+         chunk, so the multi-chunk writer branch this test claims to cover is \
+         unreached"
+    );
 
     // Survives a reload from the same cells, i.e. it is really on "flash".
     let mut reloaded = NonceAbSlot::load_slots(FlashPartition::new(&flash, 0, 4, "nonces"));
     assert_eq!(
         reloaded.get(stream_id).and_then(|s| s.read_slot()),
         Some(value)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 3b. The POST-WRITE half of `sign_guaranteeing_nonces_destroyed`.
+//
+// Three of the thirteen former panic sites PLAN.md §6.3 enumerates live after
+// the nonce advance has been written, and NOTHING in the tree had ever produced
+// any of them: `rg SlotUnreadable` and `rg WriteVerifyFailed` found the
+// identifiers only in their own definitions and in doc comments. That includes
+// the read-back comparison, whose comment carries the entire anti-nonce-reuse
+// argument and which `nonce_slots.rs:38-42` cites as already settled.
+//
+// A note on the double, because it decides which crate these tests live in.
+// `frostsnap_embedded`'s own `FaultyNorFlash` (`test.rs`) is `#[cfg(test)]`, so
+// it is unreachable from here at all; and it delegates writes to
+// `TestNorFlash::write`, which asserts 4-byte alignment and then
+// `copy_from_slice`s with NO clear-bits-only rule — it accepts a re-program that
+// is `PROGERR` on silicon, which is verbatim the §8.1 defect-5 class `FakeFlash`
+// was fixed for, at `WRITE_SIZE = 4` against the Mk4's 8. So a double MORE
+// permissive than the hardware is not put into a gate: these use `FakeFlash`,
+// whose injection surface is a strict superset at the shipped geometry.
+// ---------------------------------------------------------------------------
+
+/// A nonce slot that no longer reads back must make signing REFUSE, not halt.
+///
+/// `device_nonces.rs`'s `read_slot().ok_or(NoncesUnavailable::SlotUnreadable)?`
+/// was `.expect("cannot sign with uninitialized slot")` upstream. On hardware
+/// `read_slot` goes through `AbSlot::read` and a degraded slot yields `None`, so
+/// under `panic = "abort"` with RDP=2 that `expect` was a brick — and no test
+/// anywhere had ever produced the variant that replaced it.
+///
+/// Two legs make this falsifiable rather than "I broke flash and got an `Err`":
+///
+/// * The EXACT variant. `SlotUnreadable` is returned at exactly one site, so the
+///   variant names the site — as against `WriteVerifyFailed`, which the read-back
+///   half returns, and `Overflow`, which the lookup and the nonce iterator
+///   return.
+/// * The flash operation COUNTERS, and deliberately NOT `last_write_outcome()`.
+///   MEASURED: with a "self-heal" mutation at the site — re-`initialize` the slot
+///   before returning the error, which resets `index` to 0 and is therefore the
+///   nonce-reuse catastrophe — the recorded outcome becomes `Some(Committed)`
+///   again, identical to what it was before the call, so
+///   `assert_eq!(last_write_outcome(), before)` stays GREEN. The counters caught
+///   it; the outcome could not.
+///
+/// The reachability limit, stated because the site's own comment overstates it:
+/// the shipped path is `device.rs:499` ->
+/// `AbSlots::sign_guaranteeing_nonces_destroyed`, whose first act is
+/// `self.get(stream_id).ok_or(Overflow)?`, and `get` calls `nonce_stream_id()` ->
+/// `read_slot()`. An already-unreadable slot is filtered one call earlier and the
+/// caller sees `Overflow`, never `SlotUnreadable`. The window is between those
+/// two ADJACENT reads, not across the `RequestSign` handler. This test calls the
+/// trait method on the slot handle to hold that window open.
+#[test]
+fn an_unreadable_nonce_slot_refuses_to_sign_instead_of_halting() {
+    let flash = RefCell::new(FakeFlash::new(4));
+    let mut slots = NonceAbSlot::load_slots(FlashPartition::new(&flash, 0, 4, "nonces"));
+    let mut rng = entropy(21);
+    let stream_id = NonceStreamId::random(&mut rng);
+
+    let slot = slots.get_or_create(stream_id, &mut rng);
+    assert_eq!(
+        slot.last_write_outcome(),
+        Some(AbWriteOutcome::Committed),
+        "the setup write must reach flash or the degradation below proves nothing"
+    );
+
+    // 0xff, the ERASED state, and NOT 0x00. This is load-bearing, not cosmetic:
+    // under Fixint a slot scribbled to 0x00 DECODES — `SlotValue.index` 0,
+    // `Versioned` tag 0 = `V0`, an all-zero `nonce_stream_id`, `Option` tag 0 =
+    // `None` — so `read_slot()` returns `Some`, the site below is passed, and the
+    // very next line, `assert_eq!(.., "wrong stream id")` (kept deliberately,
+    // vendor/README.md), fires. That is a PANIC, i.e. the brick this test exists
+    // to rule out, reached by the test's own setup. At 0xff `read_index` sees
+    // `u32::MAX`, the empty-slot sentinel, both A/B copies rank `None` and
+    // `AbSlot::read` returns `None` before the assert. Charge loss also drifts
+    // NOR cells towards 0xff, so it is the realistic degradation direction.
+    let n = flash.borrow().len();
+    flash.borrow_mut().scribble(0, n, 0xff);
+    let (programs, erases) = {
+        let f = flash.borrow();
+        (f.programs, f.erases)
+    };
+
+    let err = slot
+        .sign_guaranteeing_nonces_destroyed(
+            SignSessionId([1u8; 32]),
+            CoordNonceStreamState {
+                stream_id,
+                index: 0,
+                remaining: 100,
+            },
+            1,
+            Vec::<(PairedSecretShare<EvenY>, PartySignSession)>::new(),
+            &mut FakeDeviceHmac,
+            30,
+        )
+        .expect_err("an unreadable slot must not be signable");
+    assert!(
+        matches!(err, NoncesUnavailable::SlotUnreadable),
+        "wrong site fired: {err:?}"
+    );
+
+    // Nothing reached flash. A recovery-by-rewrite here would look like a repair
+    // and would in fact hand the coordinator a stream restarted at index 0.
+    assert_eq!(
+        (flash.borrow().programs, flash.borrow().erases),
+        (programs, erases),
+        "the refusal path touched flash"
+    );
+}
+
+/// An empty `sessions` iterator must be refused BEFORE the write, not
+/// `unwrap()`ed.
+///
+/// This single `let-else` -> `Err(Overflow)` replaced two upstream panics,
+/// `panic!("sign sessions must not be empty")` and `next_prg_state.unwrap()`, and
+/// its own comment calls it "the backstop if that invariant is ever bypassed" —
+/// the wire cannot produce an empty `sessions` because `GroupSignReq::check`
+/// enforces the count. A backstop nothing exercises is a backstop nobody has
+/// checked, and this is the only way in.
+///
+/// WHICH `Overflow`: the variant alone is not enough here, because
+/// `AbSlots::sign_guaranteeing_nonces_destroyed` also returns `Overflow` as its
+/// placeholder for "stream not found" and the nonce iterator returns it when
+/// exhausted. Both are excluded by argument, not by a further assertion — the
+/// setup asserts the slot reads back exactly what was written, so the lookup by
+/// stream id cannot miss, and an empty `sessions` never enters the loop that
+/// could exhaust the iterator. Re-asserting "the stream is still findable" after
+/// the call would be a restatement of the fixture: it cannot fail while the
+/// counters below are unchanged, since `FakeFlash` only mutates cells through
+/// program, erase or the test's own `scribble`.
+#[test]
+fn empty_sign_sessions_are_refused_before_anything_reaches_flash() {
+    let flash = RefCell::new(FakeFlash::new(4));
+    let mut slots = NonceAbSlot::load_slots(FlashPartition::new(&flash, 0, 4, "nonces"));
+    let mut rng = entropy(22);
+    let stream_id = NonceStreamId::random(&mut rng);
+
+    let mut material = [0u8; 32];
+    rng.fill_bytes(&mut material);
+    let before = SecretNonceSlot {
+        index: 7,
+        nonce_stream_id: stream_id,
+        ratchet_prg_seed_material: material,
+        last_used: 1,
+        signing_state: None,
+    };
+    let slot = slots.get_or_create(stream_id, &mut rng);
+    slot.write_slot(&before);
+    assert_eq!(
+        slot.read_slot(),
+        Some(before),
+        "the fixture must be on flash and findable by stream id, or the Overflow \
+         below could be the lookup's rather than the backstop's"
+    );
+    let (programs, erases) = {
+        let f = flash.borrow();
+        (f.programs, f.erases)
+    };
+
+    // The production path (`device.rs:499`), not the trait method: `AbSlots::get`
+    // matching the stream id is what keeps the "wrong stream id" assert
+    // unreachable, and `remaining: 100 >= nonce_batch_size: 30` keeps
+    // replenishment out of it.
+    let err = slots
+        .sign_guaranteeing_nonces_destroyed(
+            SignSessionId([2u8; 32]),
+            CoordNonceStreamState {
+                stream_id,
+                index: 7,
+                remaining: 100,
+            },
+            Vec::<(PairedSecretShare<EvenY>, PartySignSession)>::new(),
+            &mut FakeDeviceHmac,
+            30,
+        )
+        .expect_err("no sessions means no nonce was consumed, so nothing to sign");
+    assert!(
+        matches!(err, NoncesUnavailable::Overflow),
+        "wrong site fired: {err:?}"
+    );
+
+    assert_eq!(
+        (flash.borrow().programs, flash.borrow().erases),
+        (programs, erases),
+        "the backstop fired AFTER a write, so something reached flash on a request \
+         that consumed no nonce"
+    );
+}
+
+/// A RETRY of a session already on flash must return the cached shares and must
+/// NOT advance the index. This is the anti-nonce-reuse property the read-back
+/// comment leans on ("a retry cannot advance the index twice"), and it had no
+/// test.
+///
+/// The empty `sessions` is legitimate here precisely because the cached branch
+/// never touches it: it re-uses `slot_value` wholesale. That is also what makes
+/// this test the load-bearing one for the branch — if a future edit made the
+/// cached arm iterate `sessions`, this flips from `Ok` to `Err(Overflow)`.
+#[test]
+fn a_retry_of_the_same_signing_session_returns_the_cached_shares_without_advancing() {
+    let flash = RefCell::new(FakeFlash::new(4));
+    let mut slots = NonceAbSlot::load_slots(FlashPartition::new(&flash, 0, 4, "nonces"));
+    let mut rng = entropy(23);
+    let stream_id = NonceStreamId::random(&mut rng);
+    let session_id = SignSessionId([5u8; 32]);
+
+    let mut material = [0u8; 32];
+    rng.fill_bytes(&mut material);
+    let slot = slots.get_or_create(stream_id, &mut rng);
+    slot.write_slot(&SecretNonceSlot {
+        index: 7,
+        nonce_stream_id: stream_id,
+        ratchet_prg_seed_material: material,
+        last_used: 1,
+        signing_state: Some(SigningState {
+            session_id,
+            signature_shares: vec![filler_share(11), filler_share(12)],
+        }),
+    });
+    assert_eq!(slot.last_write_outcome(), Some(AbWriteOutcome::Committed));
+
+    // `replenish` is deliberately dropped rather than asserted `is_none()`.
+    // `reconcile_coord_nonce_stream_state` returns `None` exactly when the slot's
+    // index equals the coordinator's claimed index, so `replenish.is_none()` and
+    // the index assertion below are the SAME fact read two ways: whichever is
+    // written second cannot fail. The index is the one that says what the
+    // property is, so it is the one kept.
+    let (shares, _replenish) = slots
+        .sign_guaranteeing_nonces_destroyed(
+            session_id,
+            CoordNonceStreamState {
+                stream_id,
+                index: 7,
+                remaining: 100,
+            },
+            Vec::<(PairedSecretShare<EvenY>, PartySignSession)>::new(),
+            &mut FakeDeviceHmac,
+            30,
+        )
+        .expect("a retry of a cached session must not need nonces");
+    assert_eq!(
+        shares,
+        vec![filler_share(11), filler_share(12)],
+        "a retry returned different shares, so it re-derived rather than re-read"
+    );
+    assert_eq!(
+        slots
+            .get(stream_id)
+            .expect("the cached branch rewrote the same stream, so it is still found")
+            .read_slot()
+            .expect("the rewrite committed, so the slot decodes")
+            .index,
+        7,
+        "THE NONCE-REUSE CASE: a retry advanced the index a second time"
+    );
+}
+
+/// THE HEADLINE. A nonce advance that flash refuses must come back as
+/// `WriteVerifyFailed`, with the old state intact — because
+/// `device.rs:507` maps that to `ActionError::StateInconsistent` and returns
+/// before building the `SignatureShare` message, so no share leaves the device
+/// for a nonce whose consumption could not be confirmed. `nonce_slots.rs:38-42`
+/// states that as settled fact; until this test nothing had produced the value,
+/// and `rg WriteVerifyFailed` found the identifier only in its own definition and
+/// in two doc comments.
+///
+/// The cheap route to this site is vacuous and was rejected: with an EMPTY
+/// `sessions` the cached branch sets `with_signatures = slot_value`, and a
+/// refused `AbSlot::try_write` leaves the surviving A/B copy holding exactly that
+/// `slot_value`, so the read-back compares the old value against itself and the
+/// function returns `Ok` no matter how hard flash failed. Reaching it
+/// non-vacuously costs one real `(PairedSecretShare<EvenY>, PartySignSession)`;
+/// both halves are copied from the tree
+/// (`frostsnap_core/tests/device_backward_compat.rs` for the markers,
+/// `device.rs:466-490` for the session), and the agg nonce comes from the same
+/// `try_nonce_task`/`run_until_finished`/`into_segment` chain used above, so
+/// `session.sign` is handed the nonce `iter_secret_nonces` actually derives
+/// rather than a degenerate one — `sign` panics on a mismatched key or a
+/// non-member party, so consistency here is not optional.
+///
+/// THE PRE-EXISTING `signing_state` BELONGS TO A DIFFERENT SESSION, and that is
+/// the whole design of this test. MEASURED: with `signing_state: None` — the
+/// obvious shape — deleting the read-back comparison leaves the suite GREEN,
+/// because the `signing_state.ok_or(WriteVerifyFailed)?` two lines further down
+/// catches the stale `None` and returns the same variant. With a stale
+/// `SigningState` present, that backstop is bypassed and the mutation returns
+/// `Ok` carrying ANOTHER SESSION'S shares for an advance that never reached
+/// flash. So the comparison is the only site that can fire, and the assertion
+/// below pins it.
+///
+/// Two things this test does NOT claim. It does not assert "no `SignatureShare`
+/// was emitted": the return type carries none in the `Err` arm and `device.rs`'s
+/// `?` is on the same line as the call, so that assertion cannot fail. And it
+/// does not reach the `read_slot()`-returns-`None` leg one line earlier, which
+/// needs corruption to appear BETWEEN the write and the read-back, i.e. a torn
+/// multi-chunk write. That needs an offset-scheduled refusal
+/// (`refuse_programs_after(k)`) that `FakeFlash` does not have; it is the phase-7
+/// increment and is deliberately not faked here.
+#[test]
+fn a_refused_nonce_advance_reports_write_verify_failed_and_leaves_the_index_unadvanced() {
+    let flash = RefCell::new(FakeFlash::new(4));
+    let mut slots = NonceAbSlot::load_slots(FlashPartition::new(&flash, 0, 4, "nonces"));
+    let mut rng = entropy(24);
+    let stream_id = NonceStreamId::random(&mut rng);
+    let stale_session = SignSessionId([7u8; 32]);
+
+    let mut material = [0u8; 32];
+    rng.fill_bytes(&mut material);
+    let stale = SecretNonceSlot {
+        index: 7,
+        nonce_stream_id: stream_id,
+        ratchet_prg_seed_material: material,
+        last_used: 1,
+        signing_state: Some(SigningState {
+            session_id: stale_session,
+            signature_shares: vec![filler_share(31), filler_share(32)],
+        }),
+    };
+    let slot = slots.get_or_create(stream_id, &mut rng);
+    slot.write_slot(&stale);
+    assert_eq!(slot.last_write_outcome(), Some(AbWriteOutcome::Committed));
+
+    // The nonce the sign path will derive at index 7, and a session bound to it.
+    let mut job = stale
+        .try_nonce_task(None, 1)
+        .expect("a 1-nonce task at index 7 is well formed");
+    job.run_until_finished(&mut FakeDeviceHmac);
+    let frost = frost::new_without_nonce_generation::<sha2::Sha256>();
+    let agg = frost.aggregate_binonces(job.into_segment().nonces);
+    let paired = PairedSecretShare::new_unchecked(
+        SecretShare {
+            index: s!(1).public(),
+            share: s!(42).mark_zero(),
+        },
+        g!(42 * G).normalize(),
+    )
+    .into_xonly();
+    let session = frost.party_sign_session(
+        paired.public_key(),
+        BTreeSet::from([paired.index()]),
+        agg,
+        Message::raw(b"coldsnap fault injection"),
+    );
+
+    // PROGRAMS refused, not erases, and that choice is load-bearing. A refused
+    // erase means `Slot::try_write` fails at its first line and flash is
+    // bit-identical afterwards, which makes the "the old value survived" leg
+    // below a claim about a no-op. Refusing programs lets the erase of the OLDER
+    // A/B copy land first, so flash really does change under this test and the
+    // surviving-copy claim is about A/B redundancy doing its job.
+    flash.borrow_mut().refuse_programs_now();
+    let err = slots
+        .sign_guaranteeing_nonces_destroyed(
+            SignSessionId([6u8; 32]),
+            CoordNonceStreamState {
+                stream_id,
+                index: 7,
+                remaining: 100,
+            },
+            vec![(paired, session)],
+            &mut FakeDeviceHmac,
+            30,
+        )
+        .expect_err("a nonce advance flash did not take must not be signable");
+    assert!(
+        matches!(err, NoncesUnavailable::WriteVerifyFailed),
+        "wrong site fired: {err:?}"
+    );
+
+    // Once flash recovers, the slot still holds the STALE session at index 7 —
+    // index, ratchet material and the old shares all unmoved. That is the
+    // anti-nonce-reuse half: the nonce at index 7 was derived and signed over in
+    // RAM, but flash still says 7, so it will be derived again rather than
+    // skipped, and the share computed from it never left the device.
+    //
+    // Ordered BEFORE the outcome leg deliberately. The lookup and the read both
+    // go through `read_slot()`, so this is what fails if the refused write took
+    // the A/B copies with it. MEASURED: dropping `AbSlot::try_write`'s early
+    // return between the two copies ("write both, report the worst") erases both
+    // and lands on the first `expect` here; with this block ordered after the
+    // outcome leg it landed on an `expect` whose message named nothing.
+    //
+    // `FakeFlash` never refuses READS, so the read-back inside the site returned
+    // `Some` — which is what says the equality comparison fired rather than the
+    // `ok_or(WriteVerifyFailed)` one line above it.
+    flash.borrow_mut().heal();
+    let after = slots
+        .get(stream_id)
+        .expect("both A/B copies lost the stream: the refused write destroyed the slot")
+        .read_slot()
+        .expect("the slot is still findable but no longer decodes");
+    assert_eq!(
+        after, stale,
+        "a refused advance changed what is on flash: the index, the ratchet \
+         material or the stale session's shares moved"
+    );
+
+    // A write WAS attempted and left nothing — as against the two tests above,
+    // where the refusal came before any write. This is the leg that separates
+    // "the read-back caught it" from "the write silently succeeded and the
+    // comparison is the thing that is wrong".
+    let outcome = slots
+        .get(stream_id)
+        .expect("proven findable above")
+        .last_write_outcome();
+    assert!(
+        matches!(outcome, Some(AbWriteOutcome::NotCommitted(_))),
+        "expected NotCommitted, got {outcome:?}"
     );
 }
 
