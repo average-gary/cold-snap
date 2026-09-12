@@ -297,11 +297,17 @@
 //!    backup for a DIFFERENT share (another device's 25 words drawn on this glass) and
 //!    an 11-bit checksum collision (p = 2^-11). No one-line mutation of this tree
 //!    produces either.
-//!  - the same is true of M7e's share-image check on the RE-REPORTED record, for a
-//!    different reason: this flow consolidates the device's OWN share back onto itself,
-//!    so the write is content-preserving and a record that survived is indistinguishable
-//!    from one that was never replaced. Provoking it needs a second share to
-//!    consolidate, i.e. the tenth-device configuration.
+//!  - the same is held for M7e's share-image check on the RE-REPORTED record, and this
+//!    entry was STALE until M12 swept it. It used to say "this flow consolidates the
+//!    device's OWN share back onto itself, so the write is content-preserving and a
+//!    record that survived is indistinguishable from one that was never replaced" —
+//!    the sentence commit a5922e4 explicitly WITHDREW, on the ground that a record that
+//!    was never written would also re-report correctly. That commit corrected
+//!    `Phase::Reheld`'s doc and the M7e failure message and did not sweep this entry
+//!    with them. The true position, now that M12 exists, is in M12's own WHAT SURVIVED
+//!    below: what a blank device makes falsifiable is the `Some`/`None` discrimination
+//!    on the re-report, NOT the share-image comparison, which stays over-determined by
+//!    upstream's own device-side guard.
 //!  - `restore_step`'s `Completion::Abort` arm is a fail-closed guard, not a
 //!    demonstrated assertion: all three drivers abort only from `cancel()` or
 //!    `disconnected()`, and this harness calls neither. It converts a 95 s hang into an
@@ -550,6 +556,156 @@
 //!  coordinator is waiting on now fails immediately, scoped to the restore device and to
 //!  the two phases that wait on a save for [`Restore::erase_refusals`]' reason.
 //!
+//!  M12 (THE TENTH, BLANK DEVICE -- a restore ONTO A UNIT THAT HOLDS NOTHING).
+//!  [`ALL_DEVICES`] devices announce and [`N_DEVICES`] of them do the keygen. The tenth is
+//!  cut out of the same expression as the roster (`announced[..N_DEVICES]` /
+//!  `announced[N_DEVICES]`) at the `BeginKeygen` site, so it is ASSIGNED and never
+//!  inferred: this process owns `BeginKeygen`, so it CREATES the fact rather than trusting
+//!  any device about the one thing under test. PLAN.md §9 item 12's correction (a) said the
+//!  split "needs a way for hostcheck to IDENTIFY the blank device, which the protocol
+//!  cannot supply" -- the premise is true and the conclusion is FALSE, and that error is
+//!  most of what made this item look expensive.
+//!
+//!  It is checked independently, not merely arranged: on the lap `kg.finished` becomes
+//!  `Some`, the coordinator's OWN access structure must have `devices().count() ==
+//!  N_DEVICES` and must not `contains_device(blank)`. That check lives in the loop and NOT
+//!  at PASS, and the reason is the one place this whole item makes an existing assertion
+//!  weaker: by PASS the blank device IS a tenth entry in `device_to_share_index`, because
+//!  leg 2's `FinishedConsolidation` applies `KeyMutation::NewShare` for it. Changing the
+//!  PASS-block count to `ALL_DEVICES` and calling it the roster check would have DELETED
+//!  the only check that the keygen finalized with the right roster.
+//!
+//!  WHAT IT ADDS, precisely ONE assertion, and the other candidates are named below rather
+//!  than shipped: the `Some`/`None` discrimination on the RE-REPORT becomes falsifiable.
+//!  On leg 1 the device consolidates its OWN share back onto itself, so a consolidation
+//!  that acked without ever reaching the signer re-reports correctly and is GREEN. On a
+//!  blank device it cannot be: the pre-signature `HeldShares2` says it holds nothing, and
+//!  the post-consolidation one says it holds this coordinator's share at leg 1's index.
+//!  That pre-report is the one thing here not implied by control flow, so it is the one
+//!  thing asserted (`blank_reported_empty`).
+//!
+//!  THE SHEET IS THE HANDOFF, and it is explicit in both processes. The blank device has
+//!  no reveal of its own -- upstream refuses `DisplayBackup` for it COORDINATOR-SIDE, so
+//!  no frame is ever sent -- so its 25 words come from leg 1's glass, via the stub's
+//!  `sheet_read`. A human carrying a piece of paper between two units is exactly the
+//!  modelled event.
+//!
+//!  MEASURED: `cargo run` 10.11 s -> 12.38 s for all three passes (chunk 64, chunk 1,
+//!  DECLINE). No timeout constant moved: no `State` variant was added, `State::longest()`
+//!  is still 95 s and the stub's DEADLINE still 240 s, so the documented ~2.53x ratio is
+//!  unmoved. `HANDSHAKE_DEADLINE` stays at 5 s and now covers ten announces plus ten
+//!  session rebuilds; the tenth announce landed at 199 ms, 64 ms and 305 ms on the three
+//!  passes. Zero device code, so the ARM image is unchanged at 377,256 B / .text 0x4deb0.
+//!
+//!  A DEFECT FOUND ON THE WAY, in the stub and unrelated to the tenth device: the loop
+//!  that recorded which devices had saved a share drained
+//!  `session.signer.staged_mutations()` looking for `KeyMutation::SaveShare`, and it NEVER
+//!  MATCHED ONCE -- probed at 308 calls per run, every one `staged=0`, because
+//!  `Session::run`'s first statement is `persist_staged`, which clears the queue. So
+//!  `saved` stayed EMPTY and both conditions reading it were vacuous: the latch that
+//!  advances `STATE` to `SharesSaved` and runs the "every share belongs to ONE access
+//!  structure" check never fired, and a hand run's EOF PASS arm was unreachable, so a
+//!  completely successful hand run died `0/9 share(s) saved`. Reading
+//!  `signer.held_shares()` instead makes both live for the first time: `saved` now reaches
+//!  9 on every pass and 10 on the two signature passes.
+//!
+//!  NINE MUTATIONS RUN, each file restored and `cmp`ed byte-identical after:
+//!  - `BeginKeygen::new(announced.clone(), ..)`: **`THE KEYGEN FINALIZED WITH THE WRONG
+//!    ROSTER: ... has 10 device share(s), expected 9, and the device this run left OUT
+//!    (...) is in it`**, exit 1 in 1 s.
+//!  - the same, with BOTH halves of that check disabled: the 9-of-10 keygen ran the whole
+//!    pass -- signature, leg 1's four flows, leg 2's ingest and consolidation -- and died
+//!    only at PASS with **`only 10/9 device(s) reported a session hash`**, exit 1 in 3 s.
+//!    A far worse diagnosis three seconds later, which is what the in-loop check buys.
+//!  - `roster = announced[1..ALL_DEVICES]`, i.e. the right SIZE and the wrong MEMBERS:
+//!    **`... has 9 device share(s), expected 9, and the device this run left OUT (...) is
+//!    in it`**, exit 1. The `contains_device` half is independently falsifiable; the count
+//!    alone cannot see this.
+//!  - the pre-signature round trip over `roster` instead of `announced`: **`M12: ...
+//!    consolidated a share, but this coordinator never got a HeldShares2 from it reporting
+//!    NOTHING beforehand`**, exit 1. This is the mutation `blank_reported_empty` exists
+//!    for.
+//!  - an EXTRA `request_held_shares(blank)` at the leg-1 handoff, i.e. an empty report
+//!    while `restore` is `Some`: **`... reported 0 held share(s), NONE for the access
+//!    structure keygen just finished`**, exit 1 -- the untouched fail-closed bail. With
+//!    `restore.is_none()` dropped from the loosened arm the SAME edit is **exit 0, GREEN**.
+//!    That is the fail-open this guard exists for, and it is why the exemption is scoped by
+//!    STATE as well as by identity.
+//!  - `restore.is_none()` dropped and a round trip added at ingest-done, where the blank
+//!    device holds the saved backup and nothing else: **`... reported 1 held share(s),
+//!    NONE for the access structure keygen just finished`**, exit 1. Drop
+//!    `shares.is_empty()` too and the same edit is **exit 0, GREEN**. All three clauses of
+//!    that guard are load-bearing and none of them is a count.
+//!  - the quiz-count bail left reading the live `restore` instead of `sighted`: **`M7c:
+//!    <blank> reported None quiz answer(s), not exactly 8`**, exit 1 on the FIRST pass.
+//!  - `save_v1` passed to leg 2 unchanged: leg 2 enters `Phase::SavedV1`, reports the
+//!    saved backup only, and hits the fail-closed bail -- **`reported 1 held share(s),
+//!    NONE for the access structure`**, exit 1 on the chunk-1 pass.
+//!  - leg 2 started at `Phase::Erase`: upstream's `EraseDevice` was driven at the BLANK
+//!    device and it refused (**`M9 PASS -- <blank> REFUSED the driver's DataErase`**),
+//!    which is the tenth `refused_erase` entry that would fail that EXACT count; the run
+//!    then died in the NEXT phase with **`1: DisplayBackupProtocol::new / 2: state
+//!    inconsistent: device does not have share in key`**, exit 1. That is (d)'s mechanism,
+//!    MEASURED, and it is COORDINATOR-side: PLAN.md says it surfaces as `Fault::Signer`
+//!    and the stub's `die(2)`, and it does not -- no frame is ever sent.
+//!  - the stub's pre-match `paper.entry(id).or_default()` restored in place of
+//!    `sheet_read`: the blank device gets an EMPTY sheet and dies at `type_backup`'s **`no
+//!    share index was ever read off a reveal page`** (exit 2, state `BackupIngest`) --
+//!    the symptom, pointing a reader at the reveal walk instead of at the sheet plumbing.
+//!  - `Grant::Reveal` writing to a throwaway `Sheet::default()` so `paper` stays empty:
+//!    **`<id> was asked to read a reveal back and there is NO sheet in the room`**, exit 2.
+//!
+//!  ONE MUTATION SURVIVED GREEN, and it is the more interesting result: reverting the
+//!  stub's `acked == ALL_DEVICES` to `== N_DEVICES` leaves the harness at **exit 0** and
+//!  the `all 10 devices acked` line still prints. So the ten `AnnounceAck`s do NOT all
+//!  arrive in one `recv_timeout` payload on this machine -- `acked` walks up through 9 and
+//!  the equality catches it there. `ALL_DEVICES` is still the correct spelling, because at
+//!  9 the line asserts "all acked" when one device has not, but the change is
+//!  correctness-by-construction and NOT load-bearing at this timing: if the acks ever
+//!  coalesce, 9 is skipped, `STATE` never reaches 3 and every later `die` names a stale
+//!  stage. That failure would be invisible.
+//!
+//!  WHAT SURVIVED, stated rather than hidden:
+//!  - the SHARE-IMAGE half of M7e is still over-determined and a tenth device does NOT
+//!    change that, contrary to PLAN.md §9 item 12. The device's own `Consolidate` handler
+//!    refuses a wrong image before any prompt exists (`expected_image != actual_image ||
+//!    secret_share.index != consolidate.share_index`, vendored
+//!    `device/restoration.rs`), so the coordinator's comparison is a second opinion on
+//!    both legs. What a blank device makes falsifiable is the `Some`/`None`
+//!    discrimination, which is a different assertion in the same block.
+//!  - the `index != r.share_index` bail in `Phase::Ingest` is a fail-closed BOUND, not a
+//!    demonstrated assertion, and a tenth device does not promote it.
+//!    `check_physical_backup` takes the index FROM `phase.backup.share_image.index` -- the
+//!    device's own claim -- and then requires `root_shared_key.share_image(that)` to equal
+//!    the typed image, so every one-line corruption is `ShareImageIsWrong` first, with a
+//!    better message. The only thing that reaches the bail is handing over the WRONG
+//!    SHEET, which needs a second reveal in the room to be possible at all. NOT built: it
+//!    would need a third `Restore` leg and a rule, duplicated across both processes, for
+//!    which sheet the blank device retypes, and what it buys is a self-check of the
+//!    harness rather than device evidence. The stub's `sheet_read` refuses two sheets
+//!    instead, so the rule cannot be added by accident.
+//!  - the PASS-block `devices.len()` count is control-flow implied on the signature passes
+//!    and is kept only as an exact count that would catch a share holder nobody put there.
+//!    Its expectation is `sighted.is_some()` rather than a constant, because the DECLINE
+//!    pass runs no restoration and therefore has NO tenth holder; a flat `N_DEVICES` there
+//!    fails **`expected 9-of-9 with 9 share holder(s) ... coordinator has 9-of-10`**
+//!    (MEASURED, exit 1) and a flat `ALL_DEVICES` fails the DECLINE pass.
+//!  - FIVE tempting assertions were NOT written, all for the same reason -- each is
+//!    already implied by control flow, so each would read like coverage: the blank device
+//!    appearing in `device_to_share_indicies()` at leg 1's index (both halves come from
+//!    the same `FinishedConsolidation` and from an index the coordinator itself chose);
+//!    the blank device reporting no `SetName` (`commit_name` fires only from
+//!    `FinalizeKeyGen`, and the exact `device_names.len() == N_DEVICES - 1` already
+//!    discriminates); the blank device not being in `refused_erase` (it is never sent the
+//!    frame); its `HeldShares2` being empty as a STANDALONE assert -- folded into the
+//!    loosened arm's GUARD instead, so anything else falls through to the untouched bail;
+//!    and `PhysicalBackupSaved` having arrived, which is M11's already-recorded shape.
+//!  - the DECLINE pass is untouched by design and that is the cheapest evidence the tenth
+//!    device perturbs nothing: it gets an `AnnounceAck` and a name preview and no prompt
+//!    at all -- no `CheckKeyGen`, no forged `DataErase`, no restoration -- so
+//!    `STUB_EXPECT_DECLINES` stays at `N_DEVICES` and the pass's own assertions are
+//!    byte-for-byte the ones it made before.
+//!
 //! Usage: `hostcheck [path-to-stub-binary]`. Build the stub FIRST and pass the
 //! artifact -- never `cargo run`: the child's stdout IS the wire, and one stray
 //! byte of cargo progress output desynchronises the magic scan permanently.
@@ -625,16 +781,38 @@ use rand_chacha::ChaCha20Rng;
 /// expensive kind: a green run certifying code that is not in the binary.
 const DEFAULT_STUB: &str = "../target/aarch64-apple-darwin/debug/examples/stub";
 
-/// 3 devices, threshold 2. n=3 is not arbitrary: it is what fits the frame bound.
-/// MEASURED sizes at n=3 are `CertifyPlease` 778 B, `Check` 646 B,
-/// `KeyGenResponse` ~318 B, so nothing crosses the ~1 KB point at which an
-/// undrained pty blocks a write. That is now a bound, not a hang
-/// (`WRITE_STALL_LIMIT`), but staying under it is still why keygen is fast.
+/// **THE KEYGEN ROSTER, not the number of devices on the wire** — that is
+/// [`ALL_DEVICES`]. Everything counted per keygen participant keys off THIS: shares,
+/// acks, session hashes, glass codes, `SetName`s, declines, the forged `DataErase`.
+///
+/// n is not arbitrary: it is what fits the frame bound. MEASURED sizes at n=3 are
+/// `CertifyPlease` 778 B, `Check` 646 B, `KeyGenResponse` ~318 B, so nothing crosses
+/// the ~1 KB point at which an undrained pty blocks a write. That is now a bound, not
+/// a hang (`WRITE_STALL_LIMIT`), but staying under it is still why keygen is fast.
 /// At 9-of-9 `CertifyPlease` is
 /// 2,179 B and does not even fit the device's frame limit. Do not raise these
-/// without re-deriving both bounds.
+/// without re-deriving both bounds. The tenth device does NOT move either figure,
+/// because it is not in the roster the certpedpop transcript is built over.
 const N_DEVICES: usize = 9;
 const THRESHOLD: u16 = 9;
+
+/// Devices on the wire. The tenth is THE BLANK ONE (M12): it announces, gets an
+/// `AnnounceAck` and a name preview like the rest, and is then left OUT of
+/// `BeginKeygen`, so it reaches the signature holding nothing at all.
+///
+/// `N_DEVICES` was NOT renamed to `KEYGEN_DEVICES`, deliberately. 40-plus
+/// occurrences, most of them inside format strings, and a mechanical rename would
+/// have flipped the seven counted conditions that must STAY at 9 into this constant
+/// and weakened all seven at once. Leaving `N_DEVICES = 9` means an unconverted site
+/// keeps the STRICTER count, which is the fail-closed direction; the cost is that
+/// `N_DEVICES` names something narrower than it reads, which is why its doc says so
+/// in its first line.
+///
+/// Which device is blank is DECIDED HERE, not reported by any device: the roster is
+/// cut at `announced[..N_DEVICES]` and the blank one is `announced[N_DEVICES]`, both
+/// out of one expression on one lap. A harness that asked the devices which of them
+/// was blank would be trusting them about the very thing under test.
+const ALL_DEVICES: usize = N_DEVICES + 1;
 
 /// ONE nonce stream per device, and this is the whole M5 frame-size decision.
 ///
@@ -1274,6 +1452,16 @@ struct Sign {
 /// ever DID obey a `DataErase`, the share every phase below reads would be gone and all
 /// four of them would fail too — so the refusal gets corroborated by the rest of the pass
 /// and not only by the `Debug` line it prints.
+///
+/// M12's SECOND leg does not start at [`Phase::Erase`], and where it does start is
+/// [`Restore::new`]'s `start` parameter rather than a constant here. That leg runs at the
+/// BLANK device, which holds no share, so the first three phases are all impossible for
+/// it — see that parameter's doc for which process refuses each and why. It enters at
+/// [`Phase::Ingest`], types in 25 words off ANOTHER device's sheet, and finishes through
+/// the same [`Phase::Consolidate`] / [`Phase::Reheld`] pair. No `State` variant was added
+/// for it: `Phase::state()` maps it onto the states leg 1 already uses, so
+/// `State::budget` and `State::longest()` are untouched at 95 s and the stub's 240 s
+/// DEADLINE keeps its documented ~2.53x ratio.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Phase {
     /// M9: upstream's `EraseDevice`, which must NEVER reach `Completion::Success`.
@@ -1414,12 +1602,27 @@ struct Restore {
 }
 
 impl Restore {
-    fn new(device: DeviceId, share_index: ShareIndex, digest: Sha256Digest) -> Self {
+    /// `start` is a parameter and not a constant because M12's leg starts at
+    /// [`Phase::Ingest`], never at [`Phase::Erase`] or [`Phase::Reveal`]. Both of those
+    /// are impossible for a device holding no share, and BOTH fail in THIS process
+    /// rather than on the device — `DisplayBackupProtocol::new` and
+    /// `CheckBackupProtocol::new` go through `request_device_{display,check}_backup`,
+    /// whose `device_to_share_index.get(..).ok_or(ActionError::StateInconsistent("device
+    /// does not have share in key"))` is coordinator-side and sends no frame at all.
+    /// MEASURED by starting leg 2 at `Phase::Reveal`: `M7 Reveal: DisplayBackupProtocol
+    /// ::new: StateInconsistent("device does not have share in key")`, exit 1. PLAN.md
+    /// records this refusal as `Fault::Signer` and the stub's `die(2)`; the device-side
+    /// refusals exist but are UNREACHABLE from here.
+    ///
+    /// `Phase::Erase` is additionally ruled out by an exact count: `refused_erase.len()
+    /// != N_DEVICES` at PASS, and driving `EraseDevice` at a tenth device adds a tenth
+    /// `refused=DataErase`.
+    fn new(device: DeviceId, share_index: ShareIndex, digest: Sha256Digest, start: Phase) -> Self {
         Restore {
             device,
             share_index,
             digest,
-            phase: Phase::Erase,
+            phase: start,
             started: false,
             glass_index: None,
             glass_words: BTreeMap::new(),
@@ -1838,9 +2041,26 @@ fn restore_step(
                                 r.device
                             )
                         })?;
+                    // A BOUND on data flowing into a destructive write, not a
+                    // demonstrated assertion, and it is honest about which. Every
+                    // one-line corruption of the typed words fails in
+                    // `check_physical_backup` first and with a better message:
+                    // that call takes the index FROM `phase.backup.share_image.index`
+                    // — the device's own claim — and then requires
+                    // `root_shared_key.share_image(that)` to equal the typed image,
+                    // so a wrong index with a right scalar is `ShareImageIsWrong`.
+                    // The only thing that reaches here is handing over the WRONG
+                    // SHEET, which needs a second reveal in the room to be possible
+                    // at all (see `sheet_read` in the stub, whose two-or-more arm
+                    // refuses rather than picking).
+                    //
+                    // M12 changed the WORDING and not the guard: for the blank device
+                    // `r.share_index` is not an index it holds, it is the index of the
+                    // share it is being GIVEN on paper.
                     if index != r.share_index {
                         bail!(
-                            "{} typed in a share at index {index:?}, not the {:?} it holds",
+                            "{} typed in a share at index {index:?}, not the {:?} on the sheet it \
+                             was handed",
                             r.device,
                             r.share_index
                         );
@@ -2168,7 +2388,8 @@ fn main() -> Result<()> {
     eprintln!("--- pass: DECLINE (every device presses x at the signing screen) ---");
     one_pass(&stub, 64, &t0, Expect::Decline, false).context("pass DECLINE")?;
     println!(
-        "M1+M2+M3+M5+M7+M8+M9 PASS: real {THRESHOLD}-of-{N_DEVICES} keygen, nonce replenishment and a \
+        "M1+M2+M3+M5+M7+M8+M9+M12 PASS: real {THRESHOLD}-of-{N_DEVICES} keygen over a roster cut \
+         out of {ALL_DEVICES} announced devices, nonce replenishment and a \
          signature that VERIFIES against the group key, across the pty at both chunk sizes, \
          including the 1-byte case that forces reassembly; the 4-byte code ON THE GLASS equals the \
          coordinator's session hash on every device; a declined signing prompt yields no signature \
@@ -2178,9 +2399,11 @@ fn main() -> Result<()> {
          only from what that reveal drew, those same words go back in through the letter picker and \
          `check_physical_backup` accepts them, and the destructive consolidation leaves a record \
          the device can still describe; a coordinator-previewed 14-char/56-byte name reaches FLASH \
-         on all {N_DEVICES} devices and comes back byte-exact as `SetName`; and upstream's own \
+         on all {N_DEVICES} devices and comes back byte-exact as `SetName`; upstream's own \
          `EraseDevice` driver NEVER completes against this device, which refuses its `DataErase` on \
-         the wire"
+         the wire; and the TENTH device, which this coordinator left out of the keygen and which \
+         reported holding nothing at all, ingested another device's 25 words off its sheet and \
+         CONSOLIDATED them onto a flash that held no share"
     );
     Ok(())
 }
@@ -2294,6 +2517,33 @@ fn one_pass(
     let mut requested_held = false;
     let mut read_timeouts = 0usize;
     let mut announced: Vec<DeviceId> = Vec::new();
+    // ============================== M12 ==============================
+    // THE KEYGEN ROSTER AND THE BLANK DEVICE, both cut out of ONE expression on the
+    // lap the tenth device announces (see the `BeginKeygen` site). Cutting them
+    // together is what makes them unable to disagree: `roster` is
+    // `announced[..N_DEVICES]` and `blank` is `announced[N_DEVICES]`, so a device is
+    // in exactly one of the two by construction.
+    //
+    // ASSIGNED, NEVER INFERRED. This process owns `BeginKeygen`, so it CREATES the
+    // fact that one device holds nothing rather than discovering it. PLAN.md §9 item
+    // 12 recorded that a split "needs a way for hostcheck to IDENTIFY the blank
+    // device, which the protocol cannot supply because all ten flashes are blank
+    // before keygen" — the premise is true and the conclusion is false, and the
+    // difference matters: a harness that asked the devices which one was blank would
+    // be trusting them about the very thing under test. The choice is independently
+    // checkable from the coordinator's own `contains_device`, which is what the
+    // in-loop roster check below does.
+    //
+    // `blank` stays `None` until then, and every use of it is `Some(x) == blank`
+    // rather than an unwrap, so a run that never got ten announces cannot mistake an
+    // absent blank device for a match.
+    let mut roster: Vec<DeviceId> = Vec::new();
+    let mut blank: Option<DeviceId> = None;
+    // M12: the blank device answered the pre-signature `RequestHeldShares` with NOTHING
+    // — no entry for the access structure keygen just finished. Asserted at PASS
+    // because it is NOT implied by control flow: dropping the tenth device from that
+    // round trip leaves the run green and this false.
+    let mut blank_reported_empty = false;
     // What each device says the keygen session hash is, and which devices refused
     // the forged `DataErase` below. Both arrive as `DeviceSendBody::Debug`, which
     // this loop intercepts and never hands to the `FrostCoordinator` -- so neither
@@ -2353,7 +2603,20 @@ fn one_pass(
     // construction; and `is_complete()` as the pass criterion -- except for
     // `DisplayBackupProtocol`, which has none (see [`Restore::recorded`]).
     let mut ui: Option<Box<dyn UiProtocol>> = None;
+    // M12: TWO legs through ONE slot. `restore` is always the LIVE leg — every
+    // per-message handler does `restore.as_mut()` and therefore follows it with no
+    // change, and there is never a second `UiProtocol` alive — and `sighted` is leg 1
+    // after it retired.
+    //
+    // `sighted` is named for what it holds: the device that SAW its own reveal on the
+    // glass. Leg 2 is the blank device, which sees nothing, so `sighted` is where every
+    // M7b/M7c fact at PASS has to be read from. The quiz-count bail in particular MUST
+    // read it: leg 2 never enters `Phase::Quiz`, so leaving that bail on `restore` fires
+    // on EVERY GREEN RUN — MEASURED, `M7c: <blank> reported None quiz answer(s), not
+    // exactly 8`, exit 1. That is the proof the redirection is load-bearing and not
+    // cosmetic.
     let mut restore: Option<Restore> = None;
+    let mut sighted: Option<Restore> = None;
 
     let outcome = loop {
         state.publish();
@@ -2484,7 +2747,7 @@ fn one_pass(
                             if !announced.contains(&from) {
                                 announced.push(from);
                                 eprintln!(
-                                    "hostcheck: ANNOUNCE {}/{N_DEVICES} from {from} digest \
+                                    "hostcheck: ANNOUNCE {}/{ALL_DEVICES} from {from} digest \
                                      {firmware_digest} after {:?}",
                                     announced.len(),
                                     started.elapsed()
@@ -2580,9 +2843,35 @@ fn one_pass(
                                 }
                                 writes_queued += 1;
                             }
-                            if announced.len() == N_DEVICES && keygen.is_none() {
+                            // ============================== M12 ==============================
+                            // TEN devices on the wire, NINE in the keygen. The gate is
+                            // `ALL_DEVICES` so that the roster is a DECISION taken once
+                            // all ten ids are known, rather than a race: at
+                            // `== N_DEVICES` the roster was whichever nine announced
+                            // first, which is deterministic here only because the stub
+                            // writes its announces in `DeviceId` order out of a
+                            // `BTreeMap` — MEASURED, by running the tenth device against
+                            // the old gate: keygen began on the 9th announce and the run
+                            // failed at the fail-closed `None =>` arm 1.76 s in.
+                            //
+                            // The blank device is slot N_DEVICES, and that slot is not
+                            // free: M10's differential assigns `name_cancelled` on the
+                            // FIRST announce and `name_recovered` on the second, and
+                            // requires `cancelled` to report no name. A blank device in
+                            // slot 0 never receives a `FinalizeKeyGen`, so it never runs
+                            // `commit_name` and would report no name whatever `Cancel`
+                            // did — M10's first bail would pass VACUOUSLY and the bail
+                            // that exists to catch exactly that (`THE M10 DIFFERENTIAL IS
+                            // VACUOUS`) would never fire. Slot 9 is neither subject.
+                            //
+                            // Deliberately not an `is_blank(id)` predicate: a predicate
+                            // makes the slot invisible at this site, and this site is
+                            // where the pairing with M10 has to be readable.
+                            if announced.len() == ALL_DEVICES && keygen.is_none() {
+                                roster = announced[..N_DEVICES].to_vec();
+                                blank = announced.get(N_DEVICES).copied();
                                 let begin = BeginKeygen::new(
-                                    announced.clone(),
+                                    roster.clone(),
                                     THRESHOLD,
                                     "cold-snap M3".to_string(),
                                     KeyPurpose::Test,
@@ -2591,8 +2880,10 @@ fn one_pass(
                                 let id = begin.keygen_id;
                                 eprintln!(
                                     "hostcheck: begin_keygen {THRESHOLD}-of-{N_DEVICES} \
-                                     (keygen_id {id}) after {:?}",
-                                    started.elapsed()
+                                     (keygen_id {id}) after {:?}; M12: {:?} is LEFT OUT and \
+                                     stays blank",
+                                    started.elapsed(),
+                                    blank
                                 );
                                 match coordinator.begin_keygen(begin, &mut rng) {
                                     Ok(sends) => queue.extend(sends),
@@ -2702,6 +2993,49 @@ fn one_pass(
                                                 r.reheld = true;
                                             }
                                         }
+                                    }
+                                    // ============================ M12 ============================
+                                    // THE ONE PLACE A TENTH DEVICE MAKES AN EXISTING
+                                    // ASSERTION WEAKER, loosened as narrowly as it can
+                                    // be. Three scopes, all by IDENTITY or by STATE and
+                                    // not one of them by count:
+                                    //
+                                    //  - `Some(from) == blank`: the nine keygen devices
+                                    //    keep the untouched bail below, byte for byte.
+                                    //    Scoped by the id this run itself left out of
+                                    //    `BeginKeygen`, so it cannot drift with a count.
+                                    //  - `restore.is_none()`: this is the PRE-SIGNATURE
+                                    //    round trip and NOT `Phase::Reheld`'s. The blank
+                                    //    device is asked twice, and the SECOND time it
+                                    //    MUST report the share it just consolidated —
+                                    //    which is the very thing M12 exists to prove, so
+                                    //    an exemption keyed only on the id would swallow
+                                    //    it and fail OPEN. `restore` is built only once
+                                    //    `sign.signatures.is_some()`, so this is true
+                                    //    here and false at Reheld; a future edit moving
+                                    //    that construction earlier would TIGHTEN this
+                                    //    arm, which is the fail-closed direction.
+                                    //  - `shares.is_empty()`: a blank device reporting
+                                    //    ANYTHING falls through to the bail below. This
+                                    //    is the guard rather than a separate assert
+                                    //    deliberately — "the blank device's HeldShares2
+                                    //    is empty" is unreachable otherwise in this tree
+                                    //    (the round trip precedes any
+                                    //    `SavePhysicalBackup2`, so `keys` is empty), so
+                                    //    as a standalone `bail!` it could not fail and
+                                    //    would read like coverage. As a PATTERN it makes
+                                    //    every other shape fail closed.
+                                    None if Some(from) == blank
+                                        && restore.is_none()
+                                        && shares.is_empty() =>
+                                    {
+                                        blank_reported_empty = true;
+                                        eprintln!(
+                                            "hostcheck: M12 -- {from} was LEFT OUT of the keygen \
+                                             and reports holding NOTHING AT ALL (0 shares), so \
+                                             the {want:?} it is about to be handed on paper is a \
+                                             share it cannot already have"
+                                        );
                                     }
                                     None => {
                                         break Err(anyhow::anyhow!(
@@ -3031,11 +3365,56 @@ fn one_pass(
             if let Some(want) = kg.finished {
                 if !requested_held {
                     requested_held = true;
+                    // ============================== M12 ==============================
+                    // THE ROSTER CHECK, and it lives HERE rather than at PASS because
+                    // this is the last lap on which it can still fail. By PASS the
+                    // blank device is IN `found.devices()`: leg 2's
+                    // `FinishedConsolidation` makes the coordinator apply
+                    // `KeyMutation::NewShare { device_id: blank, .. }`, whose apply is
+                    // `device_to_share_index.insert`, and `AccessStructure::devices()`
+                    // is that map's keys. Changing the PASS-block count to
+                    // `ALL_DEVICES` and calling it the roster check would therefore
+                    // have DELETED the only check that the keygen finalized with the
+                    // right roster — the one silent weakening this whole item risks.
+                    //
+                    // Both halves are falsifiable, and by the SAME one-line mutation:
+                    // pass `announced.clone()` to `BeginKeygen::new` above and this
+                    // bails by name at finalize.
+                    let found = coordinator
+                        .iter_access_structures()
+                        .find(|a| a.access_structure_ref() == want);
+                    let (n_devices, has_blank) = match found {
+                        Some(a) => (
+                            a.devices().count(),
+                            blank.is_some_and(|b| a.contains_device(b)),
+                        ),
+                        None => {
+                            break Err(anyhow::anyhow!(
+                                "{want:?} came out of finalize_keygen and is not in the \
+                                 coordinator"
+                            ))
+                        }
+                    };
+                    if n_devices != N_DEVICES || has_blank {
+                        break Err(anyhow::anyhow!(
+                            "THE KEYGEN FINALIZED WITH THE WRONG ROSTER: {want:?} has {n_devices} \
+                             device share(s), expected {N_DEVICES}, and the device this run left \
+                             OUT ({blank:?}) is{} in it. The roster is this coordinator's own \
+                             choice at `BeginKeygen`, so a mismatch means the ceremony ran over a \
+                             different set of devices than the one asked for",
+                            if has_blank { "" } else { " not" }
+                        ));
+                    }
+                    // OVER ALL TEN, deliberately. This is the ONLY wire evidence that
+                    // the tenth device holds nothing, and without it the blank
+                    // configuration would be a harness claim rather than a measured
+                    // fact. It is also what forces the narrowed `None =>` arm below.
                     for id in &announced {
                         queue.extend(coordinator.request_held_shares(*id));
                     }
                     eprintln!(
-                        "hostcheck: keygen FINISHED {want:?}; asking {} device(s) what they hold",
+                        "hostcheck: keygen FINISHED {want:?} with the {N_DEVICES}-device roster \
+                         and WITHOUT {blank:?}; asking {} device(s) what they hold",
                         announced.len()
                     );
                 }
@@ -3064,9 +3443,15 @@ fn one_pass(
             //
             // Sent here, after `HeldShares2` and before the nonce round trip, so a
             // device that obeyed has already told us it had something to lose.
+            //
+            // M12: the ROSTER, not all ten. `refused_erase.len() != N_DEVICES` at PASS
+            // is an EXACT count and every device refuses `DataErase` unconditionally, so
+            // a tenth entry FAILS the run — and the claim this makes is about devices
+            // that had something to lose, which the blank one does not. Both halves of
+            // the two-sided assertion stay exactly as strong.
             if held.len() == N_DEVICES && !lied {
                 lied = true;
-                let sent = announced.iter().try_for_each(|id| {
+                let sent = roster.iter().try_for_each(|id| {
                     send_frame(
                         &wtx,
                         ReceiveSerial::Message(
@@ -3077,18 +3462,25 @@ fn one_pass(
                 if let Err(e) = sent {
                     break Err(e.context("forged DataErase"));
                 }
-                writes_queued += announced.len();
+                // `roster.len()` and not `announced.len()`: over-counting by one here
+                // corrupts the WRITE STALL message's `frame {}/{writes_queued}`.
+                writes_queued += roster.len();
                 eprintln!(
                     "hostcheck: FORGED DataErase to {} device(s) -- every one must refuse it \
                      and still be able to sign",
-                    announced.len()
+                    roster.len()
                 );
             }
 
             if held.len() == N_DEVICES && !sign.requested_nonces {
                 sign.requested_nonces = true;
+                // M12: the ROSTER. The blank device has durable nonce slots on its blank
+                // flash and would happily replenish, which costs a MEASURED 2,040 B frame
+                // plus 30 debug-build nonce derivations and pushes
+                // `sign.replenished.len()` to 10 against the `== N_DEVICES` gate below.
+                // Both counts stay exact.
                 let devices: std::collections::BTreeSet<DeviceId> =
-                    announced.iter().copied().collect();
+                    roster.iter().copied().collect();
                 queue.extend(coordinator.maybe_request_nonce_replenishment(
                     &devices,
                     NONCE_STREAMS,
@@ -3112,8 +3504,11 @@ fn one_pass(
                     .finished
                     .expect("nonces are only requested after finalize");
                 // THRESHOLD of N, not all N: signing with a strict subset is what
-                // selects the signer subset; at THRESHOLD == N_DEVICES that is everyone.
-                sign.signers = announced.iter().copied().take(THRESHOLD as usize).collect();
+                // selects the signer subset; at THRESHOLD == N_DEVICES that is everyone
+                // IN THE ROSTER. Taken from `roster` and not `announced`: numerically
+                // identical today, and it stays true if THRESHOLD ever drops below
+                // N_DEVICES, where `announced` would start admitting the blank device.
+                sign.signers = roster.iter().copied().take(THRESHOLD as usize).collect();
                 match coordinator.start_sign(want, sign_task(), &sign.signers, &mut rng) {
                     Ok(id) => {
                         eprintln!(
@@ -3147,11 +3542,13 @@ fn one_pass(
                 // not on the arrival of `Signed`, exactly as before.
                 Expect::Signature => {
                     if sign.signatures.is_some() {
-                        if restore.is_none() {
+                        if restore.is_none() && sighted.is_none() {
                             // One device, and the FIRST to announce -- deterministic,
                             // because the stub writes its announces in `DeviceId`
-                            // order out of a `BTreeMap`.
-                            let device = match announced.first() {
+                            // order out of a `BTreeMap`. `roster.first()` and not
+                            // `announced.first()`: identical today, and it is the
+                            // roster this leg's four flows need a share from.
+                            let device = match roster.first() {
                                 Some(id) => *id,
                                 None => break Err(anyhow::anyhow!("a signature with no devices")),
                             };
@@ -3179,9 +3576,12 @@ fn one_pass(
                                     break Err(anyhow::anyhow!("{device} announced no digest"))
                                 }
                             };
-                            restore = Some(Restore::new(device, share_index, digest));
+                            restore = Some(Restore::new(device, share_index, digest, Phase::Erase));
                         }
-                        let r = restore.as_mut().expect("just set");
+                        let r = restore.as_mut().expect(
+                            "restore is Some here: it is built above when both legs are unstarted, \
+                             and leg 1's `take` below refills it on the same lap",
+                        );
                         state = r.phase.state();
                         if let Err(e) = restore_step(
                             &mut coordinator,
@@ -3190,12 +3590,82 @@ fn one_pass(
                             &mut ui,
                             r,
                             kg.finished.expect("a signature implies an access structure"),
-                            save_v1,
+                            // ============================== M12 ==============================
+                            // `&& sighted.is_none()` keeps M11's v1 downgrade on LEG 1
+                            // only, so leg 2 never enters `Phase::SavedV1` and M11 does
+                            // not move at all. Leg 2's restoration is a DIFFERENT one
+                            // with a different `RestorationId`, and its `HeldShare2` for
+                            // the saved backup carries whatever v2 body it was sent —
+                            // MEASURED by passing `save_v1` unchanged: on the chunk-1
+                            // pass leg 2 enters `Phase::SavedV1` and the run hangs there
+                            // to `DEADLINE (95s) in state BackupIngest`, because
+                            // `saved_v1_threshold` is only ever set for
+                            // `from == r.device` while `r.phase == Phase::SavedV1` and
+                            // leg 2's reply arrives against a phase leg 1 has left.
+                            save_v1 && sighted.is_none(),
                         ) {
                             break Err(e.context(format!("M7 {:?}", r.phase)));
                         }
-                        if r.phase == Phase::Done {
-                            break Ok(());
+                        // Copied out before the borrow of `restore` ends: the handoff
+                        // below moves the whole `Option`.
+                        let phase = r.phase;
+                        if phase == Phase::Done {
+                            if sighted.is_some() {
+                                break Ok(());
+                            }
+                            // ========================= M12 =========================
+                            // THE SECOND LEG, and the whole item. Leg 1 is retired into
+                            // `sighted` — every M7b/M7c fact at PASS is read from there,
+                            // because leg 2 sits no quiz and reads no glass — and
+                            // `restore` is rebuilt for the BLANK device at
+                            // `Phase::Ingest`.
+                            //
+                            // ONE SLOT, deliberately: every per-message handler that does
+                            // `restore.as_mut()` follows the live leg with no change at
+                            // all, and there is no second `UiProtocol` alive at any
+                            // moment (the SETTLED "one boxed UiProtocol at a time").
+                            //
+                            // THE SHEET IS THE HANDOFF. The blank device has no reveal of
+                            // its own, so the 25 words it types come from leg 1's — over
+                            // there `sheet_read` hands it the single sheet in the room,
+                            // which is the harness's stand-in for a human carrying a
+                            // piece of paper between two units. That is why leg 2 is
+                            // given LEG 1's `share_index`: it is not a share this device
+                            // holds, it is the index of the share it is being GIVEN, and
+                            // `check_physical_backup` derives the same index from the
+                            // words themselves.
+                            //
+                            // `digest` is leg 2's OWN announced digest, not leg 1's. Only
+                            // `Phase::Quiz` reads it and leg 2 never enters that phase,
+                            // but the blank device did announce one and the honest value
+                            // is cheaper than explaining a borrowed one.
+                            // `expect` and not a `bail`, because control flow already makes
+                            // it a precondition: standing here needs a signature, which
+                            // needs a keygen, and `blank` is cut out of the same
+                            // expression as the roster on the lap keygen begins. A bail
+                            // here would read like coverage.
+                            let blank = blank.expect(
+                                "a signature implies a keygen, and the roster and the blank id \
+                                 come out of ONE expression on the lap keygen begins",
+                            );
+                            let digest = match digests.get(&blank) {
+                                Some(digest) => *digest,
+                                None => break Err(anyhow::anyhow!("{blank} announced no digest")),
+                            };
+                            let leg1 = restore.take().expect("just borrowed it");
+                            let share_index = leg1.share_index;
+                            eprintln!(
+                                "hostcheck: M12 -- leg 1 at {} is DONE; handing its sheet to the \
+                                 BLANK device {blank} and asking IT to type share {share_index:?} \
+                                 in, save it and consolidate it onto a flash that holds nothing",
+                                leg1.device
+                            );
+                            sighted = Some(leg1);
+                            restore =
+                                Some(Restore::new(blank, share_index, digest, Phase::Ingest));
+                            // `ui` is already None: `Phase::Consolidate` retired the last
+                            // driver through `advance`, and the new `Restore` has
+                            // `started: false`, so leg 2 builds its own.
                         }
                     }
                 }
@@ -3288,10 +3758,33 @@ fn one_pass(
                 .with_context(|| {
                     format!("{as_ref:?} came out of finalize_keygen but is not in the coordinator")
                 })?;
+            //
+            // M12: THIS IS NO LONGER THE ROSTER CHECK — that moved into the loop, to the
+            // lap `kg.finished` becomes `Some`, and the comment there says why. By here
+            // the blank device IS a tenth entry in `device_to_share_index`, because leg
+            // 2's `FinishedConsolidation` made the coordinator apply
+            // `KeyMutation::NewShare` for it; and reaching PASS on a signature pass
+            // REQUIRES `r.consolidated`, which is set from that same message. So on those
+            // passes both members below are implied by control flow. It is kept as an
+            // EXACT count for the one thing it can still see: a share holder nobody put
+            // there.
+            //
+            // The expectation is `sighted.is_some()` and not a constant, because the
+            // DECLINE pass breaks before any restoration and so has NO tenth holder. That
+            // asymmetry is itself the statement that leg 2 is what adds the tenth — a
+            // flat `ALL_DEVICES` here fails the DECLINE pass outright, and a flat
+            // `N_DEVICES` fails the other two.
             let devices: Vec<DeviceId> = found.devices().collect();
-            if found.threshold() != THRESHOLD || devices.len() != N_DEVICES {
+            let want_holders = if sighted.is_some() {
+                ALL_DEVICES
+            } else {
+                N_DEVICES
+            };
+            if found.threshold() != THRESHOLD || devices.len() != want_holders {
                 bail!(
-                    "expected {THRESHOLD}-of-{N_DEVICES}, coordinator has {}-of-{}",
+                    "expected {THRESHOLD}-of-{N_DEVICES} with {want_holders} share holder(s) \
+                     (M12's blank device becomes the tenth once leg 2 consolidates, and only \
+                     then), coordinator has {}-of-{}",
                     found.threshold(),
                     devices.len()
                 );
@@ -3453,14 +3946,26 @@ fn one_pass(
             // says so, and what reaches here is a device missing for some THIRD reason.
             // The exact count and not `>=`: a second unexplained absence must fail even
             // though `cancelled`'s absence is expected.
+            //
+            // M12 does NOT move this count and does not weaken it. It counts a
+            // `commit_name`, which fires only from `Session::run`'s `FinalizeKeyGen` arm —
+            // so the blank device cannot appear here at all, and the exact `N_DEVICES - 1`
+            // still catches any THIRD absence. What changed is only the message: with ten
+            // devices on the wire TWO are expected to be silent, and both are named rather
+            // than subtracted. The blank device is still sent `Naming(Preview)` like every
+            // other, deliberately: a preview commits nothing without a `FinalizeKeyGen`, so
+            // the announce arm stays free of a per-device exception a future edit could
+            // widen, at a cost of one 97 B frame per run.
             if device_names.len() != N_DEVICES - 1 {
                 bail!(
                     "{}/{} device(s) reported a NAME (SetName: {device_names:?}) -- \
                      `commit_name` pushes SetName only after NameStore::save returned Ok, so a \
                      device missing here either never took the preview or could not persist it. \
-                     Exactly ONE of the {N_DEVICES} is expected to be missing and it is \
-                     {cancelled}, whose preview was followed by a `Cancel` (M10); anything else \
-                     absent is a device that failed to commit",
+                     TWO of the {ALL_DEVICES} on the wire are expected to be missing: \
+                     {cancelled}, whose preview was followed by a `Cancel` (M10), and \
+                     {blank:?}, which M12 left OUT of the keygen so it never reached \
+                     `FinalizeKeyGen` at all. Anything else absent is a device that failed to \
+                     commit",
                     device_names.len(),
                     N_DEVICES - 1,
                 );
@@ -3598,7 +4103,17 @@ fn one_pass(
             // number comes off the device's own `Debug` channel and is compared against
             // arithmetic over `frost_backup::NUM_WORDS` here, so a device that answered
             // nine questions to pass eight fails by name.
-            let r = restore.as_ref().expect("PASS implies M7 ran to Phase::Done");
+            //
+            // M12: read off `sighted`, i.e. LEG 1. Leg 2 is the blank device and never
+            // enters `Phase::Quiz` at all, so its `quiz_answers` is `None` and pointing
+            // this at the live `restore` fires on every green run.
+            let r = sighted
+                .as_ref()
+                .expect("PASS implies M7's first leg ran to Phase::Done");
+            // M12's own leg, whose facts are read from the still-live `restore`.
+            let blank_leg = restore
+                .as_ref()
+                .expect("PASS implies M12's second leg ran to Phase::Done");
             if r.quiz_answers != Some(QUIZ_POSITIONS) {
                 bail!(
                     "M7c: {} reported {:?} quiz answer(s), not exactly {QUIZ_POSITIONS} -- MORE \
@@ -3607,6 +4122,31 @@ fn one_pass(
                      different number of positions than `frost_backup::NUM_WORDS / 3`",
                     r.device,
                     r.quiz_answers
+                );
+            }
+            // ============================== M12 ==============================
+            // THE ONE FACT LEG 2 ADDS THAT IS NOT A PRECONDITION OF STANDING HERE.
+            //
+            // Everything else about leg 2 is control flow, exactly as M7's own phase gate
+            // is: reaching `Phase::Done` on the blank device REQUIRES `check_physical_backup`
+            // to have accepted the typed words, `PhysicalBackupSaved` to have completed
+            // `EnterPhysicalBackup`, `FinishedConsolidation` to have arrived, and the
+            // re-report to have matched this coordinator's polynomial at leg 1's index. A
+            // `bail!` on any of those would be an assertion that cannot fail.
+            //
+            // This one CAN fail, and its mutation is one line: change the pre-signature
+            // round trip to `for id in &roster` and the blank device is never asked what it
+            // holds, so nothing establishes that the share it consolidated is one it did not
+            // already have — and that is the entire difference between M12 and leg 1, where
+            // the device consolidates its OWN share back onto itself.
+            if !blank_reported_empty {
+                bail!(
+                    "M12: {} consolidated a share, but this coordinator never got a HeldShares2 \
+                     from it reporting NOTHING beforehand -- without that report the \
+                     consolidation is indistinguishable from leg 1's, where the device already \
+                     held the share it was handed, and the `Some`/`None` discrimination on the \
+                     re-report proves nothing",
+                    blank_leg.device
                 );
             }
 
@@ -3618,8 +4158,10 @@ fn one_pass(
                  \n    SIGNATURE VERIFIES over {SIGN_MESSAGE:?}\
                  \n      sig    = {}\n      key    = {derived}\
                  \n      appkey = {}\n      signers = {:?} ({} of {N_DEVICES})\
-                 \n    device half verified over the wire: {}/{N_DEVICES} HeldShares2 \
-                 reports matched our own access structure\
+                 \n    device half verified over the wire: {}/{ALL_DEVICES} HeldShares2 \
+                 reports matched our own access structure -- {N_DEVICES} from the keygen, and \
+                 the tenth is M12's blank device AFTER it consolidated (it reported NOTHING \
+                 the first time it was asked)\
                  \n    session_hash AGREED device<->coordinator on {}/{N_DEVICES} devices \
                  (two processes, two copies of frostsnap_core)\
                  \n    THE GLASS shows {want_glass} on {}/{N_DEVICES} devices -- the 4 bytes \
@@ -3643,6 +4185,17 @@ fn one_pass(
                  \n      M9  ERASE     -- upstream's own EraseDevice driver stayed at \
                  is_complete()==None for the whole grace window and the device REFUSED its \
                  DataErase on the wire, so its completion path is unreachable here\
+                 \n    M12 THE TENTH, BLANK DEVICE: {} announced with the other {N_DEVICES} and \
+                 was LEFT OUT of BeginKeygen -- a roster this coordinator cut itself and then \
+                 checked at finalize against its own contains_device -- and it reported holding \
+                 NOTHING AT ALL when asked. It was then handed {}'s SHEET, the same 25 words that \
+                 device's glass drew, typed them in through the letter picker in {} keypresses, \
+                 saved them, and CONSOLIDATED onto a flash that held no share at all; asked \
+                 again, it described the record for share index {:?} to a coordinator that had \
+                 never given it one\
+                 \n      so the Some/None discrimination on the re-report is FALSIFIABLE here and \
+                 is not on leg 1: a consolidation that acked without reaching the signer is green \
+                 there, because that device already held the share it was handed\
                  \n    M8 NAME: all {}/{} device(s) persisted and reported {:?} \
                  ({} chars, {} bytes -- the widest name the wire admits), previewed before \
                  keygen and acked only after NameStore::save returned Ok\
@@ -3669,6 +4222,12 @@ fn one_pass(
                 r.glass_words.len(),
                 QUIZ_POSITIONS,
                 r.typed.map_or("?".to_string(), |n| n.to_string()),
+                // M12's four: the blank device, the sheet's source, its own keypress
+                // count and the index it was handed.
+                blank_leg.device,
+                r.device,
+                blank_leg.typed.map_or("?".to_string(), |n| n.to_string()),
+                blank_leg.share_index,
                 device_names.len(),
                 N_DEVICES - 1,
                 DEVICE_NAME,
@@ -3753,7 +4312,9 @@ fn pump(
                     .try_into()
                     .map_err(|e: &'static str| anyhow::anyhow!("CoordinatorSend -> wire: {e}"))?;
                 let n_dest = match &msg.target_destinations {
-                    frostsnap_coordinator::frostsnap_comms::Destination::All => N_DEVICES,
+                    // `ALL_DEVICES`: this is a claim about the WIRE, and the wire has ten
+                    // listeners even though nine of them are the keygen roster.
+                    frostsnap_coordinator::frostsnap_comms::Destination::All => ALL_DEVICES,
                     frostsnap_coordinator::frostsnap_comms::Destination::Particular(d) => d.len(),
                 };
                 // The gist names the frame. It bounds WHICH frames are in the
