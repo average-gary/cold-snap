@@ -60,18 +60,21 @@ use embedded_storage::nor_flash::{ErrorType, NorFlash, ReadNorFlash};
 use frostsnap_comms::{
     CommsMisc, DeviceName, DeviceSendBody, DeviceSendMessage, Downstream, NameCommand, Sha256Digest,
 };
+use frostsnap_core::bitcoin_transaction::LocalSpk;
 use frostsnap_core::device::{
     restoration::{BackupDisplayPhase, EnterBackupPhase, ToUserRestoration},
     DeviceSecretDerivation, DeviceToUserMessage, FrostSigner,
 };
 use frostsnap_core::message::{
-    keygen::Keygen, signing::CoordinatorSigning, signing::DeviceSigning, CoordinatorRestoration,
-    CoordinatorToDeviceMessage, DeviceSend, DeviceToCoordinatorMessage,
+    keygen::Keygen, screen_verify::ScreenVerify, signing::CoordinatorSigning,
+    signing::DeviceSigning, CoordinatorRestoration, CoordinatorToDeviceMessage, DeviceSend,
+    DeviceToCoordinatorMessage,
 };
 use frostsnap_core::schnorr_fun::fun::{prelude::*, KeyPair};
+use frostsnap_core::tweak::BitcoinBip32Path;
 use frostsnap_core::{
-    AccessStructureRef, CheckedSignTask, CoordShareDecryptionContrib, DeviceId, SignTask,
-    SymmetricKey,
+    AccessStructureRef, CheckedSignTask, CoordShareDecryptionContrib, DeviceId, MasterAppkey,
+    SignTask, SymmetricKey,
 };
 use frostsnap_embedded::{AbSlot, AbWriteOutcome, FlashPartition, NonceAbSlot, SECTOR_SIZE};
 use sha2::{Digest, Sha256};
@@ -194,8 +197,36 @@ pub enum Refusal {
     ///   own-set distractor exists. A refused quiz is a `CheckBackup` this device
     ///   does not answer, which is where the message stood entirely until now.
     PhysicalBackup,
-    /// `ScreenVerify`: address display. Harmless but unimplemented; refusing
-    /// beats silently dropping it, which leaves the app waiting.
+    /// `ScreenVerify`: this device will not draw an address for **this** key.
+    ///
+    /// No longer the blanket refusal of the message it was until 2026-09-12:
+    /// [`Session::recv`] admits `ScreenVerify` and [`prompt_screen_at`] draws the
+    /// address. What is left under this name is the one gate,
+    /// `FrostSigner::wallet_network(master_appkey.key_id())` returning `None`
+    /// (`Session::verify_prompt`), which covers both of the cases that matter and
+    /// is the whole security content of the screen:
+    ///
+    /// * A `master_appkey` whose `key_id` this device does not hold. Without this
+    ///   check a coordinator could have the device draw, with its own authority, an
+    ///   address derived from a key it has no share of — and the entire point of
+    ///   showing an address on trusted hardware is that it came from a key this
+    ///   device holds.
+    /// * A key held for a purpose that is not `KeyPurpose::Bitcoin(..)`
+    ///   (`device.rs:545-550`). `Test` and `Nostr` have no network, so there is no
+    ///   address to compute and nothing honest to draw.
+    ///
+    /// The word "harmless" was here until 2026-09-12 and it was wrong. Handing this
+    /// message to `signer.recv_coordinator_message` runs two `expect`s in the
+    /// vendored `device.rs` — `wallet_network(..).expect("cannot verify address on
+    /// key that doesn't support bitcoin")` (:409-411) and
+    /// `Address::from_script(..).expect("has address form")` (:412-413) — and the
+    /// vendored copy is byte-identical to upstream (`diff -u` exits 0), so both are
+    /// live in this tree. The first is REACHABLE on one wire frame by any device
+    /// holding a `Test`- or `Nostr`-purpose key, and every `KeyPurpose` in this
+    /// repo's fixtures and in `hostcheck`'s real keygen is `Test`. With
+    /// `panic = "abort"` and RDP=2 that is a permanent brick, which is why
+    /// [`Session::recv`]'s arm returns before the fall-through and builds the prompt
+    /// itself.
     AddressVerify,
     /// `Keygen::Begin` naming more than [`MAX_PARTIES`] devices, or a threshold
     /// outside `1..=devices`.
@@ -1162,8 +1193,41 @@ impl<'a, F: NorFlash + fmt::Debug> Session<'a, F> {
             CoordinatorToDeviceMessage::Restoration(CoordinatorRestoration::CheckBackup {
                 ..
             }) => {}
-            CoordinatorToDeviceMessage::ScreenVerify(_) => {
-                return Err(Fault::Refused(Refusal::AddressVerify))
+            // `ScreenVerify` — ADMITTED, and the ONLY arm here that returns without
+            // ever reaching `signer.recv_coordinator_message`. That `return` is not
+            // style: the vendored handler (`device.rs:383-421`, byte-identical to
+            // upstream, `diff -u` exit 0) ends in
+            // `wallet_network(key_id).expect("cannot verify address on key that
+            // doesn't support bitcoin")` (:409-411) and
+            // `Address::from_script(..).expect("has address form")` (:412-413). The
+            // first is reachable with one frame on any device holding a
+            // `KeyPurpose::Test` or `KeyPurpose::Nostr` key — which is EVERY key any
+            // fixture or `hostcheck` run in this repo creates — and a reachable panic
+            // on this unit is permanent. Deleting the `return` re-arms it; that is
+            // what `verify_address_on_a_test_purpose_key_is_refused_not_a_panic`
+            // catches.
+            //
+            // ATTACKER-CONTROLLED SURFACE, in full: 65 bytes of `MasterAppkey` and one
+            // `u32` (`message/screen_verify.rs:6-11`). Both are fixed-width to bincode,
+            // so no wire length drives an allocation and there is nothing for
+            // `Outbox::push`'s caps or `comms::ENCAPS_DECODE_LIMIT` to bound further.
+            // The 65 bytes are bounded by the `key_id` lookup in
+            // `Session::verify_prompt` — a SHA-256 preimage over all of them — and
+            // the `u32` is bounded by being total: `LocalSpk::spk` feeds it straight
+            // into an HMAC-SHA512 with no hardened check (`tweak.rs:380-392`), so
+            // every one of the 2^32 values yields an address. What is NOT wire-
+            // controlled is the rest of the path: `verify_prompt` hardcodes
+            // `BitcoinAccountKeychain::external()` exactly as upstream does.
+            //
+            // Through `run`, not `Ok(vec![prompt])`, so `run`'s claim to be the single
+            // funnel ("recv_core ends here") stays true; its `other => prompts.push`
+            // arm already handles `VerifyAddress`.
+            CoordinatorToDeviceMessage::ScreenVerify(ScreenVerify::VerifyAddress {
+                master_appkey,
+                derivation_index,
+            }) => {
+                let prompt = self.verify_prompt(*master_appkey, *derivation_index)?;
+                return self.run([DeviceSend::ToUser(alloc::boxed::Box::new(prompt))], out);
             }
         }
         let sends = self
@@ -1230,7 +1294,12 @@ impl<'a, F: NorFlash + fmt::Debug> Session<'a, F> {
         // arm looks like, so removing a screen from `prompt_screen_at` disables
         // consent instead of blinding it. `Page { last: false }` is refused for a
         // third reason: it is a page with more to read after it, so it prints no
-        // digit, so no human can have pressed the digit it did not show.
+        // digit, so no human can have pressed the digit it did not show. And
+        // [`Shown::Info`] — a screen that was DRAWN but authorises nothing, which today
+        // is address verification alone — is refused for that same third reason: it
+        // prints no digit either, so a `confirm` naming it is a caller inventing a
+        // press. The `Ok(_)` arm below already catches it, fail-closed, with no new
+        // code; do not narrow that arm to name the variants.
         //
         // The `Frame` is 1,024 B on the stack of a function that already runs on
         // `boot`'s frame (548,268 B of runway, MEASURED), which is cheaper than
@@ -1872,6 +1941,95 @@ impl<'a, F: NorFlash + fmt::Debug> Session<'a, F> {
         }
         Ok(prompts)
     }
+
+    /// The address-verification prompt for one `(master_appkey, index)` pair — or a
+    /// [`Refusal`]. This is `device.rs:383-421` rewritten with its two `expect`s
+    /// replaced, and it is the reason [`Session::recv`]'s arm never calls upstream's.
+    ///
+    /// `&self`: nothing is written, nothing is staged, no RNG is drawn and no
+    /// [`Outbox`] is touched. Address verification is READ-ONLY — see
+    /// [`prompt_screen_at`]'s `VerifyAddress` arm for the argument and the evidence.
+    ///
+    /// # The key lookup is the whole gate, and it is the whole point of the screen
+    ///
+    /// `wallet_network(master_appkey.key_id())` (`device.rs:545-550`) is one call that
+    /// answers two questions — "do we hold this key?" and "is it a bitcoin key?" —
+    /// because it is `keys.get(&key_id).and_then(|k| match k.purpose {
+    /// Bitcoin(net) => Some(net), _ => None })` and `keys` is private with this as its
+    /// only public accessor yielding a network. `None` is [`Refusal::AddressVerify`].
+    ///
+    /// Without it this device would draw, with its own authority, an address derived
+    /// from a key it holds no share of — which inverts the only thing verifying an
+    /// address on trusted hardware is for. It also happens to kill both upstream
+    /// `expect`s at once, which is why there is one check here and not three.
+    ///
+    /// # Every panic on this path, named
+    ///
+    /// * `MasterAppkey::to_xpub`'s `Point::from_slice(&self.0[..33]).expect("invariant")`
+    ///   (`master_appkey.rs:20`), reached inside `LocalSpk::spk`. Unreachable here
+    ///   because the lookup runs FIRST and `KeyId::from_master_appkey` is SHA-256 over
+    ///   `prefix_hash("KEY_ID")` and all 65 bytes (`frostsnap_core/src/lib.rs:220-227`),
+    ///   while the stored `key_id` came from this device's own certified keygen
+    ///   (`save_complete_share`, `device.rs:526-530`). A hit therefore means the 65
+    ///   bytes ARE the ones this device derived, or a SHA-256 second preimage — the
+    ///   same class as the tree's existing `expect("computationally unreachable")`s
+    ///   (`tweak.rs:226`, `:285`). **No redundant `Point::from_slice` pre-check is
+    ///   added for it**: its bail branch would be unreachable, i.e. the cannot-fail
+    ///   class this project deletes.
+    /// * `XOnlyPublicKey::from_slice(..).expect("a secp256kfun Point<EvenY> is always
+    ///   a valid x-only public key")` (`bitcoin_transaction.rs:480-483`). Already on
+    ///   the `sign_ack` sighash path; an argument about the type, not about the wire.
+    /// * `ChildNumber::from_normal_idx(..).expect("valid normal derivation index")`
+    ///   (`tweak.rs:453-458`), reached from `impl From<BitcoinBip32Path> for
+    ///   DerivationPath` (`tweak.rs:96-104`). **This one is live and this code must
+    ///   never call it.** `from_normal_idx` errs for every index with bit 31 set
+    ///   (`bitcoin-0.32.8/src/bip32.rs:144-150`), so formatting a `DerivationPath` for
+    ///   the screen would brick the device for HALF of all `derivation_index` values —
+    ///   and `tools/research-scratch/wire_size_measure.rs:1045` already measured the
+    ///   `idx=u32::MAX` frame as wire-legal. `spk()` itself is total over the index,
+    ///   so only the FORMATTING was ever the hazard; [`prompt_screen_at`] composes a
+    ///   `ui::Buf` instead and `a_hardened_derivation_index_still_verifies` pins it.
+    ///   That conversion has no other caller in this tree.
+    ///
+    /// # `from_script` is a BAIL and its `Err` leg cannot fire
+    ///
+    /// `LocalSpk::spk` always returns `ScriptBuf::new_p2tr_tweaked(..)`, i.e.
+    /// `OP_1 <32 bytes>` (`bitcoin_transaction.rs:471-485`), and
+    /// `Address::from_script` takes the `is_witness_program` branch for exactly that
+    /// shape (`bitcoin-0.32.8/src/address/mod.rs:568-590`), where
+    /// `WitnessVersion::try_from(OP_PUSHNUM_1)` and `WitnessProgram::new(V1, 32B)` both
+    /// succeed. So this is a **bail with an unreachable branch**, kept rather than an
+    /// `expect` because §8.1 defect 12 was precisely an
+    /// `Address::from_script(..).expect("has address representation")` — and NOT an
+    /// `assert`, because an assertion that cannot fail reads like coverage. **No test
+    /// claims to reach it**, and do not describe it as a guard against a coordinator:
+    /// the coordinator cannot choose the script, only the key and the index.
+    fn verify_prompt(
+        &self,
+        master_appkey: MasterAppkey,
+        index: u32,
+    ) -> Result<DeviceToUserMessage, Fault> {
+        let network = self
+            .signer
+            .wallet_network(master_appkey.key_id())
+            .ok_or(Fault::Refused(Refusal::AddressVerify))?;
+        // `external()`, hardcoded, exactly as upstream (`device.rs:400-403`): the
+        // keychain and the account are NOT wire-controlled, only the index is. A
+        // coordinator that could ask for the internal (change) keychain could get a
+        // change address presented as a receive address.
+        let bip32_path = BitcoinBip32Path::external(index);
+        let spk = LocalSpk {
+            master_appkey,
+            bip32_path,
+        }
+        .spk();
+        let address = bitcoin::Address::from_script(&spk, network)
+            .map_err(|_| Fault::Refused(Refusal::Undisplayable))?;
+        Ok(DeviceToUserMessage::VerifyAddress {
+            address,
+            bip32_path,
+        })
+    }
 }
 
 /// What the human must be shown for one sign request — or a [`Refusal`].
@@ -2346,6 +2504,9 @@ fn sign_page(
 ///   confirm digit, and the only page a signature may be authorised on.
 /// - `Ok(Shown::Nothing)` — informational prompt with no screen; `frame` is
 ///   untouched.
+/// - `Ok(Shown::Info)` — `frame` holds a screen that authorises nothing, so it
+///   printed no digit and nothing about it is answerable. Address verification is
+///   the only one.
 /// - `Err(refusal)` — this device cannot show the request, so it must not be
 ///   signed. `frame` holds [`ui::refusal`] on the way out, never a partial layout.
 ///
@@ -2364,9 +2525,13 @@ fn sign_page(
 /// a 16-byte id) and the consolidation screen carries a real `ConsolidatePhase`'s key
 /// name, share index and threshold — never its plaintext `SecretShare`. So do the quiz
 /// question, which carries a real `BackupDisplayPhase`'s key name and share index and
-/// nothing else. The one §4.2 screen still without a caller is address verify, because
-/// `ScreenVerify` is refused in [`Session::recv`]; adding a screen for it would be a
-/// lie about what the device does.
+/// nothing else. Address verify — the last §4.2 screen to get a caller, on 2026-09-12
+/// — is honest in a different way: the address is one this device DERIVED, from a key
+/// it made the coordinator prove this device holds (`Session::verify_prompt`), and it
+/// is the only screen here that authorises nothing. It returns [`Shown::Info`], prints
+/// no digit, and [`Session::confirm_at`] cannot reach it. Until that day this paragraph
+/// said the screen had no caller "because `ScreenVerify` is refused in
+/// [`Session::recv`]"; the refusal is now the key lookup and not the message.
 ///
 /// The backup *words* are not drawn from here and cannot be — neither the reveal's 25
 /// nor the quiz's three candidates: this function has no [`Secrets`] to decrypt with
@@ -2560,8 +2725,77 @@ pub fn prompt_screen_at(
             // answer `NotConfirmable`, which is the fail-closed direction for both.
             _ => Ok(Shown::Nothing),
         },
-        // `FinalizeKeyGen` is informational and `VerifyAddress` is reached only
-        // through a message `Session::recv` refuses.
+        // THE ONE READ-ONLY SCREEN, and the only arm here that ignores `confirm`.
+        //
+        // It prints NO digit because there is nothing to authorise, and that is a
+        // claim about the protocol rather than a judgement call:
+        // `frostsnap_coordinator`'s `VerifyAddressProtocol::is_complete()` returns
+        // `None` unless `cancel()` was called (`verify_address.rs:52-58`), so there is
+        // no `Completion::Success` path at all; the protocol consumes no device
+        // message, so there is nothing for a press to send; upstream's own device
+        // routes this prompt to `Workflow::DisplayAddress` and not
+        // `Workflow::prompt(..)` (`esp32_run.rs:640-650`); and nothing here writes
+        // flash or touches a secret. It is strictly weaker than `RequestHeldShares`,
+        // which `recv_core` already admits with no consent and which DOES emit a
+        // bounded reply. A needless digit on a read-only screen is as wrong as a
+        // missing one on something that authorises: it teaches a human that the
+        // randomised digit is a dismiss key.
+        //
+        // `Shown::Info` is what keeps that fail-closed. `confirm_at`'s `Ok(_) =>
+        // NotConfirmable` catches it, so `Session::confirm` on this prompt is a fault
+        // rather than an ack, and `prompt_screen` reports `Ok(false)`.
+        //
+        // ROW 0 IS A COMPOSED LABEL AND NEVER A `DerivationPath`. Formatting the path
+        // would call `ChildNumber::from_normal_idx(..).expect(..)` via `impl
+        // From<BitcoinBip32Path> for DerivationPath` (`tweak.rs:96-104`, `:453-458`),
+        // which errs for every index with bit 31 set — a permanent brick for HALF of
+        // all `derivation_index` values a coordinator can send. `"Recv #"` is 6 chars
+        // and `u32::MAX` is 10 digits, so `Buf::<16>` is exactly wide enough and
+        // `ui::COLS` is 16, so `Frame::text` drops nothing: NO `truncated()` guard and
+        // NO drawn-vs-asked comparison are added, because both are arithmetically
+        // vacuous and review deleted exactly that shape from `consent_screen`'s legend
+        // on 2026-09-12. What keeps it honest instead is a ROW READBACK at
+        // `u32::MAX` — `a_hardened_derivation_index_still_verifies`.
+        //
+        // Upstream shows only the index too (`AddressWithIndex::new_with_seed(address,
+        // bip32_path.index, ..)`, `widget_tree.rs:209-217`); the other three segments
+        // are constants `verify_prompt` chose, so printing them would spend a
+        // 16-column row on values no coordinator can influence.
+        //
+        // A COORDINATOR `Cancel` DOES NOT TAKE THIS OFF THE GLASS, unlike the reveal,
+        // the word entry and the quiz. Those three are redrawn from a `Flow` cursor
+        // every loop iteration, so losing the grant draws standby; an `Info` draw
+        // parks nothing, so there is no cursor to hang a redraw on and `Session::recv`'s
+        // `Cancel` arm returns an empty `Vec` that `draw_batch` turns into no draw.
+        // Accepted, not overlooked: a receive address is public and the coordinator
+        // computed it itself (`coordinator.rs:1269-1295`), so a fourth `Flow` variant
+        // to wipe a public string is not worth a cursor. It is the one behavioural
+        // difference from the reveal-class flows.
+        DeviceToUserMessage::VerifyAddress {
+            address,
+            bip32_path,
+        } => {
+            let mut label = ui::Buf::<16>::new();
+            label.push_str("Recv #").push_u64(bip32_path.index as u64);
+            // `bip32_path.index` as the highlight seed, not an RNG: this function has
+            // none, and `SignPages::render` already seeds the far higher-stakes
+            // address block from the recipient index. See `ui::address_verify` for
+            // what a wire-derived seed does and does not give away.
+            ui::address_verify(
+                frame,
+                &address.to_string(),
+                label.as_str(),
+                bip32_path.index,
+            )
+            .map(|()| Shown::Info)
+            // `Unrenderable::TooLong` or `NotAscii`, neither reachable from a p2tr
+            // address (62 chars of bech32m, `ADDRESS_ROWS * COLS` is 80) — but mapped
+            // rather than unwrapped, because the alternative is a panic on a screen
+            // path and this is the class §8.1 defect 12 belonged to.
+            .map_err(|_| Refusal::Undisplayable)
+        }
+        // `FinalizeKeyGen` is informational, and so is every restoration message the
+        // arms above do not name.
         _ => Ok(Shown::Nothing),
     };
     if shown.is_err() {
@@ -2581,6 +2815,26 @@ pub enum Shown {
     /// No screen for this prompt: informational. The frame is untouched, and
     /// nothing about this prompt is answerable.
     Nothing,
+    /// A screen was drawn and **nothing about it is answerable**.
+    ///
+    /// The distinction from [`Shown::Nothing`] is the frame: `Nothing` promises the
+    /// frame is UNTOUCHED, so a caller must leave the glass exactly as it was — which
+    /// is what stops a coordinator's bookkeeping message from blanking a backup a
+    /// human is halfway through transcribing. `Info` says the frame HOLDS a screen
+    /// that must be pushed, and that the screen parks nothing. Address verification is
+    /// the only prompt in this shape, and [`prompt_screen_at`]'s arm for it carries the
+    /// argument for why it prints no confirm digit.
+    ///
+    /// **Nothing in this tree fails to compile because of this variant, so nothing
+    /// forces a reviewer to consider it.** Every consumer absorbs it silently and all
+    /// of them absorb it fail-closed: [`Session::confirm_at`]'s `Ok(_) =>
+    /// Err(Fault::NotConfirmable)`, [`prompt_screen`]'s `== Shown::Page { last: true }`,
+    /// and `main.rs`'s `matches!(shown, Ok(Shown::Nothing))` followed by
+    /// `match shown { Ok(Shown::Page { last }) => Some(last), _ => None }` — which is
+    /// why `boot()` needed no new line for this feature. The direction is checked by
+    /// VALUE rather than inferred from those `_` arms, in
+    /// `the_address_screen_prints_no_key_and_authorises_nothing`.
+    Info,
     /// A page was drawn in full. `last` means it is the final page of the set —
     /// the one that prints the confirm digit, and the only one on which a
     /// signature may be authorised.
@@ -2747,6 +3001,7 @@ mod tests {
     use coldsnap_hal::identity;
     use coldsnap_hal::keypad;
     use coldsnap_hal::rng::{mix_sources, Entropy, ProvenSeed, SE1_BYTES, SE2_BYTES, TRNG_BYTES};
+    use frostsnap_core::device::KeyPurpose;
     use frostsnap_core::message::signing::OpenNonceStreams;
     use frostsnap_core::message::HeldShare2;
     use frostsnap_core::nonce_stream::{CoordNonceStreamState, NonceStreamId};
@@ -3634,17 +3889,240 @@ mod tests {
         );
     }
 
-    /// Address verification is a screen this device does not have. Refusing beats
-    /// dropping it, which leaves the app waiting forever.
-    #[test]
-    fn address_verify_is_refused() {
-        let body = CoordinatorSendBody::Core(CoordinatorToDeviceMessage::ScreenVerify(
-            frostsnap_core::message::screen_verify::ScreenVerify::VerifyAddress {
+    /// One `ScreenVerify::VerifyAddress` body for [`appkey`] at `derivation_index`.
+    fn verify_body(derivation_index: u32) -> CoordinatorSendBody {
+        CoordinatorSendBody::Core(CoordinatorToDeviceMessage::ScreenVerify(
+            ScreenVerify::VerifyAddress {
                 master_appkey: appkey(),
-                derivation_index: 0,
+                derivation_index,
             },
-        ));
-        assert_eq!(refuse(body), Refusal::AddressVerify);
+        ))
+    }
+
+    /// Install ONE key record for [`appkey`]'s `key_id` with `purpose`, and nothing
+    /// else — no access structure and no share.
+    ///
+    /// Four lines because `wallet_network` reads exactly `keys.get(key_id).purpose`
+    /// (`device.rs:545-550`), so the rest of `hold_a_backup_named`'s three-mutation
+    /// setup would be scenery. `apply_mutation` inserts into `keys` directly and
+    /// stages nothing (`device.rs:176-190`), so there is no flash write to sequence.
+    fn hold_a_key_for(session: &mut Session<'_, DebugFlash<FakeFlash>>, purpose: KeyPurpose) {
+        use frostsnap_core::device::{keys::KeyMutation, Mutation};
+        let _ = session
+            .signer
+            .apply_mutation(Mutation::Keygen(KeyMutation::NewKey {
+                key_id: appkey().key_id(),
+                key_name: String::from("verify"),
+                purpose,
+            }));
+    }
+
+    /// **The key lookup is the gate.** A `master_appkey` this device holds no record
+    /// of gets [`Refusal::AddressVerify`] and no screen.
+    ///
+    /// Renamed from `address_verify_is_refused` on 2026-09-12, and the rename is the
+    /// point: this test PASSES UNCHANGED whether the message is blanket-refused or
+    /// implemented, because `refuse` opens a `Session` on blank flash so
+    /// `signer.keys` is empty either way. Left under its old name and old doc
+    /// ("a screen this device does not have") it would have been false comfort — it
+    /// reads like coverage of a refusal that is no longer blanket. What it actually
+    /// pins is that a coordinator cannot make this device draw an address derived
+    /// from a key it does not hold.
+    ///
+    /// MUTATION-VERIFY: replace `verify_prompt`'s
+    /// `wallet_network(..).ok_or(..)?` with a hardcoded `bitcoin::Network::Bitcoin`
+    /// and this fails at `refuse`'s `expect_err`, because `appkey()` is a valid point
+    /// so the address would be produced and the prompt returned.
+    #[test]
+    fn verify_address_for_a_key_this_device_does_not_hold_is_refused() {
+        assert_eq!(refuse(verify_body(0)), Refusal::AddressVerify);
+    }
+
+    /// **A `KeyPurpose::Test` key is refused, and would otherwise be a BRICK.**
+    ///
+    /// This is the second half of the same gate and the reason the dispatch arm
+    /// returns instead of falling through: upstream's handler ends in
+    /// `wallet_network(key_id).expect("cannot verify address on key that doesn't
+    /// support bitcoin")` (`device.rs:409-411`), and the vendored copy is
+    /// byte-identical to upstream (`diff -u` exit 0). `wallet_network` is `None` for
+    /// `Test` and `Nostr`, so a device holding either — which is EVERY key this
+    /// repo's fixtures and `hostcheck`'s real keygen create — panics on one wire
+    /// frame, and with `panic = "abort"` at RDP=2 that is permanent.
+    ///
+    /// MUTATION-VERIFY: delete the `return` from `recv_core`'s `ScreenVerify` arm so
+    /// it falls through to `signer.recv_coordinator_message`, and this test PANICS
+    /// inside `device.rs` rather than failing an assertion. That is the whole reason
+    /// it exists: the positive test below would still pass, because its key is
+    /// `Bitcoin(..)`.
+    #[test]
+    fn verify_address_on_a_test_purpose_key_is_refused_not_a_panic() {
+        let flash = fs_flash();
+        let mut rng = entropy(151);
+        let secret = identity::load_or_create(&mut *flash.borrow_mut(), &mut rng).unwrap();
+        let mut session = Session::open(&flash, &secret).unwrap();
+        let mut out = Outbox::new(session.device_id());
+        hold_a_key_for(&mut session, KeyPurpose::Test);
+        let fault = session
+            .recv(verify_body(0), &mut rng, &mut out)
+            .expect_err("a Test-purpose key has no bitcoin network");
+        assert!(
+            matches!(fault, Fault::Refused(Refusal::AddressVerify)),
+            "got {fault:?}"
+        );
+        assert_eq!(out.frames(), 0, "a refusal must not answer");
+    }
+
+    /// **A `Bitcoin`-purpose key verifies its own receive address**, and the address
+    /// is the one an INDEPENDENT implementation computes.
+    ///
+    /// The spk hex is `vendor/frostsnap/frostsnap_core/src/bitcoin_transaction.rs:575-577`'s
+    /// vector for `BitcoinBip32Path::external(0)`, computed there by a from-scratch
+    /// Python secp256k1 + BIP-32 + BIP-341 implementation. It applies verbatim because
+    /// [`appkey`] IS `MasterAppkey::derive_from_rootkey(G.normalize())`, the same
+    /// starting point. The encoding half is asserted by shape (`bc1p` and 62 chars)
+    /// rather than by a pasted bech32m string nobody in this repo derived independently.
+    ///
+    /// `out.frames() == 0` is the one that catches the ack-ahead-of-the-fact class
+    /// `confirm_at` has fought three times: this flow sends the coordinator NOTHING,
+    /// ever, because `VerifyAddressProtocol` consumes no device message
+    /// (`frostsnap_coordinator/src/verify_address.rs`).
+    ///
+    /// MUTATION-VERIFY: `internal(index)` instead of `external(index)` in
+    /// `verify_prompt`, or `index + 1`, and the spk hex mismatches. Push any ack into
+    /// `out` and the frames assert fails.
+    #[test]
+    fn a_bitcoin_key_verifies_its_own_receive_address() {
+        let flash = fs_flash();
+        let mut rng = entropy(157);
+        let secret = identity::load_or_create(&mut *flash.borrow_mut(), &mut rng).unwrap();
+        let mut session = Session::open(&flash, &secret).unwrap();
+        let mut out = Outbox::new(session.device_id());
+        hold_a_key_for(
+            &mut session,
+            KeyPurpose::Bitcoin(bitcoin::Network::Bitcoin),
+        );
+        let mut prompts = session
+            .recv(verify_body(0), &mut rng, &mut out)
+            .expect("a bitcoin key we hold must reach the human");
+        assert_eq!(prompts.len(), 1, "one request, one screen");
+        let DeviceToUserMessage::VerifyAddress {
+            address,
+            bip32_path,
+        } = prompts.pop().expect("checked above")
+        else {
+            panic!("ScreenVerify must produce a VerifyAddress prompt");
+        };
+        assert_eq!(bip32_path.index, 0);
+        assert_eq!(
+            alloc::format!("{:x}", address.script_pubkey()),
+            "51206bc8a5389a5f073608c28771846967ce313d4d3e0c55b0534cc651a0237705a0",
+            "not the independently computed spk for external(0)"
+        );
+        let text = address.to_string();
+        assert!(text.starts_with("bc1p"), "not mainnet p2tr: {text}");
+        assert_eq!(text.len(), 62, "a p2tr bech32m address is 62 chars: {text}");
+        assert_eq!(out.frames(), 0, "verification tells the coordinator nothing");
+    }
+
+    /// **`derivation_index = u32::MAX` draws, and the whole index is ON THE GLASS.**
+    ///
+    /// Half of all `derivation_index` values have bit 31 set, and for every one of
+    /// them `impl From<BitcoinBip32Path> for DerivationPath` (`tweak.rs:96-104`)
+    /// panics: it routes through `ChildNumber::from_normal_idx(..).expect("valid
+    /// normal derivation index")` (`tweak.rs:453-458`), which errs iff
+    /// `index & (1 << 31) != 0` (`bitcoin-0.32.8/src/bip32.rs:144-150`).
+    /// `wire_size_measure.rs:1045` already measured the `idx=u32::MAX` frame as
+    /// wire-legal, so on this device that is one coordinator message from a permanent
+    /// brick. `LocalSpk::spk` itself is TOTAL over the index — `derive_bip32_in_place`
+    /// feeds the raw `u32` into an HMAC-SHA512 with no hardened check
+    /// (`tweak.rs:380-392`) — so only the FORMATTING was ever the hazard.
+    ///
+    /// The row readback is deliberately the assertion, instead of a
+    /// `!label.truncated()` guard or a `text(..) == chars().count()` comparison: both
+    /// of those CANNOT FAIL (`"Recv #"` is 6, `u32::MAX` is 10 digits, `Buf::<16>` and
+    /// `ui::COLS` are both 16), and review deleted exactly that shape from
+    /// `consent_screen`'s legend on 2026-09-12.
+    ///
+    /// MUTATION-VERIFY: format `DerivationPath::from(bip32_path)` for the label and
+    /// this panics at `tweak.rs:457`. Narrow the `Buf` to `<12>`, or lengthen the
+    /// prefix, and row 0 loses digits off the end.
+    #[test]
+    fn a_hardened_derivation_index_still_verifies() {
+        let flash = fs_flash();
+        let mut rng = entropy(163);
+        let secret = identity::load_or_create(&mut *flash.borrow_mut(), &mut rng).unwrap();
+        let mut session = Session::open(&flash, &secret).unwrap();
+        let mut out = Outbox::new(session.device_id());
+        hold_a_key_for(
+            &mut session,
+            KeyPurpose::Bitcoin(bitcoin::Network::Bitcoin),
+        );
+        let mut prompts = session
+            .recv(verify_body(u32::MAX), &mut rng, &mut out)
+            .expect("spk() is total over the derivation index");
+        let prompt = prompts.pop().expect("one request, one screen");
+        let mut frame = ui::Frame::new();
+        assert_eq!(
+            prompt_screen_at(&mut frame, &prompt, ui::ConfirmDigit::draw(&mut rng), 0),
+            Ok(Shown::Info)
+        );
+        assert_eq!(
+            row_text(&frame, 0, ui::COLS),
+            "Recv #4294967295",
+            "the whole index must be on the glass"
+        );
+    }
+
+    /// **The address screen authorises nothing, and says so by VALUE.**
+    ///
+    /// `Shown::Info` compiles into every existing consumer through a `_` arm or an
+    /// `==`, so no reviewer is forced to consider the third case; this is the
+    /// assertion that checks the fail-closed direction instead of inferring it.
+    /// `prompt_screen` is what `main.rs`'s `draw_prompt` and `examples/stub.rs` ask,
+    /// and `Ok(false)` there means "drawn, but no key was printed and nothing may be
+    /// answered".
+    ///
+    /// Constructible directly, unlike `SignPhase1`, because both fields of
+    /// `DeviceToUserMessage::VerifyAddress` are public — so this needs no source pin.
+    ///
+    /// MUTATION-VERIFY: return `Shown::Page { last: true }` from the `VerifyAddress`
+    /// arm and this fails on the `prompt_screen` line; draw `ui::press_legend`'s digit
+    /// on the screen and it fails on the row readback.
+    ///
+    /// There is deliberately NO `session.confirm(prompt, ..) == Err(NotConfirmable)`
+    /// assertion here. It would read like the guard on the new arm and it cannot be
+    /// falsified by the mutation it appears to guard: `confirm_at`'s tail
+    /// `_ => Err(Fault::NotConfirmable)` catches `VerifyAddress` whatever
+    /// `prompt_screen_at` returns for it, so the line would pass before and after.
+    /// That is the ten-deleted class.
+    #[test]
+    fn the_address_screen_prints_no_key_and_authorises_nothing() {
+        let mut rng = entropy(167);
+        let spk = LocalSpk {
+            master_appkey: appkey(),
+            bip32_path: BitcoinBip32Path::external(3),
+        }
+        .spk();
+        let prompt = DeviceToUserMessage::VerifyAddress {
+            address: bitcoin::Address::from_script(&spk, bitcoin::Network::Bitcoin)
+                .expect("a p2tr spk always has an address form"),
+            bip32_path: BitcoinBip32Path::external(3),
+        };
+        let mut frame = ui::Frame::new();
+        assert_eq!(
+            prompt_screen(&mut frame, &prompt, ui::ConfirmDigit::draw(&mut rng)),
+            Ok(false),
+            "a read-only screen must not report itself as answerable"
+        );
+        assert_eq!(
+            prompt_screen_at(&mut frame, &prompt, ui::ConfirmDigit::draw(&mut rng), 0),
+            Ok(Shown::Info)
+        );
+        // The digit is nowhere on the glass, which is the shape claim `Shown::Info`
+        // stands for. `press_legend`'s wording is the one string every consent screen
+        // in `hal::ui` shares, so its absence covers all of them at once.
+        let glass = all_rows(&frame, ui::COLS);
+        assert!(!glass.contains("Press"), "a read-only screen asked for a press: {glass}");
     }
 
     /// `confirm` answers the two consent prompts and NOTHING else. The dispatch
@@ -4114,6 +4592,23 @@ mod tests {
     /// MUTATION-VERIFY. Pass `0` instead of `page`, or widen the accepting arm to
     /// `Ok(Shown::Page { .. })`, and this fails. Either one means a human can
     /// authorise a page they never saw.
+    ///
+    /// # A mutation SURVIVED this test green on 2026-09-12, and the fix is the anchor
+    ///
+    /// The accepting-arm check was `arms.contains("Ok(Shown::Page { last: true }) =>
+    /// {}")`, i.e. a bare SUBSTRING search, so widening the arm by ALTERNATION rather
+    /// than by pattern left the substring intact:
+    /// `Ok(Shown::Info) | Ok(Shown::Page { last: true }) => {}` passed all 120 lib
+    /// tests. That is the same fail-open class the test exists to forbid — one more
+    /// `Shown` variant waved through the renderability gate — and it was writable
+    /// before [`Shown::Info`] existed too (`Ok(Shown::Nothing) | ..` would have done
+    /// it), so this is a pre-existing hole and not one the new variant opened.
+    /// The needle now carries the arm's leading newline and indent, which is what
+    /// makes it a WHOLE LINE and not a fragment: after a `| ` the character before
+    /// `Ok(` is a space, so the alternation form no longer matches.
+    ///
+    /// The lesson generalises to every source pin in this tree: `contains` on a
+    /// pattern fragment tests that the pattern is PRESENT, never that it is ALONE.
     #[test]
     fn the_consent_gate_uses_the_page_it_was_given_and_demands_the_last_one() {
         let src = include_str!("lib.rs");
@@ -4139,8 +4634,10 @@ mod tests {
             .next()
             .expect("the gate's arms come before the prompt match");
         assert!(
-            arms.contains("Ok(Shown::Page { last: true }) => {}"),
-            "only the last page may authorise; got:{arms}"
+            arms.contains("\n            Ok(Shown::Page { last: true }) => {}\n"),
+            "only the last page may authorise, and it must be the WHOLE arm — an \
+             alternation like `Ok(Shown::Info) | Ok(..)` waves a second render outcome \
+             through the same gate; got:{arms}"
         );
         assert!(
             arms.contains("Ok(_) => return Err(Fault::NotConfirmable),"),

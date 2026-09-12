@@ -78,6 +78,50 @@ frostsnap_embedded = { workspace = true }
 # It therefore clears `hal/Cargo.toml`'s "every crate is flash AND another author to
 # trust" bar by spending neither.
 frost_backup = { workspace = true }
+# `src/lib.rs`'s `Session::verify_prompt` — the address-verification screen.
+# `DeviceToUserMessage::VerifyAddress` carries an `Address<NetworkChecked>`
+# (`device/device_to_user.rs:20-23`) and `bitcoin::Address::from_script` is the only
+# thing that builds one, so production code now names this crate. Promoted from
+# `[dev-dependencies]` (where it was TEST ONLY, for building a `TransactionTemplate`
+# out of raw wire values) for the reason `frost_backup` above was: nothing
+# re-exports it. Checked, not assumed: `frostsnap_core/src/lib.rs`'s `pub use` list
+# is sha2, sign_task, bincode, master_appkey, serde, schnorr_fun,
+# symmetric_encryption and hex, and `rg -n 'pub use bitcoin'` over `vendor/` and
+# `hal/src/` finds nothing.
+#
+# NOT a new package -- `bitcoin =0.32.8` is already a NON-OPTIONAL dependency of
+# `frostsnap_core` (decision 4) and this is the same workspace pin, so this makes an
+# existing graph node NAMEABLE and adds no crate and no author to trust.
+#
+# Flash: **+2,400 B** for the whole feature -- 377,680 -> 380,080 B, i.e. 26.50% ->
+# 26.66% of FLASH_TEXT (1,425,408). Invocation NAMED, because commit a5922e4 settled
+# that it matters: `cargo build --release`, ELF `.vector_table + .text + .rodata +
+# .data` per `/usr/bin/objdump -h`. Both figures were taken in the SAME git worktree,
+# whose longer absolute path inflates every one by 424 B (it is embedded 11 times in
+# panic `Location` strings, `strings -a | rg -c worktrees`), so the DELTA is exact and
+# the absolutes sit 424 B above a build in the main checkout.
+#
+# ATTRIBUTED symbol by symbol with `llvm-nm --print-size` over both images, with the
+# `-C metadata` hash stripped so the two are comparable (net over all symbols
+# +2,392 B, the rest is section alignment):
+#
+# * **+1,366 B** `coldsnap_hal::comms::Link::drain` -- the new `verify_prompt` and the
+#   new `recv_core` arm, inlined into it. This is the feature.
+# * **+878 B** net from OUTLINING, not from new functionality:
+#   `<bitcoin::Address as Display>::fmt` +1,298 and `coldsnap_hal::ui::address_block`
+#   +248 both become shared out-of-line symbols now that `prompt_screen_at` has two
+#   callers of each, and `prompt_screen_at` itself SHRANK 668 B (5,136 -> 4,468) by
+#   giving up its inline copies. Neither was a standalone symbol before; the bech32m
+#   encoder was already in the image, inlined via `sign_consent`'s
+#   `address.to_string()`.
+# * +82 B `boot`, +50 B string/const pools, and codegen-boundary noise.
+#
+# What it is NOT is a dependency-graph surprise, which was the open question:
+# `bitcoin::address::Address::from_script` is byte-identical at 342 B in both images,
+# so it was already linked, and no BIP-32 HMAC-SHA512 chain appears -- `LocalSpk::spk`,
+# `derive_xonly_key` and `bip341_taptweak_key_only` were already reachable through
+# `sign_ack`. Zero new crates.
+bitcoin = { workspace = true }
 # Reach the curve through `frostsnap_core::schnorr_fun`, so no direct
 # `schnorr_fun`/`secp256kfun` entry can drift to a second version.
 sha2 = { workspace = true }
@@ -107,14 +151,11 @@ coldsnap_hal = { path = "../hal", features = ["fake-flash", "test-seam"] }
 # the image size is unchanged (re-measured: 282,080 B).
 secp256k1 = { version = "0.29", default-features = false, features = ["alloc"] }
 
-# `src/lib.rs`'s tests only: building a `TransactionTemplate` from RAW WIRE VALUES
-# (the shape a coordinator controls, which the builder API cannot express) needs
-# `ScriptBuf`/`OutPoint`/`Txid`, and `frostsnap_core` uses `bitcoin` everywhere but
-# does not re-export it. NOT a new package -- `bitcoin =0.32.8` is already a
-# NON-OPTIONAL dependency of `frostsnap_core` (decision 4) and this is the same
-# workspace pin, so the dev graph gains a name and nothing else. A DEV-dependency,
-# so `cargo build --release` for thumbv7em never sees it and the image is unchanged.
-bitcoin = { workspace = true }
+# `bitcoin` moved UP to `[dependencies]` — see the justification there. The tests
+# that first needed it (building a `TransactionTemplate` from RAW WIRE VALUES, the
+# shape a coordinator controls and the builder API cannot express, which needs
+# `ScriptBuf`/`OutPoint`/`Txid`) still have it, because a normal dependency is in the
+# dev graph too. Same shape as the `frost_backup` note above.
 
 # `examples/stub.rs`: the `hostcheck` harness's device side, moved here from
 # `hal/examples/` so it drives THIS crate's `Session` dispatch -- the same code

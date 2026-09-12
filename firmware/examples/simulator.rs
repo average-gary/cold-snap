@@ -1101,23 +1101,26 @@ fn ui_scenes() -> Vec<Scene> {
     // -- screen 8 ---------------------------------------------------------
     scenes.push(Scene::shown(
         "8 address verify: 62-char P2TR / 74-char bech32m / over-long -> REFUSAL",
-        "the address is never truncated: if it does not fit in full, refuse. `path` \
-         IS truncated at 16 cols because derivation_index is a raw u32",
+        "the address is never truncated: if it does not fit in full, refuse. Row 0 is \
+         the LABEL `prompt_screen_at` composes, `\"Recv #\"` + the decimal index -- 6 \
+         chars plus at most 10 is exactly 16 = COLS, so frame 2 is the widest row 0 a \
+         coordinator can ask for. It is NEVER a formatted derivation path: that would \
+         call `ChildNumber::from_normal_idx(..).expect(..)` and brick the device for \
+         every index with bit 31 set. No key legend, because this screen authorises \
+         nothing",
         vec![
             frame(|f| {
-                if ui::address_verify(f, &p2tr_addr, "m/84'/0'/0'/0/7", 7).is_err() {
+                if ui::address_verify(f, &p2tr_addr, "Recv #7", 7).is_err() {
                     ui::refusal(f);
                 }
             }),
             frame(|f| {
-                if ui::address_verify(f, &long_addr, "m/86'/0'/0'/0/4294967295", 4_294_967_295)
-                    .is_err()
-                {
+                if ui::address_verify(f, &long_addr, "Recv #4294967295", 4_294_967_295).is_err() {
                     ui::refusal(f);
                 }
             }),
             frame(|f| {
-                if ui::address_verify(f, &"z".repeat(81), "m/0/0", 0).is_err() {
+                if ui::address_verify(f, &"z".repeat(81), "Recv #0", 0).is_err() {
                     ui::refusal(f);
                 }
             }),
@@ -1171,8 +1174,9 @@ fn session_scenes(
         ),
         (
             "9c session: ScreenVerify::VerifyAddress -> REFUSAL",
-            "harmless but unimplemented; refusing beats silently dropping it and \
-             leaving the app waiting",
+            "the message is IMPLEMENTED now — this refusal is the key lookup, and this \
+             session holds no key, so `MasterAppkey([0; 65])`'s key_id misses and there \
+             is no network to derive an address for. `to_xpub` is never reached",
             CoordinatorSendBody::Core(CoordinatorToDeviceMessage::ScreenVerify(
                 ScreenVerify::VerifyAddress {
                     master_appkey: MasterAppkey([0u8; 65]),
