@@ -2113,14 +2113,18 @@ fn backup_consent(
     key_name: &str,
     share_index: u32,
     confirm: ui::ConfirmDigit,
-) {
+) -> bool {
     let mut what = ui::Buf::<16>::new();
     what.push_str("share #").push_u64(share_index as u64);
-    consent_screen(
-        frame,
-        [question, key_name, what.as_str(), "SECRET on glass"],
-        confirm,
-    );
+    // `"share #"` is 7 chars, so this overflows its `Buf<16>` at a 10-digit index -- which
+    // a `u32` reaches. Checked here rather than relying on the row test below, because a
+    // `Buf` that truncated has already lost the digits and the row would then FIT.
+    !what.truncated()
+        && consent_screen(
+            frame,
+            [question, key_name, what.as_str(), "SECRET on glass"],
+            confirm,
+        )
 }
 
 /// The consent screen for typing a share back IN.
@@ -2135,9 +2139,35 @@ fn backup_consent(
 /// rather than the entry starting on the coordinator's word. A restore INGESTS a
 /// secret and puts it on the glass letter by letter; a coordinator message must not
 /// be able to reach that screen on its own.
-fn entry_consent(frame: &mut ui::Frame, confirm: ui::ConfirmDigit) {
+/// The entry screen's rows are all CONSTANTS, so whether they fit is a BUILD question and
+/// not a runtime one — and this is where it is answered.
+///
+/// `"onto THIS device"` is exactly [`ui::COLS`] chars, already at the edge, so one column
+/// of geometry drift silently clips the row that says the secret lands HERE and not
+/// somewhere else. A `const` block rather than the `bool` [`entry_consent`] returns,
+/// because a build failure on EVERY target beats a runtime branch that cannot be taken:
+/// MEASURED 2026-09-12, making that arm ignore its flag left all 116 lib tests green,
+/// because `consent_screen` can never answer `false` for a screen composed only of
+/// literals. Review found that; this is the guard that replaces the unreachable one.
+///
+/// `.len()` and not `.chars().count()`: all three are ASCII, and `len` is `const`.
+const _: () = assert!(
+    "Type a backup?".len() <= ui::COLS
+        && "onto THIS device".len() <= ui::COLS
+        && "SECRET on glass".len() <= ui::COLS,
+    "an entry-consent row is wider than the panel"
+);
+
+fn entry_consent(frame: &mut ui::Frame, confirm: ui::ConfirmDigit) -> bool {
     let mut words = ui::Buf::<16>::new();
     words.push_u64(ui::BACKUP_WORDS as u64).push_str(" words");
+    // Every row here is a CONSTANT or derived from `ui::BACKUP_WORDS`, so nothing on this
+    // screen is coordinator-chosen and the `bool` below can never be `false` today. It is
+    // returned anyway, and that is a UNIFORMITY choice rather than a check: all three
+    // restoration consent screens answer `prompt_screen_at` the same way, so there is no
+    // per-screen exception for a future edit to widen. The real guard is the `const _`
+    // above, which is a build failure on every target. The one row a `const` cannot reach
+    // is `words`, and `"25 words"` is 8 of 16 columns.
     consent_screen(
         frame,
         [
@@ -2147,7 +2177,7 @@ fn entry_consent(frame: &mut ui::Frame, confirm: ui::ConfirmDigit) {
             "SECRET on glass",
         ],
         confirm,
-    );
+    )
 }
 
 /// The consent screen for STORING a typed share — the destructive one.
@@ -2167,18 +2197,25 @@ fn consolidate_consent(
     share_index: u32,
     threshold: u16,
     confirm: ui::ConfirmDigit,
-) {
+) -> bool {
     let mut what = ui::Buf::<16>::new();
     what.push_str("#")
         .push_u64(share_index as u64)
         .push_str(" of ")
         .push_u64(threshold as u64)
         .push_str("-of-n");
-    consent_screen(
-        frame,
-        ["Store share?", key_name, what.as_str(), "REPLACES stored"],
-        confirm,
-    );
+    // THE LIVE CLIP, and it is on the destructive screen. The fixed parts are 10 chars
+    // (`#`, `" of "`, `"-of-n"`), so a 4-digit index with a 3-digit threshold already
+    // overflows the `Buf<16>` and drops the tail of `of <t>-of-n` -- the words that say
+    // what is about to be REPLACED. Both numbers are coordinator-chosen and neither is
+    // bounded anywhere upstream of here: `share_index` is any `u32` the arm's own
+    // `try_from` admits, and `threshold` is any `u16`.
+    !what.truncated()
+        && consent_screen(
+            frame,
+            ["Store share?", key_name, what.as_str(), "REPLACES stored"],
+            confirm,
+        )
 }
 
 /// The shape all three restoration consent screens share: four lines and the digit
@@ -2196,17 +2233,68 @@ fn consolidate_consent(
 /// attacker-controlled — a key name came off a coordinator's `Begin` — and
 /// `ui::Frame::text` is documented safe for arbitrary text of arbitrary length:
 /// walked with `chars()`, truncated at `ui::COLS`, never sliced.
-fn consent_screen(frame: &mut ui::Frame, lines: [&str; 4], confirm: ui::ConfirmDigit) {
+///
+/// # Returns
+///
+/// `false` if any row did **not** fit, i.e. the screen on the glass is not the screen
+/// this function was asked to draw. Callers must turn that into a [`Refusal`], never
+/// into a shrug — see below.
+///
+/// **SAFE FROM PANICS, NOT SAFE FROM SILENCE, and that was the live defect.** `text`
+/// truncating means the failure mode here was never a crash: it was a CLIPPED WORD on a
+/// consent screen, with nothing anywhere comparing what was drawn against what was
+/// asked for. Two reachable cases, both coordinator-chosen:
+///
+///  * a `key_name` over [`ui::COLS`] chars — the row a human matches against the name on
+///    the coordinator's own screen, so a clip makes two different keys look alike;
+///  * [`consolidate_consent`]'s composed `#<index> of <t>-of-n`, which overflows its
+///    `ui::Buf<16>` at a 4-digit index with a 3-digit threshold (and the device's own word
+///    entry deliberately admits a NINE-digit index). That is the row saying WHICH share is
+///    about to be destroyed, on the one screen whose write has no undo.
+///
+/// So a row that does not fit is a [`Refusal`], and that is this file's own existing rule
+/// rather than a new one: the arms in [`prompt_screen_at`] already answer
+/// `Err(Refusal::DisplayBackup)` when a share index will not fit a `u32`, on the stated
+/// ground that "a share index that cannot be printed is a question the human cannot match
+/// against the request they made". A name clipped at column 16 is the same question and
+/// the same answer. Requirement 12's rule is the general form: an undisplayable prompt is
+/// a refusal, not a rendering fallback.
+///
+/// CONSEQUENCE, stated because it is a real cost and a coordinator can provoke it: a key
+/// name longer than [`ui::COLS`] chars now REFUSES the reveal, the quiz and the
+/// consolidation on this device rather than showing a prefix of it. Wrapping onto the
+/// blank row below was the alternative and was rejected: it changes the layout of three
+/// consent screens, and `tools/pixel-check.py` drives ONE hardcoded scene
+/// (`SCENE = "2 keygen check"`), so no gate would have looked at the result.
+///
+/// The comparison is `ui::Frame::text`'s own return value against `chars().count()`,
+/// which is the use that function's doc prescribes ("Callers that must not truncate
+/// compare the result against `s.chars().count()`"). It is a pure LENGTH test and not a
+/// renderability one: `glyph` clamps every out-of-range codepoint to `MISSING_GLYPH`, so
+/// a char is always drawn and always counted, and a non-ASCII name that FITS still draws.
+fn consent_screen(frame: &mut ui::Frame, lines: [&str; 4], confirm: ui::ConfirmDigit) -> bool {
     frame.clear();
+    let mut fits = true;
     for (row, line) in lines.iter().enumerate() {
-        frame.text(0, row * 2, line);
+        fits &= frame.text(0, row * 2, line) == line.chars().count();
     }
     let mut legend = ui::Buf::<16>::new();
     legend
         .push_str("Press (")
         .push_str(confirm.as_str())
         .push_str(") x=no");
+    // `Buf` records its own overflow, and the legend is composed from a fixed prefix plus
+    // ONE digit, so this cannot fire today. Checked anyway rather than asserted: the
+    // legend is what names the key that authorises the screen, so a legend that lost
+    // characters is a screen asking for a gesture it did not show.
+    // `truncated()` is the WHOLE check for this row, and there is deliberately no
+    // drawn-vs-asked comparison beside it: `legend` is a `Buf<16>` and `ui::COLS` is 16,
+    // so `text` can never fail to draw all of it and the comparison could not fail. One
+    // stood here until review caught it on 2026-09-12 -- the same vacuous shape this very
+    // change deleted five of elsewhere in the tree.
+    fits &= !legend.truncated();
     frame.text(0, 7, legend.as_str());
+    fits
 }
 
 /// One page of a bitcoin transaction's consent screen, drawn.
@@ -2378,8 +2466,14 @@ pub fn prompt_screen_at(
             ToUserRestoration::DisplayBackup {
                 key_name, phase, ..
             } => match u32::try_from(phase.share_index) {
-                Ok(index) if page == 0 => {
-                    backup_consent(frame, REVEAL_QUESTION, key_name, index, confirm);
+                // `consent_screen`'s `false` is a row that did not FIT, and it is the
+                // same refusal as an index that will not fit a `u32` for the same reason:
+                // a question the human cannot read in full is a question they cannot match
+                // against the request they made.
+                Ok(index)
+                    if page == 0
+                        && backup_consent(frame, REVEAL_QUESTION, key_name, index, confirm) =>
+                {
                     // The whole question is on this page, so this page may authorise
                     // — and the thing it authorises is a reveal, not a signature.
                     Ok(Shown::Page { last: true })
@@ -2396,8 +2490,16 @@ pub fn prompt_screen_at(
             // same digit. What it is NOT is the same GRANT — see `confirm_at`.
             ToUserRestoration::CheckBackup { key_name, phase, .. } => {
                 match u32::try_from(phase.share_index) {
-                    Ok(index) if page == 0 => {
-                        backup_consent(frame, CHECK_QUESTION, key_name, index, confirm);
+                    Ok(index)
+                        if page == 0
+                            && backup_consent(
+                                frame,
+                                CHECK_QUESTION,
+                                key_name,
+                                index,
+                                confirm,
+                            ) =>
+                    {
                         Ok(Shown::Page { last: true })
                     }
                     // `DisplayBackup`'s refusal, for `DisplayBackup`'s reason: a share
@@ -2410,28 +2512,47 @@ pub fn prompt_screen_at(
             // a refusal for `DisplayBackup`'s reason: a caller that invents a page
             // must not be able to keep guessing until something says `last: true`.
             ToUserRestoration::EnterBackup { .. } if page == 0 => {
-                entry_consent(frame, confirm);
-                Ok(Shown::Page { last: true })
+                if entry_consent(frame, confirm) {
+                    Ok(Shown::Page { last: true })
+                } else {
+                    // Unreachable while `hal::ui`'s geometry holds -- every row here is a
+                    // constant -- so this is the arm a change to `ui::COLS` lands in.
+                    //
+                    // A VALUE and not an early `return`, and that is the whole point: this
+                    // function ends with `if shown.is_err() { ui::refusal(frame) }`, which
+                    // is what takes the clipped rows off the frame. A `return Err(..)`
+                    // here skipped it and left the half-drawn warning to be pushed at the
+                    // panel -- written that way and caught by review on 2026-09-12, whose
+                    // comment claimed it "lands fail-closed instead of drawing a clipped
+                    // warning" while doing exactly the opposite.
+                    Err(Refusal::PhysicalBackup)
+                }
             }
             // The question that gates a flash write which REPLACES a share.
             ToUserRestoration::ConsolidateBackup(phase) if page == 0 => {
                 match u32::try_from(phase.complete_share.secret_share.index) {
-                    Ok(index) => {
-                        consolidate_consent(
+                    Ok(index)
+                        if consolidate_consent(
                             frame,
                             &phase.complete_share.key_name,
                             index,
                             phase.complete_share.threshold,
                             confirm,
-                        );
+                        ) =>
+                    {
                         Ok(Shown::Page { last: true })
                     }
-                    // A share index outside `u32` cannot be printed, so the human
-                    // cannot tell what they are being asked to store over. `try_from`
-                    // and never the `expect` upstream's own `Display` uses
-                    // (`share_backup.rs`, "Share index should fit in u32"): the index
-                    // came off the wire and a reachable panic here is permanent.
-                    Err(_) => Err(Refusal::PhysicalBackup),
+                    // TWO refusals, ONE arm, because they are the same failure at two
+                    // widths. `Err(_)`: a share index outside `u32` cannot be printed at
+                    // all, so the human cannot tell what they are being asked to store
+                    // over — `try_from` and never the `expect` upstream's own `Display`
+                    // uses (`share_backup.rs`, "Share index should fit in u32"), because
+                    // the index came off the wire and a reachable panic here is permanent.
+                    // `Ok(_)` reaching here is the guard above having said the composed
+                    // `#<index> of <t>-of-n` row did not FIT, which loses exactly the
+                    // words naming what is replaced. Neither may draw a partial screen on
+                    // the one flow whose write has no undo.
+                    Err(_) | Ok(_) => Err(Refusal::PhysicalBackup),
                 }
             }
             // `BackupSaved` is informational, and the two `if page == 0` arms above
@@ -4353,10 +4474,17 @@ mod tests {
         share_index: frostsnap_core::schnorr_fun::frost::ShareIndex,
     }
 
-    fn hold_a_backup(
+    /// `key_name` is a PARAMETER so a test can hand the device a name wider than
+    /// `ui::COLS`, which is the only way to drive [`prompt_screen_at`]'s
+    /// row-does-not-fit refusal end to end. In spec it cannot happen —
+    /// `frostsnap_comms::KEY_NAME_MAX_LENGTH` is 15 and `COLS` is 16 — but the field on
+    /// the wire is a `String` and this file bounds it nowhere, so the reachable case is an
+    /// out-of-spec or hostile coordinator.
+    fn hold_a_backup_named(
         session: &mut Session<'_, DebugFlash<FakeFlash>>,
         secret: &identity::IdentitySecret,
         rng: &mut Entropy,
+        key_name: &str,
     ) -> HeldBackup {
         use frostsnap_core::device::{
             keys::KeyMutation, EncryptedSecretShare, KeyPurpose, Mutation, SaveShareMutation,
@@ -4396,7 +4524,7 @@ mod tests {
         for mutation in [
             Mutation::Keygen(KeyMutation::NewKey {
                 key_id: access_structure_ref.key_id,
-                key_name: String::from("vault"),
+                key_name: String::from(key_name),
                 purpose: KeyPurpose::Test,
             }),
             Mutation::Keygen(KeyMutation::NewAccessStructure {
@@ -4451,7 +4579,7 @@ mod tests {
         let secret = identity::load_or_create(&mut *flash.borrow_mut(), rng)
             .expect("a blank fake flash must yield a fresh identity");
         let mut session = Session::open(flash, &secret).expect("signer construction");
-        let held = hold_a_backup(&mut session, &secret, rng);
+        let held = hold_a_backup_named(&mut session, &secret, rng, "vault");
         (session, held)
     }
 
@@ -5445,6 +5573,185 @@ mod tests {
             );
         }
         assert_eq!(out.frames(), 0, "a refused question must not answer");
+    }
+
+    /// **A consent row that does not FIT is a refusal, not a clipped word.**
+    ///
+    /// `ui::Frame::text` truncates rather than panicking, so the failure this closes was
+    /// never a crash: it was a consent screen quietly missing characters, with nothing
+    /// comparing what was drawn against what was asked for. Both inputs are
+    /// coordinator-chosen and neither is bounded upstream of the screen.
+    ///
+    /// The two cases are different mechanisms and both are checked, because a fix for one
+    /// does not cover the other: the `ui::Buf<16>` compositions lose digits BEFORE the
+    /// frame is touched (so the row then fits, and only `Buf::truncated` can see it),
+    /// while a long `key_name` reaches `Frame::text` intact and is cut at `ui::COLS` (so
+    /// only the drawn-vs-asked comparison can see it).
+    ///
+    /// MUTATION-VERIFY, four ways, each of which is what the code did before this test:
+    /// drop the `!what.truncated()` guard from `consolidate_consent` and the 4-digit-index
+    /// case passes; drop it from `backup_consent` and the 10-digit case passes; ignore
+    /// `Frame::text`'s return in `consent_screen` and both long-name cases pass; and have
+    /// `consent_screen` return `true` unconditionally and all of them do.
+    #[test]
+    fn a_consent_row_that_does_not_fit_is_refused_rather_than_clipped() {
+        let mut rng = entropy(211);
+        let confirm = ui::ConfirmDigit::draw(&mut rng);
+        let mut frame = ui::Frame::new();
+        let long = "k".repeat(ui::COLS + 1);
+        // Exactly `COLS` is the widest name that still fits, and it must: the entry
+        // screen's own `"onto THIS device"` row is already that wide, so a bound one
+        // char tighter would refuse a screen composed entirely of constants.
+        let edge = "k".repeat(ui::COLS);
+
+        assert!(
+            consolidate_consent(&mut frame, "cold-snap M7", 1, 9, confirm),
+            "`#1 of 9-of-n` is 12 chars and must fit"
+        );
+        assert!(
+            consolidate_consent(&mut frame, &edge, 1, 9, confirm),
+            "a key name of exactly ui::COLS chars must still draw"
+        );
+        // `#` + 4 digits + `" of "` + 3 digits + `"-of-n"` = 17 chars into a `Buf<16>`,
+        // so the tail naming what is REPLACED is what gets dropped.
+        assert!(
+            !consolidate_consent(&mut frame, "k", 1_000, 100, confirm),
+            "a 4-digit index with a 3-digit threshold overflows the composed row"
+        );
+        assert!(
+            !consolidate_consent(&mut frame, &long, 1, 9, confirm),
+            "a key name over ui::COLS is cut, and a cut name matches the wrong key"
+        );
+
+        assert!(
+            backup_consent(&mut frame, REVEAL_QUESTION, "cold-snap M7", 1, confirm),
+            "`share #1` is 8 chars and must fit"
+        );
+        // `"share #"` is 7, so a 10-digit index -- which a `u32` reaches -- is 17.
+        assert!(
+            !backup_consent(&mut frame, REVEAL_QUESTION, "k", u32::MAX, confirm),
+            "a 10-digit share index overflows `share #<index>`"
+        );
+        assert!(
+            !backup_consent(&mut frame, CHECK_QUESTION, &long, 1, confirm),
+            "the quiz question is the same screen and takes the same name"
+        );
+
+        // Every row of the entry screen is a constant, so it fits unconditionally --
+        // which is the fact worth pinning, since `"onto THIS device"` is exactly
+        // `ui::COLS` and one char of geometry drift would break it.
+        assert!(entry_consent(&mut frame, confirm));
+
+        // NOTHING CLIPPED EVER REACHES THE GLASS, and the two cases get there differently.
+        //
+        // The composed-row case short-circuits: `!what.truncated() && consent_screen(..)`
+        // means `consent_screen` -- and so `frame.clear()` -- is never reached, so the
+        // frame is left exactly as the caller had it. Pinned by value, because it is a
+        // property of the `&&` and an edit to `&` would silently draw the clipped screen.
+        let mut untouched = ui::Frame::new();
+        ui::standby(&mut untouched, "before", "", None);
+        let before = untouched.clone();
+        assert!(!consolidate_consent(&mut untouched, "k", 1_000, 100, confirm));
+        assert!(
+            untouched.as_bytes() == before.as_bytes(),
+            "a composed row that overflowed its Buf drew onto the glass anyway"
+        );
+
+        // The long-name case DOES draw first -- `consent_screen` cannot know a row is too
+        // wide until `Frame::text` has told it -- so here the clipped rows really are on
+        // the frame, and it is `prompt_screen_at`'s `if shown.is_err() { ui::refusal(..) }`
+        // that removes them. `ui::refusal` opens with `frame.clear()`, so the removal is
+        // total rather than an overwrite of the rows it happens to occupy.
+        let mut clipped = ui::Frame::new();
+        assert!(!consolidate_consent(&mut clipped, &long, 1, 9, confirm));
+        let partial = all_rows(&clipped, ui::COLS);
+        assert!(
+            partial.contains("Store share?"),
+            "the long-name screen really was drawn before the check saw it; got:\n{partial}"
+        );
+        ui::refusal(&mut clipped);
+        let after = all_rows(&clipped, ui::COLS);
+        assert!(
+            !after.contains("Store share?") && !after.contains('k'),
+            "the refusal left part of the clipped consent screen on the glass; got:\n{after}"
+        );
+    }
+
+    /// **AND THE FUNNEL TURNS THAT `false` INTO A REFUSAL** — end to end, through
+    /// [`prompt_screen_at`] and [`Session::confirm_at`], on a device holding a key whose
+    /// name is wider than `ui::COLS`.
+    ///
+    /// This is the half `a_consent_row_that_does_not_fit_is_refused_rather_than_clipped`
+    /// does NOT cover, and review caught the gap on 2026-09-12: that test calls the three
+    /// consent helpers directly, so dropping `&& backup_consent(..)` from
+    /// `prompt_screen_at`'s guards reverted the whole change with every firmware test
+    /// green. It is not a cosmetic revert either — `confirm_at` re-gates through the SAME
+    /// funnel, so an `Ok(Shown::Page { last: true })` from a clipped screen sets
+    /// `self.reveal` and puts 25 words on the glass for a name the human could not read
+    /// in full.
+    ///
+    /// IN SPEC THIS CANNOT HAPPEN and the test says so rather than implying a live hole:
+    /// `frostsnap_comms::KEY_NAME_MAX_LENGTH` is 15 and `ui::COLS` is 16, so the shipped
+    /// app cannot produce a name that does not fit. The field on the wire is a `String`
+    /// and nothing in this file bounds it, so the reachable case is an out-of-spec or
+    /// hostile coordinator — which is exactly the case a consent screen must fail closed
+    /// on.
+    ///
+    /// MUTATION-VERIFY: drop `&& backup_consent(..)` from the `DisplayBackup` guard and
+    /// the first assertion fails; from `CheckBackup` and the second does; drop
+    /// `&& consolidate_consent(..)` and the fourth does; make `entry_consent`'s arm ignore
+    /// its `bool` and the third does.
+    #[test]
+    fn a_consent_screen_that_cannot_be_drawn_in_full_refuses_through_the_funnel() {
+        let flash = fs_flash();
+        let mut rng = entropy(212);
+        let secret = identity::load_or_create(&mut *flash.borrow_mut(), &mut rng)
+            .expect("a blank fake flash must yield a fresh identity");
+        let mut session = Session::open(&flash, &secret).expect("signer construction");
+        // 17 chars, one past `ui::COLS`. Out of spec by two, and that is the point.
+        let wide = "Family Savings V2";
+        assert!(wide.chars().count() > ui::COLS);
+        let held = hold_a_backup_named(&mut session, &secret, &mut rng, wide);
+        let mut out = Outbox::new(session.device_id());
+        let digit = ui::ConfirmDigit::draw(&mut rng);
+
+        for (what, body, refusal) in [
+            ("DisplayBackup", held.request.clone(), Refusal::DisplayBackup),
+            ("CheckBackup", held.check.clone(), Refusal::DisplayBackup),
+        ] {
+            let prompt = one_prompt(&mut session, body, &mut rng, &mut out);
+            let mut frame = ui::Frame::new();
+            assert_eq!(
+                prompt_screen_at(&mut frame, &prompt, digit, 0),
+                Err(refusal),
+                "{what}: a key name of {} chars does not fit {} columns, so the screen \
+                 must REFUSE rather than draw a prefix of it",
+                wide.chars().count(),
+                ui::COLS
+            );
+            // And the refusal is what is on the glass, not the clipped question.
+            let drawn = all_rows(&frame, ui::COLS);
+            assert!(
+                !drawn.contains("Family Savings"),
+                "{what}: the clipped key name survived on the frame:\n{drawn}"
+            );
+            // THE HALF THAT MATTERS: no grant. `confirm_at` re-renders through the same
+            // funnel, so it must refuse too and must not set the reveal or the quiz.
+            let fault = session
+                .confirm_at(prompt, 0, &mut rng, &mut out)
+                .expect_err("a screen that cannot be drawn cannot be consented to");
+            assert!(
+                matches!(fault, Fault::Refused(_)),
+                "{what}: got {fault:?}, not a refusal"
+            );
+            assert!(session.quiz_screen().is_none(), "{what} granted a quiz");
+            let mut probe = ui::Frame::new();
+            assert!(
+                session.show_backup(0, &mut probe, &mut rng).is_err(),
+                "{what} granted a REVEAL for a screen the human could not read"
+            );
+            assert_eq!(out.frames(), 0, "{what}: a refused question answered");
+        }
     }
 
     /// **A quiz digit does not buy a reveal, and a reveal digit does not buy a quiz.**

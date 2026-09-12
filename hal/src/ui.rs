@@ -1189,7 +1189,7 @@ impl ConfirmDigit {
 
     /// **FAIL CLOSED**: `true` for the exact digit and for nothing else.
     ///
-    /// This is `hsm_ux.py:58`'s `self.refused = (ch != confirm_char)` read the
+    /// This is `hsm_ux.py:66`'s `self.refused = (ch != confirm_char)` read the
     /// other way round, and the inversion is the whole mechanism: a wrong digit,
     /// `x`, an unrelated key and a key that is not even on the pad are all
     /// **refusals**, not ignored presses and not retries. Treating only `x` as
@@ -3890,8 +3890,14 @@ mod tests {
         // 14 of 16 columns. Asserted rather than eyeballed: `Buf<16>` and
         // `Frame::text` both truncate silently, so a longer legend would lose the
         // `x=no` half — the refusal — without failing anything else.
+        // 14 is the whole check, and there is deliberately no `count() <= COLS` beside
+        // it: `want` is a `Buf<16>` and `COLS` is 16, so a length test against `COLS`
+        // could not fail whatever the legend became. It stood here until 2026-09-11 and
+        // read as coverage of exactly the silent truncation the comment above names,
+        // while being unable to see it. The exact count is what sees it -- a legend that
+        // grew is no longer 14 -- so one falsifiable assertion replaces two of which one
+        // was vacuous.
         assert_eq!(want.as_str().chars().count(), 14);
-        assert!(want.as_str().chars().count() <= COLS);
         // And every drawable digit fits and lands in the same place, so the digit a
         // caller happens to draw cannot be the one that clips.
         for d in CONFIRM_CHARSET {
@@ -4026,7 +4032,7 @@ mod tests {
         assert_eq!(seen.len(), CONFIRM_CHARSET.len(), "digits reached: {seen:?}");
     }
 
-    /// FAIL CLOSED. `hsm_ux.py:58`'s `refused = (ch != confirm_char)`: anything
+    /// FAIL CLOSED. `hsm_ux.py:66`'s `refused = (ch != confirm_char)`: anything
     /// that is not the exact digit is a REFUSAL, never an ignored press and never
     /// a retry. Treating only `x` as refusal is how this gets subtly wrong, and it
     /// fails *open*, so that direction is asserted explicitly.
@@ -4663,9 +4669,15 @@ mod tests {
                 want,
                 "complete={complete} candidates={candidates:?}"
             );
+            // On the LITERAL and not on the readback. `row_text` walks `0..COLS`, so
+            // its result is at most `COLS` chars however the screen was drawn -- the
+            // check this replaces could not fail. `(y)ok (x)del(0)+` is exactly 16, i.e.
+            // already at the edge, so a legend that grew by one character would clip and
+            // the `assert_eq!` above would then be comparing two truncated strings.
             assert!(
-                row_text(&f, FOOTER_ROW).chars().count() <= COLS,
-                "footer clipped"
+                want.chars().count() <= COLS,
+                "the expected footer {want:?} is {} cols, panel is {COLS}",
+                want.chars().count()
             );
         }
     }
@@ -4804,13 +4816,14 @@ mod tests {
                     "a paging key must never be the yes on this screen"
                 );
             }
-            // Nothing on this screen may be clipped: it is a yes/no question and a
-            // half-drawn question is not one.
-            assert!(
-                screen_text(&f).lines().all(|l| l.chars().count() <= COLS),
-                "clipped: {:?}",
-                screen_text(&f)
-            );
+            // NO `screen_text(..) <= COLS` CHECK HERE, deliberately: `row_text` walks
+            // `0..COLS`, so every line it returns is at most `COLS` chars whatever was
+            // drawn, and a check on it would read as clip coverage while being unable to
+            // fail. What actually covers this screen is the content asserted above and
+            // below -- the digit is named, `x=no` is present, and the question reads as a
+            // question -- each of which fails if a row was cut. The class-wide guard for
+            // the strings themselves is `every_pin_string_fits_the_panel`, which asserts
+            // on the `&'static str` CONSTANTS.
             // And the question has to be a QUESTION, or a human cannot know what
             // the digit claims.
             assert!(screen_text(&f).contains('?'), "not phrased as a question");
@@ -5488,14 +5501,16 @@ mod tests {
                 s.chars().count()
             );
         }
-        // And the prose rows: nothing a PIN screen draws may be clipped, which on
-        // a 16-col grid means every rendered row is at most COLS and the
-        // right-hand column is the last thing on it.
+        // The rendered rows are NOT re-checked against `COLS`, and that is the point of
+        // the loop above. `row_text` walks `0..COLS`, so a readback is at most `COLS`
+        // chars however the screen was drawn: the two `screen_text(..) <= COLS` asserts
+        // that used to stand here could not fail, on either screen, for any input. The
+        // loop above is the falsifiable form of the same property -- it tests the SOURCE
+        // strings, so lengthening one by a character fails by name and says which.
+        // Rendering them is still worth doing, because it is what would panic or refuse.
         let mut f = Frame::new();
         pin_mismatch(&mut f);
-        assert!(screen_text(&f).lines().all(|l| l.chars().count() <= COLS));
         pin_checking(&mut f);
-        assert!(screen_text(&f).lines().all(|l| l.chars().count() <= COLS));
     }
 
     /// The artefact: every page of every screen, as ASCII art. Not a snapshot —
