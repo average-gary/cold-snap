@@ -66,8 +66,14 @@
 //! (`stm32/sigheader.py:30`, `256*1024`), and
 //! `signit.py:295,305` pads it to 512 and then, on the Mk4/Mk5 branch, to **4096**
 //! (`verify.c:106`: the installer erases 4 K pages). The measured body is
-//! **376,760 B**, 114,616 B over the floor, and signit pads it by 72 B
-//! (`align_to(376_760, 512) = 376_832`, and `align_to(.., 4096)` is the same number).
+//! **377,192 B**, 115,048 B over the floor, and signit pads it by **3,736 B**
+//! (`align_to(377_192, 512) = 377_344`, then `align_to(377_344, 4096) = 380_928` — the 4 K
+//! branch is the one Mk4/Mk5 take, and it is **no longer a no-op**). **This read 376,760 /
+//! 114,616 / 72 B and "`align_to(.., 4096)` is the same number" until 2026-09-12**, when
+//! `reveal_draw` and the consent-row refusals took the image past a 4 K boundary; README's
+//! "Packaging" section carried the same chain and was corrected in the same pass. The old
+//! text's agreement between the two branches was a coincidence of one image, and it ended
+//! — which is exactly what its README counterpart had hedged about and nobody re-checked.
 //! Padding is signit's job; never hand it a pre-padded body.
 //!
 //! Those three numbers were 282,016 / 19,872 / 608 before the dispatch,
@@ -411,7 +417,7 @@ enum Consent<'a> {
 /// everything else is [`Answer::No`], which is a refusal and not a retry. That is
 /// [`ui::ConfirmDigit::accepts`]'s own contract (`hal/src/ui.rs:914`,
 /// `key == self.0`) and Coldcard's rule at its highest-stakes approval
-/// (`shared/hsm_ux.py:58`, `self.refused = (ch != confirm_char)`). A loop that
+/// (`shared/hsm_ux.py:66`, `self.refused = (ch != confirm_char)`). A loop that
 /// waited for a *valid* key instead of refusing an invalid one would let a human
 /// fumble a signing screen until they got it right, which is the fail-open
 /// reading of the same code.
@@ -717,6 +723,99 @@ enum RevealStep {
     /// draw standby — a backup that was not recorded was not recorded, and the app
     /// has its own cancel. Fail-closed here is silence, not a reassuring ack.
     Idle,
+}
+
+/// Which screen a granted reveal puts on the glass for one answer from
+/// [`Session::show_backup`]. See [`reveal_draw`].
+///
+/// [`RevealScreen::Page`] carries nothing because the words are already in the frame:
+/// `show_backup` composed them there, and this file may never hold a word (it has no
+/// `Secrets`). The other three are composed by the caller from `hal::ui`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RevealScreen {
+    /// The words `show_backup` just drew. Push the frame as it stands.
+    Page,
+    /// The pages ran out and the recorded question is armed. Draw
+    /// [`ui::backup_recorded`] with this digit, over the words, into the same frame.
+    Recorded(ui::ConfirmDigit),
+    /// The reveal ended with nothing to ack. Standby, which is what takes the words off.
+    Idle,
+    /// A fault. [`ui::refusal`], which is also what takes the words off.
+    Refuse,
+}
+
+/// The PAIRING at the heart of a reveal: which screen goes up, and which cursor the
+/// event loop parks — decided together, by value, in a module item a host test can run.
+///
+/// **This function exists because of a mutation that passed every gate in the project.**
+/// The pairing used to be two expressions inside `boot`'s `show_backup_page`, and
+/// `Some(Reveal::Page(page))` there could be changed to
+/// `Some(Reveal::Page(page.saturating_add(1)))` with NOTHING failing: MEASURED
+/// 2026-09-12 against firmware tests, hal tests, both device clippy profiles,
+/// `cargo build --release` at 0 warnings, `tools/pixel-check.py` PASS all 7, and the
+/// `hostcheck` interop harness at exit 0.
+///
+/// **"Passed" means two different things across those seven and the difference matters,
+/// so it is spelled out rather than rounded off.** `show_backup_page` is a nested `fn`
+/// inside `boot`, which is `#[cfg(target_arch = "arm")]`, so THREE of the seven compiled
+/// the mutated line at all — the ARM release build and the two device clippy profiles —
+/// and they passed because the edit is well-formed code that does the wrong thing, which
+/// is precisely the blind spot PLAN.md §9 item 22 records ("the gate sees *malformed*
+/// register code and is blind to *plausible-but-wrong*"). The other four passed
+/// TRIVIALLY: the two host test gates never compiled it, `pixel-check` drives
+/// `examples/simulator`, and `hostcheck` drives the stub's own reveal walk. Neither half
+/// is reassuring, and together they are the whole argument for hoisting: the only gate
+/// that can see this class is a host test, and a host test cannot reach inside `boot`.
+///
+/// What the mutation does is skip every other page —
+/// [`reveal_step`] adds one to a cursor that is already one ahead — so a human is shown
+/// pages 0, 2, 4, 6 and then asked "Wrote down all 25 words?" over **12 words that were
+/// never drawn**. They say yes, `CommsMisc::BackupRecorded` goes to the coordinator, and
+/// the app records a backup that cannot restore the share. No gate could see it because
+/// every line of `boot` is `cfg(target_arch = "arm")` (PLAN.md §9 item 22) and the stub's
+/// own reveal walk (`firmware/examples/stub.rs`) calls `Session::show_backup` directly
+/// rather than through this file.
+///
+/// Hoisting is what makes it visible, and it is the same remedy the eight routers above
+/// already use: `the_reveal_cursor_names_the_page_that_was_drawn` checks the pairing by
+/// VALUE, so the `+ 1` is now a failing host test instead of a comment nobody re-derives.
+/// It does not make a wrong cursor impossible — the caller still forwards what this
+/// returns, and `every_exit_from_the_reveal_takes_the_words_off_the_glass` is the source
+/// pin over that residue — but it moves the arithmetic to where a value test reaches it,
+/// which is the whole of what §9 item 22's "tractable slice" means. The pin works on the
+/// host despite `boot` being ARM-only because `include_str!` reads this file as TEXT, and
+/// that is the property that makes source pins the right remedy for whatever cannot be
+/// hoisted: MEASURED, a mutation that rebuilds the cursor at the call site instead of
+/// forwarding it fails that pin on the host.
+///
+/// The SECOND pairing here is the digit: the screen is drawn with the same
+/// [`ui::ConfirmDigit`] the cursor will accept, and both come out of ONE match arm, so
+/// there is no longer a place to draw one digit and park another.
+///
+/// `Result<bool, ()>` and not `Result<bool, Fault>`: nothing here reads the fault, and
+/// taking the library type would make the test construct one.
+fn reveal_draw(
+    page: usize,
+    shown: Result<bool, ()>,
+    record_pending: bool,
+    confirm: ui::ConfirmDigit,
+) -> (RevealScreen, Option<Reveal>) {
+    match shown {
+        // THE PAIRING. `page`, and never an expression over it: the cursor names the
+        // page that was DRAWN, because that is the page whose footer the human is
+        // reading and whose `NEXT_KEY` press `reveal_step` will advance from.
+        Ok(true) => (RevealScreen::Page, Some(Reveal::Page(page))),
+        // The pages ran out with the question armed. `confirm` twice, from one arm.
+        Ok(false) if record_pending => (
+            RevealScreen::Recorded(confirm),
+            Some(Reveal::Recorded(confirm)),
+        ),
+        // Ended with nothing to ack, or faulted. Both end the flow, and both hand back
+        // `None` so the event loop stops delivering keypresses in the same statement the
+        // caller redraws the glass in.
+        Ok(false) => (RevealScreen::Idle, None),
+        Err(()) => (RevealScreen::Refuse, None),
+    }
 }
 
 /// One pad verdict against the backup screen on the glass, into the next step.
@@ -1599,38 +1698,42 @@ fn boot() -> ! {
         rng: &mut rng::Entropy,
     ) -> Option<Reveal> {
         let mut frame = ui::Frame::new();
-        match session.show_backup(page, &mut frame, rng) {
-            Ok(true) => {
+        // Drawn BEFORE the match and on every leg, so the digit handed to [`reveal_draw`]
+        // exists whichever arm it takes. Unused on three of the four, which costs one
+        // `Entropy` byte per page and buys a pure router: the alternative is to draw it
+        // inside the `Recorded` arm, which is exactly the arm-local arithmetic this
+        // change exists to get out of `boot`.
+        let confirm = ui::ConfirmDigit::draw(rng);
+        let shown = session.show_backup(page, &mut frame, rng).map_err(|_| ());
+        // The pages running out is how a reveal ENDS. `Session::show_backup` has already
+        // dropped the grant and re-derived nothing, so the only thing left to decide is
+        // what goes over the words — and `record_pending` is the library's answer to
+        // whether it ended or faulted; it is armed on the ending leg only.
+        //
+        // The screen and the cursor are decided TOGETHER, by [`reveal_draw`], and this
+        // function only forwards what it says. That is the whole point: the cursor
+        // arithmetic used to live here, where no gate in the project could execute it.
+        let (screen, next) = reveal_draw(page, shown, session.record_pending(), confirm);
+        match screen {
+            // The words are already in `frame` — `show_backup` composed them there.
+            RevealScreen::Page => {
                 let _ = panel.show(frame.as_bytes());
-                Some(Reveal::Page(page))
             }
-            // The pages ran out. `Session::show_backup` has already dropped the grant
-            // and re-derived nothing, so the only thing left to decide is what goes
-            // over the words — and this is where the "did you write it down?" question
-            // belongs, because this is the one function that knows a reveal ENDED as
-            // opposed to faulted. `record_pending` is the library's answer to which of
-            // those happened; it is armed on this leg only.
-            //
-            // The question is drawn into the SAME `frame` the words were in, which is
-            // both cheaper than a second 1,024-byte frame and the reason requirement 5
-            // still holds: every leg here overwrites the glass before returning, so
-            // there is no exit from a reveal with a share still lit.
-            Ok(false) if session.record_pending() => {
-                let confirm = ui::ConfirmDigit::draw(rng);
-                ui::backup_recorded(&mut frame, confirm);
+            // Drawn into the SAME `frame` the words were in, which is both cheaper than a
+            // second 1,024-byte frame and the reason requirement 5 still holds: every leg
+            // here overwrites the glass, so there is no exit from a reveal with a share
+            // still lit.
+            RevealScreen::Recorded(digit) => {
+                ui::backup_recorded(&mut frame, digit);
                 let _ = panel.show(frame.as_bytes());
-                Some(Reveal::Recorded(confirm))
             }
-            Ok(false) => {
-                idle(session, panel);
-                None
-            }
-            Err(_fault) => {
+            RevealScreen::Idle => idle(session, panel),
+            RevealScreen::Refuse => {
                 ui::refusal(&mut frame);
                 let _ = panel.show(frame.as_bytes());
-                None
             }
         }
+        next
     }
 
     /// Draw the current screen of a granted backup ENTRY. `false` means the entry is
@@ -2848,7 +2951,7 @@ mod tests {
 
     /// The two non-digit keys are refusals, and `x` is not special-cased.
     ///
-    /// `hsm_ux.py:58` is `refused = (ch != confirm_char)`, so CANCEL and OK are
+    /// `hsm_ux.py:66` is `refused = (ch != confirm_char)`, so CANCEL and OK are
     /// refusals for exactly the same reason a wrong digit is. Treating only `x` as
     /// refusal is how this gets subtly wrong, and it fails OPEN.
     #[test]
@@ -3353,6 +3456,77 @@ mod tests {
         );
     }
 
+    /// **The cursor names the page that was DRAWN**, and the recorded question is drawn
+    /// with the digit the cursor will accept.
+    ///
+    /// This is the pairing that lived inside `boot` until 2026-09-11, where no gate in
+    /// this project could execute it. The mutation it exists for was RUN and passed
+    /// EVERYTHING: `Some(Reveal::Page(page))` → `Some(Reveal::Page(page.saturating_add(1)))`
+    /// left firmware tests, hal tests, both device clippy profiles, `cargo build --release`
+    /// at 0 warnings, `tools/pixel-check.py` PASS all 7 and the `hostcheck` harness at
+    /// exit 0 — while showing a human pages 0, 2, 4, 6 and then asking "Wrote down all 25
+    /// words?" over **12 words never drawn**. See [`reveal_draw`].
+    ///
+    /// Walked over EVERY page rather than one, and one past the end, because the defect is
+    /// an off-by-one and a single sample at page 0 would pass under `page * 1` or
+    /// `page.saturating_sub(0)`.
+    ///
+    /// MUTATION-VERIFY: any arithmetic on `page` in [`reveal_draw`]'s `Ok(true)` arm fails
+    /// the first half. Handing `Reveal::Recorded` a second digit — the shape that lets a
+    /// screen show one key and accept another — fails the second.
+    #[test]
+    fn the_reveal_cursor_names_the_page_that_was_drawn() {
+        // Two DIFFERENT digits, through the real `draw`, so "the same digit" below is a
+        // comparison and not a tautology over one value.
+        let a = digit(CONFIRM_CHARSET[0]);
+        let b = digit(CONFIRM_CHARSET[1]);
+        assert_ne!(a.as_str(), b.as_str(), "the two fixtures must differ");
+
+        for page in 0..=BACKUP_END {
+            assert_eq!(
+                reveal_draw(page, Ok(true), false, a),
+                (RevealScreen::Page, Some(Reveal::Page(page))),
+                "page {page}: the cursor must name the page that was drawn"
+            );
+            // `record_pending` is irrelevant while pages remain: the question is armed
+            // by the library on the ENDING leg only, so a `true` here must not divert a
+            // page that rendered.
+            assert_eq!(
+                reveal_draw(page, Ok(true), true, a),
+                (RevealScreen::Page, Some(Reveal::Page(page))),
+                "page {page}: a rendered page must not be diverted by record_pending"
+            );
+        }
+
+        // The ending, with the question armed: ONE digit, on the screen and in the gate.
+        assert_eq!(
+            reveal_draw(BACKUP_END, Ok(false), true, a),
+            (RevealScreen::Recorded(a), Some(Reveal::Recorded(a))),
+            "the recorded screen and the recorded cursor must carry the SAME digit"
+        );
+        assert_eq!(
+            reveal_draw(BACKUP_END, Ok(false), true, b),
+            (RevealScreen::Recorded(b), Some(Reveal::Recorded(b))),
+            "the digit must come from the argument, not from a second draw"
+        );
+
+        // The two endings that park NOTHING. Both must hand back `None`, because the
+        // caller stops delivering keypresses on exactly that value — a `Some` here is a
+        // live gate behind a screen that is gone.
+        assert_eq!(
+            reveal_draw(BACKUP_END, Ok(false), false, a),
+            (RevealScreen::Idle, None),
+            "an ending with nothing to ack must not park a cursor"
+        );
+        for page in [0usize, 3, BACKUP_END, usize::MAX] {
+            assert_eq!(
+                reveal_draw(page, Err(()), true, a),
+                (RevealScreen::Refuse, None),
+                "page {page}: a fault must refuse and park nothing, whatever record_pending says"
+            );
+        }
+    }
+
     /// **A share on the glass is paged with no digit**, and the recorded question is
     /// the only backup screen that carries one.
     ///
@@ -3678,8 +3852,45 @@ mod tests {
         // safe (fewer pixels, never more), so it is pinned here rather than argued
         // about.
         assert!(
-            src.contains("Ok(true) => {\n                let _ = panel.show(frame.as_bytes());"),
+            src.contains(
+                "RevealScreen::Page => {\n                let _ = panel.show(frame.as_bytes());"
+            ),
             "a rendered backup page must reach the panel"
+        );
+        // AND THE CURSOR IS NOT REBUILT AT THE CALL SITE. `show_backup_page` forwards
+        // [`reveal_draw`]'s `next` verbatim; the moment it constructs a `Reveal` of its
+        // own, the page arithmetic is back inside `boot` where no gate executes it and
+        // `the_reveal_cursor_names_the_page_that_was_drawn` stops covering it.
+        //
+        // Scoped to that function's TEXT rather than counted over the image, because the
+        // value test below writes the same constructors and a count would be inflated by
+        // the test that exists to make the count unnecessary. `RevealScreen::` does not
+        // match `Reveal::` — the next character after `Reveal` is `S` — so the body may
+        // still name the screen it draws.
+        let show_backup_page_body = src
+            .split_once("fn show_backup_page")
+            .expect("`show_backup_page` is in the image")
+            .1
+            .split_once("\n    /// ")
+            .expect("a doc comment follows it")
+            .0;
+        assert!(
+            !show_backup_page_body.contains("Reveal::"),
+            "`show_backup_page` must FORWARD `reveal_draw`'s cursor and never build one; \
+             its body is:\n{show_backup_page_body}"
+        );
+        // And the two pairings themselves, spelled out, so a reordering that put the
+        // arithmetic back is a failing test and not a review question. `Ok(true) =>` and
+        // `Ok(false) if record_pending =>` are unique to `reveal_draw`.
+        assert!(
+            src.contains("Ok(true) => (RevealScreen::Page, Some(Reveal::Page(page))),"),
+            "the drawn page and the parked cursor must be the SAME `page`"
+        );
+        assert!(
+            src.contains(
+                "Ok(false) if record_pending => (\n            RevealScreen::Recorded(confirm),\n            Some(Reveal::Recorded(confirm)),\n        ),"
+            ),
+            "the recorded screen and the recorded cursor must carry the SAME digit"
         );
         // And the ending is `idle`, drawn from one place, shared with standby.
         assert_eq!(
@@ -3860,6 +4071,30 @@ mod tests {
         assert!(
             src.contains("show_backup_page(&mut session, 0, panel, &mut entropy)"),
             "a reveal must begin on the share-index page"
+        );
+        // AND THE STEP CALL PASSES THE CURSOR UNCHANGED. This is the second of the two
+        // call sites the count above pins, and it was the ONE PLACE the whole
+        // `reveal_draw` hoist did not cover — found by adversarial review, 2026-09-12,
+        // and MEASURED before it was closed: `show_backup_page(&mut session,
+        // page.saturating_add(1), ..)` left firmware tests, BOTH device clippy profiles
+        // and `cargo build --release` at 0 warnings all green, because `reveal_draw` is
+        // then handed page+1 and pairs it CONSISTENTLY with the cursor — its value test
+        // sees nothing wrong, and neither does the body pin, which only says
+        // `show_backup_page` does not BUILD a `Reveal`.
+        //
+        // The symptom is the original defect exactly: drawn pages become 1, 3, 5, 7, so a
+        // human is shown 16 of 25 words and then asked "Wrote down all 25 words?" over
+        // the 12 that were never on the glass, and `CommsMisc::BackupRecorded` tells the
+        // coordinator the backup was taken.
+        //
+        // Pinned textually because that is all that is available: this line is inside
+        // `boot`, so no host gate compiles it, and the arithmetic is on the ARGUMENT
+        // rather than inside the function a value test can call. `reveal_step` is what
+        // produces `page`, and it is checked by value.
+        assert!(
+            src.contains("glass = show_backup_page(&mut session, page, panel, &mut entropy)"),
+            "the reveal's step call must pass the cursor `reveal_step` produced, \
+             UNCHANGED -- any arithmetic here skips pages and no other gate can see it"
         );
     }
 
@@ -4440,11 +4675,13 @@ mod tests {
             all.contains("25"),
             "the failure must say the words are kept: {all}"
         );
+        // NO `row.chars().count() <= ui::COLS` here: `row_text` walks `0..ui::COLS`, so
+        // every row it returns is at most `ui::COLS` chars however the screen was drawn.
+        // The check that used to stand here could not fail for any input, which is worse
+        // than none because it read as clip coverage of a screen this file composes
+        // itself. What covers the content is the `contains` pair above and the
+        // word-material scan below.
         for (r, row) in rows.iter().enumerate() {
-            assert!(
-                row.chars().count() <= ui::COLS,
-                "row {r} overruns the panel: {row:?}"
-            );
             for word in ["ABANDON", "AB", "ABA"] {
                 assert!(
                     !row.contains(word),
