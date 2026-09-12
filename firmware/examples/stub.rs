@@ -23,19 +23,29 @@
 //! desynchronises the coordinator, whose magic-byte scan has no backtracking
 //! (any mismatch resets progress to 0). Every diagnostic goes to **stderr**.
 //!
-//! `N_DEVICES` (currently **9**) sessions in this one process, each with its OWN
+//! `ALL_DEVICES` (currently **10**) sessions in this one process, each with its OWN
 //! `FakeFlash`, all multiplexed over the one wire and told apart by
 //! `Destination` — which is what the real daisy chain does too, so nothing is
-//! faked by co-hosting them. We complete a THRESHOLD-of-N_DEVICES keygen, a nonce
-//! replenishment and a signature with the coordinator, and then keep serving so
-//! the coordinator can ask each device what it holds.
+//! faked by co-hosting them. `N_DEVICES` (currently **9**) of them complete a
+//! THRESHOLD-of-N_DEVICES keygen, a nonce replenishment and a signature with the
+//! coordinator, and then keep serving so the coordinator can ask each device what it
+//! holds.
+//!
+//! M12 — THE TENTH SESSION IS LEFT BLANK, and the COORDINATOR decides which one: it
+//! owns `BeginKeygen`, so it cuts a nine-device roster and the tenth holds nothing at
+//! all. This process is not told which, and must not be — it discovers it
+//! structurally, as the session with no [`Sheet`] (see [`sheet_read`]), which is the
+//! same discipline `advertised_key` follows. That tenth device is then asked to type
+//! ANOTHER device's 25 words in off its sheet and consolidate them onto a flash that
+//! holds no share.
 //!
 //! OUR EXIT STATUS IS NOT THE PROOF, and under `hostcheck` it is not even
 //! observed: `hostcheck`'s `reap()` SIGKILLs this process once its own
 //! verification is done, so the EOF/PASS path below is reached only when this
 //! binary is run BY HAND. What the harness passes on is what the COORDINATOR
 //! verified for itself — the aggregated signature against its own derived key,
-//! and 9/9 `HeldShares2` replies. Every `die` here is still a failure, because a
+//! and 10/10 `HeldShares2` replies (nine from the keygen, the tenth from M12's blank
+//! device after it consolidated). Every `die` here is still a failure, because a
 //! stub that dies mid-run makes `hostcheck`'s `try_wait` fail the pass by name.
 //!
 //! WHAT IT PROVES, precisely: this binary links cold-snap's VENDORED
@@ -126,14 +136,25 @@ use coldsnap_hal::flash::ERASE_SIZE;
 use coldsnap_hal::rng::{mix_sources, Entropy, ProvenSeed, SE1_BYTES, SE2_BYTES, TRNG_BYTES};
 use coldsnap_hal::{identity, memmap, ui};
 use frostsnap_comms::{DeviceSendBody, ReceiveSerial, Upstream};
-use frostsnap_core::device::keys::KeyMutation;
-use frostsnap_core::device::{restoration::ToUserRestoration, DeviceToUserMessage, Mutation};
+use frostsnap_core::device::{restoration::ToUserRestoration, DeviceToUserMessage};
 use frostsnap_core::schnorr_fun::frost::Fingerprint;
 use frostsnap_core::{AccessStructureRef, DeviceId};
 
-/// Must match `hostcheck`'s N_DEVICES; the coordinator learns the ids from our
-/// Announces, so only the count has to agree.
+/// The KEYGEN ROSTER, matching `hostcheck`'s N_DEVICES; the coordinator learns the
+/// ids from our Announces, so only the count has to agree.
+///
+/// This process does NOT know which sessions are in the roster and must not: the
+/// coordinator owns `BeginKeygen` and therefore owns that choice. What this file uses
+/// the number for is the count of sessions that must have STAGED a share, which is a
+/// fact it observes rather than one it arranges.
 const N_DEVICES: usize = 9;
+
+/// Sessions this process hosts, matching `hostcheck`'s ALL_DEVICES. The tenth is left
+/// out of the keygen BY THE COORDINATOR (M12), so it reaches the signature holding
+/// nothing; we discover which one that is structurally — it is the session with no
+/// [`Sheet`] and no staged `SaveShare` — exactly as `advertised_key` discovers the
+/// access structure rather than being told it.
+const ALL_DEVICES: usize = N_DEVICES + 1;
 
 /// One flash per device, at the shipped geometry. `DebugFlash` is only the
 /// `core::fmt::Debug` shim `FrostSigner::new` demands — see its doc in the lib.
@@ -174,7 +195,8 @@ static DECLINES: AtomicUsize = AtomicUsize::new(0);
 /// the news is that the harness's bound is broken.
 ///
 /// 240 s: a 9-of-9 certpedpop keygen is real elliptic-curve work in a DEBUG build,
-/// nine signers deep, and at `STUB_CHUNK=1` every byte of every frame costs a
+/// nine signers deep — M12's tenth device is NOT in the keygen, so nothing about the
+/// keygen's cost moved when it was added — and at `STUB_CHUNK=1` every byte of every frame costs a
 /// syscall. The harness's own cumulative budget is now 95 s — handshake 5 s + keygen
 /// 30 s + signing 30 s + the M7 restoration phase's 30 s — so this is ~2.5x its
 /// bound, deliberately, so that when both fire it is the harness's message you read.
@@ -544,6 +566,54 @@ struct Sheet {
     index: Option<u32>,
     /// 1-based position -> the word drawn at it.
     words: BTreeMap<usize, String>,
+}
+
+/// The sheet a device is READING, which is not always the sheet it wrote.
+///
+/// M12: the blank device has no reveal of its own — it holds no share, so upstream
+/// refuses `DisplayBackup` for it coordinator-side — and yet it is asked to type 25
+/// words back in. Those words come from ANOTHER device's reveal, which is the whole
+/// point: a human carries a sheet of paper from one unit to another. This is that
+/// handoff, and it is a lookup rather than an argument threaded through `drive`
+/// because `drive` is per-message and the sheet outlives the message.
+///
+/// `die`s rather than defaulting, in BOTH directions, and neither arm is decoration:
+///  - ZERO sheets means the reveal walk never ran or never filled one. A default
+///    `Sheet` would reach `type_backup`, whose `sheet.index.unwrap_or_else` dies with
+///    `no share index was ever read off a reveal page` — a message that names the
+///    symptom and points a reader at the reveal instead of at this plumbing.
+///  - TWO OR MORE is the one that matters. With two reveals in the room there is no
+///    rule saying which sheet the blank device is retyping, and picking one silently
+///    is how a harness starts asserting about the wrong share. If a second reveal
+///    ever lands here, the rule has to be written down, not guessed.
+fn sheet_read(paper: &BTreeMap<DeviceId, Sheet>, id: DeviceId) -> &Sheet {
+    if let Some(own) = paper.get(&id) {
+        return own;
+    }
+    match paper.len() {
+        1 => paper.values().next().expect("just matched len 1"),
+        0 => die(
+            2,
+            &format!(
+                "{id} was asked to read a reveal back and there is NO sheet in the room: no \
+                 device has walked its reveal pages, so there is nothing to type"
+            ),
+        ),
+        // CANNOT FIRE IN THIS TREE and is a refusal rather than an assert for exactly
+        // that reason: only one device ever reaches `Grant::Reveal`, so `paper` never
+        // holds two. It is what stops a SECOND reveal being added without writing down
+        // the rule. MEASURED by forcing the discriminant to `paper.len() + 1`: `stub:
+        // FAIL ... it has none of its own, but there are 2 sheets in the room`, exit 2.
+        _ => die(
+            2,
+            &format!(
+                "{id} was asked to read a reveal back and it has none of its own, but these \
+                 devices have sheets ({:?}) -- with more than one there is no rule for which it \
+                 retypes, and picking one silently would assert about the wrong share",
+                paper.keys().collect::<Vec<_>>()
+            ),
+        ),
+    }
 }
 
 /// Cells of a **noised** row that hold text rather than
@@ -1226,7 +1296,7 @@ fn entropy(salt: u8) -> Entropy {
     Entropy::from_proven_seed(seed)
 }
 
-/// `N_DEVICES` blank flashes at the shipped geometry, sized so a write past the
+/// `ALL_DEVICES` blank flashes at the shipped geometry, sized so a write past the
 /// nonce region is out of bounds rather than silently landing in `FS_FREE`.
 ///
 /// Separate from `open_sessions` because these must OUTLIVE every session: a
@@ -1235,7 +1305,7 @@ fn entropy(salt: u8) -> Entropy {
 /// power cycle does.
 fn blank_flashes() -> Vec<RefCell<Flash>> {
     let sectors = memmap::FS_FREE_OFFSET as usize / ERASE_SIZE;
-    (0..N_DEVICES)
+    (0..ALL_DEVICES)
         .map(|_| RefCell::new(DebugFlash(FakeFlash::new(sectors))))
         .collect()
 }
@@ -1464,15 +1534,21 @@ fn drive(
                     Ok(more) => prompts.extend(more),
                     Err(e) => die(2, &format!("confirm({grant:?}, {id}): {e:?}")),
                 }
-                let sheet = paper.entry(id).or_default();
                 match grant {
                     // M7b. Nothing is on the wire until the last page has been drawn
                     // and the recorded question answered — that is what
                     // `Session::backup_recorded`'s `record_pending` gate means.
-                    Grant::Reveal => reveal(session, rng, &mut out, sheet),
+                    //
+                    // THE ONLY WRITER, and the `entry()` lives HERE rather than above
+                    // the match for that reason (M12). Taking `&mut Sheet` for every
+                    // granted flow gave `paper` an EMPTY entry for any device that
+                    // never revealed, and [`sheet_read`] would then hand that empty
+                    // sheet straight to `type_backup` — which is exactly the blank
+                    // device's situation.
+                    Grant::Reveal => reveal(session, rng, &mut out, paper.entry(id).or_default()),
                     // M7c. Answered ONLY from what M7b's reveal showed.
                     Grant::Check => {
-                        let answers = check_quiz(session, rng, &mut out, sheet);
+                        let answers = check_quiz(session, rng, &mut out, sheet_read(paper, id));
                         if let Err(e) = out.push(DeviceSendBody::Debug {
                             message: format!("quiz={answers}"),
                         }) {
@@ -1482,7 +1558,8 @@ fn drive(
                     // M7d. `entry_key` sends `PhysicalEntered` itself, and only when
                     // 25 words pass their checksum.
                     Grant::Enter => {
-                        let (presses, more) = type_backup(session, rng, &mut out, sheet);
+                        let (presses, more) =
+                            type_backup(session, rng, &mut out, sheet_read(paper, id));
                         eprintln!(
                             "stub: {id} typed all {} words back in through the letter picker in \
                              {presses} presses",
@@ -1509,20 +1586,42 @@ fn drive(
         }
     }
 
-    // The device's persistence record. `keygen_finalize` -> `save_complete_share`
-    // stages NewKey/NewAccessStructure/SaveShare; firmware's job is to write
-    // these to flash, and NOTHING DOES YET -- there is no FLASH_FS region for
-    // shares (`FS_FREE_OFFSET` is unclaimed), which is why the restart below
-    // happens before keygen rather than after it. Draining them here is what "the
-    // device saved its share" means for this harness, and the coordinator checks
-    // it independently over the wire with `RequestHeldShares`.
-    for mutation in session.signer.staged_mutations().drain(..) {
-        if let Mutation::Keygen(KeyMutation::SaveShare(save)) = mutation {
-            eprintln!(
-                "stub: {id} SAVED share for {:?} (index {})",
-                save.access_structure_ref, save.encrypted_secret_share.share_image.index
-            );
-            saved.insert(id, save.access_structure_ref);
+    // The device's persistence record, READ OFF THE SIGNER. **This loop used to drain
+    // `session.signer.staged_mutations()` looking for `KeyMutation::SaveShare`, and it
+    // NEVER MATCHED ONCE**, so `saved` stayed empty for the whole run and both conditions
+    // that read it were dead. MEASURED with a probe printing
+    // `staged_mutations().len()` here: 308 calls in one `cargo run`, every single one
+    // `staged=0`.
+    //
+    // The mechanism, and it is firmware doing its job rather than a bug: `keygen_ack`
+    // stages the NewKey/NewAccessStructure/SaveShare triple and then calls
+    // `Session::run`, whose FIRST statement is
+    // `self.shares.persist_staged(self.signer.staged_mutations())` — and a committed
+    // write ends in `staged.clear()`. So the queue is empty again before `recv` returns.
+    // The comment here claimed the opposite ("NOTHING DOES YET -- there is no FLASH_FS
+    // region for shares"), which stopped being true when `store::ShareStore` landed.
+    //
+    // Two conditions were vacuous as a result, and this is the one place that fixes both:
+    // the `saved.len() == N_DEVICES && !announced_save` latch below never fired, so
+    // `STATE` never reached `SharesSaved` and the `refs.len() != 1` check ("every share
+    // belongs to ONE access structure") never ran; and the wire-EOF PASS arm's condition
+    // was never true, so a HAND run always died `0/9 share(s) saved` after a completely
+    // successful pass.
+    //
+    // `held_shares()` is the signer's own view of what it holds and is the SAME source
+    // the `HeldShares2` reply is built from, so this is a local read of the fact the
+    // coordinator independently checks over the wire. Filtering on
+    // `access_structure_ref.is_some()` is what separates a real access-structure share
+    // from a `needs_consolidation` saved backup, which carries `None`.
+    for held in session.signer.held_shares() {
+        if let Some(as_ref) = held.access_structure_ref {
+            if saved.insert(id, as_ref).is_none() {
+                eprintln!(
+                    "stub: {id} HOLDS a share for {as_ref:?} (index {}) -- {} device(s) do now",
+                    held.share_image.index,
+                    saved.len()
+                );
+            }
         }
     }
 
@@ -1539,7 +1638,7 @@ fn main() {
     let flashes = blank_flashes();
     let mut sessions = open_sessions(&flashes, &mut rng);
     let ids: Vec<DeviceId> = sessions.keys().copied().collect();
-    eprintln!("stub: {N_DEVICES} flash-backed sessions: {ids:?}");
+    eprintln!("stub: {ALL_DEVICES} flash-backed sessions: {ids:?}");
 
     let digest = synthetic_digest();
     let mut saved: BTreeMap<DeviceId, AccessStructureRef> = BTreeMap::new();
@@ -1611,11 +1710,22 @@ fn main() {
             // after a successful save is success, EOF before one is a failure, and
             // it must stay that way or a stub killed early would look clean.
             Ok(Ok(bytes)) if bytes.is_empty() => {
-                if saved.len() == N_DEVICES {
+                // THE LATCH, not a re-derived count, and that is the M12 fix. `saved`
+                // reaches TEN once the blank device consolidates — `finish_consolidation`
+                // stages the same keygen triple and the drain in `drive` records it — so
+                // `saved.len() == N_DEVICES` INVERTS here and turned a hand run's PASS
+                // into `die(2, "wire EOF with only 10/9 share(s) saved")`. `announced_save`
+                // latches below on the exact `== N_DEVICES`, so the strictness is
+                // unchanged and the two different meanings of `saved.len()` stop sharing
+                // one constant. It only ever bit a hand run, which is precisely where
+                // nobody is watching for it.
+                if announced_save {
                     eprintln!(
                         "stub: PASS -- coordinator closed the wire after verifying \
-                         {N_DEVICES}/{N_DEVICES} held shares and {} signature share(s), all from \
-                         sessions REBUILT FROM FLASH after the restart",
+                         {N_DEVICES}/{N_DEVICES} keygen shares (of {} device(s) that have staged \
+                         one) and {} signature share(s), all from sessions REBUILT FROM FLASH \
+                         after the restart",
+                        saved.len(),
                         SIG_ACKS.load(Ordering::Relaxed)
                     );
                     return;
@@ -1727,7 +1837,7 @@ fn main() {
             }
             STATE.fetch_max(1, Ordering::Relaxed);
             eprintln!(
-                "stub: sent MAGIC_REPLY + {N_DEVICES} Announce+NeedName = {} bytes in {} chunk(s) \
+                "stub: sent MAGIC_REPLY + {ALL_DEVICES} Announce+NeedName = {} bytes in {} chunk(s) \
                  of {chunk}",
                 hello.len(),
                 hello.len().div_ceil(chunk),
@@ -1765,16 +1875,25 @@ fn main() {
             }
             STATE.fetch_max(2, Ordering::Relaxed);
             eprintln!(
-                "stub: RESTARTED -- dropped all {N_DEVICES} signers and rebuilt them from flash; \
+                "stub: RESTARTED -- dropped all {ALL_DEVICES} signers and rebuilt them from flash; \
                  every DeviceId unchanged, so the coordinator is still talking to the same devices"
             );
         }
 
+        // `ALL_DEVICES` and not `N_DEVICES`, because every session on the wire gets an
+        // `AnnounceAck` including the blank one, and this is an EQUALITY recomputed
+        // each lap rather than a latch: all ten acks can arrive inside a single
+        // `wire_rx.recv_timeout` payload, so `acked` jumps 0 -> 10 and 9 is never
+        // observed. Left at 9 this never fires, `STATE` never reaches 3, and the
+        // progress word in every subsequent `die` message is one stage stale — a
+        // silently wrong diagnosis rather than a cosmetic count. MEASURED: reverting
+        // this to `N_DEVICES` removes the `all N devices acked` line from the log
+        // entirely.
         let acked = sessions.values().filter(|s| s.coordinator_acked).count();
-        if acked == N_DEVICES && STATE.load(Ordering::Relaxed) == 2 {
+        if acked == ALL_DEVICES && STATE.load(Ordering::Relaxed) == 2 {
             STATE.fetch_max(3, Ordering::Relaxed);
             eprintln!(
-                "stub: all {N_DEVICES} devices acked (post-restart sessions), waiting for keygen"
+                "stub: all {ALL_DEVICES} devices acked (post-restart sessions), waiting for keygen"
             );
         }
 
