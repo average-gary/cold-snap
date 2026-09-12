@@ -403,7 +403,7 @@
 //!  site says so: that frame is HAND-ROLLED here, so it proves the DEVICE refuses the
 //!  body; this drives UPSTREAM'S OWN DRIVER, so it proves the COORDINATOR-side flow cannot
 //!  complete -- an app offering "erase this device" sits on that dialog forever. MEASURED,
-//!  the driver's frame is the same **41 B** on the wire as the forged one: identical body,
+//!  the driver's frame is the same **39 B** on the wire as the forged one: identical body,
 //!  different author.
 //!
 //!  The new `State::EraseRefusal` shares `RESTORE_DEADLINE`'s cumulative budget, so
@@ -1651,9 +1651,16 @@ fn restore_step(
 /// This is deliberately a REFUSAL and not a warning: a warning in a verification tool
 /// is read as noise, and the failure it hides is the one that matters most.
 ///
-/// Compares mtimes against the sources that can change the stub's behaviour -- the
-/// firmware lib and bin, the stub itself, and the whole HAL. Anything unreadable is
-/// SKIPPED rather than fatal: this must not become a reason a correct run fails.
+/// Compares mtimes against **cargo's own depfile** for the artifact, i.e. exactly the
+/// sources that went into the binary being spawned -- 56 of them, 37 under `../vendor/`.
+/// This doc described a directory walk over "the firmware lib and bin, the stub itself,
+/// and the whole HAL" until 2026-09-11, and that was wrong in both directions: it
+/// asserted the firmware BIN is checked, when `firmware/src/main.rs` is not a
+/// dependency of any example and its presence in the walk produced refusals nothing
+/// could clear; and it never mentioned `../vendor/`, which it never looked at. See the
+/// long note at the depfile read below. Anything unreadable is SKIPPED rather than
+/// fatal: this must not become a reason a correct run fails -- but never SILENTLY, which
+/// is the fail-open that cost a green run about a 2020-dated binary.
 fn refuse_if_stale(stub: &str) -> Result<()> {
     let built = std::fs::metadata(stub).and_then(|m| m.modified());
     let Ok(built) = built else {
@@ -1663,16 +1670,20 @@ fn refuse_if_stale(stub: &str) -> Result<()> {
         return Ok(());
     };
     let mut newest: Option<(std::time::SystemTime, String)> = None;
-    let mut consider = |path: std::path::PathBuf| {
+    // A nested `fn` and not a closure, and that is load-bearing rather than style: a
+    // closure capturing `newest` by `&mut` cannot coexist with READING `newest`, and
+    // reading it between the two source-collection passes below is exactly how the
+    // fail-open in `newest.is_none()` gets closed.
+    fn consider(newest: &mut Option<(std::time::SystemTime, String)>, path: std::path::PathBuf) {
         if path.extension().is_none_or(|x| x != "rs") {
             return;
         }
         if let Ok(m) = std::fs::metadata(&path).and_then(|m| m.modified()) {
             if newest.as_ref().is_none_or(|(t, _)| m > *t) {
-                newest = Some((m, path.display().to_string()));
+                *newest = Some((m, path.display().to_string()));
             }
         }
-    };
+    }
     // CARGO'S OWN ANSWER, not a guess at which directories matter: the depfile beside
     // the artifact lists every source that went into it. Guessing was wrong in BOTH
     // directions, and both were live on 2026-09-11:
@@ -1695,36 +1706,62 @@ fn refuse_if_stale(stub: &str) -> Result<()> {
     // written by cargo at build time and lists the sources of the artifact that is
     // actually there, so it cannot disagree with the binary being run.
     //
-    // ponytail: ceiling named. Cargo escapes a space in a path as `\ ` and this splits on
-    // whitespace, so a repo checked out under a path containing a space would silently
-    // consider two half-paths, both unreadable, both SKIPPED — i.e. it degrades to the
-    // `WARNING ... UNCHECKED` case rather than to a false pass. Upgrade path is a real
+    // ponytail: ceiling named, and this note SAID THE WRONG THING until the fail-open
+    // below was found — it claimed a space in the path "degrades to the `WARNING ...
+    // UNCHECKED` case rather than to a false pass", which is precisely what it did not
+    // do. Cargo escapes a space as `\ ` and this splits on whitespace, so under a
+    // checkout path containing a space EVERY absolute dep is mangled, none is readable,
+    // and it now falls through to the directory scan below — real checking, minus
+    // `../vendor/`. If only SOME deps were mangled the rest still pin freshness and the
+    // mangled ones are silently unchecked, which is the residual. Upgrade path is a real
     // unescape; not worth it until someone has such a path.
     let depfile = format!("{stub}.d");
-    match std::fs::read_to_string(&depfile) {
-        Ok(text) => {
-            let deps = text.split_once(':').map_or("", |(_, rest)| rest);
-            for dep in deps.split_whitespace() {
-                consider(std::path::PathBuf::from(dep));
-            }
+    if let Ok(text) = std::fs::read_to_string(&depfile) {
+        let deps = text.split_once(':').map_or("", |(_, rest)| rest);
+        for dep in deps.split_whitespace() {
+            consider(&mut newest, std::path::PathBuf::from(dep));
         }
-        // No depfile: fall back to the old directory scan. Over-strict beats blind —
-        // this is the fail-closed direction, and the `main.rs` false refusal it can
-        // still produce is recoverable by a human, where a missed vendored edit is not.
-        Err(_) => {
-            eprintln!(
-                "hostcheck: WARNING no depfile at {depfile}; falling back to a directory \
-                 scan, which does NOT cover ../vendor/"
-            );
-            for dir in ["../firmware/src", "../hal/src"] {
-                if let Ok(entries) = std::fs::read_dir(dir) {
-                    for e in entries.flatten() {
-                        consider(e.path());
-                    }
+    }
+    // THE THIRD PATH, and it is the one that made the first version of this fix FAIL
+    // OPEN — measured 2026-09-11, an EMPTY `stub.d` beside a stub dated 2020-01-01
+    // produced `exit 0` and a printed PASS, with no `STALE`, no `WARNING` and no
+    // `UNCHECKED` anywhere. `newest` stayed `None`, so the refusal block below was
+    // skipped, so the function returned `Ok(())` having checked precisely nothing. A
+    // depfile that exists and yields nothing was strictly WORSE than no depfile at all.
+    //
+    // So the condition is "did we actually get a source to compare", not "was there a
+    // file". Everything that yields nothing — absent, empty, no colon, every path
+    // unreadable — lands here and falls back to the directory scan, which checks
+    // something real. That scan carries the `main.rs` false-refusal defect described
+    // above, and that is the correct trade on this leg: over-strict is recoverable by a
+    // human, silently blind is not.
+    if newest.is_none() {
+        eprintln!(
+            "hostcheck: WARNING no usable depfile at {depfile}; falling back to a \
+             directory scan, which does NOT cover ../vendor/ and MAY refuse on a \
+             ../firmware/src/main.rs edit that cannot affect the stub"
+        );
+        for dir in ["../firmware/src", "../hal/src"] {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for e in entries.flatten() {
+                    consider(&mut newest, e.path());
                 }
             }
-            consider(std::path::PathBuf::from("../firmware/examples/stub.rs"));
         }
+        consider(
+            &mut newest,
+            std::path::PathBuf::from("../firmware/examples/stub.rs"),
+        );
+    }
+    // And if even that found nothing, SAY SO. This is the one line that makes "this
+    // function never passes silently" true by construction rather than by the tree
+    // happening to be readable. Same shape and same wording as the unreadable-`built`
+    // leg above, because it is the same situation: nothing to compare.
+    if newest.is_none() {
+        eprintln!(
+            "hostcheck: WARNING no source mtime was readable at all; freshness UNCHECKED"
+        );
+        return Ok(());
     }
     if let Some((t, which)) = newest {
         if t > built {

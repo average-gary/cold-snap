@@ -329,24 +329,35 @@ enum Consent<'a> {
     /// The prompt is a **construction-site obligation, not a value [`answer`]
     /// reads** — and since 2026-09-11 nothing reads it, because that was the day the
     /// keygen check stopped having a key of its own and `answer` stopped matching on
-    /// the prompt kind at all. It stays, and `#[expect]` rather than `#[allow]`, for
-    /// two reasons. Dropping it would make this variant structurally identical to
-    /// [`Consent::Question`] — one `ConfirmDigit` each — and the direction that
-    /// matters is that a `Prompt` could then be built with no prompt in hand, which is
-    /// precisely the value whose [`Answer::Yes`] is the one route to `confirm_at`.
-    /// (The converse confusion is NOT prevented either way: naming the wrong variant
-    /// compiles whichever shape they have. Only "you may not claim a prompt you do not
-    /// hold" is enforced here.) And `#[expect]` rather than `#[allow]` fires if the
-    /// field ever IS read, which is the direction worth being told about: a per-prompt
-    /// key rule is exactly what this change removed. MEASURED: reading it warns
-    /// `this lint expectation is unfulfilled` on the release ARM build, and 0 warnings
-    /// is a gate, so the marker cannot rot into an `#[allow]`.
-    #[expect(
-        dead_code,
-        reason = "type-level: only this variant can be built from a prompt, so it \
-                  cannot be confused with Consent::Question"
-    )]
-    Prompt(&'a DeviceToUserMessage, ui::ConfirmDigit),
+    /// the prompt kind at all. It stays for a reason worth stating precisely, because
+    /// the first version of this comment gave a weaker one and conceded its own
+    /// counter-example: it argued that dropping the field would let a `Prompt` be built
+    /// with no prompt in hand, then admitted the converse confusion is unprevented
+    /// either way.
+    ///
+    /// **The real reason is that this field is the only `&'a` in [`Consent`].** Drop it
+    /// and the enum becomes lifetime-free, at which point nothing ties a parked
+    /// `Consent` to the liveness of the prompt it was made for — a digit could outlive
+    /// the `DeviceToUserMessage` that has already been moved into
+    /// [`Session::confirm_at`](coldsnap_firmware::Session::confirm_at). Today the borrow
+    /// checker forbids that pairing; without the field it would compile.
+    ///
+    /// `#[expect]` and not `#[allow]`, on the FIELD and not the variant: on the variant
+    /// it would also silence *"variant is never constructed"*, so deleting the sole
+    /// construction site — which would make it impossible to consent to any coordinator
+    /// prompt at all — would build with zero warnings. Narrower is louder.
+    /// MEASURED: reading the field warns `this lint expectation is unfulfilled` on the
+    /// release ARM build, and 0 warnings is a gate, so the marker cannot rot into an
+    /// `#[allow]`.
+    Prompt(
+        #[expect(
+            dead_code,
+            reason = "the only &'a in Consent: it is what borrow-checks a parked digit \
+                      against the liveness of the prompt it was drawn for"
+        )]
+        &'a DeviceToUserMessage,
+        ui::ConfirmDigit,
+    ),
     /// A question this DEVICE is asking, and the digit its screen printed. There is
     /// no prompt, so [`Answer::Yes`] cannot reach `confirm_at` at all — it can only
     /// mean "the human answered the device's own question", and the caller decides

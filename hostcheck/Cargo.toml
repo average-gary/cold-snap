@@ -30,9 +30,32 @@ edition = "2021"
 publish = false
 
 [dependencies]
-# The REAL coordinator, unmodified, from the sibling checkout. Verified to have a
-# zero-line diff across 0bbc18be..bbce45d, so this is the same code cold-snap's
-# vendored crates were read against.
+# The REAL coordinator, unmodified, from the sibling checkout.
+#
+# THE PIN, re-established 2026-09-11, because this comment was accurate but no longer
+# complete and a review caught it. It said only: "Verified to have a zero-line diff
+# across 0bbc18be..bbce45d, so this is the same code cold-snap's vendored crates were
+# read against." That range IS still empty for `frostsnap_coordinator` — but the
+# checkout's HEAD is now d8b0525 (`[coord] Don't panic on a signature share for an
+# unknown session`, i.e. §8.3 defect 13 fixed upstream, which PLAN.md says to leave
+# alone), which is ahead of bbce45d.
+#
+# What that means for the evidence, measured rather than assumed:
+#  - EVERY driver this harness uses is byte-identical across bbce45d..HEAD --
+#    display_backup.rs, check_backup.rs, enter_physical_backup.rs, erase_device.rs,
+#    ui_protocol.rs and frostsnap_comms/src/firmware_version.rs. So "unmodified" holds
+#    for the code under test.
+#  - `frostsnap_core/src/coordinator/restoration.rs` is +68/-20 against the doc's pin
+#    0bbc18be. That is the module M7 calls (`check_physical_backup`,
+#    `tell_device_to_save_physical_backup`, `request_device_display_backup`), so the
+#    honest statement is NOT "two copies of the same code": it is two INDEPENDENT
+#    implementations that agree on the wire, differing by 88 lines in that module. The
+#    agreement is the evidence; identity was never the claim and must not be written as
+#    if it were.
+#  - The bitcoin wallet churn in that range (bitcoin/send.rs +845) is not reachable from
+#    this harness, which drives keygen, signing and restoration and never a bdk wallet.
+#
+# Re-run those two `git diff --stat` invocations when the sibling moves.
 frostsnap_coordinator = { path = "../../frostsnap/frostsnap_coordinator" }
 # Not a direct dependency: `frostsnap_coordinator` re-exports the serialport
 # crate (`pub use serialport;`), so taking it from there makes two versions of it

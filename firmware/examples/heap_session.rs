@@ -88,8 +88,18 @@
 //! host footprint is an upper bound on the device's. The debug footprint is neither
 //! conservative nor meaningful in either direction.
 //!
-//! Run (both features are mandatory — cargo refuses the target without them, which
-//! is why the older one-feature form in this doc did not work):
+//! Run. **The one-feature form below is correct and always was** — a claim added here
+//! on 2026-09-11 said cargo "refuses the target without" `coldsnap_hal/test-seam` too,
+//! and that is FALSE: `firmware/Cargo.toml`'s `[dev-dependencies]` already enables
+//! `fake-flash` and `test-seam`, and examples are built with dev-dependencies, so that
+//! half of `required-features` is satisfied before you type anything. What actually
+//! fails is omitting `--features` ENTIRELY, which is the mistake that produced the
+//! false claim; only `frostsnap_core/coordinator` has to be named. Re-verified by
+//! running both forms — this one, which is the original and is enough:
+//!   cargo run --release --target aarch64-apple-darwin -p coldsnap_firmware \
+//!       --features frostsnap_core/coordinator --example heap_session
+//! and the explicit form, which also works and is what to paste if you are unsure
+//! whether dev-dependencies are in play:
 //!   cargo run --release --target aarch64-apple-darwin -p coldsnap_firmware \
 //!       --example heap_session \
 //!       --features="coldsnap_hal/test-seam,frostsnap_core/coordinator"

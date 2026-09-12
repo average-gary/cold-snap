@@ -274,8 +274,16 @@ The same day it also closed **naming** — a coordinator-previewed name, 14 char
 bytes at once so it sits on the wire bound and the flash bound simultaneously, reaches
 flash on all nine devices and comes back byte-exact as `SetName` — and **`erase_device`**,
 where upstream's own driver is now proven never to complete against a device that
-refuses `DataErase` outright. Every flow the device implements is now driven by a real
-coordinator. See PLAN.md §9 item 12 for what each one does and does not prove.
+refuses `DataErase` outright.
+
+**This said "every flow the device implements is now driven by a real coordinator" until
+a review falsified it**, and the exception is worth naming rather than rounding off:
+`Session::recv` also admits `CoordinatorSendBody::Cancel`, which is not a stub — it
+clears `clear_tmp_data`, the previewed name, and the reveal, recorded-question, entry and
+quiz grants, six security-relevant pieces of state whose whole point is that a cancelled
+ceremony acks nothing. No harness sends it, so none of that is exercised. The legacy
+`SavePhysicalBackup` (v1) is admitted and undriven too; only `SavePhysicalBackup2` is.
+See PLAN.md §9 item 12 for what each driven flow does and does not prove.
 
 ```sh
 cargo build --target $T -p coldsnap_firmware --example stub
@@ -578,10 +586,14 @@ did not exist at the previous measurement and appears in no earlier row.
 
 **Those are rlib sums with LTO off, i.e. upper bounds, and the gap to a real
 linked image is now measured and it is large.** `firmware/` links, and
-`target/thumbv7em-none-eabihf/release/coldsnap_firmware` is **376,752 B = 26.43%**
-flash-resident (`.vector_table` 64 + `.text` 318,640 + `.rodata` 58,012 + `.data`
-36, from `objdump -h`), re-measured 2026-09-10 with a real `FrostSigner`, 25-word
-entry and the `CheckBackup` quiz all linked. That is **2.4× smaller** than the
+`target/thumbv7em-none-eabihf/release/coldsnap_firmware` is **377,192 B = 26.46%**
+flash-resident (`.vector_table` 64 + `.text` 319,088 + `.rodata` 58,004 + `.data`
+36, from `objdump -h`), re-measured 2026-09-11 in a CLEAN target dir with a real
+`FrostSigner`, 25-word entry, the `CheckBackup` quiz and the keygen check's randomised
+digit all linked. **This row read 376,752 B = 26.43% (`.text` 318,640, `.rodata`
+58,012) until then**, which was the 2026-09-10 figure; note `.rodata` went DOWN by 8 B
+as a 12-byte literal legend was replaced by a composed one, so the +440 is not a pure
+addition. That is **2.4× smaller** than the
 rlib estimate, because LTO plus `--gc-sections` drops everything unreferenced.
 `.bss` is `0x2000_8034..0x2001_8058`, i.e. 65,572 B, of which 65,564 is the
 allocator arena (`ALLOCATOR` at `0x2000_8038`) — so `.bss` is the heap plus eight
@@ -615,9 +627,12 @@ workload in rather than `--gc-sections` keeping it by accident · 297,064 B once
 remaining §4.2 consent screens got honest callers · 331,116 B with the keypad
 driver and real consent · 362,288 B once `DisplayBackup`, `mark_sensitive` and the
 persistent share store landed · 372,688 B once 25-word entry made restore possible
-· **376,752 B** once `CheckBackup` became a real 8-question quiz behind its own
+· 376,752 B once `CheckBackup` became a real 8-question quiz behind its own
 consent digit (+4,064 B, of which +2,232 B is `firmware/src/quiz.rs` acquiring its
-first caller rather than any new code).
+first caller rather than any new code) · **377,192 B** once the keygen check stopped
+printing a fixed `1=match` and started printing the randomised `press_legend(confirm)`
+(+440 B net: a `Buf<16>` legend build and a call, less the 12-byte literal it replaced,
+which is why `.rodata` fell 8 B while `.text` rose 448).
 
 That is **+55,171 (+3.87 pt) over the 844,229 phase-0 baseline**: +5,101 for the
 first round of panic-site work in the vendored crates, +30,627 for the

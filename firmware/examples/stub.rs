@@ -1152,7 +1152,11 @@ fn approved(
         // the same rule applies and for the same reason: only the digit that is ON
         // THE SCREEN grants, and `x`, another charset digit and a key that is not on
         // the pad are all refusals. This is `main.rs`'s `answer` arm for
-        // `Consent::Prompt`, whose `_ => confirm.accepts(key)` covers exactly these.
+        // `Consent::Prompt`, which since 2026-09-11 is ONE rule for every prompt:
+        // `confirm.accepts(key)` with no inner match on the prompt kind at all. This
+        // comment described that arm's deleted `_ =>` shape as if it were still live
+        // until a review caught it; `the_keygen_prompt_is_answered_by_the_same_rule_as
+        // _every_other_prompt` is what asserts the arm does not bind the prompt.
         //
         // `BackupSaved` never reaches here: `prompt_screen_at` draws no screen for
         // it, so the `Ok(true)` gate above has already returned.

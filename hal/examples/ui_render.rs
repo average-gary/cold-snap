@@ -283,11 +283,17 @@ fn main() {
         3,
         [0xab, 0xcd, 0xef, 0x01],
         "family fund",
-        ConfirmDigit::draw(&mut Counter(0)),
+        // Counter(2) => CONFIRM_CHARSET[2] == b'3', deliberately NOT `Counter(0)`.
+        // `CONFIRM_CHARSET[0]` is b'1', which is the exact byte `keygen_check` printed
+        // as a FIXED legend until 2026-09-11 — so a fixture drawing it would leave this
+        // catalogue's two anti-MITM screens indistinguishable from the hardcoded form
+        // the randomised digit replaced. The two fixtures below use different counters
+        // for the same reason: one digit across both proves nothing about the draw.
+        ConfirmDigit::draw(&mut Counter(2)),
     );
     out.emit(
         "2 keygen check — ordinary (SECURITY: anti-MITM)",
-        "2-of-3, code abcd ef01, key \"family fund\", randomised confirm digit",
+        "2-of-3, code abcd ef01, key \"family fund\", randomised confirm digit (3)",
         "keygen-ordinary",
         &f,
     );
@@ -298,7 +304,8 @@ fn main() {
         u16::MAX,
         [0x00, 0x00, 0x00, 0x00],
         "\u{65e5}\u{672c}\u{8a9e}",
-        ConfirmDigit::draw(&mut Counter(0)),
+        // Counter(4) => CONFIRM_CHARSET[4] == b'6'. See the note above.
+        ConfirmDigit::draw(&mut Counter(4)),
     );
     out.emit(
         "2 keygen check — u16::MAX threshold, all-zero code, UTF-8 key name",
