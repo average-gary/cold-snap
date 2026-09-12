@@ -37,6 +37,7 @@
 //!     staged a `KeyMutation::SaveShare` for one and the same access structure.
 //!     That is the device-side half of the proof and it lives in the other
 //!     process, in the other copy of `frostsnap_core`.
+//!
 //! All of it at BOTH chunk sizes, run back to back by one invocation.
 //!
 //! WHY IT IS NOT A MOCK: this binary links UPSTREAM `frostsnap_core` (through
@@ -60,6 +61,7 @@
 //!    coordinator's first read. Only `STUB_CHUNK=1` forces it. For one run
 //!    `STUB_CHUNK` was an env var that NOTHING set, i.e. a test that could not
 //!    fail; `main` now runs both sizes every time.
+//!
 //!  M3 (keygen). All three RUN, at chunk 64, each restored after:
 //!  - One byte flipped in the middle of the device's 318-byte `KeyGenResponse`
 //!    frame (`out[len/2] ^= 1`): **`recv_device_message ... in
@@ -433,6 +435,121 @@
 //!    forged frame, so `restore.as_mut()` alone scopes it today. Kept as belt, and said so
 //!    at the field.
 //!
+//!  M10 (`CoordinatorSendBody::Cancel`, driven from a coordinator for the first time).
+//!  `Session::recv` admits `Cancel` and clears SIX pieces of state with it. Read the
+//!  scope of this claim carefully, because the obvious version of it is FALSE: FIVE of
+//!  those six already have named Tier-1 host tests that assert the DOWNSTREAM REFUSAL and
+//!  carry their own MUTATION-VERIFY notes --
+//!  `a_reveal_grant_ends_with_its_pages_and_is_revoked_by_cancel`,
+//!  `a_cancelled_ceremony_cannot_be_acked_as_recorded`,
+//!  `cancel_drops_a_live_quiz_and_a_pass_acks_once`, `cancel_drops_a_half_typed_backup`
+//!  and `cancel_is_handled_and_silent`. What had NO assertion anywhere in the tree is the
+//!  SIXTH: `pending_name`. Its test
+//!  (`a_previewed_name_is_neither_written_nor_announced`) stops at
+//!  `pending_name() == None` and never runs the keygen that would have committed it, so
+//!  "a cancelled preview is never acked as a `SetName`" was unasserted. M10 is that one
+//!  fact, over the wire.
+//!
+//!  WHERE IT IS SENT IS THE ONLY SAFE WINDOW IN THE RUN, and that is measured rather than
+//!  argued: the `Cancel` arm's first statement is `signer.clear_tmp_data()`, which drops
+//!  the keygen tmp maps. Sent later it breaks the ceremony every other assertion rests
+//!  on, and `firmware/examples/stub.rs` turns a non-`Refused` fault into `die(2, ..)`
+//!  rather than a phase failure. Beside the `AnnounceAck`, before `begin_keygen` (which
+//!  is gated on `announced.len() == N_DEVICES`), the signer has nothing in flight, so
+//!  `clear_tmp_data` is a provable no-op and the frame's ONLY observable effect is
+//!  `pending_name = None`. It is also the app's own sequence:
+//!  `frostsnapp/lib/device_setup.dart` calls `updateNamePreview` from the name field's
+//!  `onChanged` and `sendCancel(id)` when the sheet is popped.
+//!
+//!  THE ASSERTION IS A DIFFERENTIAL, and without the second half it could not fail for
+//!  the right reason. An absent `SetName` proves nothing on its own: M8's own mutation
+//!  list above records that a LATE preview is INDISTINGUISHABLE from no preview, so
+//!  silence is equally consistent with a preview that never arrived. So TWO devices get
+//!  the SAME TWO FRAMES IN OPPOSITE ORDERS and nothing else separates them:
+//!   1. `name_cancelled` -- preview, THEN `Cancel` -- must report NO name;
+//!   2. `name_recovered` -- `Cancel`, THEN preview -- must report the byte-exact name.
+//!
+//!  A delivery failure silences BOTH, so the pair cannot pass vacuously. `device_names`
+//!  is therefore `N_DEVICES - 1`, checked as an EXACT count AFTER the two named bails so
+//!  each failure gets its most specific message, and a second unexplained absence still
+//!  fails.
+//!
+//!  Upstream's own `UiProtocol` drivers DECIDE to send this body --
+//!  `DisplayBackupProtocol::cancel()` sets `abort`, and `is_complete()` then reports
+//!  `Completion::Abort { send_cancel_to_all_devices: true }` -- but the FRAME is emitted
+//!  by `UsbSender::send_cancel{,_all}` in `usb_serial_manager.rs`, which owns real serial
+//!  ports this harness does not have. So the body is built here, in the shape
+//!  `UsbSender::send_cancel` builds it (`CoordinatorSendMessage::to(id, Cancel)`), and
+//!  the claim is about the DEVICE's handling of it, not about a driver's decision.
+//!
+//!  THREE RUN, each file restored and `diff`ed byte-identical after:
+//!  - `self.pending_name = None` deleted from `recv`'s `Cancel` arm: **`A CANCELLED
+//!    PREVIEW WAS COMMITTED: <id> was sent Naming(Preview) and then Cancel, and still
+//!    reported the name "..."`**, exit 1.
+//!  - both devices sent the frames in the SAME order, i.e. the differential made
+//!    vacuous: **`THE M10 DIFFERENTIAL IS VACUOUS: <id> was sent the same two frames in
+//!    the OTHER order ... and still reported no name`**, exit 1. Tier-1 cannot catch this
+//!    class at all -- it is an error in the HARNESS, not the device.
+//!  - the `commit_name` call deleted from `run`'s `FinalizeKeyGen` arm: exit 1 on the same
+//!    VACUOUS bail, which is the correct diagnosis: with nothing committing, the control
+//!    device is silent too.
+//!
+//!  STATED PLAINLY, because it is the honest accounting: the FIRST mutation is ALSO caught
+//!  by Tier-1 -- `a_previewed_name_is_neither_written_nor_announced` fails, measured at
+//!  113 passed / 1 failed of the 114 lib tests that existed when the mutation was run
+//!  (the count is 115 now; the figure is dated, not stale). M10 does not add mutation coverage of the FIELD. What it adds is the field's
+//!  WIRE consequence -- no `SetName`, ever -- which nothing asserted, and the fact that
+//!  the `Cancel` discriminant survives encoding by upstream's `frostsnap_comms` and
+//!  decoding by the vendored one.
+//!
+//!  M11 (the LEGACY `SavePhysicalBackup`, v1). The last admitted restoration body nothing
+//!  drove. Upstream ALIASES it: the device rebuilds it as a `SavePhysicalBackup2` and
+//!  RECURSES (`vendor/.../device/restoration.rs:64-82`), and no coordinator sends v1 --
+//!  `tell_device_to_save_physical_backup` builds v2.
+//!
+//!  THE NAIVE ASSERTION CANNOT FAIL, and finding that out is most of this item's value.
+//!  `DeviceRestoration::PhysicalSaved` carries only a `ShareImage`, and
+//!  `EnterPhysicalBackup::process_to_user_message` sets `saved = true` on any
+//!  `PhysicalBackupSaved` for its device without checking a field. So "v1 produced
+//!  PhysicalSaved" and "the driver completed" are both byte-identical to what v2 produces
+//!  -- the same shape as the five assertions written and deleted for this reason.
+//!
+//!  THE ONE FIELD THAT DISTINGUISHES THEM is the threshold. v1's is a NON-OPTIONAL `u16`,
+//!  so the rebuild forces `threshold: Some(..)`; the v2 the other pass sends carries
+//!  `None`, because `prepare_save_physical_backup` fills it only on a successful trial
+//!  recovery and `find_valid_subset` refuses one share image against a threshold of 9.
+//!  And it is wire-observable: `held_shares()`' saved-backup iterator reports
+//!  `threshold: saved_backup.threshold` verbatim. See [`V1_THRESHOLD`] for why the value
+//!  is 7 rather than 9 and why choosing it is safe.
+//!
+//!  BOTH VARIANTS ARE DRIVEN BY ONE `cargo run`, which is why this is a `save_v1`
+//!  parameter and not a replacement: v2 stays coordinator-driven on the chunk-64 pass and
+//!  v1 runs on the chunk-1 pass. `Phase::SavedV1` reads the threshold back with
+//!  `request_held_shares` BETWEEN the ingest and the consolidation, because consolidating
+//!  DELETES the record it reads -- `Phase::Reheld`'s existing read is far too late.
+//!  Upstream's own call still runs and its send is REWRITTEN rather than dropped, because
+//!  that call is what inserts into `tmp_waiting_save` and without it the device's
+//!  `PhysicalSaved` is refused by `recv_device_message`.
+//!
+//!  THREE RUN, each file restored and `diff`ed byte-identical after:
+//!  - the downgrade skipped, so the v1 pass sends v2: **`M11: <id> ... reports the saved
+//!    backup with threshold=None`**, exit 1. This is the mutation that shows the assertion
+//!    distinguishes the two variants at all.
+//!  - the `needs_consolidation` filter dropped from the `HeldShare2` lookup:
+//!    **`threshold=Some(9)`**, exit 1 -- the real access structure's entry. This is why
+//!    [`V1_THRESHOLD`] is 7: at 9 this mutation would have passed silently.
+//!  - the DEVICE made to refuse the v1 body (the arm removed from `recv_core`'s admitted
+//!    list): **`<id> REFUSED PhysicalBackup while this coordinator was in Ingest WAITING
+//!    for it`**, exit 1 in seconds.
+//!
+//!  THAT THIRD ONE FOUND A SEPARATE DEFECT AND FIXED IT. Before this pass the refusal was
+//!  a LOG LINE only: the run printed `REFUSED PhysicalBackup (a frame our own coordinator
+//!  never asked for)` -- which was itself wrong, the coordinator HAD asked for it -- and
+//!  then sat out the whole 95 s `BackupIngest` budget to die with `DEADLINE ... in state
+//!  BackupIngest`, naming the state and not the cause. A refusal of a frame this
+//!  coordinator is waiting on now fails immediately, scoped to the restore device and to
+//!  the two phases that wait on a save for [`Restore::erase_refusals`]' reason.
+//!
 //! Usage: `hostcheck [path-to-stub-binary]`. Build the stub FIRST and pass the
 //! artifact -- never `cargo run`: the child's stdout IS the wire, and one stray
 //! byte of cargo progress output desynchronises the magic scan permanently.
@@ -470,7 +587,15 @@ use frostsnap_coordinator::frostsnap_core::coordinator::{
 };
 use frostsnap_coordinator::frostsnap_core::device::KeyPurpose;
 use frostsnap_coordinator::frostsnap_core::message::{
-    DeviceRestoration, DeviceToCoordinatorMessage, EncodedSignature,
+    // M11: `CoordinatorRestoration` and `CoordinatorToDeviceMessage` are named here only
+    // so `downgrade_save` can rebuild the LEGACY v1 body. Nothing else in this file
+    // constructs a `CoordinatorToDeviceMessage` -- every other frame comes out of the
+    // coordinator's own queue.
+    CoordinatorRestoration,
+    CoordinatorToDeviceMessage,
+    DeviceRestoration,
+    DeviceToCoordinatorMessage,
+    EncodedSignature,
 };
 use frostsnap_coordinator::frostsnap_core::schnorr_fun::frost::{Fingerprint, ShareIndex};
 use frostsnap_coordinator::frostsnap_core::schnorr_fun::{Schnorr, Signature};
@@ -660,6 +785,35 @@ const CHECK_BACKUP_SINCE: VersionNumber = VersionNumber::new(0, 3, 0);
 /// end of the pass.
 const RESTORE_KEY_NAME: &str = "cold-snap M7";
 
+/// M11: the threshold the LEGACY `CoordinatorRestoration::SavePhysicalBackup` (v1) frame
+/// carries, and it is **7 rather than [`THRESHOLD`]'s 9 on purpose**.
+///
+/// v1 is the only admitted restoration body no coordinator sends, so it was the last one
+/// nothing drove. Upstream aliases it: the device rebuilds it as a `SavePhysicalBackup2`
+/// and RECURSES (`vendor/.../device/restoration.rs:64-82`). That makes the naive
+/// assertion useless — `DeviceRestoration::PhysicalSaved` carries only a `ShareImage`, so
+/// "v1 produced PhysicalSaved" is byte-identical to what v2 produces and CANNOT FAIL
+/// against an accidental v2 in the same slot.
+///
+/// The one field that does distinguish them is this one. v1's `threshold` is a
+/// NON-OPTIONAL `u16`, so the rebuild forces `threshold: Some(threshold)`; the v2 the
+/// other pass sends carries `threshold: None`, because
+/// `prepare_save_physical_backup` fills it only on a successful trial recovery and
+/// `find_valid_subset` refuses one share image against a threshold of 9. And it is
+/// wire-observable: `held_shares()`' saved-backup iterator reports
+/// `threshold: saved_backup.threshold` VERBATIM.
+///
+/// 7 and not 9 so the value exists NOWHERE ELSE in the run — at 9 the assertion would
+/// also pass on the real access structure's entry, so a lookup that picked the wrong
+/// `HeldShare2` would go unnoticed.
+///
+/// SAFE because it is INERT on the device, which is checked and not assumed:
+/// `Consolidate` derives `threshold: root_shared_key.threshold() as u16` from the
+/// coordinator's own root shared key (`device/restoration.rs:164`) and never reads
+/// `saved_backup.threshold`. So a coordinator-chosen threshold is a reported value and
+/// nothing else — which is itself worth pinning, and this is what pins it.
+const V1_THRESHOLD: u16 = 7;
+
 /// How many positions the device's check quiz asks, and therefore how many correct
 /// answers a pass must take.
 ///
@@ -812,9 +966,9 @@ const DECLINE_GRACE: Duration = Duration::from_secs(1);
 /// messages arriving late.
 const ERASE_GRACE: Duration = Duration::from_secs(1);
 
-/// Coordinator-side states. `NAMES` is the single source of truth for the
-/// spelling, because both the loop's own error and the watchdog thread (which
-/// has only an integer) print from it.
+/// Coordinator-side states. [`State::name`] is the single source of truth for the
+/// spelling, because both the loop's own error and the watchdog thread (which has only an
+/// integer, and goes through [`State::from_index`]) print from it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
 enum State {
@@ -857,27 +1011,72 @@ enum State {
     EraseRefusal,
 }
 
-const NAMES: [&str; 14] = [
-    "WaitingForMagic",
-    "WaitingForAnnounces",
-    "KeygenAwaitingShares",
-    "KeygenAwaitingSessionHash",
-    "KeygenAwaitingAcks",
-    "KeygenAwaitingDeviceSave",
-    "KeygenAwaitingHeldShares",
-    "NonceReplenish",
-    "SigningAwaitingShares",
-    "BackupReveal",
-    "BackupQuiz",
-    "BackupIngest",
-    "BackupConsolidate",
-    "EraseRefusal",
-];
-
+/// Every state's spelling, and the ONE definition of it: both the loop's own errors and
+/// the watchdog thread print from here.
+///
+/// AN EXHAUSTIVE `match` AND NOT A PARALLEL ARRAY, which is the whole point. This was
+/// `const NAMES: [&str; 14]` indexed by `self as usize` until 2026-09-12, guarded by a
+/// `const _: () = assert!(NAMES.len() == State::EraseRefusal as usize + 1)` — and that
+/// guard was INVERTED for the only edit anyone makes. Appending a fifteenth variant AFTER
+/// `EraseRefusal` leaves that discriminant at 13, so `13 + 1 == 14 == NAMES.len()` and the
+/// assert PASSED while `NAMES[14]` panicked out of bounds; adding the variant AND its
+/// string made `15 != 14` and FAILED the build. Two reviewers found it independently.
+///
+/// A `match` with no `_` arm makes the same edit `error[E0004]` at compile time on every
+/// target, which is the shape this project already relies on for `keypad::Event`,
+/// `Answer` and `Consent`. It also deletes the index, so the watchdog's raw-integer read
+/// can no longer be out of bounds at all: it takes a `State` through [`State::from_index`]
+/// and says so when the integer is not one.
 impl State {
     fn name(self) -> &'static str {
-        NAMES[self as usize]
+        match self {
+            State::WaitingForMagic => "WaitingForMagic",
+            State::WaitingForAnnounces => "WaitingForAnnounces",
+            State::KeygenAwaitingShares => "KeygenAwaitingShares",
+            State::KeygenAwaitingSessionHash => "KeygenAwaitingSessionHash",
+            State::KeygenAwaitingAcks => "KeygenAwaitingAcks",
+            State::KeygenAwaitingDeviceSave => "KeygenAwaitingDeviceSave",
+            State::KeygenAwaitingHeldShares => "KeygenAwaitingHeldShares",
+            State::NonceReplenish => "NonceReplenish",
+            State::SigningAwaitingShares => "SigningAwaitingShares",
+            State::BackupReveal => "BackupReveal",
+            State::BackupQuiz => "BackupQuiz",
+            State::BackupIngest => "BackupIngest",
+            State::BackupConsolidate => "BackupConsolidate",
+            State::EraseRefusal => "EraseRefusal",
+        }
     }
+
+    /// The watchdog thread's read: it holds only the `usize` [`State::publish`] stored, so
+    /// this is where that integer becomes a state again.
+    ///
+    /// `Option` and not an index: a value that is not a state used to be an out-of-bounds
+    /// panic IN THE WATCHDOG THREAD, which would have taken the 95 s bound down silently
+    /// and left the harness free to hang past it — a fail-open on the one guard that exists
+    /// because the loop can get stuck outside its own deadline check.
+    fn from_index(i: usize) -> Option<State> {
+        // Walked rather than transmuted, over the same exhaustive list `name` uses, so a
+        // new variant that is not added here is missing from the walk and nowhere else.
+        [
+            State::WaitingForMagic,
+            State::WaitingForAnnounces,
+            State::KeygenAwaitingShares,
+            State::KeygenAwaitingSessionHash,
+            State::KeygenAwaitingAcks,
+            State::KeygenAwaitingDeviceSave,
+            State::KeygenAwaitingHeldShares,
+            State::NonceReplenish,
+            State::SigningAwaitingShares,
+            State::BackupReveal,
+            State::BackupQuiz,
+            State::BackupIngest,
+            State::BackupConsolidate,
+            State::EraseRefusal,
+        ]
+        .into_iter()
+        .find(|s| *s as usize == i)
+    }
+
 
     /// Publish for the watchdog, which cannot see the local variable.
     fn publish(self) {
@@ -1085,11 +1284,31 @@ enum Phase {
     Quiz,
     /// M7d: `EnterPhysicalBackup`, then `SavePhysicalBackup2`.
     Ingest,
+    /// M11: the device REPORTS the saved backup, so the threshold the LEGACY v1 frame
+    /// carried can be read back off the wire. Between [`Phase::Ingest`] and
+    /// [`Phase::Consolidate`] and not after, because consolidating DELETES the record
+    /// this reads: the `SaveShare` mutation calls `remove_backups_with_share_image`
+    /// (`vendor/.../device.rs`), so `Phase::Reheld`'s existing `request_held_shares`
+    /// is far too late.
+    ///
+    /// Only entered when the pass is driving v1 — see `save_v1` on [`one_pass`].
+    SavedV1,
     /// M7e: `Consolidate`. DESTRUCTIVE, hence last.
     Consolidate,
     /// M7e's proof: the device reports what it holds, AGAIN, after the write that
     /// replaced its record. A `FinishedConsolidation` on its own says the device
-    /// applied the mutation; this says the record it wrote is one it can read back.
+    /// applied the mutation; this says the SIGNER'S STATE after it agrees with this
+    /// coordinator's own polynomial at this device's index.
+    ///
+    /// **NOT a flash read-back, and this doc claimed it was until 2026-09-12.** It read
+    /// "this says the record it wrote is one it can read back". `RequestHeldShares` is
+    /// answered from `held_shares()`, which iterates the signer's in-RAM `keys`
+    /// (`vendor/.../device/restoration.rs`), our arm for it is a pass-through, and the
+    /// stub's only restart is PRE-KEYGEN — so no flash read happens between the
+    /// consolidation and this report. The flash half is covered at Tier 1 by
+    /// `consolidation_persists_the_share_before_it_acks`, which reopens the store after
+    /// a real reset; this is the wire half and it is worth having for what it does
+    /// compare, which is the signer against the coordinator across two processes.
     Reheld,
     Done,
 }
@@ -1100,7 +1319,13 @@ impl Phase {
             Phase::Erase => State::EraseRefusal,
             Phase::Reveal => State::BackupReveal,
             Phase::Quiz => State::BackupQuiz,
-            Phase::Ingest => State::BackupIngest,
+            // `SavedV1` shares `BackupIngest`'s state deliberately: it is the tail of
+            // the same ingest, and a new `State` variant would move `State::longest()`
+            // and with it the stub's documented ~2.5x watchdog ratio. Adding one is at
+            // least safe now -- `State::name` and `State::from_index` are exhaustive, so
+            // it is `error[E0004]` rather than a runtime panic -- but it is still churn
+            // this phase does not need.
+            Phase::Ingest | Phase::SavedV1 => State::BackupIngest,
             Phase::Consolidate | Phase::Reheld | Phase::Done => State::BackupConsolidate,
         }
     }
@@ -1159,6 +1384,16 @@ struct Restore {
     reheld: bool,
     /// M7d, for the log: how many keypresses the letter picker took.
     typed: Option<usize>,
+    /// M11: the `threshold` the device REPORTS for the saved backup, once it has
+    /// reported one. `Some(None)` is a device that answered with no threshold, which is
+    /// what a v2 in this slot looks like, so the two are distinguished rather than
+    /// collapsed.
+    ///
+    /// `Option<Option<u16>>` and not `Option<u16>`: the outer layer is "has the device
+    /// answered yet", the inner is what it said. Flattening them would make a device
+    /// that has not answered indistinguishable from one that answered `None`, and the
+    /// second is the failure this field exists to catch.
+    saved_v1_threshold: Option<Option<u16>>,
     /// M9: when upstream's `EraseDevice` was opened, i.e. when [`ERASE_GRACE`] starts.
     erase_at: Option<Instant>,
     /// M9: `refused=DataErase` frames from [`Restore::device`] seen **while
@@ -1196,6 +1431,7 @@ impl Restore {
             consolidated: false,
             reheld: false,
             typed: None,
+            saved_v1_threshold: None,
             erase_at: None,
             erase_refusals: 0,
         }
@@ -1295,6 +1531,41 @@ fn check_glass_words(
     Ok(())
 }
 
+/// Rewrite a `SavePhysicalBackup2` send as the LEGACY v1 body, keeping its
+/// `share_image` and its destinations.
+///
+/// Anything else passes through UNCHANGED, deliberately: a future upstream that returns a
+/// second send from `tell_device_to_save_physical_backup` keeps it, where a
+/// drop-and-forge would silently lose it. And a v2 that stopped being the body it returns
+/// would leave this a no-op rather than a forgery of the wrong thing — which the M11
+/// threshold assertion then FAILS on, by name, instead of passing quietly.
+///
+/// The three synthesised fields are the harness's own and cannot be otherwise: nothing
+/// upstream constructs a v1, so there is no upstream value to borrow. See
+/// [`V1_THRESHOLD`] for why the threshold is 7 and why it is safe to choose.
+fn downgrade_save(send: CoordinatorSend) -> CoordinatorSend {
+    match send {
+        CoordinatorSend::ToDevice {
+            message:
+                CoordinatorToDeviceMessage::Restoration(
+                    CoordinatorRestoration::SavePhysicalBackup2(held),
+                ),
+            destinations,
+        } => CoordinatorSend::ToDevice {
+            message: CoordinatorToDeviceMessage::Restoration(
+                CoordinatorRestoration::SavePhysicalBackup {
+                    share_image: held.share_image,
+                    key_name: RESTORE_KEY_NAME.to_string(),
+                    purpose: KeyPurpose::Test,
+                    threshold: V1_THRESHOLD,
+                },
+            ),
+            destinations,
+        },
+        other => other,
+    }
+}
+
 /// One lap of the M7 drive: build the phase's driver if it has none, then check
 /// whether the phase has proven itself and move on.
 ///
@@ -1313,6 +1584,7 @@ fn restore_step(
     ui: &mut Option<Box<dyn UiProtocol>>,
     r: &mut Restore,
     as_ref: AccessStructureRef,
+    save_v1: bool,
 ) -> Result<()> {
     // A driver that ABORTED is a failure of the phase and not a quiet ending: every
     // one of the three aborts on `disconnected`, which for this harness means the pty
@@ -1589,14 +1861,71 @@ fn restore_step(
                         KeyPurpose::Test,
                         restoration_id,
                     );
+                    // ============================== M11 ==============================
+                    // The LEGACY v1 body, on the passes that ask for it. Upstream's
+                    // `tell_device_to_save_physical_backup` still RUNS and its send is
+                    // REWRITTEN rather than dropped, and that is not a stylistic
+                    // preference: the call is what inserts into `tmp_waiting_save`, and
+                    // without that entry the device's `PhysicalSaved` is refused by
+                    // `recv_device_message` ("coordinator not waiting for that share to
+                    // be saved") and kills the pass. Rewriting also passes through any
+                    // second send a future upstream adds, where a drop-and-forge would
+                    // silently lose it.
+                    //
+                    // `share_image` is taken from upstream's OWN `HeldShare2`, because
+                    // that is the key the recursion's `tmp_loaded_backups.remove` must
+                    // hit. The other three fields are this harness's, and they have to
+                    // be: nothing upstream builds a v1 at all, so there is no upstream
+                    // value to borrow. See [`V1_THRESHOLD`].
                     queue.extend(
-                        coordinator.tell_device_to_save_physical_backup(phase, restoration_id),
+                        coordinator
+                            .tell_device_to_save_physical_backup(phase, restoration_id)
+                            .into_iter()
+                            .map(|send| if save_v1 { downgrade_save(send) } else { send }),
                     );
                 }
             }
             if done(ui) {
                 eprintln!(
                     "hostcheck: M7d PASS -- {} saved the typed share and the driver completed",
+                    r.device
+                );
+                if save_v1 {
+                    // Ask what it holds while the saved backup still EXISTS. See
+                    // `Phase::SavedV1`: consolidating deletes the record.
+                    queue.extend(coordinator.request_held_shares(r.device));
+                    r.advance(ui, Phase::SavedV1);
+                } else {
+                    r.advance(ui, Phase::Consolidate);
+                }
+            }
+        }
+
+        // ============================== M11 ==============================
+        // The legacy v1 frame's own observable, and the ONLY one it has: the threshold it
+        // carried, reported back by the device. Everything else about v1 is
+        // indistinguishable from v2 on the wire, because the v1 arm reaches v2 by
+        // recursing into it.
+        Phase::SavedV1 => {
+            if let Some(got) = r.saved_v1_threshold {
+                if got != Some(V1_THRESHOLD) {
+                    bail!(
+                        "M11: {} was sent the LEGACY SavePhysicalBackup (v1) carrying \
+                         threshold={V1_THRESHOLD}, and reports the saved backup with \
+                         threshold={got:?}. TWO different failures land here and the value \
+                         tells them apart: `None` means a v2 body reached the device instead \
+                         of the v1 one -- v1's `threshold` is a non-optional u16 and the \
+                         rebuild forces `Some(..)`, so only v2 can report nothing -- while any \
+                         OTHER `Some` means this read the wrong `HeldShare2`, and \
+                         `Some({THRESHOLD})` specifically is the real access structure's entry \
+                         rather than the saved backup's",
+                        r.device
+                    );
+                }
+                eprintln!(
+                    "hostcheck: M11 PASS -- {} accepted the LEGACY SavePhysicalBackup (v1), \
+                     recursed it into a SavePhysicalBackup2, and reports the saved backup with \
+                     the threshold={V1_THRESHOLD} that ONLY the v1 body could have carried",
                     r.device
                 );
                 r.advance(ui, Phase::Consolidate);
@@ -1627,8 +1956,10 @@ fn restore_step(
             }
             if r.consolidated {
                 // Ask again what it holds. A `FinishedConsolidation` says the device
-                // applied the mutation; this says the record it wrote is one it can
-                // read back and describe, which is the half a destructive write owes.
+                // applied the mutation; this says the state it is in AFTERWARDS agrees
+                // with this coordinator's own polynomial. See `Phase::Reheld` for what
+                // that does and does not cover -- it is not a flash read-back, and this
+                // comment said it was until 2026-09-12.
                 queue.extend(coordinator.request_held_shares(r.device));
                 r.advance(ui, Phase::Reheld);
             }
@@ -1796,7 +2127,8 @@ fn main() -> Result<()> {
                 "hostcheck: WATCHDOG at {:?} -- state {}, the loop is stuck OUTSIDE its own \
                  deadline check (a blocked write is the known way that happens)",
                 t0.elapsed(),
-                NAMES[STATE.load(Ordering::Relaxed)],
+                State::from_index(STATE.load(Ordering::Relaxed))
+                    .map_or("<not a state>", State::name),
             );
             std::process::exit(5);
         }
@@ -1821,7 +2153,11 @@ fn main() -> Result<()> {
 
     for chunk in [64usize, 1] {
         eprintln!("--- pass: STUB_CHUNK={chunk} ---");
-        one_pass(&stub, chunk, &t0, Expect::Signature)
+        // M11: v2 on the chunk-64 pass (the body a real coordinator sends) and the
+        // LEGACY v1 on the chunk-1 pass, so ONE `cargo run` drives BOTH admitted
+        // variants from a coordinator. Keyed off the chunk size only because there are
+        // exactly two signature passes; the parameter is what the phase reads.
+        one_pass(&stub, chunk, &t0, Expect::Signature, chunk == 1)
             .with_context(|| format!("pass STUB_CHUNK={chunk}"))?;
     }
     // THE DECLINE PASS. Same binary, same wire, same keygen; the only difference is
@@ -1830,7 +2166,7 @@ fn main() -> Result<()> {
     // One chunk size is enough — this pass is about the consent decision, and
     // reassembly is already proven at 1 by the pass above.
     eprintln!("--- pass: DECLINE (every device presses x at the signing screen) ---");
-    one_pass(&stub, 64, &t0, Expect::Decline).context("pass DECLINE")?;
+    one_pass(&stub, 64, &t0, Expect::Decline, false).context("pass DECLINE")?;
     println!(
         "M1+M2+M3+M5+M7+M8+M9 PASS: real {THRESHOLD}-of-{N_DEVICES} keygen, nonce replenishment and a \
          signature that VERIFIES against the group key, across the pty at both chunk sizes, \
@@ -1849,7 +2185,13 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()> {
+fn one_pass(
+    stub: &str,
+    chunk: usize,
+    t0: &Instant,
+    expect: Expect,
+    save_v1: bool,
+) -> Result<()> {
     // (master, slave). The master has `port_name: None` and so cannot be
     // reopened by path -- handing it over as the child's stdio is the whole
     // reason this works cross-process.
@@ -1896,7 +2238,9 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
         cmd.env("COLDSNAP_GLASS_KEYS", "yx")
             .env("STUB_EXPECT_DECLINES", N_DEVICES.to_string());
     }
-    let mut child = cmd.spawn().with_context(|| format!("spawn {stub}"))?;
+    // Wrapped so that EVERY exit from this function reaps it -- see [`Reaped`]. The
+    // 15 `bail!`s in the PASS block are `return`s that fire BEFORE the reaping.
+    let mut child = Reaped(cmd.spawn().with_context(|| format!("spawn {stub}"))?);
     // Drop the parent's copies of the master fds NOW, so the stub exiting gives
     // the slave a clean EOF instead of a port that stays open forever.
     drop(cmd);
@@ -1965,6 +2309,24 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
     // back-channel: this is the real protocol body the app's `device_names` entry comes
     // from, so the assertion is over the same message a coordinator would act on.
     let mut device_names: std::collections::BTreeMap<DeviceId, String> = Default::default();
+    // M10: the two devices of the `Cancel` DIFFERENTIAL. Both get the SAME TWO FRAMES in
+    // OPPOSITE ORDERS and nothing else distinguishes them:
+    //
+    //   `name_cancelled`  preview, THEN `Cancel`  -> must report NO name
+    //   `name_recovered`  `Cancel`, THEN preview  -> must report the byte-exact name
+    //
+    // The second one is what stops the first from being vacuous, and it is not a
+    // nicety: PLAN.md §9 item 12 already records that a LATE preview is
+    // indistinguishable from NO preview, so "this device sent no `SetName`" on its own
+    // is equally consistent with a preview that never landed. Identical frames,
+    // identical wire, identical device code path — so a lost preview silences BOTH, and
+    // `name_recovered`'s success is what makes `name_cancelled`'s silence a fact about
+    // the ORDER of the two frames rather than about their delivery.
+    //
+    // `Option<DeviceId>` and not an index into `announced`, so every failure message
+    // names a device.
+    let mut name_cancelled: Option<DeviceId> = None;
+    let mut name_recovered: Option<DeviceId> = None;
     // M8: devices that ANNOUNCED having no stored name. `Session::announce` sends exactly
     // one of `SetName` (a name is on flash) or `NeedName` (none is), so this is what makes
     // the `SetName` below evidence of a commit IN THIS RUN rather than an echo of a name
@@ -2012,9 +2374,7 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
                 announced.len(),
                 keygen.as_ref().map_or(0, |k| k.got_shares),
                 keygen.as_ref().map_or(0, |k| k.acks),
-                keygen
-                    .as_ref()
-                    .map_or(false, |k| k.session_hash.is_some()),
+                keygen.as_ref().is_some_and(|k| k.session_hash.is_some()),
                 held.len(),
                 sign.replenished.len(),
                 sign.session_id.is_some(),
@@ -2129,6 +2489,14 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
                                     announced.len(),
                                     started.elapsed()
                                 );
+                                // M10: assign the differential's two roles on FIRST
+                                // announce, and only here, so each device plays exactly
+                                // one and a re-announce cannot reassign it.
+                                if name_cancelled.is_none() {
+                                    name_cancelled = Some(from);
+                                } else if name_recovered.is_none() {
+                                    name_recovered = Some(from);
+                                }
                             }
                             let ack = CoordinatorSendMessage::to(
                                 from,
@@ -2154,6 +2522,40 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
                             // no prompt, no keypress (the real app calls it once per
                             // typed character) — which is why sending it unprompted is
                             // safe here and why it is not a consent event over there.
+                            //
+                            // ============================ M10 ===========================
+                            // `CoordinatorSendBody::Cancel`, and THIS LAP IS THE ONLY
+                            // SAFE WINDOW IN THE RUN for it. `Session::recv`'s `Cancel`
+                            // arm calls `signer.clear_tmp_data()`, which drops the keygen
+                            // tmp maps; sent any later it would break the ceremony every
+                            // other assertion depends on, and the stub turns a
+                            // non-`Refused` fault into `die(2, ..)` rather than a phase
+                            // failure. Here the signer has no keygen in flight — the
+                            // keygen is begun below, gated on `announced.len() ==
+                            // N_DEVICES` — so `clear_tmp_data` is a PROVABLE no-op and
+                            // the ONLY observable effect of the frame is the one under
+                            // test: `self.pending_name = None`.
+                            //
+                            // This is the app's own sequence, not a harness invention:
+                            // `frostsnapp/lib/device_setup.dart` calls
+                            // `updateNamePreview` from the name field's `onChanged` and
+                            // `sendCancel(id)` when the sheet is popped, so
+                            // preview-then-cancel-one-device is what a human abandoning
+                            // the naming sheet produces.
+                            //
+                            // `Cancel` FIRST for the recovered device. It has nothing to
+                            // clear yet, so the preview that follows must survive — see
+                            // `name_recovered`.
+                            if name_recovered == Some(from) {
+                                let cancel =
+                                    CoordinatorSendMessage::to(from, CoordinatorSendBody::Cancel);
+                                if let Err(e) =
+                                    send_frame(&wtx, ReceiveSerial::Message(cancel.into()))
+                                {
+                                    break Err(e.context("Cancel (before the preview)"));
+                                }
+                                writes_queued += 1;
+                            }
                             let preview = CoordinatorSendMessage::to(
                                 from,
                                 CoordinatorSendBody::Naming(NameCommand::Preview(
@@ -2165,6 +2567,19 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
                                 break Err(e.context("Naming(Preview)"));
                             }
                             writes_queued += 1;
+                            // And `Cancel` AFTER the preview for the cancelled device:
+                            // the same two frames in the other order, which must drop
+                            // the name this device would otherwise commit during keygen.
+                            if name_cancelled == Some(from) {
+                                let cancel =
+                                    CoordinatorSendMessage::to(from, CoordinatorSendBody::Cancel);
+                                if let Err(e) =
+                                    send_frame(&wtx, ReceiveSerial::Message(cancel.into()))
+                                {
+                                    break Err(e.context("Cancel (after the preview)"));
+                                }
+                                writes_queued += 1;
+                            }
                             if announced.len() == N_DEVICES && keygen.is_none() {
                                 let begin = BeginKeygen::new(
                                     announced.clone(),
@@ -2209,6 +2624,27 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
                                     .as_ref()
                                     .and_then(|k| k.finished)
                                     .expect("HeldShares2 only requested after finalize");
+                                // ============================== M11 ==============================
+                                // The SAVED BACKUP's own entry, which is a DIFFERENT
+                                // `HeldShare2` from the keygen one below and is found by
+                                // `needs_consolidation` rather than by the access
+                                // structure ref: `held_shares()`' `backups_iter` sets
+                                // `access_structure_ref: None` and
+                                // `needs_consolidation: true`, so the `find` below
+                                // cannot see it and this cannot see the keygen entry.
+                                // That separation is what makes the threshold a fact
+                                // about the v1 body and not about the real access
+                                // structure — see [`V1_THRESHOLD`].
+                                if let Some(r) = restore.as_mut() {
+                                    if r.phase == Phase::SavedV1 && from == r.device {
+                                        r.saved_v1_threshold = Some(
+                                            shares
+                                                .iter()
+                                                .find(|s| s.needs_consolidation)
+                                                .and_then(|s| s.threshold),
+                                        );
+                                    }
+                                }
                                 match shares
                                     .iter()
                                     .find(|s| s.access_structure_ref == Some(want))
@@ -2250,9 +2686,15 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
                                                         "M7e: after CONSOLIDATING, {from} reports \
                                                          holding share image {:?}, but this \
                                                          coordinator's root shared key says index \
-                                                         {:?} is {expect_image:?} -- the \
-                                                         destructive write replaced the record \
-                                                         with the wrong share",
+                                                         {:?} is {expect_image:?} -- the signer's \
+                                                         state after the consolidation is not this \
+                                                         device's share at this index. (This \
+                                                         compares the signer over the wire, NOT the \
+                                                         flash record: the reply is a RAM read. The \
+                                                         message said \"the destructive write \
+                                                         replaced the record with the wrong share\" \
+                                                         until 2026-09-12, which attributed it to a \
+                                                         read that does not happen.)",
                                                         s.share_image,
                                                         r.share_index
                                                     ));
@@ -2330,6 +2772,37 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
                                             if r.phase == Phase::Erase && from == r.device {
                                                 r.erase_refusals += 1;
                                             }
+                                        }
+                                    }
+                                    // A REFUSAL OF A FRAME THIS COORDINATOR DID ASK FOR
+                                    // IS A FAILURE, and until now it was only a log line.
+                                    // MEASURED: a device made to refuse the legacy
+                                    // `SavePhysicalBackup` printed this and the run then
+                                    // sat out the whole 95 s `BackupIngest` budget and
+                                    // died with `DEADLINE ... in state BackupIngest`,
+                                    // which names the state and not the cause. The
+                                    // refusal was on the wire the entire time.
+                                    //
+                                    // Scoped to the RESTORE DEVICE and to the phases that
+                                    // are waiting on a save, for the reason
+                                    // [`Restore::erase_refusals`] documents: `DataErase`
+                                    // is refused by design and by every device, so an
+                                    // unscoped check here could never pass at all.
+                                    else if let Some(r) = restore.as_mut() {
+                                        if from == r.device
+                                            && matches!(
+                                                r.phase,
+                                                Phase::Ingest | Phase::SavedV1
+                                            )
+                                        {
+                                            break Err(anyhow::anyhow!(
+                                                "{from} REFUSED {what} while this coordinator \
+                                                 was in {:?} WAITING for it -- the phase can \
+                                                 never complete, so failing here rather than \
+                                                 at the deadline, which would have named the \
+                                                 state and not the cause",
+                                                r.phase
+                                            ));
                                         }
                                     }
                                 }
@@ -2717,6 +3190,7 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
                             &mut ui,
                             r,
                             kg.finished.expect("a signature implies an access structure"),
+                            save_v1,
                         ) {
                             break Err(e.context(format!("M7 {:?}", r.phase)));
                         }
@@ -2770,7 +3244,7 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
             // not be waited on forever. It is only allowed to exit at the very
             // end, when WE close the pty -- which by then has already happened,
             // because the pass breaks out of this loop above.
-            if let Ok(Some(status)) = child.try_wait() {
+            if let Ok(Some(status)) = child.0.try_wait() {
                 break Err(anyhow::anyhow!(
                     "stub exited {status} in {} having reported {}/{N_DEVICES} held shares, \
                      {}/{N_DEVICES} nonce replenishments and {}/{} signature shares",
@@ -2915,12 +3389,80 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
             //     bytes of it. `DeviceName` counts chars, `DEVICE_NAME_MAX_BYTES` counts
             //     bytes, and a name at the byte edge is the only input that can tell a
             //     truncation at either bound from a correct round trip.
-            if device_names.len() != N_DEVICES {
+            //
+            // ONE device is EXPECTED to be missing, and it is named rather than
+            // subtracted: see M10 immediately below and `name_cancelled`.
+            let cancelled = name_cancelled.context(
+                "no device ever announced, so the M10 cancel differential never got a subject",
+            )?;
+            let recovered = name_recovered.context(
+                "fewer than two devices announced, so the M10 cancel differential had no control",
+            )?;
+
+            // ============================== M10 ==============================
+            // `CoordinatorSendBody::Cancel` DROPS THE PREVIEWED NAME, driven from a
+            // coordinator for the first time.
+            //
+            // `Session::recv`'s `Cancel` arm clears six pieces of state. FIVE of them
+            // already have named Tier-1 host tests that assert the DOWNSTREAM REFUSAL and
+            // carry their own MUTATION-VERIFY notes —
+            // `a_reveal_grant_ends_with_its_pages_and_is_revoked_by_cancel`,
+            // `a_cancelled_ceremony_cannot_be_acked_as_recorded`,
+            // `cancel_drops_a_live_quiz_and_a_pass_acks_once`,
+            // `cancel_drops_a_half_typed_backup`, `cancel_is_handled_and_silent`. The
+            // SIXTH, `pending_name`, is the one whose consequence was asserted NOWHERE:
+            // `a_previewed_name_is_neither_written_nor_announced` stops at
+            // `pending_name() == None` and never runs the keygen that would have
+            // committed it. So this is the only clearing whose observable effect — no
+            // `SetName`, ever — had no test in the tree, and it is what M10 closes.
+            //
+            // THE DIFFERENTIAL IS THE ASSERTION. An absent `SetName` on its own proves
+            // nothing: PLAN.md §9 item 12 records that a LATE preview is
+            // INDISTINGUISHABLE from no preview, so silence is equally consistent with a
+            // preview that never arrived. `recovered` got the SAME TWO FRAMES in the
+            // OTHER ORDER and must report the byte-exact name, so a delivery failure
+            // silences BOTH and the pair cannot pass. What is left when both hold is a
+            // fact about the ORDER of the two frames, which is the only thing
+            // `pending_name = None` can be evidence of.
+            if let Some(name) = device_names.get(&cancelled) {
                 bail!(
-                    "only {}/{N_DEVICES} device(s) reported a NAME (SetName: {device_names:?}) \
-                     -- `commit_name` pushes SetName only after NameStore::save returned Ok, so \
-                     a device missing here either never took the preview or could not persist it",
-                    device_names.len()
+                    "A CANCELLED PREVIEW WAS COMMITTED: {cancelled} was sent \
+                     Naming(Preview) and then Cancel, and still reported the name {name:?} -- \
+                     so `Session::recv`'s `self.pending_name = None` either did not run or \
+                     did not stick, and a coordinator that abandoned a ceremony can still \
+                     name this device from it"
+                );
+            }
+            if !device_names.contains_key(&recovered) {
+                bail!(
+                    "THE M10 DIFFERENTIAL IS VACUOUS: {recovered} was sent the same two \
+                     frames in the OTHER order -- Cancel, THEN Naming(Preview) -- and still \
+                     reported no name. So the silence at {cancelled} is not evidence about \
+                     `Cancel` dropping a previewed name; it is evidence the preview never \
+                     landed at all"
+                );
+            }
+            eprintln!(
+                "hostcheck: M10 PASS -- {cancelled} was previewed-then-CANCELLED and committed \
+                 NO name, while {recovered} was CANCELLED-then-previewed and committed the \
+                 byte-exact one, so the two frames' ORDER is what decided it"
+            );
+
+            // The COUNT, checked AFTER the two M10 bails so that each failure gets its
+            // most specific message: a missing `recovered` is a vacuous differential and
+            // says so, and what reaches here is a device missing for some THIRD reason.
+            // The exact count and not `>=`: a second unexplained absence must fail even
+            // though `cancelled`'s absence is expected.
+            if device_names.len() != N_DEVICES - 1 {
+                bail!(
+                    "{}/{} device(s) reported a NAME (SetName: {device_names:?}) -- \
+                     `commit_name` pushes SetName only after NameStore::save returned Ok, so a \
+                     device missing here either never took the preview or could not persist it. \
+                     Exactly ONE of the {N_DEVICES} is expected to be missing and it is \
+                     {cancelled}, whose preview was followed by a `Cancel` (M10); anything else \
+                     absent is a device that failed to commit",
+                    device_names.len(),
+                    N_DEVICES - 1,
                 );
             }
             for (id, got) in &device_names {
@@ -2984,16 +3526,17 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
                      the signing screen and NOT ONE signature share reached the coordinator\
                      \n    so `x` genuinely refuses: the only thing that changed from the \
                      passes above is the key pressed at the glass\
-                     \n    M8 also holds here: {}/{N_DEVICES} device(s) persisted the previewed \
-                     name and reported it back (a name is committed during keygen, which this \
-                     pass still completes)",
+                     \n    M8+M10 also hold here: {}/{} device(s) persisted the previewed name \
+                     and reported it back (a name is committed during keygen, which this pass \
+                     still completes), and the remaining one -- {cancelled} -- committed NONE \
+                     because a `Cancel` followed its preview",
                     kg.id,
                     started.elapsed(),
                     device_glass.len(),
                     declined.len(),
                     device_names.len(),
+                    N_DEVICES - 1,
                 );
-                reap(&mut child);
                 return Ok(());
             }
 
@@ -3100,9 +3643,13 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
                  \n      M9  ERASE     -- upstream's own EraseDevice driver stayed at \
                  is_complete()==None for the whole grace window and the device REFUSED its \
                  DataErase on the wire, so its completion path is unreachable here\
-                 \n    M8 NAME: all {}/{N_DEVICES} device(s) persisted and reported {:?} \
+                 \n    M8 NAME: all {}/{} device(s) persisted and reported {:?} \
                  ({} chars, {} bytes -- the widest name the wire admits), previewed before \
-                 keygen and acked only after NameStore::save returned Ok",
+                 keygen and acked only after NameStore::save returned Ok\
+                 \n    M10 CANCEL: {cancelled} got Naming(Preview) THEN Cancel and committed no \
+                 name at all, while {recovered} got the SAME TWO FRAMES REVERSED and committed \
+                 the byte-exact one -- so `Cancel` dropping `pending_name` is what decided it, \
+                 not a preview that failed to arrive",
                 kg.id,
                 started.elapsed(),
                 found.threshold(),
@@ -3123,6 +3670,7 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
                 QUIZ_POSITIONS,
                 r.typed.map_or("?".to_string(), |n| n.to_string()),
                 device_names.len(),
+                N_DEVICES - 1,
                 DEVICE_NAME,
                 DEVICE_NAME.chars().count(),
                 DEVICE_NAME.len(),
@@ -3134,13 +3682,9 @@ fn one_pass(stub: &str, chunk: usize, t0: &Instant, expect: Expect) -> Result<()
             // them ever printed their own PASS line. A harness that leaks a
             // process per run is a harness that will eventually be debugged as
             // "the pty is busy".
-            reap(&mut child);
             Ok(())
         }
-        Err(e) => {
-            reap(&mut child);
-            Err(e)
-        }
+        Err(e) => Err(e),
     }
 }
 
@@ -3322,7 +3866,32 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// A failing harness must not leave the stub parked on a pty forever.
-fn reap(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
+/// Owns the stub child so it is killed and waited on **every** exit from
+/// [`one_pass`], and not only the two the function used to spell out.
+///
+/// A `Drop` impl and not two more `reap` calls, because the leak was not in the paths
+/// anyone had thought about. COUNTED, because the first version of this note got it wrong
+/// in both the number and the place and review caught it: `one_pass`'s `let outcome = loop`
+/// contains **ZERO** `bail!`s — it ends every failing lap with `break Err(..)`, 29 of them,
+/// which is precisely why those laps DID reach the reaping. The leak is in the **15**
+/// `bail!`s of the PASS block, which sits inside `match outcome`'s `Ok(())` arm and
+/// therefore BEFORE that arm's own `reap`; `bail!` expands to `return`, so each of the 15
+/// left the function with the child alive. (31 is the FILE-wide count across five
+/// functions, and the note said 31 "in the PASS block, inside the loop", which was two
+/// errors in one clause.) Add every `?` in the same block and whatever the next assertion
+/// brings, and it is exactly the shape that wants an owner rather than a call.
+///
+/// MEASURED, and the note that used to sit on the success-path reap predicted the
+/// symptom without connecting it to this cause: three FAILING runs in a row left three
+/// stubs at PPID 1, each holding a pty master until its own 240 s watchdog fired, and
+/// the next run died at `TTYPort::pair: No such device or address` — a message that
+/// points at the OS rather than at the leak. A harness whose whole job is naming a
+/// failure precisely must not mis-diagnose its own.
+struct Reaped(Child);
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
