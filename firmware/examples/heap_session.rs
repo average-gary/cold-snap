@@ -69,10 +69,23 @@
 //!
 //!   * `--release`: exit 0, `NULLS: 0`. Footprint high-water **60,512 B of 65,536
 //!     (5,024 B spare)**. Peak requested 54,496 B, largest single allocation
-//!     11,520 B.
-//!   * debug: exit 101, `NULLS: 4`, first in phase `keygen` requesting 2,304 B.
-//!     Footprint **65,048 B of 65,536 (488 B spare)**. Peak requested 61,148 B,
-//!     largest single 13,824 B.
+//!     11,520 B. RE-MEASURED 2026-09-12, unchanged in every figure.
+//!
+//! THE DEBUG FIGURES ARE A DATED ONE-OFF AND CANNOT BE RE-DERIVED, which is stated
+//! here rather than left for a reader to discover by trying. Taken **2026-09-11**,
+//! on the commit that added the guard below and before it was added: exit 101,
+//! `NULLS: 4`, first in phase `keygen` requesting 2,304 B, footprint 65,048 B of
+//! 65,536 (488 B spare), peak requested 61,148 B, largest single 13,824 B.
+//!
+//! They are UNFALSIFIABLE BY CONSTRUCTION today, and deliberately so: the first
+//! statement of `main` refuses the debug profile with exit 2, so nobody following
+//! this file's own instructions can reproduce them. Reproducing them means
+//! temporarily deleting that guard — the `if cfg!(debug_assertions)` block — and
+//! nothing else. Do not read them as a measurement this file still makes; read them
+//! as the record of the wrong answer that made the guard necessary. **The guard is
+//! not to be relaxed to make them re-derivable, and no override env var may be
+//! added**: an escape hatch here would be taken by the next person to hit it, which
+//! is the whole failure being fixed.
 //!
 //! The two largest-single figures are consistent with one and the same vector of
 //! curve points — 11,520 = 96 x 120 B, 13,824 = 96 x 144 B — i.e. `Point` is 20%
@@ -727,10 +740,12 @@ fn main() {
              WHY: `secp256kfun`'s `Point` is larger in debug (144 B vs 120 B, derived from this \
              example's own 2026-09-11 figures), so the arena over-fills and the NULLS a debug \
              run reports are an artifact of the profile, NOT a defect in the firmware. \
-             Release: 60512 B footprint, 0 nulls. \
-             Debug: 65048 B, 4 nulls. On the 32-bit device the per-block rounding overhead \
-             halves, so the RELEASE figure is the conservative one; the debug figure is \
-             neither conservative nor meaningful.\n  \
+             Release: 60512 B footprint, 0 nulls (re-measured 2026-09-12). \
+             Debug: 65048 B, 4 nulls — a DATED ONE-OFF from 2026-09-11 that this guard \
+             makes unreproducible, quoted so you can recognise what you would have got, \
+             not offered as a figure you can check. On the 32-bit device the per-block \
+             rounding overhead halves, so the RELEASE figure is the conservative one; the \
+             debug figure is neither conservative nor meaningful.\n  \
              FIX: re-run with --release:\n  \
              cargo run --release --target aarch64-apple-darwin -p coldsnap_firmware \
              --example heap_session \

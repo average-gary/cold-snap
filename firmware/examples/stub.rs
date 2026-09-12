@@ -1142,7 +1142,7 @@ fn approved(
         // that is ON THE SCREEN acks — and `COLDSNAP_GLASS_KEYS=1yy`, which used to
         // PASS, now fails with no source mutation at all.
         DeviceToUserMessage::CheckKeyGen { .. } => digit.accepts(key),
-        // FAIL CLOSED — `hsm_ux.py:58`'s `refused = (ch != confirm_char)`,
+        // FAIL CLOSED — `hsm_ux.py:66`'s `refused = (ch != confirm_char)`,
         // inverted. Only the digit that is ON THE SCREEN signs; `x`, another
         // charset digit and a key that is not on the pad are all refusals.
         DeviceToUserMessage::SignatureRequest { .. } => digit.accepts(key),
