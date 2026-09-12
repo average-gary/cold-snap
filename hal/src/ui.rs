@@ -2830,6 +2830,32 @@ pub fn backup_quiz(frame: &mut Frame, question: &str, options: [&str; 3], select
 // Screen 8 — address verification
 // ---------------------------------------------------------------------------
 
+/// `"compare only"` — the footer of the one screen in this module that asks for
+/// **no keypress at all**.
+///
+/// # This printed `"1=ok x=no"` until 2026-09-12, and both halves were false
+///
+/// Address verification authorises nothing: `frostsnap_coordinator`'s
+/// `VerifyAddressProtocol` has no `Completion::Success` path and consumes no device
+/// message (`verify_address.rs:52-58`), upstream's own device routes it to
+/// `Workflow::DisplayAddress` rather than `Workflow::prompt`
+/// (`esp32_run.rs:640-650`), and `firmware`'s arm returns `Shown::Info`, so nothing
+/// is parked and `main.rs`'s loop never touches the pad. So `1` bought nothing and
+/// `x` refused nothing.
+///
+/// Worse, it was the exact shape [`NEXT_LEGEND`] exists to avoid:
+/// `firmware/examples/stub.rs`'s `advertised_key` treats `<k>=<what>` on the last
+/// row as a plain-press consent legend and returned `b'1'` for this screen — on a
+/// screen with no consent to give. That was a latent defect in shipped `ui.rs`,
+/// present before the firmware arm that now draws it existed, which is why
+/// `no_screen_that_authorises_nothing_advertises_a_consent_key_to_the_stub_scraper`
+/// covers this footer as well as the PIN ones.
+///
+/// Not parenthesised like `(9)next` either, because there is no key to parenthesise:
+/// the honest instruction is what the human should DO, which is compare this string
+/// against the one their coordinator is showing.
+const ADDRESS_VERIFY_LEGEND: &str = "compare only";
+
 /// Screen 8: show a receive address in full for comparison against the
 /// coordinator's, with its derivation path.
 ///
@@ -2838,9 +2864,23 @@ pub fn backup_quiz(frame: &mut Frame, question: &str, options: [&str; 3], select
 /// a truncated address that looks complete is upstream's `chunk_address` bug
 /// (`address_display.rs:88-96` silently drops the tail past 72 chars).
 ///
-/// `path` is coordinator-supplied and unbounded (`derivation_index` is a raw
-/// `u32`), so it is truncated at 16 columns; the address is the security payload
-/// and is never truncated.
+/// `path` is drawn as given and clipped at [`COLS`] if it is longer, which is safe
+/// because it is a LABEL and not the payload: `firmware`'s only caller composes a
+/// `Buf<16>` of `"Recv #"` plus the decimal index, so 6 + 10 <= 16 = `COLS` and
+/// nothing is ever dropped. The address is the security payload and is never
+/// truncated — `check_address` plus the `frame.wrap(..) != n` check in
+/// `address_block` refuse instead.
+///
+/// `seed` only picks WHICH two interior chunks are inverted, so a caller that
+/// derives it from wire data gives a coordinator the highlight positions and
+/// nothing else. Upstream draws it from its RNG (`esp32_run.rs:645`); this tree
+/// already uses a deterministic index on the higher-stakes screen
+/// ([`SignPages::render`] passes the recipient index), and `firmware` passes the
+/// derivation index here for the same reason: `prompt_screen_at` holds no RNG.
+/// ponytail: coordinator-chosen highlight positions, ceiling is that an attacker
+/// picks which middle chunks get emphasis (it cannot suppress them — `chunks` is
+/// 15 for every p2tr address, so `pick_highlights` never returns `None`); upgrade
+/// path is to thread the caller's `ConfirmDigit` RNG down if that ever matters.
 pub fn address_verify(
     frame: &mut Frame,
     address: &str,
@@ -2851,7 +2891,7 @@ pub fn address_verify(
     frame.clear();
     frame.text(0, 0, path);
     address_block(frame, 2, address, seed)?;
-    frame.text(0, 7, "1=ok x=no");
+    frame.text(0, FOOTER_ROW, ADDRESS_VERIFY_LEGEND);
     Ok(())
 }
 
@@ -5450,11 +5490,19 @@ mod tests {
     }
 
     #[test]
-    fn no_pin_screen_advertises_a_consent_key_to_the_stub_scraper() {
+    fn no_screen_that_authorises_nothing_advertises_a_consent_key_to_the_stub_scraper() {
         // `firmware/examples/stub.rs`'s `advertised_key` reads `<k>=<what>` on the
         // last row as a plain-press yes key. No PIN screen authorises a
         // signature, so none of them may match that shape — the same trap
         // `NEXT_LEGEND` documents.
+        //
+        // Renamed from `no_pin_screen_advertises_..` on 2026-09-12 because the class
+        // was never about PINs: `address_verify` — which authorises nothing at all,
+        // has no `Completion::Success` coordinator-side and parks nothing — drew
+        // `"1=ok x=no"` and so handed the scraper a `b'1'`. Its footer is in the loop
+        // below now, so the rule is enforced on the class and not on one module's
+        // worth of it. A rename and an extension, not a new test: the count does not
+        // move.
         let c = confirm();
         let mut f = Frame::new();
         let mut footers = Vec::new();
@@ -5472,6 +5520,8 @@ mod tests {
         footers.push(("checking", row_text(&f, FOOTER_ROW)));
         pin_words(&mut f, true, ["abandon", "ability"]).unwrap();
         footers.push(("words", row_text(&f, FOOTER_ROW)));
+        address_verify(&mut f, ADDR, "Recv #17", 3).unwrap();
+        footers.push(("address verify", row_text(&f, FOOTER_ROW)));
         for (name, row) in footers {
             assert_ne!(
                 row.as_bytes().get(1),
