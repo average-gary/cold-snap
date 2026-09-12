@@ -1634,8 +1634,15 @@ fn boot() -> ! {
     ///
     /// Ends a backup flow, through [`take_glass`] — see there. With no panel there is
     /// nothing to overwrite and nothing to end: every producer of a [`Flow`] needs a
-    /// panel ([`show_backup_page`] and [`show_entry_page`] both take one by `&mut`), so
-    /// the cursor is already `None` on that leg.
+    /// panel ([`show_backup_page`], [`show_entry_page`] and [`show_quiz`] all take one by
+    /// `&mut`), so the cursor is already `None` on that leg. Stronger, and measured:
+    /// `panel` is bound once in `boot` and never reassigned, so on a panel-less device the
+    /// re-park sites cannot fire either — the loop can only take a cursor off the glass if
+    /// one of those three put it there first.
+    ///
+    /// (Prose, and not that call spelled out: `production_source()` includes doc comments,
+    /// so a counted pin sees them. MEASURED — spelling it out failed
+    /// `a_parked_prompt_is_serviced_once_per_iteration_and_never_in_a_loop` with 2 != 1.)
     fn refuse(panel: Option<&mut display::Panel>, glass: &mut Option<Flow>) {
         let Some(panel) = panel else { return };
         let mut frame = ui::Frame::new();
@@ -1654,12 +1661,22 @@ fn boot() -> ! {
     /// named on this screen after an unplug. `"no name"` is the *unnamed* case only.
     ///
     /// ponytail: the share row still says "no share held" even when step 8c reloaded
-    /// one. `ui::standby`'s third field is a share INDEX and `frostsnap_core`'s
-    /// `ShareIndex` is a scalar with no honest `u32` form
-    /// (`schnorr_fun::frost::ShareIndex`), so the only way to fill it here is to
-    /// invent a number. Fixing it means `ui::standby` taking a `ShareImage`, which is
-    /// `hal/src/ui.rs`'s call; until then a held share is visible over
-    /// `RequestHeldShares`, which does answer from flash.
+    /// one — `Session::open` replays the keygen triple into the signer, and this function
+    /// passes `None` literally. Both reasons this note used to give for leaving it were
+    /// FALSE, and are corrected here rather than deleted because they priced the fix
+    /// wrong: `ui::standby` already takes `held_share: Option<u32>` and already renders
+    /// `share #<n>` from it, so `hal/src/ui.rs` needs no change at all; and
+    /// `u32::try_from(ShareIndex)` does exist — `prompt_screen_at` already uses it for
+    /// exactly this display, composing the `share #<index>` row of the reveal and check
+    /// consent screens. No number needs inventing.
+    ///
+    /// What is actually missing is a `Session` accessor: nothing on its public surface
+    /// answers "which share do you hold", so the true price is one `pub fn` over
+    /// `self.signer.held_shares()` in `lib.rs` — the same source `RequestHeldShares`
+    /// reads. Still not done, on the one reason that survives: `ui::standby`'s own doc
+    /// says the screen is not security-load-bearing, and a coordinator already sees the
+    /// held share over `RequestHeldShares`, which answers from flash. The cost is a bench
+    /// user who cannot tell a share-holding device from a blank one.
     fn idle<F: NorFlash + core::fmt::Debug>(session: &Session<'_, F>, panel: &mut display::Panel) {
         let mut frame = ui::Frame::new();
         let name = session.stored_name();
@@ -3825,6 +3842,30 @@ mod tests {
             src.contains("fn take_glass(panel: &mut display::Panel, frame: &ui::Frame, glass: &mut Option<Flow>) {\n        *glass = None;\n        let _ = panel.show(frame.as_bytes());"),
             "the drop and the redraw must be the same two lines, in that order"
         );
+        // AND THE CALLER THAT COMPOSES WHAT IT SHOWS, all four lines in order: no panel
+        // is a silent return, the frame is fresh, the refusal goes into it, and only
+        // then is the glass taken. `refuse` is `take_glass`'s pair and had no pin at
+        // all.
+        //
+        // MEASURED green under two mutations, neither of which any count here can see —
+        // `refuse` does not call `panel.show(` itself, so that count stays 10: deleting
+        // `ui::refusal(&mut frame);` (together with the `mut` on the line above: leaving
+        // that `mut` warns `variable does not need to be mutable` under
+        // `cargo build --release`, MEASURED, so the realistic single edit is both lines),
+        // and swapping it with the `take_glass` line. Either way all five refusal sites in
+        // the loop push an all-pixels-off frame, so the device says no by going dark and
+        // a bench user cannot tell that from a dead panel.
+        //
+        // The `let Some(panel) = panel else` line is in the literal for ORDER, not as
+        // coverage: `take_glass` needs `&mut display::Panel`, so the type already
+        // forbids deleting it.
+        assert!(
+            src.contains(
+                "fn refuse(panel: Option<&mut display::Panel>, glass: &mut Option<Flow>) {\n        let Some(panel) = panel else { return };\n        let mut frame = ui::Frame::new();\n        ui::refusal(&mut frame);\n        take_glass(panel, &frame, glass);\n    }"
+            ),
+            "a refusal must be composed BEFORE the glass is taken, or every policy `no` \
+             is an empty frame"
+        );
         assert_eq!(
             src.matches("panel.show(").count(),
             10,
@@ -3839,6 +3880,91 @@ mod tests {
             src.matches("take_glass(panel, &frame, glass)").count(),
             2,
             "`draw_prompt` and `refuse` are the two things that take the glass"
+        );
+        // AND THE ONE LEG THAT MUST NOT REACH IT. Deleting this guard reads as a pure
+        // simplification, because the `_ => None` arm four lines below already answers
+        // `Shown::Nothing` with the same `None`. What changes is that `take_glass` then
+        // runs with a frame nothing was drawn into.
+        //
+        // `FinalizeKeyGen` is pushed as a prompt on EVERY keygen (`Session::run`'s
+        // `commit_name` arm) and `prompt_screen_at`'s tail maps it to
+        // `Ok(Shown::Nothing)`, so the deletion ends every completed keygen on an
+        // all-pixels-off panel and drops whatever backup flow was on the glass with it.
+        // That is the happy path, not a fault path — the only surviving mutation in this
+        // area that fires without a coordinator misbehaving.
+        //
+        // MEASURED: every other pin in this test is green under it, because it adds no
+        // `show` and moves no count — it reroutes an existing one (`panel.show(` 10,
+        // `*glass = None` 1, `glass =` 13, `take_glass(panel, &frame, glass)` 2), and
+        // no other assertion in this module looks at `Shown::Nothing`. It also catches the
+        // widening to `Ok(Shown::Nothing) | Err(_)`, which would return before the
+        // refusal `prompt_screen_at` already composed for an undisplayable prompt is
+        // shown.
+        //
+        assert!(
+            src.contains(
+                "if matches!(shown, Ok(Shown::Nothing)) {\n            return None;\n        }"
+            ),
+            "an informational prompt must not reach `take_glass`: nothing was drawn into \
+             the frame, so taking the glass shows an empty one and drops a live flow"
+        );
+        // AND ITS POSITION, which the assertion above does NOT cover — the residue that
+        // came with it, measured rather than argued about. HOISTING
+        // `take_glass(panel, &frame, glass);` to the line after `ui::Frame::new()` leaves
+        // the guard, the count, the flash gate and all 168 tests GREEN (measured: `cargo
+        // test -p coldsnap_firmware` exit 0, `cargo build --release` exit 0 with 0
+        // warnings and `.text` 24 B SMALLER), and it is the worst edit in this function:
+        // the frame reaches the glass BLANK, the composed prompt screen never reaches it
+        // at all, and `draw_batch` still parks the prompt and its digit — a consent
+        // question that is answerable with nothing on the glass, which is the one thing
+        // this device may never do.
+        //
+        // Pinning the guard's place is enough to pin the composition's: the guard reads
+        // `shown`, so the compiler already forbids it from preceding
+        // `prompt_screen_at`, and anything after the guard is therefore after the
+        // composition too.
+        //
+        // Scoped to this function's TEXT, not the image, for the reason
+        // `show_backup_page_body` below is: `take_glass(panel, &frame, glass);` occurs
+        // twice in production, and a bare `find` over the image would compare against
+        // `refuse`'s copy and flip meaning if the two functions were ever reordered.
+        let draw_prompt_body = src
+            .split_once("fn draw_prompt(")
+            .expect("`draw_prompt` is in the image")
+            .1
+            .split_once("\n    /// ")
+            .expect("a doc comment follows it")
+            .0;
+        let guard_at = draw_prompt_body
+            .find("if matches!(shown, Ok(Shown::Nothing)) {")
+            .expect("the assertion above has already pinned the guard's existence");
+        let take_glass_at = draw_prompt_body
+            .find("take_glass(panel, &frame, glass);")
+            .expect("the count above has already pinned both calls to `take_glass`");
+        assert!(
+            guard_at < take_glass_at,
+            "the glass must be taken AFTER the frame is composed and after the \
+             informational leg has returned, or a prompt is parked over a blank screen; \
+             `draw_prompt`'s body is:\n{draw_prompt_body}"
+        );
+        // The arm `take_glass`'s own doc calls "the arm that was the fail-open", pinned
+        // as BOTH faults. The mutation is the NARROWING to `Err(Fault::Refused(_))`
+        // alone — not the collapse into the silent `Err(_fault) => {}` below it, which is
+        // already a build failure: this arm is the only production site in this file that
+        // names `Fault`, so collapsing it makes the import unused and `unused_imports`
+        // fires under the 0-warnings gate — MEASURED on `cargo build --release`, and only
+        // there, because `boot` is `#[cfg(target_arch = "arm")]` and the host build that
+        // runs this test never compiles it. The narrowing keeps `Fault` used and keeps
+        // both counted `refuse` variants intact, and a `Fault::Store` — flash refusing
+        // the share — then draws NOTHING and leaves the flow cursor live, against the
+        // three-bullet policy argued 40 lines above the arm: not an ack, not a panic,
+        // not a hold, but a screen.
+        assert!(
+            src.contains(
+                "Err(Fault::Refused(_) | Fault::Store(_)) => {\n                                    refuse(panel.as_mut(), &mut glass)\n                                }"
+            ),
+            "a flash that refused the share earns the same screen as a policy refusal, \
+             and the same end of the flow"
         );
         assert!(
             src.contains("glass = Some(Flow::Reveal(state))"),
@@ -3856,6 +3982,21 @@ mod tests {
                 "RevealScreen::Page => {\n                let _ = panel.show(frame.as_bytes());"
             ),
             "a rendered backup page must reach the panel"
+        );
+        // And the fourth leg, on the same reasoning and with the same direction. Deleting
+        // `ui::refusal(&mut frame);` here leaves
+        // `RevealScreen::Refuse => { let _ = panel.show(frame.as_bytes()); }`, which
+        // compiles with 0 warnings (`ui::refusal` has three other call sites) and keeps
+        // `panel.show(` at exactly 10, so no count above can see it; swapping the two
+        // lines is the same. `Session::show_backup` leaves `frame` untouched on every
+        // `Err` — both of its error legs return before the render — and this function
+        // builds a fresh `ui::Frame::new()` per call, so what reaches the glass under the
+        // mutation is BLANK. A diagnosability defect, not a share still lit.
+        assert!(
+            src.contains(
+                "RevealScreen::Refuse => {\n                ui::refusal(&mut frame);\n                let _ = panel.show(frame.as_bytes());"
+            ),
+            "the reveal's refusal leg must compose the refusal before it shows the frame"
         );
         // AND THE CURSOR IS NOT REBUILT AT THE CALL SITE. `show_backup_page` forwards
         // [`reveal_draw`]'s `next` verbatim; the moment it constructs a `Reveal` of its
