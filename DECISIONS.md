@@ -379,7 +379,7 @@ until 2026-09-10, and by then all three existed.** The one store is
 `firmware/src/entry.rs:220`, `SCB_VTOR.write_volatile(memmap::FLASH_ISR_BASE)`, and it
 is the **first** thing `init_hardware` does — before `.bss` zeroing and before the
 allocator, exactly as this section required, because NMI is unmaskable and reachable
-from a flash double-bit ECC error. `firmware/src/main.rs:1214-1221` is the full 16-entry
+from a flash double-bit ECC error. `firmware/src/main.rs`'s `VECTOR_TABLE` is the full 16-entry
 table, `KEEP`-ed at `0x0802_0000` by `link.x` and asserted to start there, whose 14
 fault entries are all `fault_trampoline` (`main.rs:1238`) — which panics with a
 `&'static str` (deliberately unformatted, so the fault path cannot itself allocate) and
@@ -555,7 +555,7 @@ argument about a Python constant.
   a `&mut [u8; FRAME_LIMIT]`. The raise costs 4,120 → 8,192 B, **1.25% of
   640 KiB**. **This ended "Still SRAM nothing in this tree allocates yet, since
   nothing places a `Link`" until 2026-09-10.** `boot()` places one:
-  `comms::Link::new()` in the event loop's own frame (`firmware/src/main.rs:1950`),
+  `comms::Link::new()` in the event loop's own frame (`firmware/src/main.rs`'s `boot`),
   deliberately in `boot`'s frame and not a `static`, so it costs 4 KiB of the
   **548,776 B** stack runway rather than `FRAME_LIMIT` bytes of `.bss` for the entry
   to zero on every boot. It is the largest single object on that stack, ahead of
@@ -614,7 +614,7 @@ sufficient for what the device constructs.** **This paragraph read "REQUIRED and
 UNIMPLEMENTED … All three live in message-construction code that does not exist in
 this tree — no event loop, no bin target, no caller of `encode_frame` outside tests
 — so none was written" until 2026-09-10, and every clause of that was false by
-then.** All three live in `Outbox::push` (`firmware/src/lib.rs:422`), the one funnel
+then.** All three live in `Outbox::push` (`firmware/src/lib.rs`), the one funnel
 every device-bound body passes through: a multi-segment `NonceResponse` is split one
 frame per segment; `Debug` is cut to `DEBUG_MESSAGE_LIMIT` = 256 B on a UTF-8
 boundary; and an over-large `HeldShares2` is refused **whole** as
