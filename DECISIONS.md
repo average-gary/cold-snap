@@ -230,8 +230,23 @@ that mattered — `ECMULT_WINDOW_SIZE=4`, `ECMULT_GEN_PREC_BITS=2`
    `hex-conservative` dep therefore compiles with neither and fails with 144
    errors; `alloc` is forced on via an explicit dep line in
    `frostsnap_core/Cargo.toml`. This is a workspace-shaped fix, not upstream's.
-3. `secp-lowmemory` trades flash for EC speed. **Signing latency on a 120 MHz
-   Cortex-M4 is UNMEASURED** and is now the highest-value open question.
+3. **`secp-lowmemory` trades flash for EC speed IN GENERAL, and for exactly nothing on
+   this port. MEASURED 2026-09-13.** This consequence read *"`secp-lowmemory` trades
+   flash for EC speed. **Signing latency on a 120 MHz Cortex-M4 is UNMEASURED** and is
+   now the highest-value open question."* until 2026-09-13. Removing the feature and
+   rebuilding gives **379,648 B on both sides**, section for section; the release ELF
+   holds 23 `secp256k1` symbols and all of them are field arithmetic, point
+   decompression or a parse, while `precomputed_ecmult.c` and
+   `precomputed_ecmult_gen.c` survive only as **zero-size `df` file symbols** either
+   way. Decision 3 moved every EC operation to `secp256kfun`, leaving two C libsecp
+   calls in the device graph and both are PARSES — so the window-size knobs govern code
+   that is not linked and cannot cost a cycle here. Signing latency IS still unmeasured
+   and is still an open question, but it belongs to `secp256kfun`'s `field_10x26` /
+   `scalar_8x32`, which no feature flag reaches; a host bench cannot answer it because
+   the host links `field_5x52` / `scalar_4x64`, different source files at a different
+   limb width. PLAN.md §9 item 1 carries both measurements. **The feature stays**: it
+   costs nothing and it is the standing guard for the day some future code does reach an
+   ecmult.
 
 **What this forecloses.** A `cc`-free, C-free build; and the possibility of
 reporting "pure Rust" without qualification. Also foreclosed: deleting the
@@ -302,8 +317,11 @@ without hardware: SSD1306 init/timing and physical legibility; keypad
 scan/debounce and its randomised timing; the callgate in any form (decision 2);
 the TRNG and its health checks (PLAN.md §5.1 — **two** sources, not three:
 SE1 is fed our own TRNG and SE2 returns a static page); panic→recovery; real STM32
-program/erase semantics and power-loss durability; and `secp-lowmemory` signing
-latency. Renode would cover the core, flash controller, SPI and TRNG register
+program/erase semantics and power-loss durability; and FROST signing latency in
+`secp256kfun` (**this read "`secp-lowmemory` signing latency" until 2026-09-13**; that
+feature is inert for this image, measured — decision 4 consequence 3 — so the latency
+is pure-Rust curve math, not the C library). Renode would cover the core, flash
+controller, SPI and TRNG register
 interface only — not the PCROP callgate, not the external SE parts.
 
 **Carried into Phase 3 as a hard constraint, and re-measured there.** The 2,060
@@ -497,9 +515,22 @@ implementations. The following survived as confirmed defects anyway:
    reference checkout, i.e. this project's own earlier research scratch. They
    did not compile (26× `E0433` on `frostsnap_comms`), which broke
    `cargo test -p frostsnap_core` wholesale, so they were moved to
-   `tools/research-scratch/`. The full suite is now **40 passing across 11
-   binaries** with `--features coordinator`, including both wire-format
-   backward-compat guards.
+   `tools/research-scratch/`. The full suite is now **63 passing across 12 test
+   binaries** with `--features coordinator` — the 11 `.rs` files in
+   `vendor/frostsnap/frostsnap_core/tests/` plus the `--lib` target, 21 lib + 42
+   integration — including both wire-format backward-compat guards. (**This read
+   "40 passing across 11 binaries", present tense, until 2026-09-13**, stale by 23
+   tests. `vendor/README.md`'s "13 binaries" for the same suite was a
+   `grep -c '^test result:'` LINE count whose 13th line is `Doc-tests
+   frostsnap_core` **running zero tests** (gate-log lines 137-139); the crate's only
+   doc fence is a non-Rust `text` fence at `src/tweak.rs:13`, so there is nothing for
+   that harness to run. `tests/common/` and `tests/env/` are `mod` helper dirs with no
+   `main.rs`, so cargo builds no target from them (this read "hold `mod.rs` only" until
+   2026-09-13 and `tests/env/` also holds a 12,727 B `test_env.rs`; the conclusion was
+   right for the right reason, and the same commit already used this wording at its two
+   sibling sites). Commands: `ls
+   vendor/frostsnap/frostsnap_core/tests/*.rs` = 11, and the gate log's own
+   `test result:` lines.)
 4. ~~**One new clippy warning, contradicting a "clippy clean" claim.**~~
    **FIXED.** `bitcoin_transaction.rs:524` raised `clippy::uninlined_format_args`
    (that citation no longer locates anything: `:524` is `pub fn spk` now and the `format!`

@@ -7,7 +7,7 @@
 //! the constraints were not previously written down anywhere.
 //!
 //! 1. **At or above `BL_SRAM_BASE = 0x2009_e000`** — the callgate wipes that 8 K on
-//!    entry *and* exit (`startup.S:124-134,148-156`) and `crate::callgate` enters it
+//!    entry *and* exit (`startup.S:124-134,148-157`) and `crate::callgate` enters it
 //!    for every SE operation. Already recorded.
 //! 2. **Across `DFU_FLAG_ADDR = 0x2000_8000`, 12 bytes — NEW, and it is a remote
 //!    brick path, not merely a layout nit.** The bootloader `memcmp`s that address
@@ -301,7 +301,7 @@
 //!    `0xdeadbeef` and refuse (return null → OOM → counted reset) until `init`
 //!    has set it. Fail-closed, and loud instead of silent.
 //! 3. **The top 8 K at [`crate::memmap::BL_SRAM_BASE`] is not available.** The
-//!    callgate wipes it on every entry **and** exit (`startup.S:124-134,148-156`)
+//!    callgate wipes it on every entry **and** exit (`startup.S:124-134,148-157`)
 //!    and [`crate::callgate`] enters it for every SE operation. This is a hard
 //!    refusal, independent of allocator choice.
 //! 4. **PSRAM is uncharacterised** (PLAN.md §9 item 5). If it lands, the available
@@ -466,8 +466,10 @@ pub const MEASURED_ARENA_FOOTPRINT_BYTES: usize = 60_512;
 /// Calling the clear at the point firmware would — right after `keygen_finalize`
 /// stages the share — leaves the full flow working: keygen, nonce replenishment, a
 /// signature that verifies, and a `HeldShares2` round-trip, at both chunk sizes.
-/// Exercised by `hal/examples/stub.rs`'s `STUB_CLEAR_TMP` (both settings runnable, so
-/// the comparison is the evidence rather than a one-way edit).
+/// Exercised by `firmware/examples/stub.rs`'s `STUB_CLEAR_TMP` (both settings
+/// runnable, so the comparison is the evidence rather than a one-way edit). **This
+/// cited `hal/examples/stub.rs` until 2026-09-13; there is no such file, and
+/// `STUB_CLEAR_TMP` is read in `firmware/examples/stub.rs`.**
 ///
 /// Two things worth knowing before firmware relies on it:
 ///

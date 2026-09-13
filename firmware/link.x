@@ -71,7 +71,9 @@ MEMORY
 
 /* Roots the reset entry for --gc-sections and silences the "cannot find entry
  * symbol" warning. `_start` does not exist here: the PCROP bootloader owns reset
- * (`startup.S:87-95`) and jumps to a fixed address, so there is no libc startup. */
+ * (`startup.S:88-112`, `reset_entry:` through the `bx lr` hand-off — this read
+ * `87-95` until 2026-09-13, which stops before the jump it names) and jumps to a
+ * fixed address, so there is no libc startup. */
 ENTRY(entry_point)
 
 SECTIONS

@@ -202,10 +202,19 @@ pub mod memmap {
     /// because one `NonceAbSlot` costs exactly 2 sectors
     /// (`nonce_slots.rs:24-31`'s `split_off_front(2)`).
     pub const FS_NONCE_OFFSET: u32 = FS_IDENTITY_OFFSET + FS_IDENTITY_LEN;
-    /// 4 nonce streams × 2 sectors = 32 K. The stream count matches
-    /// `hal/examples/stub.rs:424`, the only place in the tree that picks one; it
-    /// is a guess at max concurrent streams, and raising it later moves
-    /// everything above it.
+    /// 4 nonce streams × 2 sectors = 32 K. The stream count matches the flutter
+    /// coordinator's `N_NONCE_STREAMS = 4`
+    /// (`frostsnapp/rust/src/coordinator.rs:50`, the sibling checkout — that crate
+    /// is not vendored — already cited in PLAN.md §7's "Three device-side caps",
+    /// under "One nonce segment per frame"; the SECTION and not a line, because
+    /// this pairing has rotted three times). **Nothing in this tree
+    /// picks 4**: `hostcheck` deliberately asks for one
+    /// (`hostcheck/src/main.rs:828` `NONCE_STREAMS`). It is a guess at max
+    /// concurrent streams, and raising it later moves everything above it.
+    ///
+    /// This cited `hal/examples/stub.rs:424` as "the only place in the tree that
+    /// picks one" until 2026-09-13; that file does not exist (`ls hal/examples` =
+    /// `heap_lifo.rs`, `heap_profile.rs`, `ui_render.rs`).
     pub const FS_NONCE_LEN: u32 = 32 * 1024;
 
     /// Where the keygen share record lives (`coldsnap_firmware::store`).
@@ -217,7 +226,9 @@ pub mod memmap {
     /// erase of copy A would take copy B with it if `DBANK` turns out to be 0 —
     /// the hazard `flash::ab_copies_would_share_one_page_at_dbank_zero` already
     /// pins for the nonce region — which would make the A/B redundancy of the one
-    /// record on this device that has **no backup path** imaginary.
+    /// record on this device that has **no recovery install** imaginary. (A 25-word
+    /// backup is a route back, but only if the holder already took one; the device
+    /// itself keeps no second copy.)
     ///
     /// Like [`FS_IDENTITY_OFFSET`], this cannot change once a unit ships: moving
     /// it orphans the share, and the share cannot be re-derived.
@@ -253,8 +264,8 @@ pub mod memmap {
     /// buffer to lie inside `[SRAM_BASE, BL_SRAM_BASE)` and to be writable —
     /// a `static` in flash returns `EPERM` (`dispatch.c:39-62`). (2) Nothing of
     /// ours may live at or above it: the callgate **wipes** that 8 K on entry
-    /// before dispatching and again on exit (`startup.S:124-134,148-156`), and
-    /// `reset_entry` calls the gate on every boot (`startup.S:90-95`). This is
+    /// before dispatching and again on exit (`startup.S:124-134,148-157`), and
+    /// `reset_entry` calls the gate on every boot (`startup.S:88-98`). This is
     /// why the panic counter is in an RTC backup register and not in SRAM —
     /// PLAN.md §9.2's SRAM suggestion must be struck.
     pub const BL_SRAM_BASE: u32 = 0x2009_e000;

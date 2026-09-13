@@ -86,7 +86,7 @@ re-arms one of them.
 | `frostsnap_core/src/device_nonces.rs` | `NoncesUnavailable` gained `SlotUnreadable`, `WriteVerifyFailed`, `SkipTooLarge` (`:671-685`) + Display arms | additive |
 | `frostsnap_core/src/device_nonces.rs` | `NonceJob::n_nonces_to_generate` / `n_derivations_remaining` use `saturating_sub` | were subtraction, i.e. a debug-build overflow panic |
 | `frostsnap_core/src/device_nonces.rs` | stream-id `assert_eq!` at `:301` **left in place**, comment added | class (a): unreachable, the slot is reached through an `AbSlots` lookup keyed by that same id. Priority 3 — comment, no code churn. |
-| `frostsnap_embedded/src/ab_write.rs` | `AbSlot::try_write` returning new `pub enum AbWriteOutcome { Committed, CommittedSingleCopy(NorFlashErrorKind), NotCommitted(NorFlashErrorKind) }` (`:56`, `:214`) | **highest-value class (b) site.** `AbSlot::write` erases+writes **twice**; a flash error between the copies leaves a value that *is* committed and readable. A bare `Result` cannot say that, and collapsing it to `Err` would make callers discard good nonce state — nonce loss/reuse is the one failure that leaks the secret share. Writes the **older** slot first so `NotCommitted` is truthful. |
+| `frostsnap_embedded/src/ab_write.rs` | `AbSlot::try_write` returning new `pub enum AbWriteOutcome { Committed, CommittedSingleCopy(NorFlashErrorKind), NotCommitted(NorFlashErrorKind) }` (`:56`, `:214`) | **highest-value class (b) site.** `AbSlot::write` erases+writes **twice**; a flash error between the copies leaves a value that *is* committed and readable. A bare `Result` cannot say that, and collapsing it to `Err` would make callers discard good nonce state — nonce loss/reuse is the one failure that leaks the secret share. Writes the **older** slot first so `NotCommitted` is truthful. **That ordering is now GATED, not merely documented (2026-09-13).** `hal/tests/integration_frostsnap_over_hal.rs`'s `a_refused_write_after_a_single_copy_write_erases_the_older_copy_not_the_live_one` is the only test in the tree that reaches `AbSlot::try_write` from ASYMMETRIC A/B copies, and swapping the two `Slot::try_write` calls fails it and nothing else (exit 101, one named test). Before it, the swap was green in **FOUR** gates — hal 288, `frostsnap_embedded` 17, `frostsnap_core` 63, `coldsnap_firmware` 172, i.e. 540 tests compiled against this function and not one could see the erase order — because every other test reaches `try_write` from EQUAL copies, where the two orders are indistinguishable. The pin covers BOTH consumers, the nonce path via `NonceAbSlot::write_slot_versioned` and the share store via `ShareStore::persist_staged` (`firmware/src/store.rs`), because it is the same function: a re-vendor that reorders those two calls now fails a gate instead of silently reintroducing the defect. |
 | `frostsnap_embedded/src/ab_write.rs` | index exhaustion → `NotCommitted(OutOfBounds)` via `checked_add` (`:68`) | was an unchecked increment past the `u32::MAX` empty-slot sentinel |
 | `frostsnap_embedded/src/ab_write.rs` | `AbSlot::write` kept as a thin panicking wrapper over `try_write` (`:100`) | upstream's 4 callers all live in the non-vendored `device` crate and compile untouched |
 | `frostsnap_embedded/src/ab_write.rs` | `Slot::try_write -> Result<(), NorFlashErrorKind>` (`:158`); `Slot::write` now `#[cfg(test)]` (`:182`) | `BincodeFlashWriter`'s `Drop` asserts `buf_index == 0` (`partition.rs:318-325`), so an early return holding buffered bytes panics in the destructor. `flush()` takes self by value and zeroes `buf_index` before it can fail, so it is called before the encode result is inspected. |
@@ -196,8 +196,15 @@ Host-side tooling must request `coordinator` explicitly.
 
 `frostsnap_core`'s full test suite builds and passes — **63 tests across 12 test
 binaries** (11 files in `frostsnap_core/tests/` plus the `--lib` target; the 63 is exact —
-21 lib + 42 integration — but **this said "13 binaries" until 2026-09-12** and 13 is only
-right if the `Doc-tests` line is being counted, which it should not be) (51 before the `bitcoin_transaction.rs` work; 44 before the panic-site
+21 lib + 42 integration — but **this said "13 binaries" until 2026-09-12**. The hedge that
+followed, *"13 is only right if the `Doc-tests` line is being counted, which it should not
+be"*, is **upgraded to the fact 2026-09-13**: `grep -c '^test result:'` over the gate log
+IS 13, and the 13th line is `Doc-tests frostsnap_core` / `running 0 tests` — gate-log lines
+137-139 — so it is a harness carrying **ZERO** tests, the crate's only doc fence being a
+non-Rust `text` fence at `src/tweak.rs:13`. The two readings are therefore both correct
+about different things: 13 harnesses printed a `test result:` line, 12 binaries hold tests.
+`tests/common/` and `tests/env/` are `mod` helper dirs with no `main.rs`, so cargo builds
+no target from them, and `tests/proptest.proptest-regressions` is not a `.rs` file) (51 before the `bitcoin_transaction.rs` work; 44 before the panic-site
 work; 40 before `agg_nonce_count.rs`) with `--features coordinator` (that feature
 is required; the vendored `default = []` leaves the integration tests unable to
 resolve `frostsnap_core::coordinator`). `frostsnap_embedded --features std` is

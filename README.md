@@ -631,19 +631,57 @@ Current state against Mk4's 1,425,408-byte `FLASH_TEXT`
 | **All, as built** | **899,400** | **63.1% — fits** |
 | (without C `secp256k1-sys`) | 802,453 | 56.3% |
 
+**Read the first row as an RLIB SUM and nothing else, and do not "correct" it against the
+image.** Summing the sizes of every `rustsecp256k1_*` symbol in the linked ELF
+(`/usr/bin/objdump --syms target/thumbv7em-none-eabihf/release/coldsnap_firmware | grep -i
+rustsecp256k1`, sizes added by section) gives **6,088 B `.text` + 180 B `.rodata` + 4 B
+`.data` = 6,272 B** — 96,947 / 6,272 = **~15×** smaller, not the ~2.4× the whole table is
+over. That is not a defect in the 96,947: the rlib holds every table and every entry point
+`secp256k1-sys` compiles, and `--gc-sections` then drops all of it except field arithmetic,
+point decompression and two parses (§9 item 1 of PLAN.md, measured 2026-09-13). Replacing
+96,947 with an image figure would corrupt the rlib table it legitimately belongs to — the
+same two-variables-64-bytes-apart shape commit 9d199df records for `377,192`.
+
 **Re-measured 2026-09-10 in a clean dedicated target dir. The rows read 436,543 /
 860,898 / 60.4% / 763,951 until then** — the 2026-08-19 measurement, taken before the
 UI, the keypad, the share store, 25-word entry, the quiz and the bin crate existed.
 Only the third row moved: the two C and rust-bitcoin rows are byte-identical, and the
 whole +38,502 is `libcoldsnap_hal.rlib` 15,873 → **30,627** (27,636 `.text` + 2,991
 `.rodata`) plus `libcoldsnap_firmware.rlib` **21,000** (18,912 + 2,088), a crate that
-did not exist at the previous measurement and appears in no earlier row. **THE
-ATTRIBUTION IN THAT LAST SENTENCE DOES NOT ADD UP, flagged 2026-09-12 rather than
-reconciled by invention:** the two deltas are 14,754 + 21,000 = 35,754, leaving 2,748 B
-of the +38,502 unaccounted for. The total (899,400 − 860,898) is right and each
-component's own internal split is right, so either the hal delta is understated or a
-third rlib moved. Re-run `tools/measure-flash.py` into a clean target dir before quoting
-the split. PLAN.md §10 carries the same hedge.
+did not exist at the previous measurement and appears in no earlier row, **plus
+`liblinked_list_allocator.rlib` 2,748 B (1,762 `.text` + 986 `.rodata`)**.
+
+**THE MISSING 2,748 B IS SETTLED, 2026-09-13, residual ZERO.** This paragraph read
+*"THE ATTRIBUTION IN THAT LAST SENTENCE DOES NOT ADD UP, flagged 2026-09-12 rather than
+reconciled by invention: the two deltas are 14,754 + 21,000 = 35,754, leaving 2,748 B of
+the +38,502 unaccounted for … so either the hal delta is understated or a third rlib
+moved. Re-run `tools/measure-flash.py` into a clean target dir before quoting the split"*
+until then. **It is a third rlib, and it is the global allocator.** 14,754 + 21,000 +
+2,748 = 38,502, against 899,400 − 860,898 = 38,502. Command, in a private target dir so
+the shared `./target` stayed untouched: `CARGO_TARGET_DIR=/tmp/cs-rlib-clean
+CARGO_PROFILE_RELEASE_LTO=false cargo build --release` (exit 0, 50 rlibs), then
+`python3 tools/measure-flash.py
+'/tmp/cs-rlib-clean/thumbv7em-none-eabihf/release/deps/*.rlib'` (exit 0).
+
+**The exact match is an inference, not a coincidence, because the cause is airtight.**
+`linked_list_allocator` reaches the release rlib set by exactly ONE normal dependency
+edge — `firmware/Cargo.toml`'s `[dependencies]`. `hal/Cargo.toml` declares it under
+`[dev-dependencies]`, which `cargo build --release` never builds. So it entered the graph
+**precisely with `coldsnap_firmware`**, the crate the sentence above itself calls absent
+from every earlier row: the sentence named the new crate and missed the transitive
+dependency that new crate brought with it. It is pinned `=0.10.6`, so its 2,748 B today
+is its 2,748 B on 2026-09-10, and that is what makes this exact rather than approximate.
+The instruction to re-run the tool "before quoting the split" is deleted: it is done.
+
+**And a trajectory row, not a correction of the table above.** Today's clean re-measure
+is **899,707 B = 63.1%** with `libcoldsnap_hal` 30,644 (27,662 + 2,982),
+`libcoldsnap_firmware` 21,290 (19,196 + 2,094) and **50** rlibs, against the recorded
+30,627 / 21,000 / "a clean 48"; group rows C `secp256k1-sys` 96,947 = 6.8%, rust-bitcoin
++ encodings 327,408 = 23.0%, frostsnap + pure-Rust crypto 475,352 = 33.3%. The +307 B and
+the +2 rlibs are the tree MOVING since 2026-09-10 (address verification, ce62444), not a
+defect in the old row, and the 63.1% headline is unchanged. **The 899,400 row is not
+overwritten with 899,707** — a re-measure on a later tree is a trajectory row here, never
+a correction. PLAN.md §10 carries the same settlement.
 
 **Those are rlib sums with LTO off, i.e. upper bounds, and the gap to a real
 linked image is now measured and it is large.** `firmware/` links, and
@@ -673,7 +711,11 @@ exactly that reason.
 `.bss` is `0x2000_8034..0x2001_8058`, i.e. 65,572 B, of which 65,564 is the
 allocator arena (`ALLOCATOR` at `0x2000_8038`) — so `.bss` is the heap plus eight
 bytes, and `.uninit` is empty. (The ratio read **2.3×** against the 860,898 rlib
-sum; at the re-measured 899,400 it is 2.39×.)
+sum; at the re-measured 899,400 it is **2.37×**. **This said 2.39× until 2026-09-13**:
+899,400 / 379,648 = 2.3690, and the same figure nine lines above already read 2.37 while
+PLAN.md §10 said 2.369 — the archetypal N−1-of-N, corrected at one site in the 2026-09-12
+pass and missed at the other. 2.39 was correct only against the 376,752 image, two images
+back. The "2.3× against 860,898" clause is a correction trail and stays.)
 
 **Read the components, not just the headline.** Until 2026-09-10 this paragraph
 carried a `372,688 B` headline over a breakdown that summed to `282,080` and a
@@ -726,17 +768,49 @@ first round of panic-site work in the vendored crates, +30,627 for the
 `coldsnap_hal` rlib, +21,000 for the `coldsnap_firmware` rlib, and **+253 for the
 three `Option`-returning fixes** in `bitcoin_transaction.rs` plus one
 `saturating_sub` in `flash.rs` — less −4,482 of generic instantiations that moved
-out of the frostsnap rlibs into `coldsnap_hal`'s, and −1,328 of other net movement.
+out of the frostsnap rlibs into `coldsnap_hal`'s, and −1,328 of other net movement,
+**plus +2,748 for the `linked_list_allocator` rlib and +1,252 UNATTRIBUTED.**
 **This read "+16,669 (+1.2 pt)" with a "+15,873 `coldsnap_hal` rlib" term and no
 `coldsnap_firmware` term at all until 2026-09-10**; that breakdown was the
-2026-08-19 one, and its sum has been re-derived rather than adjusted.
+2026-08-19 one.
+
+**THAT BREAKDOWN DID NOT CLOSE, and the last clause of this paragraph read "its sum has
+been re-derived rather than adjusted" until 2026-09-13 — which the arithmetic disproves.**
+The six original terms are +5,101 +30,627 +21,000 +253 −4,482 −1,328 = **51,171**, against
+a headline that checks TWICE (899,400 − 844,229 = 55,171; 55,171 / 1,425,408 = 3.870%). So
+**4,000 B was missing from the breakdown, not from the headline** — the exact
+"headline over a checking breakdown" shape this repo names as its canonical failure, and it
+sat here unseen by 26 audit agents and every commit since. Found 2026-09-13 by addition.
+**2,748 B of the 4,000 is `linked_list_allocator`, absent here for the same reason it was
+absent from the attribution above: the phase-0 tree had no `coldsnap_firmware` and therefore
+no registered global allocator.** That term is now named and measured.
+**The remaining 1,252 B is stated as a residual and NOT invented.** The per-rlib table of
+the phase-0 tree that would attribute it was never recorded, so any named term would be
+fabrication — which is the failure this document is shaped against. This is
+`AUDIT-2026-09-10.md:519`'s own prescribed remedy ("state the residual explicitly … the
+components are per-change measurements taken at different commits and do not close on the
+total"), applied. Note also that `AUDIT-2026-09-10.md:713-714`'s companion prescription —
+correct the −4,482 term to −4,558 — is deliberately NOT applied: it was written against the
+retired 16,669 breakdown, and against THIS one it would drop the sum another 76 B and
+WIDEN the residual to 4,076. A term nobody can re-measure is not moved to make a total look
+tidy.
 Every number is measured with LTO **off**, so they are upper bounds — `lto =
 "fat"` collapses the duplicated monomorphisations. See `vendor/README.md` for the
 per-change split.
 
-**The whole phase-3 transport cost +3,461 bytes** (857,125 → 860,586, +0.3 pt),
-which is the entire delta: `libcoldsnap_hal.rlib` went 12,098 → **15,559**
-(14,606 `.text` + 953 `.rodata`) and nothing else moved. That buys `comms.rs` +
+**The whole phase-3 transport cost +3,467 bytes** (857,125 → 860,592, +0.3 pt),
+which is the entire delta: `libcoldsnap_hal.rlib` went 12,098 → **15,565**
+(14,612 `.text` + 953 `.rodata`) and nothing else moved.
+(**This read "+3,461 bytes (857,125 → 860,586)" and "12,098 → 15,559 (14,606 `.text` +
+953 `.rodata`)" until 2026-09-13.** It disagreed with `vendor/README.md`'s 15,565 /
+14,612 + 953 / +3,467 / 860,592 — while the paragraph immediately above already ends
+"See `vendor/README.md` for the per-change split", designating that file as the authority
+for exactly this number, and this file already used 15,565 twenty-two lines further down. `AUDIT-2026-09-10.md:923` flagged the
+self-inconsistency and the flag was never applied. **Both sets close internally**
+(14,612 + 953 = 15,565 → +3,467 → 860,592; 14,606 + 953 = 15,559 → +3,461 → 860,586), so
+arithmetic cannot pick between them and the phase-3 tree can no longer be rebuilt: the 6 B
+difference in one `.text` figure is **unresolvable**. Adopted on designated authority, not
+on evidence, and recorded here rather than picked silently.) That buys `comms.rs` +
 `usb.rs`, descriptors and all. (Both rlib figures are the phase-3-era ones and are
 kept as the marginal cost of that change; the rlib is **30,627 B** today.) The
 4,096-byte reassembly buffer is not part of it: it is SRAM, held inline in a `Link`
@@ -802,9 +876,24 @@ left behind when the image figure moved; PLAN.md §9 item 4 carried the identica
 **It fits.** `bitcoin`'s `secp-lowmemory` feature sets `ECMULT_WINDOW_SIZE=4`
 and `ECMULT_GEN_PREC_BITS=2`, shrinking the C library 92% (1,177,733 → 96,947)
 with no source changes. Without it the build is 135% of `FLASH_TEXT` and does
-not link. The tradeoff is slower EC math; **signing latency is unmeasured** — see
-PLAN.md §9, "Genuinely open". It is the highest-value remaining unknown: a bad
-answer partly reopens decision 4, and it cannot be settled on the host.
+not link. **The "tradeoff" costs this image exactly 0 bytes, and 0 cycles, MEASURED
+2026-09-13.** This read *"The tradeoff is slower EC math; **signing latency is
+unmeasured** — see PLAN.md §9, 'Genuinely open'. It is the highest-value remaining
+unknown: a bad answer partly reopens decision 4, and it cannot be settled on the host"*
+until then. Remove the feature, rebuild: **379,648 B on both sides**, section for
+section. The release ELF holds 23 `secp256k1` symbols and every one is field arithmetic,
+point decompression or a parse; `precomputed_ecmult.c` and `precomputed_ecmult_gen.c`
+survive only as **zero-size `df` file symbols** either way, i.e. those translation units
+linked and were entirely garbage-collected. Decision 3 moved every EC operation to
+`secp256kfun`, leaving two C libsecp calls in the device graph and both are PARSES, so
+`ECMULT_WINDOW_SIZE` governs code that is not linked. **The 92% above is real and stays —
+it is an RLIB-SUM saving, and the rlib sum overestimates the linked image by ~2.4×.**
+FROST signing latency IS still unmeasured and still cannot be settled on the host, but it
+belongs to `secp256kfun`'s `field_10x26`/`scalar_8x32` on a 120 MHz M4F, which no feature
+flag reaches; the host links `field_5x52`/`scalar_4x64`, different source files at a
+different limb width. PLAN.md §9 item 1 carries both measurements. **The feature stays**:
+it costs nothing and it is the standing guard for the day some future code does reach an
+ecmult.
 
 Dropping `schnorr_fun`'s `libsecp_compat_0_29` (decision 3) is **done**, and it
 was worth far less than earlier drafts of this file claimed: **−1,185 bytes**

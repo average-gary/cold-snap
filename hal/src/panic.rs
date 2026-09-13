@@ -84,7 +84,7 @@
 //! `0x2000_8000` *before* wiping (`main.c:115-122,129`). **PLAN.md §9.2's
 //! suggestion of SRAM for the counter must be struck** — and worse than the boot
 //! wipe, the callgate wipes the top 8 K on entry *and* exit
-//! (`startup.S:124-134,148-156`) and `reset_entry` calls the gate on every boot.
+//! (`startup.S:124-134,148-157`) and `reset_entry` calls the gate on every boot.
 //!
 //! RTC backup registers `BKP0R..BKP31R` are the right home: 32 words in the backup
 //! domain, reset only by a backup-domain reset or VBAT loss, and the bootloader

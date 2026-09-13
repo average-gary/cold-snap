@@ -50,8 +50,10 @@ description = "Bare-metal STM32L4S5 substrate for cold-snap: FLASH_FS NorFlash, 
 #                nothing we do not already have to write.
 #   cortex-m-rt  Actively WRONG here. It owns the reset vector, the vector
 #                table and `memory.x`; on Mk4 the PCROP bootloader owns reset
-#                (mk4-bootloader/startup.S:87-95) and hands control to a fixed
-#                entry, and the layout is dictated by
+#                (mk4-bootloader/startup.S:88-112, `reset_entry:` through the
+#                `bx lr` hand-off; this read 87-95 until 2026-09-13, stopping
+#                17 lines short of the hand-off it names) and hands control to a
+#                fixed entry, and the layout is dictated by
 #                stm32/COLDCARD_MK4/layout.ld. cold-snap supplies its own
 #                minimal entry + linker script instead.
 #   stm32l4xx-hal / stm32l4 (svd2rust)  Thousands of unused registers, and it

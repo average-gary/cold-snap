@@ -174,10 +174,17 @@ the linked image is **379,648 B = 26.6343%** from `cargo build --release`
 read 377,192 B = 26.46% until 2026-09-12** and **376,752 B = 26.43% until 2026-09-11**
 — the 376,752 was the figure before the keygen check's randomised digit added 440 B,
 and it is the figure a review found copied into SIX places while two carried the new
-one, which is why every image figure in this document now names its invocation). The
-cost is slower EC operations (smaller precomputation window);
-**signing latency on-device remains unmeasured** — see §9 "Genuinely open" item
-1, now the highest-value open question.
+one, which is why every image figure in this document now names its invocation). **This paragraph ended "The
+cost is slower EC operations (smaller precomputation window); signing latency
+on-device remains unmeasured — see §9 'Genuinely open' item 1, now the highest-value
+open question" until 2026-09-13.** There is **no such cost on this port**: the smaller
+window shrinks code that decision 3 then removed from the device graph entirely, and
+MEASURED 2026-09-13 the feature changes the linked image by **exactly 0 bytes** —
+`379,648 B` with and without it, section for section, and both `precomputed_ecmult*.c`
+survive only as zero-size `df` file symbols either way. The 92% above is a real
+**rlib-sum** saving and it stays; what does not follow from it is a latency cost. See
+§9 "Genuinely open" item 1 for both measurements and for the unknown that IS real,
+which is `secp256kfun`'s own `field_10x26`/`scalar_8x32` on a 120 MHz M4F.
 
 The 1.18MB, at default window sizes, is **C libsecp256k1's precomputed ECMULT
 tables**:
@@ -680,11 +687,24 @@ Two traps, both measured:
   it was 9 when this trap was first measured.)
 - **`frostsnap_core` requires `--features coordinator` to test at all.** Without
   it the integration binaries fail to resolve `frostsnap_core::coordinator`
-  (`E0432`), a consequence of the vendored `default = []`. With it: **51 tests
-  across 13 binaries, all passing** (40 across 11 before the panic-site work),
-  including both wire-format backward-compat guards. `cargo test -p
+  (`E0432`), a consequence of the vendored `default = []`. With it: **63 tests
+  across 12 binaries, all passing** — the 11 `.rs` files in
+  `vendor/frostsnap/frostsnap_core/tests/` plus the `--lib` target, 21 lib + 42
+  integration — including both wire-format backward-compat guards. `cargo test -p
   frostsnap_core --features coordinator` is the real invocation; `--lib` alone
-  runs only 9 of the 51.
+  runs 21 of the 63. The trajectory (40 → 44 → 51 → 63) lives in
+  `vendor/README.md`, which is the authority for it; all 11 test files predate this
+  repo's first commit, so the earlier pairings cannot be re-derived here.
+  **This read "51 tests across 13 binaries, all passing (40 across 11 before the
+  panic-site work)" and "`--lib` alone runs only 9 of the 51" until 2026-09-13**, and
+  the "13" was wrong even at 51. **The mechanism accounts for BOTH readings, so
+  neither is a typo:** `grep -c '^test result:'` over the gate log is **13**, because
+  `cargo test` gives `Doc-tests frostsnap_core` its own line — log lines 137-139,
+  `Doc-tests frostsnap_core` / `running 0 tests`. It carries **zero** tests; the
+  crate's only doc fence is a non-Rust `text` fence at `tweak.rs:13`. So 13 is a LINE
+  count of harnesses and 12 is the count of binaries that hold tests.
+  `tests/common/` and `tests/env/` are `mod` helper dirs with no `main.rs`, so cargo
+  builds no target from them.
 - `frostsnap_core/tests/{wire_size_measure,zz_claim3_crossover}.rs` were **moved
   to `tools/research-scratch/`** — earlier-session scratch, untracked upstream,
   and their 26 `E0432`s broke `cargo test` for the whole package rather than
@@ -803,7 +823,10 @@ SSD1306 init/timing and physical legibility; keypad scan/debounce and its
 randomised timing; the callgate in any form; the TRNG (§5.1 — **two** sources, not
 three) and its health
 checks; panic→reset recovery; real STM32 program/erase semantics and power-loss
-durability; `secp-lowmemory` signing latency; and — new in phase 3 — the OTG_FS
+durability; FROST signing latency in `secp256kfun` on a 120 MHz M4F (**this read
+"`secp-lowmemory` signing latency" until 2026-09-13**; that feature is provably inert
+here — §9 item 1 — and the latency belongs to pure-Rust code, not to the C library);
+and — new in phase 3 — the OTG_FS
 register sequences (core reset, FIFO flush, endpoint enable/NAK, VBUS override)
 plus the host-driven enumeration that exercises them. Budget for this.
 
@@ -1092,7 +1115,7 @@ Each phase ends at a testable artifact. No hardware until Phase 5.
 | 4 | Protocol on host | keygen + sign, Tier 2 simulator first, then Tier 3 stub `Serial` against real `frostsnap_coordinator` | end-to-end on host | 🟡 **gate MET on host 2026-08-18; not signed off.** `hostcheck/` + `firmware/examples/stub.rs` complete a **9-of-9 keygen, nonce replenishment and a signature that VERIFIES** (`Schnorr::verify_only()` against the coordinator's own derived x-only key) over a pty in two processes, against an **unmodified** sibling `frostsnap_coordinator`, at both `STUB_CHUNK=64` and `=1`, plus a third **DECLINE** pass. The two §7 size crossovers are **closed** by decision 7 (`FRAME_LIMIT` 2,060 → 4,096), validated on the wire: largest coordinator→device frame actually written is **2,179 B**, above the old bound, so this keygen was previously refused. Tier 1 **576** tests green. **This cell listed five uncovered items until 2026-09-10 and FOUR of them had already closed** — it read: *"the stub auto-acks `SignatureRequest`, so the approval policy — the actual security property — is untested; … but only CORE-to-CORE — nothing yet asserts the four bytes the screen renders are the coordinator's; restoration, backup consolidation, physical-backup entry and naming flows have never been driven at all; the three device-side caps (§7) are unimplemented; the allocator is sized and chosen but not registered (§9 item 7)."* Corrected: `SignatureRequest` **is** gated, on the randomised digit read back off the rendered frame (`stub.rs`'s `approved`, whose `SignatureRequest` arm is `digit.accepts(key)`), and a DECLINE pass fails the run if a refused prompt yields a share (`hostcheck/src/main.rs`'s `ASSERTION 2: A DECLINED PROMPT YIELDS NO SIGNATURE` block); the four rendered bytes **are** compared against the coordinator's session-hash prefix (its `ASSERTION 1: THE GLASS SHOWS THE COORDINATOR'S CODE` block, closed 2026-08-31, §9 item 12); the three caps **are** implemented (`Outbox::push` in `firmware/src/lib.rs`, §7); and the allocator **is** registered (`ALLOCATOR` in `firmware/src/alloc.rs`, §9 item 7). **Cited by SYMBOL and by banner comment rather than by line since 2026-09-12**: every one of those five was a line number, all five had rotted, and `hostcheck/src/main.rs:776` had moved by ~1,900 lines. **THE RESTORATION FLOWS ARE NOW COORDINATOR-DRIVEN — this cell said they were "driven by unit tests but not by a real coordinator" until 2026-09-11, and that was the largest remaining phase-4 gap.** `hostcheck` gained the five-call `UiProtocol` lifecycle and drives **four of the five** flows from UPSTREAM's own drivers, unmodified and by path — `DisplayBackupProtocol`, `CheckBackupProtocol`, `EnterPhysicalBackup`, plus consolidation through the same `queue` the keygen frames use (upstream has no driver for it). One boxed protocol at a time; no `UiStack`. Ordered AFTER the verified signature, because at t = n = 9 every device is needed to sign and `Consolidate` REPLACES the one share record the store keeps. What each asserts: the **25 words read back off the device's own framebuffer** with `ui::Frame::cell` re-encode through upstream's `ShareBackup::from_words` to this coordinator's own `expected_share_image`; the check quiz passes in **exactly 8 answers** taken only from what that reveal drew (the stub's picker is handed no `quiz::Quiz` and no option list); those same words go back in through the letter picker — whose candidate letters are a function of the secret prefix, so the typing is off the pixels too — and `check_physical_backup` accepts the result; and after the destructive consolidation the device's re-reported share **image** matches. MEASURED cost: **+1.4 s at chunk 64, +2.4 s at chunk 1**. Seventeen mutations RUN, each file restored and `diff`ed byte-identical, including three that remove one lifecycle leg each and all die on the new `DEADLINE (95s)` in the right state; plus `COLDSNAP_GLASS_KEYS=yy9`, which shows with NO source change that a hardcoded key cannot authorise a reveal, an ingest or a consolidation. See §9 item 12 for the three upstream facts this turned up, and for what did NOT get demonstrated. **NAMING AND `erase_device` CLOSED THE SAME DAY.** A coordinator-previewed name — 14 chars and 56 bytes at once, i.e. simultaneously the `FixedString<14>` wire bound and `DEVICE_NAME_MAX_BYTES` — reaches FLASH on all nine devices and comes back byte-exact as `SetName`, with a `NeedName` required first so an announce-time echo cannot be mistaken for a commit. It needed no device change: the preview must ride with the `AnnounceAck` because `commit_name` fires during keygen, and a mutation sending it post-keygen yields zero `SetName` lines. And upstream's own `EraseDevice` driver is now proven NEVER to complete against this device: `is_complete()` stays `None` for the whole grace window AND the device reports `refused=DataErase` — both halves, because silence alone is what a dead device looks like. **AND `CheckKeyGen` NOW ASKS FOR THE RANDOMISED DIGIT.** This cell said until 2026-09-11 that it was "gated on the fixed `1=match` key the screen advertises … so a hardcoded script can answer it". `ui::keygen_check` now prints `press_legend(confirm)` like the signing screens, `KEYGEN_MATCH_KEY` is deleted, and `answer` has one rule for every prompt. **No literal answers any consent screen on this device now**, shown with no source mutation: `COLDSNAP_GLASS_KEYS=1yy` exits 1 with 8 of 9 devices declining (the ninth drew `1`, which is the 1-in-5 made visible) and `=9yy` exits 1 with 9/9. Cost +440 B of flash, and the 2x code rows deliberately did not move because `glass_code` reads them back from those exact cells. **`Cancel` AND THE LEGACY `SavePhysicalBackup` v1 ARE NOW DRIVEN TOO, 2026-09-12 (M10, M11), and this cell said until then that `Cancel` was "the cheapest real gap in phase 4" — which was wrong twice over.** It is not the cheapest (five of its six clearings already had named, mutation-verified Tier-1 tests asserting the downstream refusal), and the prescription that went with it — "send it mid-reveal" — was a re-proof of those tests over a transport. The one clearing with no assertion anywhere was `pending_name`, and M10 closes it as a DIFFERENTIAL: two devices get the same two frames in OPPOSITE ORDERS, so `Cancel`-then-preview must commit the byte-exact name while preview-then-`Cancel` must commit none, and a lost preview silences both rather than passing vacuously. M11 drives the v1 body, whose naive assertion CANNOT FAIL — v1 recurses into v2, so `PhysicalSaved` is byte-identical — and asserts the one field that distinguishes them, the `threshold` v1 forces `Some(..)` and today's v2 leaves `None`, read back off the wire with `V1_THRESHOLD = 7` so the value exists nowhere else in the run. Both variants are driven by ONE `cargo run` (v2 at chunk 64, v1 at chunk 1), so nothing was traded away. SIX mutations run across the two, each file restored and `diff`ed byte-identical; two SEPARATE defects fell out of them and are fixed — a refusal of a frame the coordinator was waiting on was a log line that then burned the whole 95 s budget to die naming the state instead of the cause, and every FAILING run leaked its stub child (the PASS block's 15 `bail!`s are `return`s that fire before the reaping — the first draft of that accounting said 31 and said they were inside the loop, and review corrected both), which after three failures made the next run die at `TTYPort::pair: No such device or address`. **INGEST ONTO A DEVICE HOLDING NOTHING IS NOW CLOSED TOO, 2026-09-12 (M12, commit 7ba6ea4), and this cell said "DEFER stands" until then.** `hostcheck` announces `ALL_DEVICES = 10` and cuts a nine-device keygen roster out of `announced[..N_DEVICES]`, so `announced[N_DEVICES]` is blank **BY CONSTRUCTION** — identification is ASSIGNMENT, from one expression on one lap at the `BeginKeygen` site it already owns, so no back-channel is needed and nothing is trusted to a device about the thing under test. That device is then handed the FIRST device's sheet, types the 25 words in through the letter picker (198 keypresses) and CONSOLIDATES them onto a flash that held nothing. **What it buys is ONE new falsifiable assertion, not the two §9 item 12 commissioned it for:** the `Some`/`None` discrimination on the re-report. The share-image half of M7e and the `index != r.share_index` bound both stay OVER-DETERMINED — see the M12 block in `hostcheck/src/main.rs` for the mechanism that shadows each, and §9 item 12 for the three claims this turned out to have got wrong. Zero device code, zero flash, zero test-count movement; harness 10.11 s -> 12.38 s. **What the gate STILL does not cover: nothing has run on silicon.** |
 | 5 | Mono UI | **8 screens** (§4.2), mono `DrawTarget`, ~850 LOC ported from `frostsnap_widgets` | manual, on hardware | 🟡 **written and host-verified; the manual-on-hardware gate is untouched.** **This row read "⬜ pending — largest single item" until 2026-09-10**, by which time `hal/src/ui.rs` was 5,541 lines rendering all eight screens with real callers (§9 item 16 — which was itself PARTLY closed that day and only fully closed on 2026-09-12, when address verification got its caller; the parenthetical here read "closed the same day" until then) and `tools/pixel-check.py` was checking them against an independent framebuffer decoder. Nothing was ported from `frostsnap_widgets` in the end — the ~850 LOC estimate was never drawn on; the screens are written against `ui::Frame` directly, and the one upstream artefact reused is the idea of a distractor quiz, deliberately **not** its implementation (§7 cap notes). What the gate still means here is the part a host cannot do: whether 16 px is legible on a physical OLED, and whether the keypad's hold-to-confirm feels right (§9 item 15). It inherits §8.1 defect 12: `user_prompt()`'s `None` is a **refusal**, not a rendering fallback — now enforced, since `SignPages`/`prompt_screen` funnel through one renderability gate. |
 | 6 | Callgate integration | SE1/SE2 identity, PIN, rate limiting; ABI already determined (§5, DECISIONS.md decision 2) | hardware | ⬜ pending |
-| 7 | Nonce durability | read-back-verified writes as `Result` not `assert!`, power-loss testing | fault injection | 🟡 **first half DONE and now PINNED BY NAME; second half narrowed to a 3-line helper — and one REAL DEFECT found, with zero coverage.** **This row read "⬜ pending — `TestNorFlash` does not model power loss (§7)" until 2026-09-12**, which understated what had landed and mis-stated what remained. (a) The read-back-verified writes are `Result` and are no longer only asserted: `a_refused_nonce_advance_reports_write_verify_failed_and_leaves_the_index_unadvanced` reaches the comparison NON-VACUOUSLY (§9 item 4), and deleting the comparison returns `Ok` carrying another session's shares for an advance that never reached flash. (b) POWER LOSS / TORN WRITES is what remains, and its entire increment is a 3-line `FakeFlash::refuse_programs_after(k: u32)` mirroring `FaultyNorFlash::fail_write_after` — plus the chunk-boundary measurement, now MEASURED: a `SecretNonceSlot` with 6 signature shares is **297 B** against `BUFFER_SIZE = 256`, so the boundary falls 256 B in and the two A/B copies program **76** doublewords (2 × 38 = one full 32-doubleword chunk plus a 41 B tail padded to 48 = 6), i.e. `BincodeFlashWriter::write`'s multi-chunk branch is entered for the first time by any test in this file. With `signing_state: None` the value is 65 B, pads to 72, and programs 18. (c) **AND A REAL DEFECT, which is the load-bearing part of this row now:** in `frostsnap_embedded/src/ab_write.rs`'s `AbSlot::try_write`, swapping the two `try_write` calls so the **LIVE** copy is erased first passes EVERY test in the tree — hal's 16 integration tests and `frostsnap_embedded`'s 17. From a `CommittedSingleCopy` state the two copies hold DIFFERENT values, so erasing the live one and then failing rolls the nonce index **BACK** to the older copy's — the device re-derives a nonce for which a signature share has already been emitted, which is the affine break that solves for the share. The comment at `try_write` asserts the correct ordering ("Write the *older* slot first") and **nothing enforces it**. `ab_write::test::fault_between_the_two_copies_reports_committed_and_the_new_value_is_live` does NOT own this claim, contrary to what a design report assumed: after a `Committed` write both copies hold the same value, so the erase order is unobservable. It only becomes observable from `CommittedSingleCopy`, which no test then follows with a further refused write — which is exactly what `refuse_programs_after(k)` buys. **Schedule (c) explicitly; do not leave it inside this row's general wording.** |
+| 7 | Nonce durability | read-back-verified writes as `Result` not `assert!`, power-loss testing | fault injection | 🟡 **first half DONE and PINNED BY NAME; the helper and the defect pin both LANDED 2026-09-13 (hal 288 → 290); ONE NAMED GAP left open on purpose and the rest needs silicon.** (**This read "second half narrowed to a 3-line helper — and one REAL DEFECT found, with zero coverage" until 2026-09-13**, which was true when written; see (b) and (c) for what landed and (c)'s tail for the gap that is deliberately still open.) **This row read "⬜ pending — `TestNorFlash` does not model power loss (§7)" until 2026-09-12**, which understated what had landed and mis-stated what remained. (a) The read-back-verified writes are `Result` and are no longer only asserted: `a_refused_nonce_advance_reports_write_verify_failed_and_leaves_the_index_unadvanced` reaches the comparison NON-VACUOUSLY (§9 item 4), and deleting the comparison returns `Ok` carrying another session's shares for an advance that never reached flash. (b) POWER LOSS / TORN WRITES is what remains, and its entire increment is a 3-line `FakeFlash::refuse_programs_after(k: u32)` mirroring `FaultyNorFlash::fail_write_after` — plus the chunk-boundary measurement, now MEASURED: a `SecretNonceSlot` with 6 signature shares is **297 B** against `BUFFER_SIZE = 256`, so the boundary falls 256 B in and the two A/B copies program **76** doublewords (2 × 38 = one full 32-doubleword chunk plus a 41 B tail padded to 48 = 6), so `BincodeFlashWriter::write`'s multi-chunk branch is crossed. **The 41 B is RIGHT and must not be "corrected" to 45:** the 297 B is the whole `SlotValue`, whose ledger's FIRST term is `SlotValue.index` (`hal/tests/integration_frostsnap_over_hal.rs`'s `a_full_secret_nonce_slot_survives_the_hal_flash_round_trip` doc: `4 + 4 + 4 + 16 + 32 + 4 + 1 + 32 + 8 + 32n` = 105 + 32n, n=6 → 297), so 297 − 256 = 41 already counts the index. A "45 B" correction was proposed on 2026-09-13 on the theory that 297 measured `SecretNonceSlot` alone, and **WITHDRAWN** the same day; 41 and 45 pad to the same 48 either way, so the 38/76 doubleword figures were never in doubt. **This row claimed the new fixture entered that multi-chunk branch "for the first time by any test in this file" until 2026-09-13. It did not.** The branch was ALREADY crossed before this increment, by `a_full_secret_nonce_slot_survives_the_hal_flash_round_trip`, which already ships the 6-share fixture and already MEASURES the crossing as `assert!(programmed > 2 * (256 / 8), ..)` — 76 doublewords for two copies. That test's own doc states the "no test in this file had ever entered the multi-chunk branch" fact in the PAST TENSE, describing the state before its `signing_state` went from `None` to `Some`; **this row copied a past-tense observation as a present-tense promise about work not yet done.** What is new is not ENTERING the branch, it is **TEARING** it: `a_torn_multi_chunk_write_makes_the_slot_unreadable_and_refuses_to_sign` schedules a refusal BETWEEN the 256 B chunk and the 41 B tail flush. With `signing_state: None` the value is 65 B, pads to 72, and programs 18. (c) **AND A REAL DEFECT, which is the load-bearing part of this row now:** in `frostsnap_embedded/src/ab_write.rs`'s `AbSlot::try_write`, swapping the two `try_write` calls so the **LIVE** copy is erased first passed EVERY test in the tree. **This row said "hal's 16 integration tests and `frostsnap_embedded`'s 17" until 2026-09-13; it is BROADER than that, re-measured against the swap itself:** hal **288**, `frostsnap_embedded` **17** and `coldsnap_firmware` **172** were all exit 0 under it — **477 tests, in the three crates that LINK this function, and not one could see the erase order.** **THE "540 of the 576 sweep tests" FIGURE THIS ROW CARRIED UNTIL 2026-09-13 IS WITHDRAWN, and it is the orchestrator's own error.** `frostsnap_core` (63) was exit 0 under the swap too and it proves nothing: `frostsnap_core/Cargo.toml` declares NO `frostsnap_embedded` dependency (`grep -n embedded` exits 1) — the arrow points the OTHER way, `frostsnap_embedded/Cargo.toml:10` is `frostsnap_core.workspace = true` — so that gate never compiled `AbSlot::try_write`, and neither did `frostsnap_macros` (7), `frostsnap_comms` (10) or `frost_backup` (19). Running those four gates under the swap was uninformative BY CONSTRUCTION, not evidence of a coverage gap. **A gate with no view of a function is not a coverage measurement.** What links it: `frostsnap_embedded` 17 + `coldsnap_hal` 288 + `coldsnap_firmware` 172 = 477 at the base commit. From a `CommittedSingleCopy` state the two copies hold DIFFERENT values, so erasing the live one and then failing rolls the nonce index **BACK** to the older copy's — the device re-derives a nonce for which a signature share has already been emitted, which is the affine break that solves for the share. The comment at `try_write` asserts the correct ordering ("Write the *older* slot first") and **nothing enforces it**. `ab_write::test::fault_between_the_two_copies_reports_committed_and_the_new_value_is_live` does NOT own this claim, contrary to what a design report assumed: after a `Committed` write both copies hold the same value, so the erase order is unobservable. It only becomes observable from `CommittedSingleCopy`, which no test then follows with a further refused write — which is exactly what `refuse_programs_after(k)` buys.<br><br>**(c) LANDED 2026-09-13. hal 288 → 290.** `FakeFlash::refuse_programs_after(k)` (`hal/src/flash.rs`, `fake` module) schedules a refusal by DOUBLEWORD count, so it can land part way THROUGH one logical write; `programs` accumulates `bytes.len() / WRITE_SIZE`, i.e. 32 for a 256 B chunk and 6 for a 48 B tail, and refusal stays all-or-nothing per program. Two tests in `hal/tests/integration_frostsnap_over_hal.rs`: `a_refused_write_after_a_single_copy_write_erases_the_older_copy_not_the_live_one` (the only test in the tree that reaches `try_write` from ASYMMETRIC copies — one live, one blank — and the only thing that fails on the swap: exit 101, one named test) and `a_torn_multi_chunk_write_makes_the_slot_unreadable_and_refuses_to_sign`. The `fake` module doc's "does not model power loss" sentence was amended in the same increment, because landing the helper made that half of it false; bit rot, write disturb and ECC stay unmodelled. **ZERO ARM flash delta, and structurally so rather than luckily:** the whole `fake` module is `#[cfg(any(test, feature = "fake-flash"))]`, `fake-flash = []` is off by default, and `firmware` enables it only under `[dev-dependencies]` — image unmoved at 379,648 B, section for section.<br><br>**THREE PARTIAL SURVIVALS FROM THAT ROUND, recorded because they say which legs are load-bearing and a later reader will otherwise delete the wrong one.** (i) On a 5-share fixture the torn tail still DECODES, and there `assert!(matches!(err, NoncesUnavailable::WriteVerifyFailed))` **survived green** — only the separate non-destructive `AbSlot` probe's `is_none()` went red. So the variant assertion alone is a THREE-WAY ambiguity, the equality leg silently substitutes for the read-back's `ok_or`, and **anyone who deletes the probe leg as decorative removes the only thing naming the site.** (ii) Making `FakeFlash` count a REFUSED program left 267 lib + 5 smoke + all 16 pre-existing integration tests green: the fake could have started lying about `programs` and the whole 288-test baseline would not have noticed, which is why the counter legs stay in the asymmetric test despite adding nothing against the ordering mutation. (iii) Inverting `AbSlot::current_slot_and_index`'s `b_index > a_index` left all 16 pre-existing hal integration tests green — the vendored `unreadable_or_blank_slot_ranks_below_a_written_one` does catch it, so it is not unguarded, but the hal integration layer had no view of it before this round.<br><br>**SEVERITY IS HIGHER THAN THIS ROW ORIGINALLY STATED, because `AbSlot` HAS THREE CONSUMERS and one of them asserts the unenforced property in its PRODUCTION docs, in so many words.** `ShareStore::open` builds the share store's `AbSlot` and `ShareStore::persist_staged` calls `try_write`, both in `firmware/src/store.rs` — cited by SYMBOL, because the same commit that wrote the old `:355`/`:429`/`:64-66`/`:89-92` citations also inserted 10 lines at `:69` and 12 at `:101` and rotted them all. That module's torn-write paragraph in its module docs states "`AbSlot` writes the *older* copy first and picks the highest index, so an interrupted save leaves the previous value live in the other copy" as a load-bearing premise of the record format, and the `ponytail:` note in the same module docs closes the escape hatch: "`AbSlot` exposes no route to the intact older copy, so the previous share becomes unreachable too". Under the swap a torn share save leaves NEITHER copy holding the previous share, on a device that holds ONE share, has no recovery install (`mk4-bootloader/sdcard.c:248`) and no route to the intact older copy — **unspendable unless the holder had already taken the 25-word backup, which `Session::recv_core` does admit** (`DisplayBackup` plus the four restore-flow messages), **a different mechanism from the affine nonce break.** **THE THIRD CONSUMER, added 2026-09-13:** `NameStore::save` in `firmware/src/lib.rs` is a plain `frostsnap_embedded::AbSlot` over the name region — cheapest of the three, since a lost name reads back `None`, the device announces `NeedName` and a human retypes it. One pin on the shared function covers all three; no second test was written, and that is the point.<br><br>**NOT PINNED, deliberately, and named here so it does not read as an omission: the ROLLBACK symptom.** `refuse_programs_after(k)` can only reach a `CommittedSingleCopy` whose loser copy is **BLANK**, because `Slot::try_write` runs `self.flash.erase_all()?` as its FIRST statement — so under the swap BOTH copies are lost and `AbSlot::read` returns `None`, which is what the new asymmetric test asserts. On hardware a `CommittedSingleCopy` arising from a refused **ERASE** instead leaves the loser holding the OLD value, and there the same one-line ordering error rolls the nonce index **BACK** to a spent index rather than losing it — the affine break stated in (c)'s own words above. Pinning that needs a `refuse_erases_after(k)` companion plus ~25 lines, and it falsifies the SAME source mutation, so it was skipped as duplicate coverage. **The security property — a refused erase leaves the loser holding a spent nonce index — is asserted nowhere in the tree.** This row therefore stays 🟡 and not 🟢: that gap, plus the fact that `FakeFlash` models refusal at program granularity and NOT bit rot, write disturb, ECC or partially programmed rows, is exactly the residue "power-loss testing" named, and closing it needs silicon. |
 
 Phases 1–4 carry no brick risk. Phase 5 is the largest single item.
 
@@ -1250,7 +1273,7 @@ named test that was supposed to catch them, 0 survivors, 0 hangs.** The list is 
 | SET_CONFIGURATION accepts any `wValue`; SET_FEATURE acknowledges; DEVICE_QUALIFIER answered | three separate control-dispatch tests |
 | `ep0_xfer_size` uses the wide `XFRSIZ` field width; PKTCNT bound dropped | `ep0_xfer_size_is_narrower_than_every_other_endpoint` |
 | `rx_status` truncates BCNT to 8 bits; PKTSTS mask lets DPID leak | two `rx_status` tests |
-| `fifo_words` truncates instead of rounding up | `fifo_read_does_not_write_past_len` (`hal/src/usb.rs:2570`) — and **only** through its `&dest[..len] == payload` assert. **This cell named `fifo_words_rounds_up` until 2026-09-12; NO SUCH TEST EXISTS.** Worth stating what the real pairing is, because it is weaker than the name suggested: that test AND `fifo_write_pads_the_final_partial_word` (`:2616`) both compute their word-count expectation *from* `fifo_words` itself, so **their word-count assertions cannot see this mutation at all** — the payload comparison is the whole of the coverage. Pairing re-derived by READING on 2026-09-12 (and independently by `AUDIT-2026-09-10.md`); the mutation has not been re-run since |
+| `fifo_words` truncates instead of rounding up | **THREE** named tests, and this is the one cell in this table whose pairing was RE-RUN rather than re-read. MEASURED 2026-09-13: `len / 4 + (len % 4 != 0) as usize` → `len / 4` in `hal/src/usb.rs`'s `fifo_words`, then `cargo test --target aarch64-apple-darwin -p coldsnap_hal --features fake-flash,test-seam` → **exit 101, 264 passed / 3 failed**. (1) `fifo_read_does_not_write_past_len` fails at `assert_eq!(n, len)`, `left: 0, right: 1` — `n` is `fifo_read`'s per-byte `copied` counter and `len` the test's loop variable, so neither side derives from `fifo_words`. (2) `fifo_write_pads_the_final_partial_word` fails and **not by an assertion**: `&written[..len]` panics, `range end index 1 out of range for slice of length 0`. Real coverage, delivered by a panic rather than by an assert — weaker evidence of intent, but not zero. (3) `cdc_packets_reassemble_a_frostsnap_frame` fails at `assert_eq!(n, packet.len())`, `left: 8, right: 9`, on the stream's trailing 9-byte packet. `hal/src/usb.rs` restored byte-identical, sha256 `b34a95891b8bdba4b0b7eb206bd90c687793f98ec49612dd2ba3d3463bf25492` before = after. **No direct `fifo_words` test was added, deliberately:** three tests already fail by name, so the defect here was a wrong CLAIM in this table and not missing coverage. Add one only if this cell rots a third time. What survives from the old cell, because it is right: both `fifo_read_does_not_write_past_len` and `fifo_write_pads_the_final_partial_word` compute their word-count expectation *from* `fifo_words`, so **their word-count assertions cannot see this mutation at all**. **This cell named `fifo_words_rounds_up` until 2026-09-12; NO SUCH TEST EXISTS.** **And until 2026-09-13 it said the coverage was `fifo_read_does_not_write_past_len`'s `&dest[..len] == payload` assert ALONE, that `fifo_write_pads_the_final_partial_word` "cannot see this mutation at all", and that "the mutation has not been re-run since" — wrong THREE ways.** The payload comparison is never even evaluated: `assert_eq!(n, len)` sits one line above it and fires first, so the cell named the wrong assertion inside the right test; the second test dies anyway; and a third test was never mentioned. **The lesson is worth more than the repair.** That cell stated its own provenance as *"Pairing re-derived by READING on 2026-09-12 (and independently by `AUDIT-2026-09-10.md`)"* — **two independent readings agreed on an answer that is wrong three ways. Reading is not measuring**, and this is the strongest in-tree evidence for §8.2's own rule that a pairing is established only by running the mutation. It is also the standing argument against any proposed mechanical gate that verifies a claim by reading — see "CITATION HYGIENE — the 2026-09-13 sweep, its yield, and BOTH rejected gates" in §9's claim-hygiene item, where both proposed gates were rejected with their measurements |
 | `DIEPTXF2` overlaps `DIEPTXF0` | `the_fifo_partition_fits_and_does_not_overlap` (the `const _` block cannot see this one) |
 | `wTotalLength` off by one; `line_coding` byte order swapped; strings Latin-1 not UTF-16LE | three descriptor tests |
 | `UsbToken::take()` hands out the peripheral every time | `the_peripheral_is_handed_out_once` |
@@ -1303,12 +1326,76 @@ discarded, against **~850 LOC** reusable.
 
 ### Genuinely open
 
-1. **Signing latency under `secp-lowmemory` is UNMEASURED.** This is now the
-   highest-value unknown. `ECMULT_WINDOW_SIZE=4` / `ECMULT_GEN_PREC_BITS=2`
-   bought 92% of the flash budget (§2.2) by shrinking the precomputation window;
-   the cost is slower EC math, on a 120 MHz Cortex-M4, and nothing measures it.
-   No host benchmark substitutes — the window size interacts with the actual
-   core. A bad answer partly reopens decision 4.
+1. **`secp-lowmemory` is PROVABLY INERT for this image, so its latency cost is not an
+   unknown — it is ZERO. The unknown that IS real is a DIFFERENT question.**
+   **This item read *"Signing latency under `secp-lowmemory` is UNMEASURED. This is now
+   the highest-value unknown. `ECMULT_WINDOW_SIZE=4` / `ECMULT_GEN_PREC_BITS=2` bought
+   92% of the flash budget (§2.2) by shrinking the precomputation window; the cost is
+   slower EC math, on a 120 MHz Cortex-M4, and nothing measures it. No host benchmark
+   substitutes — the window size interacts with the actual core. A bad answer partly
+   reopens decision 4."* until 2026-09-13.** Its COST PREMISE IS FALSE, measured twice:
+
+   - **The code is not in the image.** `/usr/bin/objdump --syms
+     target/thumbv7em-none-eabihf/release/coldsnap_firmware | grep -ci secp256k1` = **23**,
+     and every one is field arithmetic (`fe_impl_mul`, `fe_impl_sqr`, `fe_sqrt`,
+     `fe_impl_normalize{,_var}`, `fe_impl_set_b32_{mod,limit}`, `fe_impl_get_b32`,
+     `fe_impl_to_storage`, `fe_impl_normalizes_to_zero`), point decompression
+     (`ge_set_xo_var`, `ge_from_storage`) or parse/serialize (`pubkey_{load,save}`,
+     `xonly_pubkey_{parse,serialize}`), plus `context_static_` (180 B),
+     `context_no_precomp` (4 B), two callbacks and `strlen`. The same output under
+     `grep -iE 'ecmult|pre_g|prec_table'` yields exactly two entries and **neither is
+     code**: `precomputed_ecmult.c` and `precomputed_ecmult_gen.c` as **zero-size `df`
+     FILE symbols**. Those translation units linked and were entirely gc'd. No ecmult
+     instructions, no table bytes.
+   - **The falsification, RUN and not argued.** Remove `secp-lowmemory` from
+     `Cargo.toml:52` and `cargo build --release` into a private target dir. Result:
+     **379,648 B on BOTH sides**, section for section (`.vector_table 0x40`,
+     `.text 0x4e7e0`, `.rodata 0xe2bc`, `.data 0x24`, `.bss 0x10024`), an identical
+     symbol COUNT, and no `pre_g`/`prec_table` either way. The residual symbol-name
+     differences are `-C metadata` hash churn and `.Lanon` label renaming — the effect
+     §10 already documents for the 4 B padding difference between `cargo build --release`
+     and `-p coldsnap_firmware`. `Cargo.toml` restored, sha256
+     `89cb3d3cf408adb4f3bce3afec6a75f7ec565032e6e305090b6872c280e87852`, tree clean.
+     (Symbol-count caveat, recorded rather than smoothed: the identity is what carries
+     the argument, and the absolute figure depends on the counting filter —
+     `grep -c '^[0-9a-f]\{8\} '` over `--syms` gives 2,519 on the image today against
+     the 2,523 recorded when the two builds were compared. Same image, different filter.)
+
+   **So the feature changes this image by exactly 0 bytes.** `ECMULT_WINDOW_SIZE` and
+   `ECMULT_GEN_PREC_BITS` govern code that is not linked, so there is nothing to ratio
+   against and no latency for them to cost. **ROOT CAUSE: decision 3.** Moving every EC
+   operation to `secp256kfun` (`Xpub::derive_bip32_in_place` → `TweakableKey::tweak` →
+   `g!(self + tweak * G)`) left exactly TWO C libsecp calls in the device graph and
+   **both are PARSES** — `TweakableKey::to_libsecp_key` is
+   `PublicKey::from_slice(33 B)` (`frostsnap_core/src/tweak.rs:255-260`) and
+   `LocalSpk::spk` is `XOnlyPublicKey::from_slice(32 B)`
+   (`frostsnap_core/src/bitcoin_transaction.rs:476-480`). §2.2's table stays exactly as
+   it is: the 92% it records is real, and it is real for the **rlib sum**, which is a
+   different quantity from the linked image (README "Flash budget" for why they differ
+   by ~2.4×). **KEEP THE FEATURE**: the tables are gc'd either way so it is free, and it
+   is the standing guard for the day some future code does reach an ecmult. Dropping it
+   saves zero bytes and costs a `Cargo.toml` change, a build and a re-measure.
+
+   **THE UNKNOWN THAT IS REAL, and it is a different question:** how long ONE FROST
+   signature share takes in `secp256kfun`'s `field_10x26` / `scalar_8x32` on a 120 MHz
+   Cortex-M4F **with no precomputed generator table at all** — the image's largest
+   `.rodata` symbol is `frost_backup::BIP39_WORDS` at 16,384 B and `secp256kfun` ships
+   no table either. That is still UNMEASURED, still needs the board, and it is what the
+   watchdog-period decision in §9's watchdog item actually waits on.
+   **A HOST BENCH CANNOT ANSWER IT, and that is measured too:** the device links
+   `secp256kfun`'s vendored k256 at 32-bit limb width (`field_10x26`, `scalar_8x32`, by
+   `objdump --syms` on the release ELF) and the host links the 64-bit ones
+   (`field_5x52`, `scalar_4x64`, by `/usr/bin/nm` over the host rlibs). Those are
+   **different source files at different limb widths**, not the same code on a faster
+   clock, so neither an absolute time nor a field-multiply count transfers. Only the
+   CURVE-level operation count transfers, and that is READABLE from `secp256kfun`'s
+   sign path with no benchmark at all. **And no benchmark exists anywhere in the tree**
+   — `rg 'criterion|\[\[bench\]\]|black_box'` finds only prose, and the only
+   `Instant::now()` in the tree are `hostcheck`'s wall-clock deadlines. So the correct
+   pre-silicon artifact here is a `g!` count, not a bench crate, and **the host signing
+   benchmark was KILLED on 2026-09-13** on exactly these grounds. Six sites in this
+   document set told a reader to reserve bench time for a measurement that could not
+   come back non-zero; they are corrected in the same pass.
 
    **Decided 2026-08-18: this stays open until phase 5, deliberately.** The cheap
    way to close it early was a generic STM32L4 dev board (same Cortex-M4F at
@@ -1368,13 +1455,24 @@ discarded, against **~850 LOC** reusable.
      `copy_from_slice`s with no clear-bits-only rule at `WRITE_SIZE = 4` — a double more
      permissive than the silicon, i.e. the §8.1 defect-5 class. **Use `FakeFlash`.**
    - `hal/src/flash.rs`'s `fake::FakeFlash` (`refuse_programs_now`, `refuse_erases_now`,
-     `heal`, `scribble`, `programs`, `erases`) drives **4 of hal's 16 integration tests**,
-     up from 2 (commit 2a055f7). **Say which metric:** that is FAULT-INJECTING tests
-     (`rg -c 'refuse_programs_now|refuse_erases_now|\.scribble\('` = 4). "Tests backed by
-     `FakeFlash` at all" is **12 of 16** (`rg -c 'FakeFlash::new'`). The lane that landed
-     those four first reported "7 of 16" and its reviewer disproved it with a one-line
-     grep; both numbers are written here so the next reader does not re-derive either.
-     Two of the four new tests inject NO fault and use the counters as an observable only.
+     `heal`, `scribble`, `programs`, `erases`, and `refuse_programs_after` as of
+     2026-09-13) drives **6 of hal's 18 integration tests**, up from 4 of 16 (**this read
+     "4 of hal's 16 integration tests", up from 2 at commit 2a055f7, until 2026-09-13**;
+     the +2 is `a_refused_write_after_a_single_copy_write_erases_the_older_copy_not_the_live_one`
+     and `a_torn_multi_chunk_write_makes_the_slot_unreadable_and_refuses_to_sign`).
+     **Say which metric:** that is FAULT-INJECTING tests. "Tests backed by `FakeFlash` at
+     all" is **14 of 18**, up from 12 of 16 (`rg -c 'FakeFlash::new'`). The lane that
+     landed the first four reported "7 of 16" and its reviewer disproved it with a
+     one-line grep; both numbers are written here so the next reader does not re-derive
+     either. Two of those four inject NO fault and use the counters as an observable only.
+     **AND THE GREP IS NO LONGER SAFE TO QUOTE RAW — this is the trap-15 shape again.**
+     `rg -c 'refuse_programs_now|refuse_erases_now|refuse_programs_after|\.scribble\('`
+     over that file is **8**, not 6: two of the eight are DOC-COMMENT mentions of the
+     helper (`:938` and `:1080`), not calls. Attributing per-test without excluding
+     comment lines counts a seventh test that injects nothing —
+     `a_retry_of_the_same_signing_session_returns_the_cached_shares_without_advancing`
+     was mis-attributed exactly that way while this paragraph was being written. The 6
+     is CODE lines only, one per test.
 
    **Four of the §6.3 priority-2 sites now have named tests reaching them**, all in
    `hal/tests/integration_frostsnap_over_hal.rs`:
@@ -1388,9 +1486,67 @@ discarded, against **~850 LOC** reusable.
    (the read-back comparison, reached NON-VACUOUSLY with a stale `SigningState` for a
    DIFFERENT session).
 
-   **STILL OPEN:** the read-back's `read_slot()`-returns-`None` leg and `ab_write.rs`'s
-   `EncodeError` leg both need a TORN multi-chunk write, whose whole increment is a 3-line
-   `FakeFlash::refuse_programs_after(k)` mirroring `FaultyNorFlash::fail_write_after`.
+   **BOTH LEGS ARE NOW SETTLED, and they settle DIFFERENTLY. This read "STILL OPEN: the
+   read-back's `read_slot()`-returns-`None` leg and `ab_write.rs`'s `EncodeError` leg both
+   need a TORN multi-chunk write, whose whole increment is a 3-line
+   `FakeFlash::refuse_programs_after(k)` mirroring `FaultyNorFlash::fail_write_after`"
+   until 2026-09-13.** The grouping was the error: only ONE of the two legs is about a torn
+   write.
+
+   **LEG 1, `read_slot()` returns `None` — CLOSED 2026-09-13 by
+   `a_torn_multi_chunk_write_makes_the_slot_unreadable_and_refuses_to_sign`**, and
+   mutation-verified: `read_slot().ok_or(WriteVerifyFailed)?` →
+   `.unwrap_or_else(|| with_signatures.clone())` is exit 101 with exactly that one named
+   failure, and the mutation's own panic payload shows the call returning `Ok` carrying six
+   cached shares for an advance that never reached flash. The helper landed as
+   `FakeFlash::refuse_programs_after(k)` scheduling by DOUBLEWORD count (§8's phase-7 row).
+   **And the division of labour is worth stating, because a production doc comment had it
+   backwards until 2026-09-13:** `Session::open`'s `load_slots` does NOT notice a torn nonce
+   write — a slot too torn to decode is silently DROPPED from the `last_used` maximum,
+   `AbSlots::new` `filter_map`s it out. What DOES notice it is this read-back-and-compare on
+   the CONSUMING path, which turns it into `NoncesUnavailable::WriteVerifyFailed` so **no
+   signature share is emitted** (`frostsnap_embedded/src/nonce_slots.rs`'s own
+   `last_write_outcome` doc). Verified by reading `AbSlots::new` in
+   `frostsnap_core/src/device_nonces.rs`.
+
+   **AND A LIVE HAZARD SITTING IN A DOCUMENTED UPGRADE PATH, which is the most valuable
+   thing the 2026-09-13 round measured and belongs in this register rather than only in a
+   source comment.** `firmware/src/store.rs`'s own `ponytail:` note proposes, as the upgrade
+   for a torn second keygen, "`identity.rs`'s paired-record design, read both copies and pick
+   the newest that checksums". **Implemented as a fallback inside `AbSlot::read`, that is a
+   nonce-reuse hazard.** MEASURED: making `AbSlot::read` fall back to the older copy on a
+   decode failure left **267 hal lib tests, 5 smoke tests and all 16 pre-existing integration
+   tests GREEN**, while making `sign_guaranteeing_nonces_destroyed` return `Ok` carrying six
+   cached `SignatureShare`s for a nonce advance that never reached flash — because the cached
+   arm's `with_signatures` **IS** the older copy, so the read-back equality check passes.
+   `a_torn_multi_chunk_write_makes_the_slot_unreadable_and_refuses_to_sign` is the only test
+   in the tree that catches it. The share record can fall back safely **only** because it has
+   its own checksum; the nonce slot has none, and its read-back verification depends on
+   `AbSlot::read` NOT falling back. The scoping sentence is now in `store.rs` beside the note
+   that proposes it, so the implementer reads it where the work would start.
+
+   **LEG 2, `ab_write.rs`'s `EncodeError` leg — RECLASSIFIED from open to UNREACHABLE BY
+   CONSTRUCTION, and deliberately NOT converted to an `expect`.** `BincodeFlashWriter::write`
+   (`partition.rs:292-315`) returns its only error from inside `if self.buf_index ==
+   BUFFER_SIZE`, **before** `self.buf_index = 0` and **before** `self.word_pos +=`. So it
+   returns with `buf_index == BUFFER_SIZE` and `word_pos` unmoved; `flush()` then computes
+   `aligned_index == BUFFER_SIZE` (`BUFFER_SIZE % WRITE_SIZE == 0` is asserted at
+   construction), fills an EMPTY range, and issues `nor_write(word_pos * WRITE_SIZE,
+   &self.buf[..BUFFER_SIZE])` — **the byte-identical program at the identical offset that
+   just failed.** `writer.flush()?` therefore returns first and `encode_result` is NEVER
+   inspected. Observing that leg needs one identical program to fail and its exact replay to
+   succeed: impossible under any monotone count-scheduled refusal (`FakeFlash::programs`
+   only increments on SUCCESS, so once `programs >= k` it never rises again), impossible
+   under the vendored `FaultyNorFlash::fail_write_after`'s identical permanent-from-n
+   semantics, and impossible under `FakeFlash`'s clear-bits rule since the failed attempt
+   mutated nothing. **NOT converted to `expect`/`unreachable!`, and the reason is the
+   project's whole shape:** that would turn a provably unobservable total error branch into
+   a REACHABLE panic on a transient `PROGERR`, under `panic = "abort"` at RDP=2 with DFU
+   hardware-impossible and no PIN — strictly worse than the `map_err`. Both legs also
+   collapse to `NorFlashErrorKind::Other` (`hal/src/flash.rs` maps `FlashError::Hardware`
+   to `Other`), so no assertion could name the site even if it were reached. Reaching it at
+   all would need a TRANSIENT knob (`refuse_next_programs(n)`), which is a different helper
+   from the one this item scoped.
    **MUST NOT GET A TEST:** `read_back_state.signing_state.ok_or(WriteVerifyFailed)?` is
    unreachable BY CONSTRUCTION — the equality check one line above has just proved
    `read_back_state == with_signatures`, and `with_signatures.signing_state` is `Some` in
@@ -2135,22 +2291,55 @@ reachability is not hypothetical and does not need a corrupt frame — an ordina
     **M10 — `CoordinatorSendBody::Cancel`, and the scope of the old claim was wrong.**
     The withdrawn text said "NONE of them is exercised by any harness: `Cancel` appears
     zero times in a green run". The qualifier saves the first clause and nothing saves
-    the second: `Cancel` is constructed SIX times in the Tier-1 run, and FIVE of the six
-    clearings already had named host tests asserting the DOWNSTREAM REFUSAL, each with
-    its own MUTATION-VERIFY note —
-    `a_reveal_grant_ends_with_its_pages_and_is_revoked_by_cancel` (which cancels
-    mid-reveal and requires `show_backup` to answer `Err(Refused(DisplayBackup))`
-    afterwards), `a_cancelled_ceremony_cannot_be_acked_as_recorded`,
-    `cancel_drops_a_live_quiz_and_a_pass_acks_once`, `cancel_drops_a_half_typed_backup`
-    and `cancel_is_handled_and_silent`. So "send it mid-reveal and assert the grant is
-    gone" was NOT the cheapest real gap; it was a re-proof, over a transport, of a fact
-    already mutation-verified by name.
+    the second: `Cancel` is constructed SIX times in the Tier-1 run, and the clearings
+    already had named host tests asserting the DOWNSTREAM REFUSAL. So "send it mid-reveal
+    and assert the grant is gone" was NOT the cheapest real gap; it was a re-proof, over a
+    transport, of a fact already mutation-verified by name.
 
-    What had no assertion anywhere in the tree was the SIXTH clearing, `pending_name`:
-    its test (`a_previewed_name_is_neither_written_nor_announced`) stops at
-    `pending_name() == None` and never runs the keygen that would have committed it, so
-    "a cancelled preview is never acked as a `SetName`" was unasserted. That is what M10
-    closes, and it needed no stub change and no device change.
+    **BUT THE COVERAGE IS 4 + 1 + 1, NOT FIVE OF SIX. This paragraph read "FIVE of the six
+    clearings already had named host tests asserting the DOWNSTREAM REFUSAL, each with its
+    own MUTATION-VERIFY note", and listed `cancel_is_handled_and_silent` as one of the five,
+    until 2026-09-13.** The six clearings are `firmware/src/lib.rs`'s `Cancel` arm, in
+    order: `signer.clear_tmp_data()`, `pending_name = None`, `reveal = None`,
+    `record_pending = false`, `entry = None`, `check = None`.
+      - **FOUR** carry a doc-comment MUTATION-VERIFY naming that exact clearing:
+        `a_reveal_grant_ends_with_its_pages_and_is_revoked_by_cancel` (cancels mid-reveal
+        and requires `show_backup` to answer `Err(Refused(DisplayBackup))` afterwards),
+        `a_cancelled_ceremony_cannot_be_acked_as_recorded`,
+        `cancel_drops_a_live_quiz_and_a_pass_acks_once`, `cancel_drops_a_half_typed_backup`.
+      - **THE FIFTH, `pending_name`, has the coverage but not the RECORD.**
+        `a_previewed_name_is_neither_written_nor_announced` ends with a live falsifiable
+        `assert_eq!(session.pending_name(), None)` after a `Cancel`, so deleting
+        `self.pending_name = None` fails it TODAY — but that test's own MUTATION-VERIFY note
+        names a DIFFERENT mutation ("Save or announce the name from the `Naming` arm"). A
+        false record of a true fact, which is the class 9d199df spent 64 corrections on.
+        **STILL OPEN as of 2026-09-13**: it is a one-sentence edit inside
+        `firmware/src/lib.rs`, which was not in the doc lane's write set this round.
+      - **THE SIXTH, `signer.clear_tmp_data()`, has NO assertion anywhere on the `Cancel`
+        path.** `cancel_is_handled_and_silent` — the test the withdrawn count listed as the
+        fifth witness — opens a FRESH session with no half-finished state and asserts only
+        `prompts.is_empty()` and `out.frames() == 0`, so **all six clearings can be deleted
+        and it stays green.** It was never a witness for any of them.
+      - **The sixth is DELIBERATELY left open, with its reason.** `FrostSigner` exposes no
+        read accessor for `restoration`'s or `keygen`'s tmp data
+        (`frostsnap_core/src/device.rs`'s `clear_tmp_data` is
+        `clear_unfinished_keygens()` + `restoration.clear_tmp_data()`, and no
+        `pub fn` reads either map), so asserting its effect needs a vendor modification with
+        a new `vendor/README.md` row. And what it guards is **RAM retention** of a half-typed
+        backup — not the glass and not the wire. The four grants that put share material on
+        the glass or ack a ceremony (`reveal`, `entry`, `check`, `record_pending`) all have
+        named mutation evidence, which is why this is the acceptable one to leave.
+
+    What had no assertion anywhere in the tree was the WIRE half of the `pending_name`
+    clearing (**this said "the SIXTH clearing" until 2026-09-13, on the withdrawn
+    five-of-six count above; `pending_name` is the fifth, and the ordinal is the only thing
+    that changes here**): its test
+    (`a_previewed_name_is_neither_written_nor_announced`) stops at `pending_name() == None`
+    and never runs the keygen that would have committed it, so "a cancelled preview is never
+    acked as a `SetName`" was unasserted. **That distinction is exactly why the field
+    clearing and the wire claim are separate rows**: the field clearing IS asserted there,
+    the announcement is not. M10 closes the wire half, and it needed no stub change and no
+    device change.
 
     THE ASSERTION IS A DIFFERENTIAL, because an absent `SetName` proves nothing on its
     own — this item already records that a LATE preview is indistinguishable from no
@@ -2507,8 +2696,9 @@ reachability is not hypothetical and does not need a corrupt frame — an ordina
     those two mutations turned out to be caught by an exact-text pin anyway, which is the
     other half of the correction: the lane understated its own coverage.)
 
-    **TWO WAYS A SOURCE PIN GOES SOFT, both found 2026-09-12 and both worth reading before
-    writing another one.**
+    **SEVEN WAYS A SOURCE PIN GOES SOFT — two found 2026-09-12, five more on 2026-09-13,
+    every one of the five with a mutation that was GREEN on the tree that already carried
+    the "fix". Read them before writing another pin.**
       - **`contains` on a pattern FRAGMENT tests that a pattern is PRESENT, never that it is
         ALONE.** `the_consent_gate_uses_the_page_it_was_given_and_demands_the_last_one`
         pinned `confirm_at`'s accepting arm with a bare
@@ -2517,17 +2707,344 @@ reachability is not hypothetical and does not need a corrupt frame — an ordina
         needle intact, and that mutation ran **GREEN on all 120 lib tests** while the pin
         that exists to forbid exactly this did not fire. It was writable before the
         address-verification work and would have passed then too, so this is a PRE-EXISTING
-        fail-open in the pin, not a regression. Fixed by anchoring the needle to the WHOLE
-        LINE (leading newline + indent), so a `| `-prefixed form no longer matches;
-        re-verified in BOTH directions, including that the pin's own originally documented
-        mutation still fails. `hal/src/keypad.rs`'s
-        `the_scan_order_is_actually_shuffled_at_the_only_call_site` is the same shape and
-        nobody has swept the class.
+        fail-open in the pin, not a regression. Fixed on 2026-09-12 by anchoring the needle
+        to the WHOLE LINE (leading newline + indent), so a `| `-prefixed form no longer
+        matches; re-verified in BOTH directions, including that the pin's own originally
+        documented mutation still fails.
+
+        **THAT FIX WAS ITSELF INCOMPLETE, and this is the SECOND time a repair for this
+        class has shipped containing a fresh instance of it.** Anchoring the needle closes
+        widening-by-ALTERNATION and leaves **widening-by-ADDED-ARM wide open.** MEASURED
+        2026-09-13 against the SHIPPED fix, not argued from reading: inserting a whole new
+        line `Ok(Shown::Page { last: false }) => {}` **above** the pinned arm left **all 172
+        firmware tests GREEN, exit 0, with no `unreachable_patterns` warning**. A non-last
+        page then authorises while the assertion's own message says "only the last page may
+        authorise". **So the rule to record is not "anchor the needle". It is: AN
+        EXCLUSIVITY CLAIM NEEDS A BOUND ON BOTH SIDES OF THE REGION IT IS ABOUT.** Closed
+        2026-09-13 by holding the arm block BY VALUE —
+        `assert_eq!(arms.lines().collect::<Vec<_>>(), [the three exact arm lines])`, bounded
+        LEFT by a `split_once` on the `) {` that opens the block and RIGHT by a `split_once`
+        on the `}` that closes it. **The "right-bounding also kills a self-match hazard"
+        clause that stood here until 2026-09-13 was FALSE and is withdrawn:** `arms` came
+        from `call`, which came from `body`, and BOTH of those were `split(..).nth(1)` — a
+        MIDDLE segment, bounded on the right by the next delimiter — so at the base commit
+        `body` spanned lines 1277-4616 and `call` spanned 1313-2570, nowhere near the test
+        module at 4644. A vanished `match prompt {` could only have widened `arms` to the
+        rest of `call`, never to EOF, and the needle literal in this module was never inside
+        it (measured: 1 occurrence in `call`, and it is the production one). What IS true and
+        is the reason the code uses `split_once`: `split(..).next()` is INFALLIBLE, so a
+        vanished delimiter widens the region SILENTLY instead of failing.
+
+        `hal/src/keypad.rs`'s `the_scan_order_is_actually_shuffled_at_the_only_call_site`
+        **was called "the same shape" here until 2026-09-13, and is not.** That dismissal
+        compared it to a `contains` on a pattern fragment; the consent-gate pin is now a
+        right-bounded value comparison, so the analogy no longer says anything. The keypad
+        pin stands on its own recorded grounds: its needles are span-scoped to the `pub fn
+        scan_once` body (the next `\n    pub fn ` is `read_key`), its "only call site" is
+        true, and its residual hole is an ENUMERATION ceiling — three literal spellings, so
+        `let _ = shuffle_rows(rng); let order = [1u8, 0, 3, 2];` survives it, because a
+        fixed order is fixed whether or not it is sorted. That ceiling was already recorded
+        at `AUDIT-2026-09-10.md:264` over a block inside `cfg(target_arch = "arm")` that no
+        gate compiles, and as of 2026-09-13 it is recorded IN THE SOURCE too, beside the
+        enumeration it limits. The test was NOT renamed and its needles were NOT changed:
+        the name is cited eight times across this file and that audit, which is 5c1232b's
+        orphan trap eight times over.
       - **`production_source()` splits `include_str!("main.rs")` on the FIRST `#[cfg(test)]`,
         so DOC COMMENTS above that point are production source as far as every counted pin
         is concerned.** Writing `glass.take()` longhand in a doc comment fails
         `a_parked_prompt_is_serviced_once_per_iteration_and_never_in_a_loop` with
         `left: 2, right: 1` on an otherwise-green tree. The code says so in place now.
+      - **THE SUPERSTRING CLASS, found 2026-09-13. A `contains` needle whose FIRST or LAST
+        character is a RENDERED NUMBER is satisfied by a SUPERSTRING**, so the value the
+        screen exists to display can be wrong with the pin green. EIGHT sites in
+        `hal/src/ui.rs`, all closed 2026-09-13: one `push_str("1")` before the threshold in
+        `keygen_check` defeated the quorum pin AND the hostile-threshold `contains` at once
+        (`"165535-of-65535"` contains both at offset 1), and one `push_u64(n * 10)` defeated
+        both fail-counter pins. **The two QUIZ-count pins were a DIFFERENT mutation and this
+        bullet conflated them into that one until 2026-09-13:** `backup_quiz_passed` builds
+        its own `Buf` and never calls `keygen_check`, so they needed their own
+        `push_str("1")` (`"18 of 25 words"` contains `"8 of 25 words"` at offset 1;
+        `"125 of 25 words"` contains `"25 of 25 words"` at offset 1) plus a gated variant for
+        the all-25 half. The remedy is
+        that file's own dominant idiom, `assert_eq!(row_text(&f, ROW), ..)`, because the
+        drawing row is a literal in the production function. **THE CLASS IS NARROW and the
+        contrast is what proves it, so do not read this as a ban on `contains`:**
+        `format!("pg {}/{}", ..)` is anchored on BOTH sides and `"pg 12/67"` does not contain
+        `"pg 2/67"`; same for `"word 3 of 25"`, `"03: abo_"` and every
+        `Press (N)` needle, where the digit sits inside its own parentheses. **But the
+        discriminator is NOT "anchored on both sides", and this bullet listed `"share #3"` as
+        safe on that reading until 2026-09-13. It is not safe:** its LAST character is a
+        rendered number, so `"share #30"` contains it — MEASURED, appending a digit to
+        `standby`'s rendered index left all 267 hal lib tests GREEN while the screen named a
+        share the device does not hold. That is the EIGHTH site, closed the same day with
+        `assert_eq!(row_text(&f, 4), "share #3", ..)`. The test to apply is the heading's
+        own: neither the FIRST nor the LAST character of the needle may be a rendered
+        number. **And one
+        prescribed fix for this class did NOT close it, measured:** widening
+        `contains("65535-of-6")` to `contains("65535-of-65535")` closes TRUNCATION and not
+        the superstring, because `"165535-of-65535"` still contains it at offset 1. That
+        needle's claim is held by NAME in a different test, and the source comment says so.
+      - **A HEADER PINNED WHERE A BEHAVIOUR WAS CLAIMED.** `hal/src/callgate.rs`'s
+        `no_counted_or_destructive_selector_is_reachable_from_this_module` pinned
+        `contains("impl Drop for PinAttempt")` — an impl HEADER — while the comment above it
+        claimed the BEHAVIOUR, "the PIN buffer must still be wiped on the way out". MEASURED
+        2026-09-13: with that `Drop` body emptied to `fn drop(&mut self) {}` — the
+        `write_volatile` deleted, a 280-byte buffer holding a PIN, its HMAC and 72 bytes of
+        pairing secret left in SRAM — the hal gate was **exit 0, 290 passed**. There is no
+        runtime witness and there cannot be one: observing a dropped local's bytes is UB.
+        The needle now BOUNDS the destructor on BOTH sides — `split_once` on the header,
+        `split_once` on the impl's closing brace — and requires the `write_volatile`
+        statement to be INSIDE it, and it carries a message, which it did not before (it was
+        the only assertion in that test with none). **The statement alone is not enough, and
+        neither is the statement CONJOINED with the header, MEASURED 2026-09-13:**
+        `&mut self.raw` compiles in ANY `&mut self` method of `PinAttempt` and
+        `PinAttempt::as_mut_ptr` takes the identical expression, so moving the wipe there
+        left an empty destructor, BOTH needles satisfied and the hal gate at **exit 0, 290
+        passed** — while the same mutation is exit 101 by name against the bounded form.
+        Residual, recorded rather than closed: a NEW `&mut self` method declared below that
+        impl could hold the statement instead. **SEVERITY,
+        stated so nobody writes this up as closing a live leak:** nothing outside
+        `callgate.rs` constructs a `PinAttempt` today (PIN is PUNTED), so this is an
+        unpinned FORWARD guard, not a live leak. The same shape held the anti-phishing
+        screen's LEARN-vs-CHECK discrimination as two PRESENCE checks on two frames:
+        `assert_ne!(PIN_WORDS_LEARN, PIN_WORDS_CHECK)` proves the consts differ and nothing
+        proved the screen PICKS, so drawing BOTH unconditionally on rows 0 and 1 — a screen
+        saying "Write these down" AND "Recognize these?" at once — left both needles green.
+        Now two row-0 equalities, each with its own gated mutation. The `assert_ne!` was
+        KEPT and is not redundant: were the consts equal, both equalities would still pass.
+      - **AN ASSERTION THAT FAILS OPEN IS WORSE THAN NONE, and this one named the exact
+        overrun it could not see.** `hal/src/ui.rs`'s `text_never_panics_on_hostile_input`
+        carried `assert!(Buf::<16>::new().push_str(s).as_str().len() <= 16, "Buf overran on
+        {s:?}")`. `Buf::push` writes through a checked `get_mut` on a `[u8; N]`, so `len` can
+        never exceed N, and `as_str()` is `buf.get(..len).and_then(from_utf8).unwrap_or("")`
+        — so the exact overrun the message named produced an EMPTY string, length 0, and the
+        assertion read that as SUCCESS. MEASURED 2026-09-13: with `push_str` silently
+        DROPPING every non-ASCII-printable character, the hal gate was **exit 0, 290
+        passed**. Replaced by the char-count identity `push_str`'s own doc states; the same
+        mutation is now exit 101 with one named failure, and that test is the only one of the
+        290 that sees it.
+      - **`str::split(..).next()` IS INFALLIBLE, so `.expect(..)` on it is VACUOUS** — and
+        worse, the message names a condition the expect cannot detect. Three such messages
+        in `firmware/src/lib.rs`, all replaced 2026-09-13 with `split_once`, whose `None` IS
+        reachable and whose messages now claim only that. `hal/src/callgate.rs`'s
+        `.expect("split always yields at least one part")` is the MODEL and is deliberately
+        left: its message is honest about what it can see, and a real guard follows on the
+        next lines. Note what the change does NOT buy, stated in the source rather than
+        dressed up: re-spelling the `#[cfg(test)]` cut literal is red on BOTH forms (8 named
+        tests on the new one, 5 on the old), so `split_once` buys message honesty, not
+        detection. What actually detects a broken cut is the named tests either side of it.
+      - **A UNIVERSALLY QUANTIFIED CLAIM NEEDS A QUANTIFIED MUTATION, or the pin is credited
+        to the wrong assertion.** A whole-row `assert_eq!` on the ONE digit a test happens to
+        render does not hold a claim about EVERY digit. MEASURED 2026-09-13 in
+        `hal/src/ui.rs`'s `keygen_check_renders_the_code_and_the_compare_instruction`: a
+        uniform `frame.text(1, FOOTER_ROW, ..)` fires that single-digit equality, but
+        shifting the legend **only for the four `CONFIRM_CHARSET` digits that case never
+        renders** left all 290 hal tests GREEN under the loop's old
+        `contains(press_legend) + ends_with("x=no")` pair. The anti-MITM consent legend is
+        off-position on 4 of 5 possible digits with the suite green. The loop now carries the
+        same equality. **And the uniform mutation is caught by the WRONG assertion**, so
+        recording it as the loop's evidence would have been the wrong-reason pairing 7f168fa
+        exists to prevent.
+
+    **THE SOURCE-PIN POPULATION, RECONCILED 2026-09-13 — and the reconciliation IS the
+    finding, because the figure that has been quoted is not a count of source pins.**
+    Measured at `5c1232b`: contains-based SOURCE pins are `firmware/src/main.rs` **57** +
+    `hal/src/ui.rs` **0** + `firmware/src/lib.rs` **2** + `hal/src/callgate.rs` **4** +
+    `hal/src/keypad.rs` **2** = **65**, NOT 106. The **182** that has been quoted is
+    `rg -c 'contains('` over those five files — a LINE count, not a pin count; the
+    OCCURRENCE count is **199**. **`hal/src/ui.rs` holds ZERO source pins**: it contains no
+    `include_str!` and no `production_source()`, so it is not one of the five self-reading
+    harnesses (`hal/src/callgate.rs`, `hal/src/keypad.rs`, `firmware/src/lib.rs` **twice**,
+    `firmware/src/main.rs`). **37 of the quoted 106 therefore never existed** — the premise
+    was wrong IN KIND, not off by a little — and all 94 `contains` calls over 82 lines in
+    that file are framebuffer readbacks, `Range`/`RangeInclusive` bounds or `[u8]`/`Vec`
+    membership. The analogous defect IS real there, in the framebuffer medium rather than the
+    source medium: that is the superstring class above, closed as six edit patterns.
+    (Snapshot, per this section's own rule: the 2026-09-13 edits moved the raw greps to
+    **180** lines / **196** occurrences over the same five files, and `main.rs`'s
+    `.matches(` from 29 to 33, because eleven `contains` pins became `assert_eq!` forms.)
+
+    **AND THE LOAD-BEARING CONSEQUENCE, which is worth more than the tidying.** Commit
+    9d199df's *"all 30 counted source-pin substrings over `production_source()` are IDENTICAL
+    to HEAD"* refers to the **29** `.matches(..).count()` needles at that commit — 2
+    `production_source().matches(` + 27 `src.matches(` — plus, most likely, the harness's own
+    `split("#[cfg(test)]")` literal. **That is a plausible reconstruction and not a verified
+    identity; it is marked as such here rather than repaired, because the 30 cannot be
+    recovered from the commit.** What IS verified is that the counted population and the 57
+    `contains` pins are **DISJOINT**. So that verification pass covered exactly the half that
+    already expresses exclusivity CORRECTLY, and **not one** of the 57 that does not. Twelve
+    of the 57 were closed on 2026-09-13, with **eleven mutations that were GREEN on the tree
+    before them** — including moving `let _ = clear_counter(Counter::Panic);` below its
+    guard's closing brace, which leaves the header needle, the count of 1 and all 172
+    firmware tests green while turning a BOUNDED reset loop into an unbounded one: at RDP=2
+    with DFU hardware-impossible and no PIN, a permanent brick.
+
+    **THE TWELFTH PIN AND THE ELEVENTH GREEN MUTATION WERE FOUND BY THE REVIEW ROUND ITSELF,
+    AFTER the pass above had already anchored its sibling — which is the finding.**
+    `every_exit_from_the_entry_takes_the_words_off_the_glass` anchored the entry's
+    `Err(_fault) => refuse(..)` arm and the reveal's `RevealStep::Park` arm, and left
+    `EntryStep::Park => glass = Some(Flow::Entry),` on a BARE `contains` beside a
+    `matches("glass = Some(Flow::Entry)").count() == 2`. MEASURED 2026-09-13: commenting the
+    live arm out and putting `EntryStep::Park => {}` under it is **exit 0, all 172 firmware
+    tests GREEN** — the needle matches from inside the `// ` and the count stays at 2 because
+    the commented copy is still text. A `Wait` mid-entry would then re-park NOTHING: the flow
+    cursor is dropped while the typed prefix stays lit, i.e. the reveal's own leak in the
+    entry's clothing, in the very test whose name is about taking words off the glass. Both
+    needles are now anchored with their leading `\n` and their MEASURED indents (24 and 28),
+    and the same mutation is **exit 101, one named failure**. THE LESSON, and it is why the
+    green count moved after the lane closed: a pass that anchors N of N+1 sibling needles
+    leaves the unanchored one looking reviewed. The three-siblings-in-one-test shape is what
+    hid it. In the same pass the
+    `production_source()` harness doc's "Three tests read this" was corrected to **13 call
+    sites across 12 tests** — and **do NOT quote a raw `rg -c 'production_source()'` total
+    for it**: the grep also matches the definition and every comment that names the helper,
+    so the figure moves whenever anyone writes prose about it. Two drafts of that very
+    sentence falsified themselves by adding a matching line.
+
+    **THE RUNNING TALLY OF VACUOUS ASSERTIONS WRITTEN AND DELETED IN THIS REPO IS NOW 22.**
+    The arithmetic in full, because a wrong total sitting over a checking breakdown is this
+    tree's canonical failure and this is the worst paragraph in the document to commit it in:
+    **14** across three prior sessions (one of them inside a fix for exactly this class),
+    **+2** on 2026-09-13 in `hal/src/ui.rs` — the fails-open `Buf` assertion above, and the
+    dominated digit check `!screen_text(&a).contains('1')`, which was DELETED rather than
+    replaced because the `assert_eq!(a.as_bytes(), b.as_bytes())` three lines above already
+    held the fact (it could only have fired on an input-INDEPENDENT '1', which is not a
+    leak). **That deletion's stated GROUND was too broad and was narrowed the same day:** a
+    byte equality over ONE pair of PINs holds only the digit-derived functions that DIFFER
+    on that pair, and '9876' shares '1234''s odd/even pattern, so a rendering that leaked
+    per-digit PARITY was invisible to it — MEASURED green. The second PIN is now '9875'
+    (parity 1011 against 1234's 1010, digit sets still disjoint) and the same leak is
+    MEASURED red. **+3** on 2026-09-13, the three infallible
+    `split(..).next().expect(..)` messages in `firmware/src/lib.rs`. **+3** on 2026-09-13,
+    `assert_ne!(Grant::Reveal, Grant::Entry)`, `(Reveal, Check)` and `(Entry, Check)` at the
+    tail of `firmware/src/main.rs`'s `only_a_display_backup_prompt_grants_a_reveal` —
+    **WRITTEN AND DELETED INSIDE ONE SESSION**, which is the shortest round trip this class
+    has managed here. `Grant` is three FIELDLESS variants under a derived `PartialEq`, so
+    the comparison is a discriminant compare and a duplicate discriminant is
+    `error[E0081]`: they could not fail. Worse, the two-line comment above them claimed a
+    property about the MATCH ARMS ("no arm can accidentally hand a reveal's screen to an
+    entry or to a quiz") that they did not test at all — the same header-vs-behaviour class
+    this session fixed elsewhere. What holds that fact now is the by-value `assert_eq!` over
+    `grants`'s four arm lines plus the three `matches("Some(Grant::X)").count() == 2` in the
+    same test. **14 + 2 + 3 + 3 = 22.** Two further sites are deliberately NOT in
+    that total, for the same reason in both: `hal/src/callgate.rs`'s and
+    `firmware/src/main.rs`'s `.expect("split always yields …")` messages were HONEST about
+    what they could see, so changing the second and keeping the first were form calls, not
+    vacuity repairs. (The commit that landed the +2 calls the `Buf` assertion "the
+    sixteenth", which is its running index at that moment: 14 + the digit check = 15, + the
+    `Buf` assertion = 16. Same series, different vantage — not a disagreement.)
+
+    **ONE 5c1232b-CLASS ORPHAN CLOSED 2026-09-13.** `hal/src/ui.rs`'s prose named
+    `every_pin_string_fits_the_panel`; the function is
+    `every_pin_string_this_module_owns_fits_the_panel`. The PROSE was fixed and the function
+    name left alone. Commit d5628df's message carries the same wrong short name and is
+    correctly unfixable: a commit message is the record.
+
+    **CITATION HYGIENE — the 2026-09-13 sweep, its yield, and BOTH rejected gates.**
+
+    **THE CORPUS, at `5c1232b`, and SAY WHICH METRIC because two of these numbers depend on
+    the pattern.** `rg -o -N --no-filename '[A-Za-z0-9_./-]+\.(py|S|c|h|rs|x|ld|md|toml|json):[0-9]+'`
+    over PLAN.md, DECISIONS.md, README.md, vendor/README.md, `hal/src`, `firmware/src`,
+    `firmware/examples`, `hostcheck/src`, `tools/*.py` and `firmware/link.x` = **1,449**
+    `path:line` occurrences and **257** distinct paths, of which **1,158** are on the SOURCE
+    side. Re-measured 2026-09-13 against a clean checkout of `5c1232b`; all three reproduce
+    exactly. **Distinct CITATIONS is 881 under that pattern and 922 under the sweep's own,
+    which also captures the `-<end>` and `:<col>` suffixes** — `startup.S:148-156` and
+    `startup.S:148` collapse together under the shorter one. Neither is wrong; quoting either
+    without its pattern is.
+    **AND THE CORPUS IS SELF-REFERENTIAL, which is a trap unique to this material:** prose
+    ABOUT citations contains citations. The same commands over the tree carrying this
+    paragraph give **1,492** occurrences and **1,163** source-side. Any figure here is a
+    dated snapshot at a named commit, never a running total. ~155 hand-verified,
+    including a blind random sample of 25 coldcard citations: **24 correct, 1 off by one.**
+    Measured rot ~**3.4%**. **DO NOT RE-RUN THE 922-CITATION SWEEP** — the yield does not pay
+    for the resolver, both previously known rots (`ssd1306.py:214`, `startup.S:137-138`) are
+    already fixed and still hold, and a range check over all **564** resolved coldcard
+    citations finds **0** pointing past EOF. 20 defect sites shipped 2026-09-13.
+
+    **THE CADENCE FINDING, and it is worth more than the 20 sites.** `AUDIT-2026-09-10.md`
+    spent 26 agents on the FOUR DOCUMENTS — PLAN.md 249, README.md 101, DECISIONS.md 61,
+    vendor/README.md 48 findings, and only **6** of its 465 findings were source files —
+    while **1,158 of the 1,449** `path:line` citations live on the SOURCE side (both counts
+    re-measured 2026-09-13 at `5c1232b`; the AUDIT split is
+    `rg -o '^### [A-Za-z0-9_/.-]+' AUDIT-2026-09-10.md | sed 's/^### //;s/:.*//' | sort |
+    uniq -c`, which also shows `hostcheck/src/main.rs` 3 and `firmware/examples/stub.rs` 3 —
+    the 6 source-file findings). **The
+    instance:** commit 9d199df fixed `startup.S:148-156` → `:148-157` in PLAN.md and
+    `firmware/link.x` and recorded it DONE, and **five live `hal/src` sites still said
+    `148-156`** — `callgate.rs:1219`, `lib.rs:256`, `heap.rs:10`, `heap.rs:304`,
+    `panic.rs:87`. Ground truth: `bne wipe_loop2` is `startup.S:157`, so `:156` stops one
+    line inside the loop. All five fixed 2026-09-13. None of the five carries a "this read
+    `148-156` until 2026-09-13" clause, and that OMISSION is right — the correction trail for
+    this citation already lives here and in `firmware/link.x:65-66`, so the source comments
+    carry none. **The REASON given for it in that fix's own commit message — "that is the doc
+    register's convention, not a source comment's" — is a generalisation this document
+    contradicts, and it is scoped to this one citation as of 2026-09-13:** the same commit
+    wrote "this read X until" clauses into source comments nine times. A commit message is
+    the record and is not edited; the scoping lives here. **A doc-lane fix that never reaches
+    the source comments is this project's real rot mechanism, and it is the highest-value
+    unopened surface in the tree.** NEXT SESSION'S PRIORITY 1, with its mechanical check:
+    `rg` each 9d199df-corrected citation across `hal/src` and `firmware/src`. (One
+    quotation is deliberately left at `148-156`: `AUDIT-2026-09-10.md:164` quotes
+    `hal/src/panic.rs:84-87` VERBATIM as prescribed replacement text, and `:163` and `:2879`
+    are correction record — `:2879` says in as many words "with `bne` at `:157` — one line
+    past". Renumbering inside a quotation of what the source USED to say destroys the
+    evidence, which is 9d199df's own DELIBERATELY-LEFT-ALONE rule.)
+
+    **THE OBLIGATORY EXCLUSION, measured.** **132 of the 1,449 citations are PROTECTED** —
+    dated trajectory rows, "this read X until <date>" clauses, and citations inside quoted
+    withdrawn text — including **20 of the 24 in `vendor/README.md`**, whose citations are
+    almost entirely correction record and were left wholesale. Per file: `firmware/link.x`
+    15 of 27, PLAN.md 63 of 182, DECISIONS.md 16 of 70. And the counting rule that produces
+    132 rather than 236 is worth keeping: **a `///`-only line IS a paragraph break.** Treating
+    a whole Rust doc block as one paragraph over-protects, and it wrongly shielded a real
+    finding (`hal/src/heap.rs`'s dead `hal/examples/stub.rs` path) behind a `SUPERSEDES
+    18,036 B` note fourteen lines above it. The struck-through `bitcoin_transaction.rs:524`
+    in DECISIONS.md gets a parenthetical, **never a renumber**; it already has one.
+
+    **THE TRAP THAT WOULD HAVE MANUFACTURED FALSE ROT.** `/Users/garykrause/repos/frostsnap`
+    is **1,269 commits AHEAD** of the vendored `0bbc18be` with **17 differing files**, so
+    every vendored-crate citation must be verified against `vendor/frostsnap/` IN-TREE, never
+    against the sibling; resolving `device.rs:491` or `tweak.rs:573` there would report rot
+    that does not exist, over ~171 distinct citations. Conversely
+    `/Users/garykrause/repos/coldcard-firmware` is at `0431fd2b` (2026-08-09), BEFORE this
+    project's first citation, with local changes only under `docs/` — so **coldcard rot is
+    never DRIFT, only WRONG-AS-WRITTEN**, which makes the check a content read rather than a
+    diff. Two further resolution traps: `stm32l4s5xx.h` exists in **FIVE** copies in that
+    sibling and they disagree inside `SPI_TypeDef`, and `oled.c` / `storage.c` each exist in
+    both `stm32/bootloader/` (Mk3) and `stm32/mk4-bootloader/` (Mk4). `main.c:42` is cited at
+    **29** sites and `dispatch.c:570-574` at 7; both are verified correct and are **not** to
+    be re-derived — if either ever moves it moves 36 times.
+
+    **GATE (a) — pair every line citation with a companion MARKER: REJECTED, with numbers.**
+    Implemented and run over all **924** coldcard citation occurrences: **125 pass, 671
+    (72.6%) carry NO MARKER AT ALL, 128 no-match.** Of 6 no-matches hand-verified, **5 were
+    false positives** — `ssd1306.py:61` for `0xf0` is `SET_DISP_CLK_DIV, 0xF0` (hex case),
+    and `oled.c:71`, `oled.c:498`, `clocks.h:6`, `clocks.c:147-149` are all exact. So it is
+    silent on nearly three quarters of the corpus and ~83% wrong on the rest. Worse, **it
+    cannot RESOLVE a third of its own input**: 284 of the 922 distinct citations are bare
+    basenames with no directory, and nothing in the tree declares a citation base path. The
+    range check it would subsume finds **nothing** (0 of 564). And it gates a **DEPRECATED
+    idiom** — this repo has been moving citations from LINES to SYMBOLS precisely because
+    lines rot. **The suggested alternative, a lint FORBIDDING new line citations, is also
+    REJECTED:** it would have caught NONE of the nine findings (one is a wrong PATH, one a
+    test NAME, three pre-existing), and `main.c:42` is correct at 29 sites.
+
+    **GATE (b) — every named test in prose exists: REJECTED.** 175 backticked snake_case
+    candidates, 16 not any `fn` in the tree. Triaged all 16: 7 external symbols, 1 local
+    variable, 1 struct field, **6 deliberately-preserved rename or withdrawal records**, and
+    exactly **1 live defect**. 94% false positive — and **6 of the 15 FPs are text this
+    project FORBIDS touching. A gate that fires on the correction record has only two
+    responses: suppress (forbidden here) or delete the evidence (worse).**
+
+    **THE HONEST CONCLUSION, written as the conclusion: THERE IS NO CHEAP MECHANICAL GATE FOR
+    THIS CLASS. KEEP DOING PASSES.** The narrowed form of (b) survives as ONE `rg` line in a
+    REVIEW CHECKLIST and not in CI: run the name check only over prose in an ASSERTING
+    position (`enforced by|pinned by|caught by|covered by|the pin is`) and only OUTSIDE
+    withdrawal-marked paragraphs. At 1 true positive per 175 candidates that is a checklist
+    line. **And §8.2's `fifo_words` cell is the standing argument against any gate that
+    verifies a claim by READING:** two independent readings agreed on an answer that was
+    wrong three ways, and only running the mutation found it.
 
     **The count is a snapshot, not a bound, and it has moved three times:** 152 → **169**
     on 2026-09-08 (the first recount said 164, missing `entry.rs` and `hal/src/lib.rs`
@@ -2770,6 +3287,27 @@ reachability is not hypothetical and does not need a corrupt frame — an ordina
     RE-CONFIRMED 2026-09-12 (a63eaa7) by tracing a mutation for each of the five: the
     reasoning holds and no severity-1 leak survives in them.
 
+    **TWO FURTHER HOISTS PROPOSED AND STILL DECLINED, re-derived 2026-09-13 so the grounds
+    are on the record rather than in a lane's head.**
+      - **Hoisting `Flow`/`Reveal`/`Check` and the three `*_step` routers — DECLINED,
+        because all 16 of those items are ALREADY at module scope** in
+        `firmware/src/main.rs`: `Reveal`, `reveal_consent`, `RevealStep`, `RevealScreen`,
+        `reveal_draw`, `reveal_step`, `Flow`, `flow_consent`, `EntryStep`, `entry_step`,
+        `entry_frame`, `Check`, `CheckStep`, `check_step`, `quiz_frame`, `grants`, with 38
+        host tests in that file (`grep -c '#\[test\]' firmware/src/main.rs` = 38,
+        re-confirmed 2026-09-13). There is nothing left to hoist. What the proposal actually
+        wanted was a CONSUMER, and the 2026-09-13 nonce-durability round does not create one
+        by a single line: it landed in `hal/src/flash.rs` and `hal/tests/`, and adds no
+        caller in `firmware/examples/stub.rs` or `firmware/src/main.rs`.
+      - **Lap-driven restoration walks — DEFERRED, and the corrected `Cancel` count in §8.3's
+        M10 makes the case STRONGER rather than weaker.** `reveal`, `check_quiz` and
+        `type_backup` in `firmware/examples/stub.rs` are each a blocking `loop` with **no
+        wire read**, so making them resumable across laps is a ~250-line state-machine
+        rewrite of the stub plus the main loop. The one clearing it might newly exercise is
+        the UNCOVERED sixth, `signer.clear_tmp_data()` — and it would not ASSERT it, because
+        the stub has no observable for `tmp_loaded_backups`. So the cost buys the STUB's
+        guards, not `boot()`'s, exactly as already recorded.
+
     **BUT THE COUNT WAS WRONG, AND THE MISCOUNT IS WHAT HID THE REAL HOLE.** "The five
     other" — six with `show_backup_page` — undercounts by three. `boot` nests **NINE**
     functions that put pixels on the glass: `hold`, `draw_prompt`, `draw_batch`,
@@ -2820,12 +3358,22 @@ reachability is not hypothetical and does not need a corrupt frame — an ordina
 
     **Two concrete mutations that pass all six gates**, measured 2026-09-08 during
     adversarial verification of this item, recorded because "a lint cannot see a deleted
-    security property" is abstract and these are not. (a) Deleting the `& 0x0f` bound in
-    `usb::Mmio::write_fifo_word` (`usb.rs:1351`) — the mask the comment there calls "a
-    property of the code rather than of every caller" — puts an unsafe
-    `write_volatile` outside the OTG_FS window. (b) Changing `page << 3` to `page << 4`
-    in `StmFlash::erase`'s `FLASH_CR` `PNB` field (`flash.rs:1169`) erases the **wrong
-    page**. Both left 265 hal + 81 firmware tests green, host clippy 0, `cargo build
+    security property" is abstract and these are not. (a) Deleting the `& 0x0f` bound the
+    mask's own doc calls what "keeps the address inside the peripheral for ANY `ep`, rather
+    than relying on every caller" — inline in `usb::Mmio::write_fifo_word` when this was
+    measured, **extracted to `hal/src/usb.rs`'s `fifo_window` later the same day** — puts an
+    unsafe `write_volatile` outside the OTG_FS window. (b) Changing `page << 3` to
+    `page << 4` in `hal/src/flash.rs`'s `pnb_bits`, whose value reaches `FLASH_CR`'s `PNB`
+    field in `StmFlash::erase`, erases the **wrong page**. (**Both were cited as
+    `usb.rs:1351` and `flash.rs:1169` until 2026-09-13 and neither line holds anything
+    relevant now** — `flash.rs:1169` is now a comment inside `StmFlash::erase`'s
+    latched-error note (the statement it used to quote, `let (page, bank2) =
+    erase_page_of(abs)?;`, sits four lines above it at the time of writing, which is the
+    whole reason this citation is a symbol now) and `usb.rs:1351` is an unrelated volatile
+    pair. Converted to SYMBOLS rather than to fresh
+    numbers, per this document's own remedy: both expressions were HOISTED into pure `const
+    fn`s two paragraphs above, which is exactly the movement that rots a line citation. The
+    dated counts in this paragraph are the 2026-09-08 measurement and stay as written.) Both left 265 hal + 81 firmware tests green, host clippy 0, `cargo build
     --release` at 0 warnings *and* 0 errors, and both new device gates at 0. What the
     gate does catch, also by mutation: `apb2 & RCC_APB2ENR_SPI1EN == 0` → `== 1` in
     `display::enable_clocks` (a flag test that can never be true, so `SPI1`'s clock is
@@ -3109,9 +3657,12 @@ reachability is not hypothetical and does not need a corrupt frame — an ordina
     Every spin limit in the tree is comfortably inside 32.77 s — `FLASH_SPIN_LIMIT`
     50,000,000 volatile reads is ≈ 1.3-2 s at 120 MHz, and `MODE_SETTLE_SPINS` 6 M,
     `SAMPLE_GAP_SPINS` 2 M, `DISPLAY_SPIN_LIMIT`/`USB_SPIN_LIMIT`/`DRDY_SPIN_LIMIT`
-    1 M each are far below it — but **`secp-lowmemory` signing latency is UNMEASURED
-    (item 1)** and is the one operation that could plausibly approach tens of seconds
-    on a 120 MHz M4. A watchdog whose window a legitimate signature can exceed kills
+    1 M each are far below it — but **FROST signing latency is UNMEASURED (item 1)** and
+    is the one operation that could plausibly approach tens of seconds on a 120 MHz M4.
+    (**This read "`secp-lowmemory` signing latency is UNMEASURED" until 2026-09-13.** The
+    concern is unchanged and the attribution is: `secp-lowmemory` is provably inert for
+    this image — 0 bytes, measured — so the cost, if any, is in `secp256kfun`'s
+    `field_10x26`/`scalar_8x32`, which no feature flag reaches.) A watchdog whose window a legitimate signature can exceed kills
     the device mid-signature, and if that turns out to be the case the fix is not a
     longer period (32.77 s is the ceiling) but a kick *inside* the signing loop —
     i.e. threading one through vendored `frostsnap_core`, a far larger change than
@@ -3188,7 +3739,7 @@ reachability is not hypothetical and does not need a corrupt frame — an ordina
 | Rust toolchain | 1.88.0 (upstream pin) + `thumbv7em-none-eabihf` |
 | C cross-compiler | clang 21 (`/opt/homebrew/opt/llvm/bin/clang`) — still required, decision 4 |
 | Decisions record | [DECISIONS.md](DECISIONS.md), dated 2026-08-12 |
-| Flash, as built | **899,400 B = 63.1%** of `FLASH_TEXT` as an rlib sum, re-measured in a clean target dir **2026-09-10** (**this row read 860,898 B = 60.4% until then**, which was the 2026-08-19 figure, taken before the UI, the keypad, the share store, 25-word entry, the quiz and the `coldsnap_firmware` crate existed; the two C-secp and rust-bitcoin components are byte-identical, and the whole +38,502 is `libcoldsnap_hal.rlib` 15,873 → **30,627** plus `libcoldsnap_firmware.rlib` **21,000**, a crate absent from every earlier row — **but the two deltas sum to 35,754 (14,754 + 21,000), so 2,748 B of that +38,502 is UNATTRIBUTED. Flagged 2026-09-12 rather than reconciled by invention:** 899,400 − 860,898 = 38,502 is right and each component's own internal split checks (27,636 + 2,991 = 30,627; 18,912 + 2,088 = 21,000), so either the hal delta is understated or a third rlib moved. Re-run `tools/measure-flash.py` into a CLEAN target dir before quoting the split). Headroom on that sum is **526,008 B**. Earlier: 860,898 on 2026-08-19 (844,229 at phase 0; +5,101 panic sites, +253 for §8.1 defects 10–12, **+15,873 `coldsnap_hal` rlib** — of which +3,461 is phase 3's `comms.rs` + `usb.rs` — less −4,482 instantiations that moved between rlibs; all with LTO off, so upper bounds). **This row read 893,099 B = 62.7% until 2026-08-19**, on the strength of a +32,513 B growth attributed to `comms::decode_body`; that does not reproduce clean and is retracted — see README "Flash budget". The live `./target` glob measures 1,311,110 B = 92.0% from 131 rlibs against a clean 48, which is the artefact to suspect first.  **The linked image is measured, and the rlib sum above overestimates it by ~2.4×:** `firmware/` links at **379,648 B = 26.6343%** of `FLASH_TEXT` (`/usr/bin/objdump -h` after `cargo build --release` — `.vector_table` `0x40` + `.text` `0x4e7e0` + `.rodata` `0xe2bc` + `.data` `0x24`; re-measured 2026-09-12 in the MAIN checkout after the four-lane merge; margin **1,045,760 B**), because LTO plus `--gc-sections` keeps only what is reachable. **The ratio in this sentence read `~2.9×` until 2026-09-12 and was simply wrong arithmetic** — 899,400 / 377,256 = 2.384, and README's "Flash budget" said `2.39×` in the same document set; against today's image it is 899,400 / 379,648 = 2.369. **The image read 377,256 B = 26.47% until 2026-09-12** (and 377,192 B = 26.46% at 2026-09-11, 376,752 B = 26.43% at 2026-09-10). **Do NOT take an absolute image figure from a report written in a worktree under `.claude/worktrees/`:** the longer absolute path is embedded ~11 times in panic `Location` strings and inflates `.rodata` by ~424 B while leaving `.text` and `.bss` exact — see the traps note in §9 item 22's neighbourhood. Three of this round's four lanes reported 377,680 B for an unchanged image for exactly that reason, and one of them concluded the 377,256 record was stale. It was not. `llvm-nm` finds **190** frostsnap/secp/schnorr/bitcoin symbols (frostsnap 118, bitcoin 34, schnorr 28, secp256k1 22) and **22** `coldsnap_hal::ui` symbols, re-measured 2026-09-10 — **this pair read 267 and 17 until then** and neither reproduced; README carried the same pair, so both were copied rather than re-derived. The trajectory, each step a real caller appearing rather than a code addition: 11,604 B when `boot()` polled USB but touched no `comms` · 94,304 B with `Link::poll` + `decode_body` · 99,684 B with `identity` · 101,416 B once the identity-hold screen gave `ui`/`display` a caller · 282,080 B once a real `FrostSigner` was constructed and dispatched to · 297,064 B once the remaining §4.2 consent screens got honest callers · 331,116 B with the keypad driver and real consent · 362,288 B once `DisplayBackup`, `mark_sensitive` and the persistent share store landed · 372,688 B once 25-word entry made restore possible · 376,752 B once `CheckBackup` became a real 8-question quiz behind its own consent digit (+4,064 B: +32 B of `ui.rs` screens, +2,232 B when `firmware/src/quiz.rs` first acquired a caller and its generics were instantiated, +1,800 B for the `main.rs` event-loop arm) · **377,192 B** once the keygen check stopped printing a fixed `1=match` and started printing the randomised `press_legend(confirm)` (+440 B: a `Buf<16>` legend build and a call replacing a 12-byte literal). · **377,256 B** once `reveal_draw` hoisted the reveal's screen/cursor pairing out of `boot` into a value-tested module item (§9 item 22) and the three restoration consent screens started REFUSING a row that does not fit instead of drawing a clipped one (+64 B net: +104 B for those two, less 40 B when the review round deleted a vacuous legend-length comparison and turned an early `return` into a value). · **379,648 B** once address verification stopped being refused and got a real caller (`Session::verify_prompt` + `prompt_screen_at`'s `VerifyAddress` arm, ce62444): **+2,392 B**, `.text` +2,352 and `.rodata` +40, attributed symbol by symbol with `llvm-nm --print-size` over both images rather than predicted — +1,366 B `coldsnap_hal::comms::Link::drain` (the new `verify_prompt` and dispatch arm, inlined: THIS is the feature), +1,298 B `<bitcoin::Address as Display>::fmt` and +248 B `coldsnap_hal::ui::address_block` becoming OUTLINED shared symbols, less 668 B as `coldsnap_firmware::prompt_screen_at` gave up its inline copies of both. So ~878 B of it is outlining rather than new functionality. NOT a new dependency edge: `bitcoin::address::Address::from_script` is byte-identical at 342 B in BOTH images, so it was already linked, and no BIP-32 HMAC-SHA512 chain appears — `derive_xonly_key` and `bip341_taptweak_key_only` were already reachable through `sign_ack`. Zero new crates; `bitcoin =0.32.8` was already a non-optional dependency of `frostsnap_core`. That +440 was DISPUTED on review as +444, and **the dispute is SETTLED as of 2026-09-12: BOTH readings were correct and neither party named the cargo invocation.** `cargo build --release` gives `.text 0x4de70` (377,192 B); `cargo build --release -p coldsnap_firmware` gives `.text 0x4de74` (377,196 B). Reproduced in a CLEAN private target dir, both figures, both stable, and the two artifacts' `-C metadata` hashes are the same there as in the live tree — the 0x4de74 binary was still on disk at `target/thumbv7em-none-eabihf/release/deps/`. CAUSE, measured rather than hypothesised: `frostsnap_comms` is a WORKSPACE MEMBER, so the all-members build compiles it with its own `default` feature while `-p coldsnap_firmware` compiles it only as a dependency, where the workspace dep says `default-features = false`. `default = []` has NO CODE BEHIND IT, so the two units compile IDENTICAL source and differ only in the metadata hash cargo derives from the feature list — which changes every generic instantiation's symbol hash, hence function ordering under `lto = "fat"`, hence inter-function ALIGNMENT PADDING. Both binaries hold exactly **807 `.text` symbols totalling 318,780 B of code**; the difference is 312 B of padding against 308 B, and ZERO bytes of code. `.rodata`, `.data` and `.vector_table` are byte-identical. `firmware/link.x`'s `.text : ALIGN(4)` quantises the section, so the smallest observable difference is exactly 4 B. **CONSEQUENCE FOR THE RECIPE, and it is the actionable part: a flash figure is only meaningful with its invocation named.** Every figure in this document is the `cargo build --release` side, which is what README's "Test" section runs. Also settled by the same experiment: "incremental readings have disagreed by 4 B" does NOT reproduce — two clean builds in separate private target dirs and the in-tree incremental build produced a BYTE-IDENTICAL ELF (sha256 `938d317f56…`), so under `codegen-units = 1`, `lto = "fat"`, `incremental = false` this build is bit-for-bit reproducible. `.bss` is byte-identical across all of it at `0x2000_8034..0x2001_8058`, and nothing on the quiz path allocates, so the ~5,024 B arena margin is unchanged. **This cell said "`EnterPhysicalBackup`, `SavePhysicalBackup`, `SavePhysicalBackup2`, `Consolidate` and the naming flows are refused rather than implemented (§9), so their code is absent" until 2026-09-10. All five are IMPLEMENTED and ADMITTED**, which is part of why the image is 376,752 B: `Session::recv` passes each of them through to the signer (`firmware/src/lib.rs:1106-1110` for the four restoration variants, `:935` for `Naming(NameCommand::Preview)`), each behind its own consent digit, with `ToUserRestoration::EnterBackup` and `ConsolidateBackup` handlers at `:1334` and `:1358`. What IS refused, and where the absent code actually is: `Upgrade` (`Refusal::FirmwareUpgrade`), `DataErase` and `Challenge` (the genuine check) — cited by SYMBOL, in `Session::recv_core`'s refusal arms in `firmware/src/lib.rs`. **`ScreenVerify` (address verification) was on this list until 2026-09-12 and is not refused any more** (ce62444, §9 item 16): the dispatch admits it, `Session::verify_prompt` draws the address, and the +2,392 B in the trajectory above is what it cost. So a PIN's SE1 paths are what remains bound-but-gc-sectioned, and address verification is no longer the ceiling. Read the rlib rows for the MARGINAL cost of a change, never as a prediction of image size. |
+| Flash, as built | **899,400 B = 63.1%** of `FLASH_TEXT` as an rlib sum, re-measured in a clean target dir **2026-09-10** (**this row read 860,898 B = 60.4% until then**, which was the 2026-08-19 figure, taken before the UI, the keypad, the share store, 25-word entry, the quiz and the `coldsnap_firmware` crate existed; the two C-secp and rust-bitcoin components are byte-identical, and the whole +38,502 is `libcoldsnap_hal.rlib` 15,873 → **30,627** plus `libcoldsnap_firmware.rlib` **21,000**, a crate absent from every earlier row — **plus `liblinked_list_allocator` 2,748 B. SETTLED 2026-09-13, residual ZERO. This read *"the two deltas sum to 35,754 (14,754 + 21,000), so 2,748 B of that +38,502 is UNATTRIBUTED. Flagged 2026-09-12 rather than reconciled by invention: … so either the hal delta is understated or a third rlib moved. Re-run `tools/measure-flash.py` into a CLEAN target dir before quoting the split"* until then.** It is a THIRD rlib, and it is the global allocator: `liblinked_list_allocator-385fcb8155824808.rlib` = 1,762 `.text` + 986 `.rodata` = **2,748 B**, so 14,754 + 21,000 + 2,748 = **38,502** against a recorded delta of 899,400 − 860,898 = **38,502**, residual **0**. Each component's own internal split still checks (27,636 + 2,991 = 30,627; 18,912 + 2,088 = 21,000). Command, in a PRIVATE target dir so the shared `target/` was untouched: `CARGO_TARGET_DIR=/tmp/cs-rlib-clean CARGO_PROFILE_RELEASE_LTO=false cargo build --release` (exit 0, 50 rlibs) then `python3 tools/measure-flash.py '/tmp/cs-rlib-clean/thumbv7em-none-eabihf/release/deps/*.rlib'` (exit 0). **The exact match is an inference and not a coincidence, because the CAUSE is airtight:** `linked_list_allocator` reaches the RELEASE rlib set by exactly ONE normal dependency edge, `firmware/Cargo.toml`'s `[dependencies]` section; `hal/Cargo.toml` declares it under **`[dev-dependencies]`**, which `cargo build --release` never builds. So it entered the graph precisely WITH `coldsnap_firmware` — the crate this very sentence calls "absent from every earlier row". **The sentence named the new crate and missed the transitive dependency that new crate brought with it**, which is why the residual was exactly one third-party rlib and not a diffuse rounding error. The version is pinned `=0.10.6`, so its 2,748 B today IS its 2,748 B on 2026-09-10 — that pinning is what makes the reconciliation exact rather than approximate — and the old instruction to re-run `measure-flash.py` "before quoting the split" is DELETED because it is DONE, not pending. **AND A TRAJECTORY ROW, NOT a correction of the figure above: today's clean re-measure is 899,707 B = 63.1%**, with `libcoldsnap_hal` 30,644 (27,662 + 2,982), `libcoldsnap_firmware` 21,290 (19,196 + 2,094) and **50** rlibs, against the recorded 30,627 (27,636 + 2,991) / 21,000 (18,912 + 2,088) / "a clean 48"; group rows C secp256k1-sys **96,947 = 6.8%**, rust-bitcoin + encodings **327,408 = 23.0%**, frostsnap + pure-Rust crypto **475,352 = 33.3%**. The +307 B and the +2 rlibs are the tree MOVING since 2026-09-10 (address verification, ce62444), not a defect in the old row, and the 63.1% headline is unchanged. **Do NOT overwrite 899,400 with 899,707 as if the old figure were wrong** — this repo's convention for a later tree is a trajectory row, not a correction.). Headroom on that sum is **526,008 B**. Earlier: 860,898 on 2026-08-19 (844,229 at phase 0; +5,101 panic sites, +253 for §8.1 defects 10–12, **+15,873 `coldsnap_hal` rlib** — of which **+3,467** is phase 3's `comms.rs` + `usb.rs` — less −4,482 instantiations that moved between rlibs; all with LTO off, so upper bounds). **THAT BREAKDOWN DOES NOT CLOSE, and it is stated rather than adjusted: 5,101 + 253 + 15,873 − 4,482 = 16,745 against 860,898 − 844,229 = 16,669, a residual of −76 B.** Confirmed by addition 2026-09-13. `AUDIT-2026-09-10.md:713-714` found the same 76 B and prescribed correcting the −4,482 term to −4,558; that prescription was applied nowhere, and it is NOT applied here either, because the per-rlib table that would justify moving that particular term was never recorded and any named term would be fabricated. **The residual is the artifact.** Same treatment as README's larger hole in the same family — see README "Flash budget". (**The sub-term read +3,461 until 2026-09-13**; `vendor/README.md` carries the per-change split with a table row behind it — `libcoldsnap_hal.rlib` 15,565 = 14,612 `.text` + 953 `.rodata`, up from 12,098 = 11,420 + 678, so +3,467 = its own 860,592 − 857,125 — and README.md's "Flash budget" already names that file as the authority for exactly this split. The competing set closes internally too (14,606 + 953 = 15,559 → +3,461 → 860,586), so ARITHMETIC CANNOT PICK; the phase-3 tree can no longer be rebuilt, so the 6 B is **unresolvable** and the choice is made on designated authority, not on evidence. Recorded rather than picked silently.) **This row read 893,099 B = 62.7% until 2026-08-19**, on the strength of a +32,513 B growth attributed to `comms::decode_body`; that does not reproduce clean and is retracted — see README "Flash budget". The live `./target` glob measures 1,311,110 B = 92.0% from 131 rlibs against a clean 48, which is the artefact to suspect first.  **The linked image is measured, and the rlib sum above overestimates it by ~2.4×:** `firmware/` links at **379,648 B = 26.6343%** of `FLASH_TEXT` (`/usr/bin/objdump -h` after `cargo build --release` — `.vector_table` `0x40` + `.text` `0x4e7e0` + `.rodata` `0xe2bc` + `.data` `0x24`; re-measured 2026-09-12 in the MAIN checkout after the four-lane merge; margin **1,045,760 B**), because LTO plus `--gc-sections` keeps only what is reachable. **The ratio in this sentence read `~2.9×` until 2026-09-12 and was simply wrong arithmetic** — 899,400 / 377,256 = 2.384, and README's "Flash budget" said `2.39×` in the same document set; against today's image it is 899,400 / 379,648 = 2.369. **The image read 377,256 B = 26.47% until 2026-09-12** (and 377,192 B = 26.46% at 2026-09-11, 376,752 B = 26.43% at 2026-09-10). **Do NOT take an absolute image figure from a report written in a worktree under `.claude/worktrees/`:** the longer absolute path is embedded ~11 times in panic `Location` strings and inflates `.rodata` by ~424 B while leaving `.text` and `.bss` exact — see the traps note in §9 item 22's neighbourhood. Three of this round's four lanes reported 377,680 B for an unchanged image for exactly that reason, and one of them concluded the 377,256 record was stale. It was not. `llvm-nm` finds **190** frostsnap/secp/schnorr/bitcoin symbols (frostsnap 118, bitcoin 34, schnorr 28, secp256k1 22) and **22** `coldsnap_hal::ui` symbols, re-measured 2026-09-10 — **this pair read 267 and 17 until then** and neither reproduced; README carried the same pair, so both were copied rather than re-derived. The trajectory, each step a real caller appearing rather than a code addition: 11,604 B when `boot()` polled USB but touched no `comms` · 94,304 B with `Link::poll` + `decode_body` · 99,684 B with `identity` · 101,416 B once the identity-hold screen gave `ui`/`display` a caller · 282,080 B once a real `FrostSigner` was constructed and dispatched to · 297,064 B once the remaining §4.2 consent screens got honest callers · 331,116 B with the keypad driver and real consent · 362,288 B once `DisplayBackup`, `mark_sensitive` and the persistent share store landed · 372,688 B once 25-word entry made restore possible · 376,752 B once `CheckBackup` became a real 8-question quiz behind its own consent digit (+4,064 B: +32 B of `ui.rs` screens, +2,232 B when `firmware/src/quiz.rs` first acquired a caller and its generics were instantiated, +1,800 B for the `main.rs` event-loop arm) · **377,192 B** once the keygen check stopped printing a fixed `1=match` and started printing the randomised `press_legend(confirm)` (+440 B: a `Buf<16>` legend build and a call replacing a 12-byte literal). · **377,256 B** once `reveal_draw` hoisted the reveal's screen/cursor pairing out of `boot` into a value-tested module item (§9 item 22) and the three restoration consent screens started REFUSING a row that does not fit instead of drawing a clipped one (+64 B net: +104 B for those two, less 40 B when the review round deleted a vacuous legend-length comparison and turned an early `return` into a value). · **379,648 B** once address verification stopped being refused and got a real caller (`Session::verify_prompt` + `prompt_screen_at`'s `VerifyAddress` arm, ce62444): **+2,392 B**, `.text` +2,352 and `.rodata` +40, attributed symbol by symbol with `llvm-nm --print-size` over both images rather than predicted — +1,366 B `coldsnap_hal::comms::Link::drain` (the new `verify_prompt` and dispatch arm, inlined: THIS is the feature), +1,298 B `<bitcoin::Address as Display>::fmt` and +248 B `coldsnap_hal::ui::address_block` becoming OUTLINED shared symbols, less 668 B as `coldsnap_firmware::prompt_screen_at` gave up its inline copies of both. So ~878 B of it is outlining rather than new functionality. NOT a new dependency edge: `bitcoin::address::Address::from_script` is byte-identical at 342 B in BOTH images, so it was already linked, and no BIP-32 HMAC-SHA512 chain appears — `derive_xonly_key` and `bip341_taptweak_key_only` were already reachable through `sign_ack`. Zero new crates; `bitcoin =0.32.8` was already a non-optional dependency of `frostsnap_core`. That +440 was DISPUTED on review as +444, and **the dispute is SETTLED as of 2026-09-12: BOTH readings were correct and neither party named the cargo invocation.** `cargo build --release` gives `.text 0x4de70` (377,192 B); `cargo build --release -p coldsnap_firmware` gives `.text 0x4de74` (377,196 B). Reproduced in a CLEAN private target dir, both figures, both stable, and the two artifacts' `-C metadata` hashes are the same there as in the live tree — the 0x4de74 binary was still on disk at `target/thumbv7em-none-eabihf/release/deps/`. CAUSE, measured rather than hypothesised: `frostsnap_comms` is a WORKSPACE MEMBER, so the all-members build compiles it with its own `default` feature while `-p coldsnap_firmware` compiles it only as a dependency, where the workspace dep says `default-features = false`. `default = []` has NO CODE BEHIND IT, so the two units compile IDENTICAL source and differ only in the metadata hash cargo derives from the feature list — which changes every generic instantiation's symbol hash, hence function ordering under `lto = "fat"`, hence inter-function ALIGNMENT PADDING. Both binaries hold exactly **807 `.text` symbols totalling 318,780 B of code**; the difference is 312 B of padding against 308 B, and ZERO bytes of code. `.rodata`, `.data` and `.vector_table` are byte-identical. `firmware/link.x`'s `.text : ALIGN(4)` quantises the section, so the smallest observable difference is exactly 4 B. **CONSEQUENCE FOR THE RECIPE, and it is the actionable part: a flash figure is only meaningful with its invocation named.** Every figure in this document is the `cargo build --release` side, which is what README's "Test" section runs. Also settled by the same experiment: "incremental readings have disagreed by 4 B" does NOT reproduce — two clean builds in separate private target dirs and the in-tree incremental build produced a BYTE-IDENTICAL ELF (sha256 `938d317f56…`), so under `codegen-units = 1`, `lto = "fat"`, `incremental = false` this build is bit-for-bit reproducible. `.bss` is byte-identical across all of it at `0x2000_8034..0x2001_8058`, and nothing on the quiz path allocates, so the ~5,024 B arena margin is unchanged. **This cell said "`EnterPhysicalBackup`, `SavePhysicalBackup`, `SavePhysicalBackup2`, `Consolidate` and the naming flows are refused rather than implemented (§9), so their code is absent" until 2026-09-10. All five are IMPLEMENTED and ADMITTED**, which is part of why the image is 376,752 B: `Session::recv` passes each of them through to the signer (`firmware/src/lib.rs:1106-1110` for the four restoration variants, `:935` for `Naming(NameCommand::Preview)`), each behind its own consent digit, with `ToUserRestoration::EnterBackup` and `ConsolidateBackup` handlers at `:1334` and `:1358`. What IS refused, and where the absent code actually is: `Upgrade` (`Refusal::FirmwareUpgrade`), `DataErase` and `Challenge` (the genuine check) — cited by SYMBOL, in `Session::recv_core`'s refusal arms in `firmware/src/lib.rs`. **`ScreenVerify` (address verification) was on this list until 2026-09-12 and is not refused any more** (ce62444, §9 item 16): the dispatch admits it, `Session::verify_prompt` draws the address, and the +2,392 B in the trajectory above is what it cost. So a PIN's SE1 paths are what remains bound-but-gc-sectioned, and address verification is no longer the ceiling. Read the rlib rows for the MARGINAL cost of a change, never as a prediction of image size. |
 | Host tests passing | **576** = hal 288 (267 lib + 5 smoke + 16 integration) + firmware 172 (120 lib + 52 bin) + vendored 116 (`frostsnap_core` 63 + `comms` 10 + `embedded` 17 with `--features std`, 15 without + `frost_backup` 19 + `macros` 7), re-verified 2026-09-12 against every gate, all exit 0; **568** earlier the same day, before hal's integration file went 12 → 16 (`device_nonces`' post-write half: `SlotUnreadable`, the empty-`sessions` `Overflow` backstop, the cached-retry branch and the read-back `WriteVerifyFailed` comparison — 2a055f7) and `firmware/src/lib.rs` went 116 → 120 lib (address verification — ce62444; a fifth name in that commit is a RENAME of `address_verify_is_refused`, not an addition, which is why it is +4 and not +5, and hal stayed at 284 there because its scraper test was renamed and extended in place); **565** before the round before that's THREE new host tests (the consent-row fit refusal, its propagation through `prompt_screen_at`, and the reveal cursor's pairing); **530** before the `CheckBackup` quiz (+6 hal, +29 firmware); 357 before the gap-closing pass; 355 before the signing pipeline; 344 on 2026-08-25 before `FrostSigner`; the firmware gate is now a SUM of two `test result` lines, 11 lib + 14 bin; 341 on 2026-08-24, +40 for `ui.rs`; 268 until 2026-08-24, which never counted `coldsnap_firmware`'s 14; +19 for `identity`; 204 at the phase-2 gate, 253 at the end of phase 3, 261 before §9 item 7(c)'s three outer-leg tests, 264 before the three inner-leg `decode_body` tests, 267 before the pin on the vendored `MAX_MESSAGE_ALLOC_SIZE`; `frostsnap_core` no longer needs an allowlist, `frost_backup` still does — §7) |
 
 Vendored crates live in `vendor/frostsnap/` with upstream commit recorded in

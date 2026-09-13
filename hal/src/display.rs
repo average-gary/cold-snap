@@ -337,7 +337,15 @@ pub const fn window_prologue() -> [u8; 6] {
 // Registers. Offsets from the CMSIS header in this tree, not from memory.
 //
 // `external/micropython/lib/stm32lib/CMSIS/STM32L4xx/Include/stm32l4s5xx.h`,
-// referred to below as `stm32l4s5xx.h`.
+// referred to below as `stm32l4s5xx.h`. That path is load-bearing, not decoration:
+// FIVE copies of this header exist in the sibling checkout and they disagree inside
+// `SPI_TypeDef`. This one is the copy `stm32/mk4-bootloader/Makefile:78` compiles.
+// The four `SPI_TypeDef` member citations below read `:962`-`:965` until 2026-09-13
+// — one line short in this copy, where `CR1` is at `:963`. They did NOT come from
+// the tinyusb copy either (`external/micropython/lib/tinyusb/hw/mcu/st/st_driver/
+// CMSIS/Device/ST/STM32L4xx/Include/stm32l4s5xx.h` puts `CR1` at `:961`), so a
+// reviewer who reaches for a second copy to refute this will not find `:962` in any
+// of the five. The BASE citations (`:1370`, `:1318`, `:1292`) were and are exact.
 // ---------------------------------------------------------------------------
 
 /// `SPI1` base: `APB2PERIPH_BASE + 0x3000` = `0x4001_3000`
@@ -345,14 +353,14 @@ pub const fn window_prologue() -> [u8; 6] {
 /// `:1292`).
 pub const SPI1_BASE: u32 = 0x4001_3000;
 
-/// `SPI1->CR1`, offset `0x00` (`SPI_TypeDef`, `stm32l4s5xx.h:962`).
+/// `SPI1->CR1`, offset `0x00` (`SPI_TypeDef`, `stm32l4s5xx.h:963`).
 pub const SPI1_CR1: *mut u32 = SPI1_BASE as *mut u32;
-/// `SPI1->CR2`, offset `0x04` (`stm32l4s5xx.h:963`).
+/// `SPI1->CR2`, offset `0x04` (`stm32l4s5xx.h:964`).
 pub const SPI1_CR2: *mut u32 = (SPI1_BASE + 0x04) as *mut u32;
-/// `SPI1->SR`, offset `0x08` (`stm32l4s5xx.h:964`).
+/// `SPI1->SR`, offset `0x08` (`stm32l4s5xx.h:965`).
 pub const SPI1_SR: *mut u32 = (SPI1_BASE + 0x08) as *mut u32;
 
-/// `SPI1->DR`, offset `0x0C` (`stm32l4s5xx.h:965`), typed `*mut u8`
+/// `SPI1->DR`, offset `0x0C` (`stm32l4s5xx.h:966`), typed `*mut u8`
 /// **deliberately**.
 ///
 /// With `DS` = 8-bit, ST's own driver writes this register a byte at a time —
