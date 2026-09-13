@@ -235,8 +235,10 @@
 //! # Not testable off-hardware
 //!
 //! Real program/erase timing and `PROGERR`/`WRPERR` behaviour on silicon, power
-//! loss (PLAN.md §7; neither `TestNorFlash` nor [`fake::FakeFlash`] models it),
-//! the true `DBANK` value, and whether these functions must execute from RAM.
+//! loss (PLAN.md §7; `TestNorFlash` models none of it and [`fake::FakeFlash`] models
+//! it only at PROGRAM GRANULARITY, never a partially programmed row — see that
+//! module's docs), the true `DBANK` value, and whether these functions must execute
+//! from RAM.
 //!
 //! **ECC is unhandled.** `FLASH->ECCR` is at offset `0x18` (above) and this module
 //! never reads it. A single-bit error is corrected silently; an **uncorrectable
@@ -1392,8 +1394,18 @@ impl NorFlash for StmFlash {
 /// * offsets and lengths must be [`WRITE_SIZE`]/[`ERASE_SIZE`]-aligned and in
 ///   bounds, via the same [`check_bounds`] the real driver uses.
 ///
-/// It does **not** model power loss, bit rot, write disturb, ECC, or partially
-/// programmed rows (PLAN.md §7). It is not a substitute for phase 7.
+/// Power loss is modelled only at PROGRAM GRANULARITY, via
+/// `FakeFlash::refuse_programs_after` — inline code and NOT an intra-doc link,
+/// because the type is declared inside this module and so is not in scope at the
+/// module doc, and `cargo doc --no-deps` at 0 warnings is a gate. A refusal
+/// scheduled part way through a multi-chunk `BincodeFlashWriter` write tears that
+/// write, which is what the A/B ordering pin in
+/// `hal/tests/integration_frostsnap_over_hal.rs` needs. What stays true, and is
+/// the reason the tear is still not the silicon's: a refused program is
+/// ALL-OR-NOTHING — the check runs before any cell is touched — so a tear lands
+/// only on a 256-byte buffer boundary, never mid-doubleword and never as a
+/// partially programmed row. Bit rot, write disturb and ECC are not modelled at
+/// all (PLAN.md §7). It is not a substitute for phase 7.
 #[cfg(any(test, feature = "fake-flash"))]
 pub mod fake {
     use super::{check_bounds, FlashError, ERASE_SIZE, WRITE_SIZE};
@@ -1447,6 +1459,26 @@ pub mod fake {
         /// unreachable from here, which is why this exists.
         pub fn refuse_programs_now(&mut self) {
             self.refuse_programs_from = Some(self.programs);
+        }
+
+        /// Refuse every program from the `doublewords`'th onward, so a fault can
+        /// land part way *through* one logical write rather than before it.
+        ///
+        /// Units are DOUBLEWORDS, not calls: [`FakeFlash::programs`] accumulates
+        /// `bytes.len() / WRITE_SIZE`, so a full 256-byte `BincodeFlashWriter`
+        /// chunk counts 32 and a 48-byte padded tail counts 6. The first program
+        /// whose PRE-call count has reached `doublewords` is refused, and every
+        /// one after it; `refuse_programs_now()` is this called with the current
+        /// `programs`.
+        ///
+        /// The point of the counted form is the multi-chunk branch of
+        /// `BincodeFlashWriter::write`: schedule between the first 256-byte chunk
+        /// and the flush and the newest A/B copy ends up holding a valid
+        /// generation index with an undecodable body — the torn write. Refusal is
+        /// still all-or-nothing (see this module's docs), so the tear can only
+        /// land on a chunk boundary.
+        pub fn refuse_programs_after(&mut self, doublewords: u32) {
+            self.refuse_programs_from = Some(doublewords);
         }
 
         /// Refuse every erase from the current count onward, reporting `WRPERR`.
