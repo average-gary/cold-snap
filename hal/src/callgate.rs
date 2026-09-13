@@ -1216,7 +1216,7 @@ mod tests {
             Err(BufFault::NotInSram)
         );
         // At BL_SRAM_BASE: the gate wipes that 8K on entry AND exit
-        // (startup.S:124-134,148-156), so a buffer there is destroyed by the very
+        // (startup.S:124-134,148-157), so a buffer there is destroyed by the very
         // call meant to fill it. `good_addr` uses `<=` so ending exactly at
         // BL_SRAM_BASE is legal, but starting there is not.
         assert_eq!(
@@ -1774,7 +1774,25 @@ mod tests {
             );
         }
 
-        // The PIN buffer must still be wiped on the way out: it holds a PIN.
-        assert!(src.contains("impl Drop for PinAttempt"));
+        // The PIN buffer must still be WIPED on the way out, and the needle has to be
+        // the statement that does it, INSIDE the destructor. This read
+        // `contains("impl Drop for PinAttempt")` until 2026-09-13, which is a HEADER:
+        // emptying the body to `fn drop(&mut self) {}` left it green (MEASURED). The
+        // bare statement is no better on its own, and neither is the two conjoined:
+        // `&mut self.raw` compiles in ANY `&mut self` method of `PinAttempt`, and
+        // `as_mut_ptr` above takes the identical expression — MEASURED, moving the wipe
+        // there left the header, the statement and all 290 hal tests GREEN with the
+        // destructor doing nothing. So the region is bounded on BOTH sides, header to
+        // the impl's closing brace, and the statement must be inside it. Residual: a
+        // NEW `&mut self` method declared BELOW this impl could hold it instead.
+        assert!(
+            src.split_once("impl Drop for PinAttempt")
+                .and_then(|(_, tail)| tail.split_once("\n}\n"))
+                .is_some_and(|(body, _)| body
+                    .contains("write_volatile(&mut self.raw, [0u8; PIN_ATTEMPT_SIZE])")),
+            "PinAttempt holds a PIN plus 72 bytes of pairing secret; the volatile wipe \
+             must not be deleted, downgraded to a plain assignment the optimiser is free \
+             to elide, or moved out of the destructor into another `&mut self` method"
+        );
     }
 }

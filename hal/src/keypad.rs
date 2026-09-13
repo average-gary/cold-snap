@@ -414,7 +414,9 @@ pub const COL_PUPDR_MASK: u32 = COL_MODER_MASK;
 ///
 /// `GPIO_PULLUP = 1` (`stm32l4xx_hal_gpio.h:151`), written as
 /// `PUPDR |= Pull << (position * 2)` (`stm32l4xx_hal_gpio.c:266-269`). Matches
-/// `mempad.py:30`'s `pull=Pin.PULL_UP`.
+/// `shared/mempad.py:29`'s `pull=Pin.PULL_UP` (this read `mempad.py:30` until
+/// 2026-09-13; `:30` is the column-name tuple, and the module docs at the
+/// `# The pins, double-sourced` heading already cite the `29-32` range correctly).
 ///
 /// There is **no external pull-up** anywhere in the schematic's NUMPAD block
 /// (`R13`-`R15` are 1 kΩ *series* to the MCU), so this internal one is the only
@@ -1583,6 +1585,16 @@ mod tests {
         );
         // And not a hardcoded order alongside it, which is how the measured mutation
         // defeated every other test.
+        // ponytail: this is an ENUMERATION of three literal spellings, so the
+        // SHADOWING variant survives it -- `let _ = shuffle_rows(rng); let order =
+        // [1u8, 0, 3, 2];` keeps the call, discards the result, and is not on the list
+        // because a fixed order is fixed whether or not it is sorted. Ceiling recorded
+        // at AUDIT-2026-09-10.md:264. Upgrade path is not a longer list: it is a
+        // structural pin — assert `order` is only ever bound by `shuffle_rows(` — which
+        // needs the span extraction above to survive a reformat first. No example is given
+        // on purpose: the obvious one, `body.matches("let order").count() == 1`, is 1 both
+        // today AND under the shadowing variant this note just named, so copying it would
+        // add a fresh assertion that cannot fail, inside a comment about that very class.
         for fixed in ["[0u8, 1, 2, 3]", "[0, 1, 2, 3]", "[0u8, 1u8, 2u8, 3u8]"] {
             assert!(
                 !body.contains(fixed),

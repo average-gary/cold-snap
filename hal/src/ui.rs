@@ -3427,9 +3427,19 @@ mod tests {
             let n = f.text(0, 0, s);
             assert!(n <= COLS);
             assert!(f.wrap(0, ROWS, s) <= COLS * ROWS);
-            assert!(
-                Buf::<16>::new().push_str(s).as_str().len() <= 16,
-                "Buf overran on {s:?}"
+            // `push_str`'s documented invariant: one input char in, one cell out,
+            // capped at N. Asserted as an EQUALITY because the `<= 16` form that
+            // stood here until 2026-09-13 could not fail for ANY input: `Buf::push`
+            // writes through a checked `get_mut` on a `[u8; N]`, so `len` can never
+            // exceed N, and `as_str` returns `""` if it ever did -- so the exact
+            // overrun the old message named produced length 0 and read as success.
+            // `min(16)` mixes a BYTE budget with a CHAR count safely here and only
+            // here: every byte `push_str` stores is in `FONT_FIRST..=FONT_LAST`
+            // (32..=127), one byte per input char, so bytes and chars coincide.
+            assert_eq!(
+                Buf::<16>::new().push_str(s).as_str().chars().count(),
+                s.chars().count().min(16),
+                "Buf dropped or doubled a char on {s:?}"
             );
         }
     }
@@ -3665,7 +3675,12 @@ mod tests {
         let t = screen_text(&f);
         assert!(t.contains(FEE_UNVERIFIED_1), "missing provenance line 1: {t}");
         assert!(t.contains(FEE_UNVERIFIED_2), "missing provenance line 2: {t}");
-        assert!(t.contains('7'));
+        // `fee_page` wraps the amount from row 1, column 0. This read
+        // `t.contains('7')` until 2026-09-13 -- one character, no message, anywhere
+        // on the screen -- and `push_u64(sats * 10)` drew "70" and stayed green
+        // (MEASURED), so the one number PLAN.md 4.2 exists to display could be off
+        // by 10x with this test passing.
+        assert_eq!(row_text(&f, 1), "7", "the fee number itself");
     }
 
     #[test]
@@ -3912,7 +3927,17 @@ mod tests {
         assert_eq!(text_2x_at(&f, (COLS - 8) / 2, 4, 4), "ef01", "code low half");
         assert!(t.contains(KEYGEN_COMPARE_1), "no compare instruction: {t}");
         assert!(t.contains(KEYGEN_COMPARE_2), "no compare instruction: {t}");
-        assert!(t.contains("2-of-3"), "no threshold: {t}");
+        // The WHOLE row, not `contains("2-of-3")`. That needle STARTED with a
+        // rendered digit and so was satisfied by a superstring: `push_str("1")`
+        // before `push_u64(threshold)` draws "12-of-3 wallet", which contains
+        // "2-of-3" at offset 1, and the same one mutation also survived the
+        // `"65535-of-6"` needle in the hostile-input test below, so nothing in the
+        // tree caught a quorum this screen states that cannot exist (MEASURED).
+        assert_eq!(
+            row_text(&f, 6),
+            "2-of-3 wallet",
+            "threshold and key name share row 6"
+        );
 
         // THE ANTI-MITM CONSENT GESTURE. This screen printed a FIXED `1=match` until
         // 2026-09-11, which is a key a script can press without reading the glass —
@@ -3945,9 +3970,19 @@ mod tests {
                 CONFIRM_CHARSET.iter().position(|x| *x == d).unwrap() as u32,
             ));
             keygen_check(&mut f, 2, 3, [0xab, 0xcd, 0xef, 0x01], "wallet", c);
-            let row = row_text(&f, FOOTER_ROW);
-            assert!(row.contains(press_legend(c).as_str()), "{row}");
-            assert!(row.ends_with("x=no"), "no refusal on the row: {row}");
+            // The same whole-row equality the single-digit case above uses, reusing
+            // its own composition. The `contains(press_legend) + ends_with("x=no")`
+            // pair that stood here until 2026-09-13 held "fits" but nothing about
+            // WHERE, which is what the comment above claims ("lands in the same
+            // place"). Measured, and stated precisely because the obvious mutation is
+            // NOT the one that proves it: a UNIFORM `text(1, FOOTER_ROW, ..)` is
+            // caught by the assert_eq! above, which renders digit `1`. Shifting only
+            // the four digits that case never renders --
+            // `text(usize::from(confirm.as_str() != "1"), ..)` -- left all 290 hal
+            // tests GREEN under the old pair and fails here by name.
+            let mut want = press_legend(c);
+            want.push_str(" x=no");
+            assert_eq!(row_text(&f, FOOTER_ROW), want.as_str(), "digit {}", d as char);
         }
     }
 
@@ -3960,7 +3995,16 @@ mod tests {
         assert_eq!(text_2x_at(&f, (COLS - 8) / 2, 2, 4), "0102", "code high half");
         assert_eq!(text_2x_at(&f, (COLS - 8) / 2, 4, 4), "0304", "code low half");
         assert!(t.contains(KEYGEN_COMPARE_1), "hostile name pushed out the check");
-        assert!(t.contains("65535-of-6"), "threshold row: {t}");
+        // BOTH numbers. This read `contains("65535-of-6")` until 2026-09-13, a
+        // PROPER PREFIX that stops in the middle of the parties field, so the silent
+        // `Buf<16>`/`Frame::text` truncation this file guards everywhere else left it
+        // green -- exactly the truncation `keygen_check` has to survive here, since
+        // the two numbers plus the separator are 14 of 16 columns. No `assert_eq!` on
+        // the row: the hostile key name puts a missing-glyph cell at column 15, and
+        // the superstring form of this defect (a digit prepended to the threshold) is
+        // caught by name in `keygen_check_renders_the_code_and_the_compare_instruction`
+        // rather than here -- "165535-of-65535" still contains the whole value.
+        assert!(t.contains("65535-of-65535"), "threshold row truncated: {t}");
     }
 
     // -- 5. the remaining screens.
@@ -3991,7 +4035,13 @@ mod tests {
         let mut f = Frame::new();
         standby(&mut f, "coldsnap-01", "family", Some(3));
         let t = screen_text(&f);
-        assert!(t.contains("coldsnap-01") && t.contains("family") && t.contains("share #3"));
+        assert!(t.contains("coldsnap-01") && t.contains("family"), "no name: {t}");
+        // The index itself, by ROW EQUALITY — the eighth site of the superstring class
+        // the other seven were fixed at on 2026-09-13, and the only one that was still
+        // live. `contains("share #3")` is satisfied by "share #30": MEASURED, appending a
+        // digit to the rendered index left all 267 hal lib tests GREEN while standby named
+        // a share the device does not hold. `standby` draws it at `frame.text(0, 4, ..)`.
+        assert_eq!(row_text(&f, 4), "share #3", "the held share index itself");
         standby(&mut f, "x", "y", None);
         assert!(screen_text(&f).contains("no share held"));
     }
@@ -4862,8 +4912,8 @@ mod tests {
             // fail. What actually covers this screen is the content asserted above and
             // below -- the digit is named, `x=no` is present, and the question reads as a
             // question -- each of which fails if a row was cut. The class-wide guard for
-            // the strings themselves is `every_pin_string_fits_the_panel`, which asserts
-            // on the `&'static str` CONSTANTS.
+            // the strings themselves is `every_pin_string_this_module_owns_fits_the_panel`,
+            // which asserts on the `&'static str` CONSTANTS.
             // And the question has to be a QUESTION, or a human cannot know what
             // the digit claims.
             assert!(screen_text(&f).contains('?'), "not phrased as a question");
@@ -5239,7 +5289,13 @@ mod tests {
         let mut f = Frame::new();
         backup_quiz_passed(&mut f, 8).unwrap();
         let t = screen_text(&f);
-        assert!(t.contains("8 of 25 words"), "{t}");
+        // The whole row. This read `contains("8 of 25 words")` until 2026-09-13, a
+        // needle STARTING with the rendered count, so `push_str("1")` before
+        // `push_u64(checked)` drew "18 of 25 words" and matched at offset 1 -- the
+        // screen overstating how much of a backup was verified, which is the false
+        // assurance this test is named against. `backup_quiz_passed` draws the count
+        // at (0, 2).
+        assert_eq!(row_text(&f, 2), "8 of 25 words", "the count itself");
         assert!(t.contains("matched."), "{t}");
         assert!(t.contains("not checked."), "17 unchecked words went unsaid: {t}");
         assert!(
@@ -5250,7 +5306,10 @@ mod tests {
         // All 25 checked: the caveat would be false, so it is not drawn.
         backup_quiz_passed(&mut f, BACKUP_WORDS).unwrap();
         let all = screen_text(&f);
-        assert!(all.contains("25 of 25 words"), "{all}");
+        // Same defect, other half, and it is what made the mutation above invisible:
+        // "125 of 25 words" contains "25 of 25 words" at offset 1, so the all-25 case
+        // could not catch a digit prepended to the count either.
+        assert_eq!(row_text(&f, 2), "25 of 25 words", "the count itself");
         assert!(!all.contains("not checked"), "{all}");
         for bad in [0, BACKUP_WORDS + 1, usize::MAX] {
             let mut blank = Frame::new();
@@ -5346,16 +5405,24 @@ mod tests {
                 pin_entry(&mut a, prompt, "1234", 13, confirm()),
                 Ok(PinScreen::Entry)
             );
-            pin_entry(&mut b, prompt, "9876", 13, confirm()).unwrap();
+            pin_entry(&mut b, prompt, "9875", 13, confirm()).unwrap();
             assert_eq!(
                 a.as_bytes(),
                 b.as_bytes(),
                 "{prompt:?}: the panel leaks which digits were typed"
             );
-            assert!(
-                !screen_text(&a).contains('1'),
-                "{prompt:?}: a typed digit reached the 1x rows"
-            );
+            // A `!screen_text(&a).contains('1')` stood here until 2026-09-13 and was
+            // DOMINATED by the byte equality above it: it could only fire on an
+            // input-INDEPENDENT '1', which is not a leak. Deleted rather than
+            // re-pointed, same call as commit d5628df.
+            //
+            // What the byte equality holds is exactly one pair of PINs, so it holds only
+            // the digit-derived functions that DIFFER on that pair. "9876" was the
+            // second PIN until 2026-09-13 and shares 1234's odd/even pattern, so a
+            // rendering that leaked per-digit PARITY was invisible: MEASURED, all 267 hal
+            // lib tests GREEN under it. "9875" is 1011 against 1234's 1010, digit sets
+            // still disjoint. Residual: a function that collapses to one value on this
+            // pair is still invisible.
         }
         // Longer than the field can hold is a refusal, not a shortened star run:
         // a count that stops growing is a lie about what was typed.
@@ -5410,10 +5477,19 @@ mod tests {
         assert_eq!(text_2x_at(&f, 0, 1, 1), "4");
         let s = screen_text(&f);
         assert!(s.contains("WRONG PIN") && s.contains(PIN_TRIES_2), "{s}");
-        assert!(s.contains("fails: 9"), "{s}");
+        // The whole row. Both of these read `contains("fails: N")` until 2026-09-13,
+        // needles ENDING in the rendered count, so ONE mutation --
+        // `push_u64(num_fails * 10)` -- drew "fails: 90" here and "fails: 990" below
+        // and survived both, letting an irreversibly-erasing unit misstate how many
+        // wrong tries it has seen. `pin_wrong` draws it at (0, 6).
+        assert_eq!(row_text(&f, 6), "fails: 9", "the fail counter itself");
         // 99 is `pins.c:478`'s sentinel, not a count: it must print in full.
         pin_wrong(&mut f, 13, 99);
-        assert!(screen_text(&f).contains("fails: 99"));
+        assert_eq!(
+            row_text(&f, 6),
+            "fails: 99",
+            "the 99 sentinel prints in full"
+        );
     }
 
     #[test]
@@ -5495,10 +5571,25 @@ mod tests {
     fn the_words_screen_says_record_them_the_first_time_and_recognise_them_after() {
         assert_ne!(PIN_WORDS_LEARN, PIN_WORDS_CHECK);
         let mut f = Frame::new();
+        // The header ROW, not its presence somewhere on the screen. Two presence
+        // checks stood here until 2026-09-13 and could not hold the DISCRIMINATION
+        // this test is named for: `assert_ne!` above proves the two consts differ, but
+        // drawing BOTH unconditionally on rows 0 and 1 left both needles green, so an
+        // anti-phishing screen saying "Write these down" AND "Recognize these?" at
+        // once passed. `pin_words` draws the header at (0, 0) and both consts are
+        // exactly COLS = 16 chars, so one row holds exactly one of them.
         pin_words(&mut f, true, ["abandon", "ability"]).unwrap();
-        assert!(screen_text(&f).contains(PIN_WORDS_LEARN));
+        assert_eq!(
+            row_text(&f, 0),
+            PIN_WORDS_LEARN,
+            "the first-time header, and only it"
+        );
         pin_words(&mut f, false, ["abandon", "ability"]).unwrap();
-        assert!(screen_text(&f).contains(PIN_WORDS_CHECK));
+        assert_eq!(
+            row_text(&f, 0),
+            PIN_WORDS_CHECK,
+            "the recognise header, and only it"
+        );
     }
 
     #[test]
