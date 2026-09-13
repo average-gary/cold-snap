@@ -1856,9 +1856,14 @@ fn main() {
             //    read their keypair back out of flash. A non-durable identity
             //    yields different ids and the coordinator never completes a keygen
             //    with them. The coordinator is the judge, not us;
-            //  - nothing persists a completed share yet (see `drive`), so a
-            //    restart after keygen would lose it. Before keygen there is
-            //    nothing on flash but the identity, which is the point.
+            //  - and NOT because a share would be lost. This read "nothing persists a
+            //    completed share yet (see `drive`), so a restart after keygen would lose
+            //    it" until review caught it on 2026-09-12: `store::ShareStore::persist_staged`
+            //    writes the keygen triple to `FS_SHARE`, and it runs as `Session::run`'s
+            //    FIRST statement, so a post-keygen restart would find the share on flash.
+            //    The reason above is the whole reason. A restart AFTER keygen is therefore
+            //    possible now and is deliberately not done here — it would be a second
+            //    durability claim, and this file makes one.
             //
             // The assert below is belt: it fails fast and by name, whereas the
             // coordinator's failure would be a keygen timeout.
@@ -1881,14 +1886,23 @@ fn main() {
         }
 
         // `ALL_DEVICES` and not `N_DEVICES`, because every session on the wire gets an
-        // `AnnounceAck` including the blank one, and this is an EQUALITY recomputed
-        // each lap rather than a latch: all ten acks can arrive inside a single
+        // `AnnounceAck` including the blank one, and this is an EQUALITY recomputed each
+        // lap rather than a latch: at 9 it would claim "all acked" while one device has
+        // not. Left at 9 and reached, `STATE` never advances to 3 and the progress word
+        // in every subsequent `die` message is one stage stale — a silently wrong
+        // diagnosis rather than a cosmetic count.
+        //
+        // CORRECT BY CONSTRUCTION AND **NOT** LOAD-BEARING AT THIS MACHINE'S TIMING, and
+        // that distinction is recorded because the first version of this comment claimed
+        // the opposite. It said all ten acks "can arrive inside a single
         // `wire_rx.recv_timeout` payload, so `acked` jumps 0 -> 10 and 9 is never
-        // observed. Left at 9 this never fires, `STATE` never reaches 3, and the
-        // progress word in every subsequent `die` message is one stage stale — a
-        // silently wrong diagnosis rather than a cosmetic count. MEASURED: reverting
-        // this to `N_DEVICES` removes the `all N devices acked` line from the log
-        // entirely.
+        // observed", and asserted that reverting to `N_DEVICES` removes the line from the
+        // log. MEASURED, and neither holds: `hostcheck` queues each ack on its own lap, so
+        // `acked` walks 1..10, the equality catches it at 9, and reverting to `N_DEVICES`
+        // leaves the harness GREEN at exit 0 with the line still printing. Caught by
+        // review, 2026-09-12. The failure this guards is real and would be INVISIBLE — if
+        // the acks ever do coalesce (heavier load, larger reads, a chunk-size change), 9
+        // is skipped and nothing says so.
         let acked = sessions.values().filter(|s| s.coordinator_acked).count();
         if acked == ALL_DEVICES && STATE.load(Ordering::Relaxed) == 2 {
             STATE.fetch_max(3, Ordering::Relaxed);

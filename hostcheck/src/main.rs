@@ -3596,12 +3596,16 @@ fn one_pass(
                             // not move at all. Leg 2's restoration is a DIFFERENT one
                             // with a different `RestorationId`, and its `HeldShare2` for
                             // the saved backup carries whatever v2 body it was sent —
-                            // MEASURED by passing `save_v1` unchanged: on the chunk-1
-                            // pass leg 2 enters `Phase::SavedV1` and the run hangs there
-                            // to `DEADLINE (95s) in state BackupIngest`, because
-                            // `saved_v1_threshold` is only ever set for
-                            // `from == r.device` while `r.phase == Phase::SavedV1` and
-                            // leg 2's reply arrives against a phase leg 1 has left.
+                            // MEASURED by passing `save_v1` unchanged, and the OUTCOME is
+                            // not the one first recorded here. That said the run "hangs
+                            // there to `DEADLINE (95s) in state BackupIngest`"; review
+                            // traced it on 2026-09-12 and it does not. Leg 2 enters
+                            // `Phase::SavedV1`, reports ONLY the saved backup, and the
+                            // UNTOUCHED fail-closed `None =>` arm bails by name —
+                            // `reported 1 held share(s), NONE for the access structure
+                            // keygen just finished` — exit 1 in 9 s on the chunk-1 pass.
+                            // That is `restore.is_none()` doing its job a second time, and
+                            // it is a better failure than a deadline: it names the cause.
                             save_v1 && sighted.is_none(),
                         ) {
                             break Err(e.context(format!("M7 {:?}", r.phase)));

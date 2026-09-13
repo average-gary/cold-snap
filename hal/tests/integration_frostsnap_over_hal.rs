@@ -722,13 +722,22 @@ fn a_retry_of_the_same_signing_session_returns_the_cached_shares_without_advanci
     });
     assert_eq!(slot.last_write_outcome(), Some(AbWriteOutcome::Committed));
 
-    // `replenish` is deliberately dropped rather than asserted `is_none()`.
-    // `reconcile_coord_nonce_stream_state` returns `None` exactly when the slot's
-    // index equals the coordinator's claimed index, so `replenish.is_none()` and
-    // the index assertion below are the SAME fact read two ways: whichever is
-    // written second cannot fail. The index is the one that says what the
-    // property is, so it is the one kept.
-    let (shares, _replenish) = slots
+    // `replenish` IS asserted, and the reason it is worth saying so is that this
+    // comment previously deleted the assertion on a FALSE argument. It claimed
+    // `reconcile_coord_nonce_stream_state` "returns `None` exactly when the slot's index
+    // equals the coordinator's claimed index", making the two the same fact — but that
+    // function SHORT-CIRCUITS first: `if our_index > state.index || state.remaining <
+    // nonce_batch_size { .. }` is tested BEFORE the `else if our_index == state.index {
+    // return None }`. With `remaining: 5` against a batch of 30 it returns `Some(job)`
+    // with the indices EQUAL, so the two facts merely coincide under THIS fixture's
+    // `remaining: 100`. Caught by review, 2026-09-12.
+    //
+    // Kept AFTER the index assertion rather than before it, the same ordering trick used
+    // at the refused-write block below: the index says what the property IS, and this
+    // says the coordinator was told nothing needs replenishing. It is the only pin in the
+    // tree on that `return None` arm — `nonce_index_bounds.rs` bounds the job size and
+    // asserts nothing in its `None` leg.
+    let (shares, replenish) = slots
         .sign_guaranteeing_nonces_destroyed(
             session_id,
             CoordNonceStreamState {
@@ -755,6 +764,15 @@ fn a_retry_of_the_same_signing_session_returns_the_cached_shares_without_advanci
             .index,
         7,
         "THE NONCE-REUSE CASE: a retry advanced the index a second time"
+    );
+    // And nothing was asked of the coordinator. See the note above the call for why this
+    // is a SECOND fact and not a restatement of the index: with a `remaining` below the
+    // batch size, `reconcile_coord_nonce_stream_state` returns `Some(job)` at an EQUAL
+    // index, so this arm and the index arm are independently reachable.
+    assert!(
+        replenish.is_none(),
+        "a retry of a cached session asked the coordinator to replenish, so \
+         `reconcile_coord_nonce_stream_state`'s equal-index return was skipped"
     );
 }
 
@@ -883,9 +901,21 @@ fn a_refused_nonce_advance_reports_write_verify_failed_and_leaves_the_index_unad
     // and lands on the first `expect` here; with this block ordered after the
     // outcome leg it landed on an `expect` whose message named nothing.
     //
-    // `FakeFlash` never refuses READS, so the read-back inside the site returned
-    // `Some` — which is what says the equality comparison fired rather than the
-    // `ok_or(WriteVerifyFailed)` one line above it.
+    // AND THIS BLOCK IS WHAT NAMES THE SITE. `WriteVerifyFailed` has THREE producers —
+    // the read-back's `ok_or`, the equality comparison, and the `signing_state` `ok_or`
+    // below it — so the variant assertion alone does not say which fired. What excludes
+    // the read-back's `ok_or` is the `expect` immediately below: had it fired, both A/B
+    // copies would be blank, `AbSlots::get` would return `None`, and that `expect` would
+    // have panicked instead. So reaching the comparison of `after` against `stale` is
+    // what says the EQUALITY leg fired.
+    //
+    // This comment previously gave the reason as "`FakeFlash` never refuses READS, so the
+    // read-back returned `Some`", which is an invalid inference and one the paragraph
+    // directly above it disproves: `read_slot()` returns `None` whenever neither copy
+    // DECODES, which has nothing to do with a refused read, and the both-copies-erased
+    // mutation reaches exactly that with no read refused. Caught by review, 2026-09-12.
+    // The distinction matters because believing the wrong reason is how the next test
+    // written here drops this block and silently stops naming the site.
     flash.borrow_mut().heal();
     let after = slots
         .get(stream_id)
