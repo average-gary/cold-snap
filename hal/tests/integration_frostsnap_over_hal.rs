@@ -57,7 +57,7 @@ use frostsnap_core::schnorr_fun::frost::{
 };
 use frostsnap_core::schnorr_fun::fun::prelude::*;
 use frostsnap_core::schnorr_fun::Message;
-use frostsnap_core::SignSessionId;
+use frostsnap_core::{SignSessionId, Versioned};
 use frostsnap_embedded::{AbSlot, AbWriteOutcome, FlashPartition, NonceAbSlot, SECTOR_SIZE};
 use rand_core::RngCore;
 
@@ -259,6 +259,142 @@ fn refused_flash_leaves_the_previous_nonce_state_readable() {
     // Usable again once flash recovers.
     assert_eq!(slot.try_write(&44u32), AbWriteOutcome::Committed);
     assert_eq!(slot.read::<u32>(), Some(44));
+}
+
+/// `AbSlot::try_write` erases and rewrites the **older** A/B copy first, so a
+/// refusal can never destroy the copy holding the live value.
+///
+/// NOTHING enforced this. The order is expressed solely by which of `next_slot`
+/// and `other_slot` appears first in `ab_write.rs`, its own comment ("Write the
+/// *older* slot first") is unchecked prose, and MEASURED: swapping the two calls
+/// left frostsnap_embedded (17), coldsnap_hal (288) and coldsnap_firmware (172) ALL
+/// GREEN — **477** tests at the base commit, which is every test in the tree that
+/// LINKS the function. `frostsnap_core` (63) is green under the swap too and it
+/// means NOTHING: `frostsnap_core/Cargo.toml` declares no `frostsnap_embedded`
+/// dependency, the arrow points the other way, so that gate never compiled
+/// `try_write`. A gate with no view of a function is not a coverage measurement.
+/// Every test that DOES see it reaches `try_write` from a state where both copies
+/// are EQUAL, where the order cannot be observed at all.
+///
+/// One pin here covers ALL THREE in-tree consumers, because it is the same function
+/// and no consumer adds a way for it to be wrong:
+///
+/// * the nonce path, `NonceAbSlot::write_slot_versioned` -> `AbSlot::try_write`,
+///   reached on every `sign_ack` and every `OpenNonceStreams`. Losing both copies
+///   loses the STREAM: `read_slot()` is `None`, so `AbSlots::get_or_create` takes
+///   its `None => initialize(..)` arm, which draws FRESH `ratchet_prg_seed_material`
+///   from the RNG and restarts at index 0. It fails CLOSED — the coordinator's
+///   committed public nonces no longer match, and signing on the lost stream is
+///   `NoncesUnavailable::Overflow` because `get` cannot find it — and there is NO
+///   reuse, because a re-derived INDEX over new material is a different nonce. The
+///   affine break belongs to the ROLLBACK case below, which this test never reaches.
+/// * the share store, `ShareStore::persist_staged` in `firmware/src/store.rs`,
+///   whose PRODUCTION module docs state this ordering as a premise of the record
+///   format ("`AbSlot` writes the *older* copy first ... so an interrupted save
+///   leaves the previous value live in the other copy") and whose own `ponytail:`
+///   note closes the escape hatch ("`AbSlot` exposes no route to the intact older
+///   copy, so the previous share becomes unreachable too"). Under the swap a torn
+///   share save loses the ONLY COPY ON THE DEVICE, with no recovery install
+///   (`mk4-bootloader/sdcard.c:248`) and no route to the intact older copy —
+///   unspendable unless the holder had already taken the 25-word backup, which
+///   `Session::recv_core` does admit (`DisplayBackup` plus the four restore-flow
+///   messages). This is the worst of the three, and by a different mechanism from
+///   the nonce path's.
+/// * the name region, `NameStore::save` in `firmware/src/lib.rs`, also a plain
+///   `frostsnap_embedded::AbSlot`. Cheapest of the three: a lost name reads back
+///   `None`, the device announces `NeedName` and a human retypes it.
+///
+/// Steps (a)-(c) are swap-INVARIANT and cannot be what fails: they run from equal
+/// copies, so the write lands on whichever slot and the read is `Some(33)` in
+/// either orientation. Step (d) is the entire test.
+/// `refused_flash_leaves_the_previous_nonce_state_readable` above also reaches the
+/// asymmetric state, one live copy and one blank; what is unique HERE is that the
+/// refusal is still ARMED for a FURTHER write from it, which is the only way the
+/// erase order becomes observable.
+///
+/// WHAT IS NOT PINNED HERE, and it is a decision rather than an omission (PLAN.md
+/// phase-7 row): the ROLLBACK symptom. A `CommittedSingleCopy` reached by a
+/// refused PROGRAM leaves the loser copy BLANK, because `Slot::try_write` erases
+/// before it writes, so under the swap BOTH copies are lost and `read` is `None`.
+/// On hardware a `CommittedSingleCopy` from a refused ERASE instead leaves the
+/// loser holding the OLD value at a SPENT index, and there the same one-line
+/// ordering error rolls the index BACK rather than losing it — and THAT is the
+/// affine break: two challenges over one nonce solve for the secret share, because
+/// the material is the same and only the index was rewound. Pinning that would need a
+/// `refuse_erases_after(k)` companion plus ~25 lines and it falsifies the SAME
+/// mutation, so it buys a second name for coverage that already exists.
+#[test]
+fn a_refused_write_after_a_single_copy_write_erases_the_older_copy_not_the_live_one() {
+    let flash = RefCell::new(FakeFlash::new(4));
+    let slot = AbSlot::new(FlashPartition::new(&flash, 0, 2, "coldsnap-nonce"));
+
+    // (a), (b): two committed writes, so both copies hold the same value.
+    assert_eq!(slot.try_write(&11u32), AbWriteOutcome::Committed);
+    let programs_before = flash.borrow().programs;
+    assert_eq!(slot.try_write(&22u32), AbWriteOutcome::Committed);
+    // DERIVED from the write just measured, never hardcoded. A hardcoded
+    // doubleword count rots silently into a refusal scheduled PAST the end of the
+    // write, and then (c) asserts only that a successful write succeeded.
+    let per_copy = (flash.borrow().programs - programs_before) / 2;
+    assert!(
+        per_copy > 0,
+        "no programs measured, so the schedule below is blind"
+    );
+
+    // (c): refuse the SECOND copy's program. The first copy takes the new value;
+    // the second is left BLANK by its own already-successful `erase_all`. Flash
+    // is now asymmetric — exactly one copy is live — which is the state no other
+    // test in the tree puts `try_write` in.
+    let refuse_from = flash.borrow().programs + per_copy;
+    flash.borrow_mut().refuse_programs_after(refuse_from);
+    let outcome = slot.try_write(&33u32);
+    assert!(
+        matches!(outcome, AbWriteOutcome::CommittedSingleCopy(_)),
+        "expected CommittedSingleCopy, got {outcome:?}"
+    );
+    assert_eq!(
+        slot.read::<u32>(),
+        Some(33),
+        "the surviving copy is not live, so (d) below has nothing left to lose"
+    );
+
+    // (d): THE ASSERTION. Another write from the asymmetric state, still refused.
+    let (erases, programs) = {
+        let f = flash.borrow();
+        (f.erases, f.programs)
+    };
+    let outcome = slot.try_write(&44u32);
+    assert!(
+        matches!(outcome, AbWriteOutcome::NotCommitted(_)),
+        "expected NotCommitted, got {outcome:?}"
+    );
+    assert_eq!(
+        slot.read::<u32>(),
+        Some(33),
+        "THE ORDERING IS WRONG: the refused write erased the LIVE copy, so both \
+         copies are now blank. `AbSlot::read` takes the highest index with no \
+         integrity check and no fallback, so there is no route back to the intact \
+         one -- a re-derived nonce index, or on the share store the only share"
+    );
+
+    // ANTI-VACUITY, and the two legs differ. Neither count moves under the ORDERING
+    // swap. A `FakeFlash` that STOPS counting is already caught by
+    // `ab_slot_round_trips_over_the_hal_geometry`'s `programs > 0 && erases > 0` and by
+    // `identity`'s over-flash test, and `erases + 1` is a local diagnostic those two
+    // own as well. But a `FakeFlash` that COUNTS A REFUSED program is caught by
+    // NOTHING ELSE — MEASURED, that fake left all 267 lib, 5 smoke and 16
+    // pre-existing integration tests GREEN — so `programs` unchanged is the tree's
+    // only pin on it. Do not delete it as redundant.
+    assert_eq!(
+        flash.borrow().erases,
+        erases + 1,
+        "no erase: nothing was attempted, so the read above proves nothing"
+    );
+    assert_eq!(
+        flash.borrow().programs,
+        programs,
+        "a refused program still reached flash"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -814,9 +950,11 @@ fn a_retry_of_the_same_signing_session_returns_the_cached_shares_without_advanci
 /// `?` is on the same line as the call, so that assertion cannot fail. And it
 /// does not reach the `read_slot()`-returns-`None` leg one line earlier, which
 /// needs corruption to appear BETWEEN the write and the read-back, i.e. a torn
-/// multi-chunk write. That needs an offset-scheduled refusal
-/// (`refuse_programs_after(k)`) that `FakeFlash` does not have; it is the phase-7
-/// increment and is deliberately not faked here.
+/// multi-chunk write. That is now
+/// `a_torn_multi_chunk_write_makes_the_slot_unreadable_and_refuses_to_sign`
+/// below, via `FakeFlash::refuse_programs_after` — COUNT-scheduled in
+/// DOUBLEWORDS, not offset-scheduled, so the fault lands on a 256-byte buffer
+/// boundary rather than at an address.
 #[test]
 fn a_refused_nonce_advance_reports_write_verify_failed_and_leaves_the_index_unadvanced() {
     let flash = RefCell::new(FakeFlash::new(4));
@@ -939,6 +1077,128 @@ fn a_refused_nonce_advance_reports_write_verify_failed_and_leaves_the_index_unad
     assert!(
         matches!(outcome, Some(AbWriteOutcome::NotCommitted(_))),
         "expected NotCommitted, got {outcome:?}"
+    );
+}
+
+/// A nonce write TORN between its 256-byte chunk and its tail flush leaves the
+/// newest A/B copy carrying a valid generation index over an undecodable body, and
+/// signing must then REFUSE rather than trust it.
+///
+/// This is the third and last of §6.3's post-write panic sites, and the one the
+/// test above says it cannot reach: `read_slot()` returning `None` *after* the
+/// write. Three vendored facts compose into it, and none of them is
+/// coincidental — `Slot::read_index` decodes only the leading `u32`, so a torn
+/// copy still reports its NEW index and WINS `current_slot_and_index`;
+/// `AbSlot::read` then decodes that one copy and has no fallback to the intact
+/// older one; so `read_slot()` is `None` even though a perfectly good older copy
+/// is sitting in the other sector.
+///
+/// The refusal must be scheduled INSIDE one logical write, which is what
+/// `FakeFlash::refuse_programs_after` is for. `refuse_programs_now` cannot do it:
+/// it stops the write before its first program and flash comes out unchanged.
+///
+/// THE CACHED ARM IS LOAD-BEARING, not a shortcut. `session_id` below matches the
+/// one already on flash, so `sign_guaranteeing_nonces_destroyed` re-writes the
+/// whole 297 B value verbatim — which the vendored comment explicitly sanctions
+/// ("we may redundantly rewrite it but that's ok"). A FRESH sign would build a
+/// value with one share per session, 137 B, a single chunk, and there is nothing
+/// to tear.
+///
+/// WHICH of `WriteVerifyFailed`'s three producers fired is named by the probe's
+/// `is_none()`, not by the variant: if the torn copy still decoded, the EQUALITY
+/// leg would fire and return the identical variant. That assertion is load-bearing.
+#[test]
+fn a_torn_multi_chunk_write_makes_the_slot_unreadable_and_refuses_to_sign() {
+    // One `BincodeFlashWriter` buffer, in the DOUBLEWORDS `FakeFlash` counts.
+    // `Slot::try_write` uses `bincode_writer_remember_to_flush::<256>`.
+    const CHUNK: u32 = 256 / coldsnap_hal::flash::WRITE_SIZE as u32;
+
+    let flash = RefCell::new(FakeFlash::new(4));
+    let mut slots = NonceAbSlot::load_slots(FlashPartition::new(&flash, 0, 4, "nonces"));
+    let mut rng = entropy(25);
+    let stream_id = NonceStreamId::random(&mut rng);
+    let session_id = SignSessionId([8u8; 32]);
+
+    let mut material = [0u8; 32];
+    rng.fill_bytes(&mut material);
+    // The 6-share / 297 B shape whose byte ledger
+    // `a_full_secret_nonce_slot_survives_the_hal_flash_round_trip` derives above:
+    // 105 fixed bytes + 32n, so the 41-byte tail past the first chunk is what the
+    // refusal below cuts off.
+    let big = SecretNonceSlot {
+        index: 7,
+        nonce_stream_id: stream_id,
+        ratchet_prg_seed_material: material,
+        last_used: 1,
+        signing_state: Some(SigningState {
+            session_id,
+            signature_shares: (1..=6).map(filler_share).collect(),
+        }),
+    };
+
+    let slot = slots.get_or_create(stream_id, &mut rng);
+    let programs_before = flash.borrow().programs;
+    slot.write_slot(&big);
+    assert_eq!(slot.last_write_outcome(), Some(AbWriteOutcome::Committed));
+    // DERIVED, not hardcoded, for the reason the ordering test above gives.
+    let per_copy = (flash.borrow().programs - programs_before) / 2;
+    assert!(
+        per_copy > CHUNK,
+        "{per_copy} doublewords per copy against a {CHUNK}-doubleword buffer: the \
+         value fits ONE chunk, so the refusal below lands before the write instead \
+         of inside it and nothing tears"
+    );
+
+    // `AbSlots::get` filters on `nonce_stream_id()` -> `read_slot()`, so once the
+    // copy is torn the slot handle is UNREACHABLE, and `get_or_create` would
+    // re-`initialize` straight over the evidence. A second `AbSlot` over the same
+    // two sectors is the only non-destructive read. Asserted `Some` HERE, BEFORE
+    // the fault, because a probe aimed at the wrong sectors reads `None`
+    // unconditionally and would make the discrimination below vacuous.
+    let probe = AbSlot::new(FlashPartition::new(&flash, 0, 2, "nonce-probe"));
+    assert!(
+        matches!(probe.read::<Versioned<SecretNonceSlot>>(), Some(Versioned::V0(ref v)) if *v == big),
+        "the probe is not reading the slot under test, so its `is_none()` below \
+         would say nothing"
+    );
+
+    // Between the first 256-byte chunk and the tail's flush.
+    let refuse_from = flash.borrow().programs + CHUNK;
+    flash.borrow_mut().refuse_programs_after(refuse_from);
+
+    let err = slots
+        .sign_guaranteeing_nonces_destroyed(
+            session_id,
+            CoordNonceStreamState {
+                stream_id,
+                index: 7,
+                remaining: 100,
+            },
+            Vec::<(PairedSecretShare<EvenY>, PartySignSession)>::new(),
+            &mut FakeDeviceHmac,
+            30,
+        )
+        .expect_err("a nonce advance torn part way into flash must not be signable");
+    assert!(
+        matches!(err, NoncesUnavailable::WriteVerifyFailed),
+        "wrong site fired: {err:?}"
+    );
+
+    // THE LEG THIS TEST EXISTS FOR. The newest copy no longer decodes, so
+    // `read_slot()` answered `None` and the read-back's `ok_or` is what returned
+    // the variant above. Had the torn copy still decoded, the EQUALITY comparison
+    // one line further down would have fired instead and returned the same
+    // variant — which is why the assertion above cannot name the site on its own.
+    //
+    // Concretely why it does not decode: the torn tail reads back as 0xff, so
+    // share 5 becomes ~2^72 (still a legal `Scalar`) and share 6 becomes
+    // 32 x 0xff, above the group order, which `Scalar::from_bytes` rejects. If
+    // that ever stops being true this assertion goes red loudly rather than the
+    // test passing for the wrong reason.
+    assert!(
+        probe.read::<Versioned<SecretNonceSlot>>().is_none(),
+        "the torn copy still DECODES, so the equality leg fired and the \
+         read-back's `ok_or` is still unreached"
     );
 }
 

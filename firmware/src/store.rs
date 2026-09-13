@@ -69,6 +69,16 @@
 //! at a partial body, and without a checksum a half-written share reads back as a
 //! *valid* share. That is the failure this record's tail exists to prevent.
 //!
+//! The erase-order premise in that first sentence is **GATED as of 2026-09-13**, not
+//! merely documented. Swapping the two `Slot::try_write` calls inside
+//! `AbSlot::try_write` was green in FOUR gates — hal 288, `frostsnap_embedded` 17,
+//! `frostsnap_core` 63, `coldsnap_firmware` 172 — because every test in the tree
+//! reached `try_write` from EQUAL copies. `hal/tests/`'s
+//! `a_refused_write_after_a_single_copy_write_erases_the_older_copy_not_the_live_one`
+//! now reaches it from asymmetric ones and fails on the swap; it covers this consumer
+//! too, because it is the same function. Under the swap the first sentence is FALSE
+//! and, with the `ponytail:` ceiling below, a torn save loses the ONLY share.
+//!
 //! `StmFlash::write` programs `bytes.chunks_exact(WRITE_SIZE)` in **ascending**
 //! order (`hal/src/flash.rs:1256`) and `BincodeFlashWriter` streams a `[u8; N]` in
 //! byte order, so putting the checksum in the final doubleword buys exactly
@@ -90,6 +100,18 @@
 //! becomes unreachable too. Acceptable on a device that holds one share and does
 //! one keygen in its life; the upgrade path is `identity.rs`'s paired-record
 //! design, read both copies and pick the newest that checksums.
+//!
+//! **MEASURED 2026-09-13: that upgrade must be built on the SHARE RECORD, not by
+//! adding a fallback to `AbSlot::read`.** Making `AbSlot::read` fall back to the
+//! older copy on a decode failure left 267 hal lib tests, 5 smoke tests and all 16
+//! pre-existing integration tests GREEN while making
+//! `sign_guaranteeing_nonces_destroyed` return `Ok` carrying six cached
+//! `SignatureShare`s for a nonce advance that never reached flash — the cached arm's
+//! `with_signatures` IS the older copy, so the read-back equality check passes. This
+//! record can fall back safely only because it has its own checksum; the nonce slot
+//! has none, and its read-back verification depends on `AbSlot::read` **not** falling
+//! back. `a_torn_multi_chunk_write_makes_the_slot_unreadable_and_refuses_to_sign` is
+//! the only test in the tree that catches it.
 //!
 //! # Full
 //!
@@ -363,9 +385,10 @@ impl<'a, F: NorFlash> ShareStore<'a, F> {
     /// correctness property, not a style choice: the coordinator applies its own
     /// `NewShare` on the keygen ack and then shows the wallet as complete
     /// (`coordinator/keys.rs:74-78`), so a power cut between ack and persist
-    /// leaves it believing `n` shares exist when `n-1` do. With no backup path on
-    /// this port the threshold is then silently short and the funds are
-    /// unspendable. Upstream persists first for the same reason
+    /// leaves it believing `n` shares exist when `n-1` do. The threshold is then
+    /// silently short, and with no recovery install and no route to the intact older
+    /// copy the funds are unspendable unless the holder had already taken the
+    /// 25-word backup. Upstream persists first for the same reason
     /// (`esp32_run.rs:588-600` then `:618-624`).
     ///
     /// An empty `staged` is the common case and is `Ok(())`.
