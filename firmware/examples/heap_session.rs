@@ -23,7 +23,9 @@
 //!     be compared with the old numbers and substituted into the binding assert.
 //!
 //! The wrapper is `heap_lifo.rs`'s `Lll`, not `src/alloc.rs`'s `Arena`: `Arena` is
-//! private to the **bin** target (`mod alloc;` at `src/main.rs:104`) and exposes no
+//! private to the **bin** target (`mod alloc;` in `src/main.rs` — cited by symbol; the
+//! `:104` that stood here until 2026-09-12 was already stale when commit 6cfbde9 rewrote
+//! this file, and the item is at `:200` today) and exposes no
 //! `used()`/`largest_fit()`, so reaching it would mean editing shipped code for a
 //! harness. Its two guards only *reject* (an out-of-arena dealloc, a stale
 //! sentinel); they do not change what fits. Same crate, same version, same

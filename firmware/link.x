@@ -32,7 +32,10 @@ MEMORY
    * on the `-b` path an emitted header makes `firmware0.bin` 16,384 B and trips
    * `assert len(vectors) <= FW_HEADER_OFFSET` (`signit.py:292`). The address of
    * this slot is pinned by the FLASH_ISR end ASSERT below and by
-   * `hal/src/lib.rs:317`'s `FW_HEADER_OFFSET + FW_HEADER_SIZE == FLASH_ISR_LEN`;
+   * `hal/src/lib.rs`'s `memmap` const-assert block asserts
+   *   `FW_HEADER_OFFSET + FW_HEADER_SIZE == FLASH_ISR_LEN` (cited by symbol -- this said
+   *   `hal/src/lib.rs:317` until 2026-09-12, which is prose about `main.c:130` and
+   *   `enter_dfu`; the assert is at `:348`);
    * that pair is the whole contract, and there is nothing left for a twelfth
    * ASSERT to say. */
   FLASH_ISR  (rx)  : ORIGIN = 0x08020000, LENGTH = 0x3F80
@@ -59,7 +62,8 @@ MEMORY
    *
    * LENGTH 0x9_5FF0 so the region ends EXACTLY at BL_SRAM_BASE = 0x2009_E000
    * (`Makefile:61`). At or above that address is the bootloader's 8 K, which the
-   * callgate WIPES on entry and again on exit (`startup.S:124-134,148-156`), and
+   * callgate WIPES on entry and again on exit (`startup.S:124-134,148-157`; the exit
+   *   range read `148-156` until 2026-09-12, one line short of `bne wipe_loop2`), and
    * `crate::callgate` enters it for every SE operation — so nothing of ours can
    * survive there. */
   RAM        (rwx) : ORIGIN = 0x20008010, LENGTH = 0x95FF0

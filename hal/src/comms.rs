@@ -14,7 +14,9 @@
 //! everything below.
 //!
 //! **There is no length prefix.** A frame is self-delimiting `bincode`
-//! (`BINCODE_CONFIG` = little-endian, varint, `lib.rs:60-63`). A frame's length
+//! (`BINCODE_CONFIG` = little-endian, varint — cited by SYMBOL; the `lib.rs:60-63` that
+//! stood here until 2026-09-12 is prose inside `MAX_MESSAGE_ALLOC_SIZE`'s doc block, and
+//! `pub const BINCODE_CONFIG` is at `:71-75`). A frame's length
 //! is not knowable until it has been decoded. So a size bound cannot be checked
 //! on arrival; it can only be enforced by refusing to *buffer* more than the
 //! bound — which is what [`FRAME_LIMIT`] and [`Link`]'s fixed array do. The
@@ -30,7 +32,9 @@
 //! **Both directions are typed, and the device is the `Upstream` end.** The
 //! device *receives* [`frostsnap_comms::ReceiveSerial<Upstream>`] and *sends*
 //! `ReceiveSerial<Downstream>`; `MagicBytes<O>`'s `Encode` adds
-//! `O::VERSION_SIGNAL` to the last byte (`lib.rs:396-404`), so the pattern we
+//! `O::VERSION_SIGNAL` to the last byte (`impl bincode::Encode for MagicBytes<O>`, cited
+//! by symbol; the `lib.rs:396-404` that stood here opens two impls early — the impl is at
+//! `:403` and the `+=` at `:409`), so the pattern we
 //! scan for and the pattern we answer with differ in that byte. Getting this
 //! backwards produces a device that never links, so [`MAGIC_REPLY`] is pinned
 //! byte-for-byte against the vendored encoder by
@@ -55,8 +59,14 @@
 //! the declared support envelope.
 //!
 //! *Some* hard bound must still exist, because the bytes are attacker-controlled
-//! and the vendored decoder's own limit is `1 << 15` (`lib.rs:57`) — 32 KiB is 5%
-//! of SRAM and not a bound this device can honour. (That limit is no longer what
+//! and the vendored decoder's own limit **was** `1 << 15` when this bound was written —
+//! 32 KiB is 5% of SRAM and not a bound this device can honour. It is `20_480` today
+//! (`MAX_MESSAGE_ALLOC_SIZE` in `frostsnap_comms/src/lib.rs`, lowered by us — see
+//! `vendor/README.md`'s local-modifications table), which is still ~31% of the heap, so
+//! the argument for a device-side bound is unchanged and only the number moved.
+//! **This sentence asserted `1 << 15` in the PRESENT TENSE, and cited `lib.rs:57`, until
+//! 2026-09-12** — while `an_over_claiming_frame_is_refused_before_it_allocates` one screen
+//! below already said the vendored budget is 20,480 now. (That limit is no longer what
 //! this module decodes under: see [`DECODE_ALLOC_LIMIT`], which is a separate
 //! refusal, because `FRAME_LIMIT` bounds *wire bytes* and never bounded what those
 //! bytes make the decoder allocate.) **4,096 rather than 3,072** because 3,072
@@ -195,10 +205,17 @@ const _: () = {
 /// `Vec`/`String` in the decoded type is built from a length varint *before* the
 /// payload is read (`bincode-2.0.1` `impl_alloc.rs:269` is `alloc::vec![0u8;
 /// len]`), and the only ceiling on that length is the config's limit. The
-/// vendored [`BINCODE_CONFIG`] sets it to `1 << 15` = **8 × `FRAME_LIMIT`**
-/// (`frostsnap_comms/src/lib.rs:54`), so a ten-byte frame buys a 32,748-byte
-/// allocation — measured, and pinned by
-/// `an_over_claiming_frame_is_refused_before_it_allocates`.
+/// vendored [`BINCODE_CONFIG`] **set** it to `1 << 15` = **8 × `FRAME_LIMIT`** when this
+/// defect was found (`MAX_MESSAGE_ALLOC_SIZE`, cited by symbol), so a ten-byte frame
+/// bought a 32,748-byte allocation — measured, and pinned against `HISTORICAL_32K_CONFIG`
+/// by `an_over_claiming_frame_is_refused_before_it_allocates`, which additionally asserts
+/// that today's vendored `20_480` refuses the same frame.
+///
+/// **This read "sets it to `1 << 15`", present tense, citing `lib.rs:54`, until
+/// 2026-09-12.** Both halves were wrong: the constant is `20_480` (we lowered it, and the
+/// doc block we added with it pushed the definition to `:69`). The argument for a
+/// device-side bound is untouched — `FRAME_LIMIT` bounds wire bytes and never bounded what
+/// those bytes make the decoder allocate — and only the number moved.
 ///
 /// Worse, that lands on [`DecodeError::UnexpectedEnd`], the one error `drain`
 /// treats as "more bytes are coming" and keeps buffered, so the allocation is
@@ -313,7 +330,9 @@ const _: () = {
 
 /// The exact 8 bytes this device answers a coordinator handshake with:
 /// `bincode` variant tag `0` for `ReceiveSerial::MagicBytes` (it is the first of
-/// 13 variants, so the varint tag is one byte — `lib.rs:68-85`), then
+/// 13 variants, so the varint tag is one byte — `ReceiveSerial`, cited by symbol; the
+/// count of 13 is right, but the `lib.rs:68-85` that stood here starts inside
+/// `BINCODE_CONFIG` — the enum opens at `:83` and its variants run to `:100`), then
 /// `MAGICBYTES_RECV_DOWNSTREAM` with `Downstream::VERSION_SIGNAL == 2` added to
 /// its last byte.
 ///
@@ -346,7 +365,8 @@ pub enum CommsError {
     ///
     /// [`Link`] has already dropped its buffer and returned to the unlinked
     /// state, so recovery is to wait for the coordinator's next magic bytes (it
-    /// re-sends them every `MAGIC_BYTES_PERIOD` = 100 ms, `lib.rs:22`). The
+    /// re-sends them every `MAGIC_BYTES_PERIOD` = 100 ms — cited by symbol; the `lib.rs:22`
+    /// that stood here is a `use` re-export, and the const is at `:43`). The
     /// caller must not try to interpret the stream itself.
     Desync,
     /// The body inside the frame claimed more than [`ENCAPS_DECODE_LIMIT`] and was
@@ -1127,7 +1147,8 @@ mod tests {
     #[test]
     fn magic_bytes_after_the_handshake_are_an_ordinary_frame() {
         // The coordinator re-sends them every 100 ms forever
-        // (MAGIC_BYTES_PERIOD, lib.rs:22), so they must decode, not desync.
+        // (`MAGIC_BYTES_PERIOD`, cited by symbol -- the `lib.rs:22` that stood here is a
+        // `use` re-export; the const is at `:43`), so they must decode, not desync.
         let mut link = Link::new();
         let mut stream = coordinator_magic();
         stream.extend_from_slice(&coordinator_magic());

@@ -169,11 +169,12 @@ This is enabled in `Cargo.toml`. The whole table above is the **phase-1** image 
 it predates `coldsnap_hal`, and is kept in that form because its point is the
 comparison across feature flags, not the current size. Current: **899,400 B = 63.1%** as an rlib sum with LTO off, re-measured
 2026-09-10 (**this read 860,898 B = 60.4%, "with phases 2 and 3 in", until then**);
-the linked image is **377,192 B = 26.46%** (§10, and README "Flash budget" for both
-splits and why they differ by 2.4×; **the rows below and in README read 376,752 B =
-26.43% until 2026-09-11** — that was the figure before the keygen check's randomised
-digit added 440 B, and it is the figure a review found copied into six places while
-two carried the new one). The
+the linked image is **379,648 B = 26.6343%** from `cargo build --release`
+(§10, and README "Flash budget" for both splits and why they differ by ~2.4×; **this
+read 377,192 B = 26.46% until 2026-09-12** and **376,752 B = 26.43% until 2026-09-11**
+— the 376,752 was the figure before the keygen check's randomised digit added 440 B,
+and it is the figure a review found copied into SIX places while two carried the new
+one, which is why every image figure in this document now names its invocation). The
 cost is slower EC operations (smaller precomputation window);
 **signing latency on-device remains unmeasured** — see §9 "Genuinely open" item
 1, now the highest-value open question.
@@ -278,7 +279,7 @@ Frostsnap's UI cannot run on Mk4. Decision 1 accepts this cost knowingly.
 
 | | Frostsnap | Coldcard Mk4 |
 |---|---|---|
-| Panel | 240×280 ST7789 SPI | 128×64 SSD1306 **SPI1 @ 40 MHz**, CS `PA4` / RESET `PA6` / DC `PA8` (`shared/display.py:19-20,32-35,44`) |
+| Panel | 240×280 ST7789 SPI | 128×64 SSD1306 **SPI1 @ 40 MHz**, CS `PA4` / RESET `PA6` / DC `PA8` (`shared/display.py:19-20,32-35,44` for the geometry and pin setup; the **40 MHz is not at any of those lines** — `:32` is a bare `machine.SPI(1)` with no baud rate — it is `shared/ssd1306.py:214`, `rate = 40_000_000 if not self.is_mk5 else 10_000_000`, so Mk4 takes the 40 MHz branch and Mk5 10 MHz. Corrected 2026-09-12) |
 | Pixels | 67,200 | 8,192 |
 | Buffer | — | 1,024 B `MONO_VLSB` `framebuf.FrameBuffer` (`shared/ssd1306.py:33,40,43`) |
 | Flush | partial | **full 1,024 B every `show()`** (`ssd1306.py:123-132`) |
@@ -315,7 +316,7 @@ too: `hal/src/ui.rs` and `firmware/src/wordentry.rs` were written against `ui::F
 directly. Treat this row as the phase-0 estimate it was, not as a plan of record.
 
 **Not obvious, and worth exploiting:** the `Widget` *contract* is not
-colour-bound. `Widget::Color` is an associated type (`lib.rs:230-232`),
+colour-bound. `Widget::Color` is an associated type (`Widget::Color` in `frostsnap_widgets/src/lib.rs`, cited by symbol — **this said `lib.rs:230-232` until 2026-09-12 and was NEVER right**: `type Color: WidgetColor;` is at `:227` inside `pub trait Widget` at `:225`, while `:230-232` is `fn draw`'s doc and signature. Not sibling drift — that file is byte-identical between `0bbc18be` and the sibling's HEAD),
 `VecFramebuffer` already bit-packs `BinaryColor` (`vec_framebuffer.rs:230-237,366`)
 and `ColorInterpolate` has a `BinaryColor` impl thresholding at 50%
 (`widget_color.rs:42-50`). Build a mono `DrawTarget` and reuse the
@@ -590,8 +591,8 @@ eliminating panic sites, not perfecting recovery, is the priority.
 | Priority | Site | Why |
 |---|---|---|
 | **1** | `device.rs:491` indexes `agg_nonces[signature_index]` | **Remotely triggerable by the coordinator, pre-flash-write.** `signature_index` enumerates `sign_items` (`device.rs:480-491`), whose length is the count of locally-owned input sighashes (`sign_task.rs:120-144`), but `GroupSignReq::check` never validates `agg_nonces.len()` against it (`message.rs:101-113` copies `agg_nonces` through unchecked; `sign_task.rs:42-102` checks purpose and ownership only). A coordinator sending fewer `agg_nonces` than sighashes panics the device. Must return `ActionError`. It is **post-consent**: `device.rs:491` is inside `sign_ack`, invoked only on `UiEvent::SigningConfirm` (`device/src/esp32_run.rs:736-741`), and is the only site indexing `agg_nonces`. |
-| 2 | `device_nonces.rs` write/sign path `:234, :235, :269, :278, :281, :298, :300, :307` | 8 of that file's 16 panic sites; each a reset-loop trigger. Convert to `Result`. |
-| 3 | `frostsnap_embedded/src/ab_write.rs:44, :106, :109, :110, :118` | The panics that actually fire on real flash I/O errors, previously out of scope. `AbSlot::write` erases+writes **twice** (`:56-57`), so any STM32 flash error panics mid-A/B-update — the worst moment for nonce state. |
+| 2 | `device_nonces.rs` write/sign path, in `sign_guaranteeing_nonces_destroyed`, BY SYMBOL: the `read_slot` before the stream-id check, the `assert_eq!(.., "wrong stream id")`, the nonce-iterator `next()`, the empty-`sessions` and `next_prg_state` pair, the read-back `read_slot`, the read-back `assert_eq!`, and the `signing_state` unwrap | 8 of that file's 16 panic sites; each a reset-loop trigger. **ALL CONVERTED.** **The line numbers that stood here until 2026-09-12 (`:234, :235, :269, :278, :281, :298, :300, :307`) were UPSTREAM's, not this repo's** — they resolve exactly in `/Users/garykrause/repos/frostsnap` but in `vendor/` `:234-235` are doc-comment prose, `:298-300` are a justification comment and `:278` is blank. Cited by symbol per a5922e4's rule. Four of the eight now have named tests reaching them — see §9 item 4. |
+| 3 | `frostsnap_embedded/src/ab_write.rs`, BY SYMBOL: `AbSlot::try_write`'s index `checked_add`, and in `Slot::try_write` the `erase_all`, the encode, the `flush` and `read_index`'s int decode (**the `:44, :106, :109, :110, :118` that stood here until 2026-09-12 were UPSTREAM lines** — in `vendor/` `:44` is `///`, `:106` is a match arm and `:110` is a bare `}`) | The panics that actually fire on real flash I/O errors, previously out of scope. `AbSlot::write` erases+writes **twice** (`:56-57`), so any STM32 flash error panics mid-A/B-update — the worst moment for nonce state. |
 
 Boot sequencing: clear the panic counter only *after* the event loop is proven
 healthy, or it never trips.
@@ -634,14 +635,14 @@ invocations must be pinned in a script; the vendored manifests have `default = [
 | `frostsnap_embedded` | `--features std` | 17 (**15** without `std`, was 7) |
 | `frost_backup` | `--lib` + 5 of 6 test targets | 19 |
 | `frostsnap_macros` | *(none needed)* | 7 |
-| `coldsnap_hal` | **`--features fake-flash,test-seam`** — 267 lib + 5 smoke + 12 integration | 88 → **284** |
-| `coldsnap_firmware` | *(none needed)* — 114 lib + 51 bin | **165** |
-| **Total** | | 204 → **565** |
+| `coldsnap_hal` | **`--features fake-flash,test-seam`** — 267 lib + 5 smoke + 16 integration | 88 → **288** |
+| `coldsnap_firmware` | *(none needed)* — 120 lib + 52 bin | **172** |
+| **Total** | | 204 → **576** |
 
 **The `coldsnap_hal` row read "135 lib + 5 smoke + 11 integration \| 88 → 151" and the
 total "204 → 268" until 2026-09-10, and the table had no `coldsnap_firmware` row at
-all** — the crate that holds the dispatch, the consent gate, the event loop and 165 of
-the 565 tests. Every figure above was re-verified 2026-09-10 by running each gate and
+all** — the crate that holds the dispatch, the consent gate, the event loop and 172 of
+the 576 tests. Every figure above was re-verified 2026-09-10 by running each gate and
 taking the exit status off the command rather than off a pipe; all fourteen exit 0.
 
 `coldsnap_hal` needs those two features for its `tests/` directory (`cfg(test)`
@@ -1003,7 +1004,7 @@ tree: there is no event loop, no bin target, and nothing calls `encode_frame`
 outside tests. No helper was written for them either — a cap with no caller cannot
 be tested against the code that will need it."* **Every clause of that was false.**
 There is an event loop (`firmware/src/main.rs` step 10), there is a bin target
-(`firmware/`, which links at 377,192 B), `encode_frame` has a production caller
+(`firmware/`, which links at 379,648 B under `cargo build --release`), `encode_frame` has a production caller
 (`Outbox::encode`, `firmware/src/lib.rs`'s `Outbox::encode`), and all three caps are implemented in
 `Outbox::push` (`firmware/src/lib.rs`). This was the single most misleading
 paragraph in the file: it read as a standing reason to go and build something that
@@ -1088,10 +1089,10 @@ Each phase ends at a testable artifact. No hardware until Phase 5.
 | 1b | Close the residual test gaps | odd-y/`lift_x` assertion; device-path vector; clippy at `bitcoin_transaction.rs:524` | tests fail on mutating `tweak.rs:342` | 🟡 **two of three closed; this row read "⬜ pending" until 2026-09-10.** The odd-y assertion shipped as `odd_y_internal_keys_tweak_to_the_same_output` (`frostsnap_core/src/tweak.rs:583`), which pins the *property* — `P` and `-P` must tweak to the same output key — touches no `bitcoin` type, and so survives decision 4 being revisited (DECISIONS.md residual gap 1, marked FIXED there). The clippy finding is fixed too (residual gap 4); `bitcoin_transaction.rs:524` is now `pub fn spk`, so that citation no longer locates anything. **Still open: the device-path vector** — every shipped test exercises `TweakableKey for Point`, while production signs through `SharedKey` and `PairedSecretShare` (residual gap 2). |
 | 2 | STM32 HAL substrate | `NorFlash` for STM32 flash, **2-source** `RngCore` (§5.1 — not three), **panic → `NVIC_SystemReset`** (§6.2), plus removal of the §6.3 panic sites | host tests; handler disassembly; **§8.1 defect register empty** | 🟡 **written, all 12 review defects fixed, host-verified; hardware claims unverified** — see **§8.1**. Device build links; clippy and rustdoc clean; **204 tests** and **857,125 B = 60.1%** at the gate (now 268 / 860,898 with phase 3 and 4 on top). What remains is §8.1 items 3–5 — the real `DBANK`, `.ramfunc`, ECC/NMI — all bench work. Every on-silicon claim is still an assumption (§9); nothing has run on hardware. |
 | 3 | Transport | USB CDC carrying `frostsnap_comms` framing, within the **4,096 B** ceiling (§7, raised from 2,060 — DECISIONS.md 7) | coordinator handshake | 🟡 **written and host-verified; no enumeration has been attempted.** `hal/src/comms.rs` (framing, +18 tests) and `hal/src/usb.rs` (OTG_FS device mode + CDC-ACM, +31 tests, **23/23 mutations caught**) — see **§8.2**. The bound is structural, not a comparison: the accumulator *is* `[u8; FRAME_LIMIT]`, and it costs 2 × that in SRAM. The gate is **not** met **on silicon**, which is what it means here — a real unmodified coordinator *has* handshaked with this framing on the host over a pty (§9 item 6, phase 4's row below); what has never happened is enumeration on the device. §7's census is what raised the bound: at 2,060 the transport refused a real `SignatureShare`, a real 11-input `RequestSign`, 9-of-9 keygen and a 14-share `HeldShares2`; at 4,096 it refuses none of them, and the **three device-side construction caps are now implemented** in `Outbox::push` (§7; this cell said they "remain UNIMPLEMENTED" until 2026-09-10). |
-| 4 | Protocol on host | keygen + sign, Tier 2 simulator first, then Tier 3 stub `Serial` against real `frostsnap_coordinator` | end-to-end on host | 🟡 **gate MET on host 2026-08-18; not signed off.** `hostcheck/` + `firmware/examples/stub.rs` complete a **9-of-9 keygen, nonce replenishment and a signature that VERIFIES** (`Schnorr::verify_only()` against the coordinator's own derived x-only key) over a pty in two processes, against an **unmodified** sibling `frostsnap_coordinator`, at both `STUB_CHUNK=64` and `=1`, plus a third **DECLINE** pass. The two §7 size crossovers are **closed** by decision 7 (`FRAME_LIMIT` 2,060 → 4,096), validated on the wire: largest coordinator→device frame actually written is **2,179 B**, above the old bound, so this keygen was previously refused. Tier 1 **568** tests green. **This cell listed five uncovered items until 2026-09-10 and FOUR of them had already closed** — it read: *"the stub auto-acks `SignatureRequest`, so the approval policy — the actual security property — is untested; … but only CORE-to-CORE — nothing yet asserts the four bytes the screen renders are the coordinator's; restoration, backup consolidation, physical-backup entry and naming flows have never been driven at all; the three device-side caps (§7) are unimplemented; the allocator is sized and chosen but not registered (§9 item 7)."* Corrected: `SignatureRequest` **is** gated, on the randomised digit read back off the rendered frame (`stub.rs`'s `approved`, whose `SignatureRequest` arm is `digit.accepts(key)`), and a DECLINE pass fails the run if a refused prompt yields a share (`hostcheck/src/main.rs`'s `ASSERTION 2: A DECLINED PROMPT YIELDS NO SIGNATURE` block); the four rendered bytes **are** compared against the coordinator's session-hash prefix (its `ASSERTION 1: THE GLASS SHOWS THE COORDINATOR'S CODE` block, closed 2026-08-31, §9 item 12); the three caps **are** implemented (`Outbox::push` in `firmware/src/lib.rs`, §7); and the allocator **is** registered (`ALLOCATOR` in `firmware/src/alloc.rs`, §9 item 7). **Cited by SYMBOL and by banner comment rather than by line since 2026-09-12**: every one of those five was a line number, all five had rotted, and `hostcheck/src/main.rs:776` had moved by ~1,900 lines. **THE RESTORATION FLOWS ARE NOW COORDINATOR-DRIVEN — this cell said they were "driven by unit tests but not by a real coordinator" until 2026-09-11, and that was the largest remaining phase-4 gap.** `hostcheck` gained the five-call `UiProtocol` lifecycle and drives **four of the five** flows from UPSTREAM's own drivers, unmodified and by path — `DisplayBackupProtocol`, `CheckBackupProtocol`, `EnterPhysicalBackup`, plus consolidation through the same `queue` the keygen frames use (upstream has no driver for it). One boxed protocol at a time; no `UiStack`. Ordered AFTER the verified signature, because at t = n = 9 every device is needed to sign and `Consolidate` REPLACES the one share record the store keeps. What each asserts: the **25 words read back off the device's own framebuffer** with `ui::Frame::cell` re-encode through upstream's `ShareBackup::from_words` to this coordinator's own `expected_share_image`; the check quiz passes in **exactly 8 answers** taken only from what that reveal drew (the stub's picker is handed no `quiz::Quiz` and no option list); those same words go back in through the letter picker — whose candidate letters are a function of the secret prefix, so the typing is off the pixels too — and `check_physical_backup` accepts the result; and after the destructive consolidation the device's re-reported share **image** matches. MEASURED cost: **+1.4 s at chunk 64, +2.4 s at chunk 1**. Seventeen mutations RUN, each file restored and `diff`ed byte-identical, including three that remove one lifecycle leg each and all die on the new `DEADLINE (95s)` in the right state; plus `COLDSNAP_GLASS_KEYS=yy9`, which shows with NO source change that a hardcoded key cannot authorise a reveal, an ingest or a consolidation. See §9 item 12 for the three upstream facts this turned up, and for what did NOT get demonstrated. **NAMING AND `erase_device` CLOSED THE SAME DAY.** A coordinator-previewed name — 14 chars and 56 bytes at once, i.e. simultaneously the `FixedString<14>` wire bound and `DEVICE_NAME_MAX_BYTES` — reaches FLASH on all nine devices and comes back byte-exact as `SetName`, with a `NeedName` required first so an announce-time echo cannot be mistaken for a commit. It needed no device change: the preview must ride with the `AnnounceAck` because `commit_name` fires during keygen, and a mutation sending it post-keygen yields zero `SetName` lines. And upstream's own `EraseDevice` driver is now proven NEVER to complete against this device: `is_complete()` stays `None` for the whole grace window AND the device reports `refused=DataErase` — both halves, because silence alone is what a dead device looks like. **AND `CheckKeyGen` NOW ASKS FOR THE RANDOMISED DIGIT.** This cell said until 2026-09-11 that it was "gated on the fixed `1=match` key the screen advertises … so a hardcoded script can answer it". `ui::keygen_check` now prints `press_legend(confirm)` like the signing screens, `KEYGEN_MATCH_KEY` is deleted, and `answer` has one rule for every prompt. **No literal answers any consent screen on this device now**, shown with no source mutation: `COLDSNAP_GLASS_KEYS=1yy` exits 1 with 8 of 9 devices declining (the ninth drew `1`, which is the 1-in-5 made visible) and `=9yy` exits 1 with 9/9. Cost +440 B of flash, and the 2x code rows deliberately did not move because `glass_code` reads them back from those exact cells. **`Cancel` AND THE LEGACY `SavePhysicalBackup` v1 ARE NOW DRIVEN TOO, 2026-09-12 (M10, M11), and this cell said until then that `Cancel` was "the cheapest real gap in phase 4" — which was wrong twice over.** It is not the cheapest (five of its six clearings already had named, mutation-verified Tier-1 tests asserting the downstream refusal), and the prescription that went with it — "send it mid-reveal" — was a re-proof of those tests over a transport. The one clearing with no assertion anywhere was `pending_name`, and M10 closes it as a DIFFERENTIAL: two devices get the same two frames in OPPOSITE ORDERS, so `Cancel`-then-preview must commit the byte-exact name while preview-then-`Cancel` must commit none, and a lost preview silences both rather than passing vacuously. M11 drives the v1 body, whose naive assertion CANNOT FAIL — v1 recurses into v2, so `PhysicalSaved` is byte-identical — and asserts the one field that distinguishes them, the `threshold` v1 forces `Some(..)` and today's v2 leaves `None`, read back off the wire with `V1_THRESHOLD = 7` so the value exists nowhere else in the run. Both variants are driven by ONE `cargo run` (v2 at chunk 64, v1 at chunk 1), so nothing was traded away. SIX mutations run across the two, each file restored and `diff`ed byte-identical; two SEPARATE defects fell out of them and are fixed — a refusal of a frame the coordinator was waiting on was a log line that then burned the whole 95 s budget to die naming the state instead of the cause, and every FAILING run leaked its stub child (the PASS block's 15 `bail!`s are `return`s that fire before the reaping — the first draft of that accounting said 31 and said they were inside the loop, and review corrected both), which after three failures made the next run die at `TTYPort::pair: No such device or address`. **What the gate STILL does NOT cover:** ingest onto a device with **no share at all** (all nine hold one, so M7d re-ingests the device's own backup — the tenth-device decision was re-derived independently on 2026-09-12 and DEFER stands, with the cost and one withdrawn false claim in §9 item 12); and nothing has run on silicon. |
-| 5 | Mono UI | **8 screens** (§4.2), mono `DrawTarget`, ~850 LOC ported from `frostsnap_widgets` | manual, on hardware | 🟡 **written and host-verified; the manual-on-hardware gate is untouched.** **This row read "⬜ pending — largest single item" until 2026-09-10**, by which time `hal/src/ui.rs` was 5,541 lines rendering all eight screens with real callers (§9 item 16, closed the same day) and `tools/pixel-check.py` was checking them against an independent framebuffer decoder. Nothing was ported from `frostsnap_widgets` in the end — the ~850 LOC estimate was never drawn on; the screens are written against `ui::Frame` directly, and the one upstream artefact reused is the idea of a distractor quiz, deliberately **not** its implementation (§7 cap notes). What the gate still means here is the part a host cannot do: whether 16 px is legible on a physical OLED, and whether the keypad's hold-to-confirm feels right (§9 item 15). It inherits §8.1 defect 12: `user_prompt()`'s `None` is a **refusal**, not a rendering fallback — now enforced, since `SignPages`/`prompt_screen` funnel through one renderability gate. |
+| 4 | Protocol on host | keygen + sign, Tier 2 simulator first, then Tier 3 stub `Serial` against real `frostsnap_coordinator` | end-to-end on host | 🟡 **gate MET on host 2026-08-18; not signed off.** `hostcheck/` + `firmware/examples/stub.rs` complete a **9-of-9 keygen, nonce replenishment and a signature that VERIFIES** (`Schnorr::verify_only()` against the coordinator's own derived x-only key) over a pty in two processes, against an **unmodified** sibling `frostsnap_coordinator`, at both `STUB_CHUNK=64` and `=1`, plus a third **DECLINE** pass. The two §7 size crossovers are **closed** by decision 7 (`FRAME_LIMIT` 2,060 → 4,096), validated on the wire: largest coordinator→device frame actually written is **2,179 B**, above the old bound, so this keygen was previously refused. Tier 1 **576** tests green. **This cell listed five uncovered items until 2026-09-10 and FOUR of them had already closed** — it read: *"the stub auto-acks `SignatureRequest`, so the approval policy — the actual security property — is untested; … but only CORE-to-CORE — nothing yet asserts the four bytes the screen renders are the coordinator's; restoration, backup consolidation, physical-backup entry and naming flows have never been driven at all; the three device-side caps (§7) are unimplemented; the allocator is sized and chosen but not registered (§9 item 7)."* Corrected: `SignatureRequest` **is** gated, on the randomised digit read back off the rendered frame (`stub.rs`'s `approved`, whose `SignatureRequest` arm is `digit.accepts(key)`), and a DECLINE pass fails the run if a refused prompt yields a share (`hostcheck/src/main.rs`'s `ASSERTION 2: A DECLINED PROMPT YIELDS NO SIGNATURE` block); the four rendered bytes **are** compared against the coordinator's session-hash prefix (its `ASSERTION 1: THE GLASS SHOWS THE COORDINATOR'S CODE` block, closed 2026-08-31, §9 item 12); the three caps **are** implemented (`Outbox::push` in `firmware/src/lib.rs`, §7); and the allocator **is** registered (`ALLOCATOR` in `firmware/src/alloc.rs`, §9 item 7). **Cited by SYMBOL and by banner comment rather than by line since 2026-09-12**: every one of those five was a line number, all five had rotted, and `hostcheck/src/main.rs:776` had moved by ~1,900 lines. **THE RESTORATION FLOWS ARE NOW COORDINATOR-DRIVEN — this cell said they were "driven by unit tests but not by a real coordinator" until 2026-09-11, and that was the largest remaining phase-4 gap.** `hostcheck` gained the five-call `UiProtocol` lifecycle and drives **four of the five** flows from UPSTREAM's own drivers, unmodified and by path — `DisplayBackupProtocol`, `CheckBackupProtocol`, `EnterPhysicalBackup`, plus consolidation through the same `queue` the keygen frames use (upstream has no driver for it). One boxed protocol at a time; no `UiStack`. Ordered AFTER the verified signature, because at t = n = 9 every device is needed to sign and `Consolidate` REPLACES the one share record the store keeps. What each asserts: the **25 words read back off the device's own framebuffer** with `ui::Frame::cell` re-encode through upstream's `ShareBackup::from_words` to this coordinator's own `expected_share_image`; the check quiz passes in **exactly 8 answers** taken only from what that reveal drew (the stub's picker is handed no `quiz::Quiz` and no option list); those same words go back in through the letter picker — whose candidate letters are a function of the secret prefix, so the typing is off the pixels too — and `check_physical_backup` accepts the result; and after the destructive consolidation the device's re-reported share **image** matches. MEASURED cost: **+1.4 s at chunk 64, +2.4 s at chunk 1**. Seventeen mutations RUN, each file restored and `diff`ed byte-identical, including three that remove one lifecycle leg each and all die on the new `DEADLINE (95s)` in the right state; plus `COLDSNAP_GLASS_KEYS=yy9`, which shows with NO source change that a hardcoded key cannot authorise a reveal, an ingest or a consolidation. See §9 item 12 for the three upstream facts this turned up, and for what did NOT get demonstrated. **NAMING AND `erase_device` CLOSED THE SAME DAY.** A coordinator-previewed name — 14 chars and 56 bytes at once, i.e. simultaneously the `FixedString<14>` wire bound and `DEVICE_NAME_MAX_BYTES` — reaches FLASH on all nine devices and comes back byte-exact as `SetName`, with a `NeedName` required first so an announce-time echo cannot be mistaken for a commit. It needed no device change: the preview must ride with the `AnnounceAck` because `commit_name` fires during keygen, and a mutation sending it post-keygen yields zero `SetName` lines. And upstream's own `EraseDevice` driver is now proven NEVER to complete against this device: `is_complete()` stays `None` for the whole grace window AND the device reports `refused=DataErase` — both halves, because silence alone is what a dead device looks like. **AND `CheckKeyGen` NOW ASKS FOR THE RANDOMISED DIGIT.** This cell said until 2026-09-11 that it was "gated on the fixed `1=match` key the screen advertises … so a hardcoded script can answer it". `ui::keygen_check` now prints `press_legend(confirm)` like the signing screens, `KEYGEN_MATCH_KEY` is deleted, and `answer` has one rule for every prompt. **No literal answers any consent screen on this device now**, shown with no source mutation: `COLDSNAP_GLASS_KEYS=1yy` exits 1 with 8 of 9 devices declining (the ninth drew `1`, which is the 1-in-5 made visible) and `=9yy` exits 1 with 9/9. Cost +440 B of flash, and the 2x code rows deliberately did not move because `glass_code` reads them back from those exact cells. **`Cancel` AND THE LEGACY `SavePhysicalBackup` v1 ARE NOW DRIVEN TOO, 2026-09-12 (M10, M11), and this cell said until then that `Cancel` was "the cheapest real gap in phase 4" — which was wrong twice over.** It is not the cheapest (five of its six clearings already had named, mutation-verified Tier-1 tests asserting the downstream refusal), and the prescription that went with it — "send it mid-reveal" — was a re-proof of those tests over a transport. The one clearing with no assertion anywhere was `pending_name`, and M10 closes it as a DIFFERENTIAL: two devices get the same two frames in OPPOSITE ORDERS, so `Cancel`-then-preview must commit the byte-exact name while preview-then-`Cancel` must commit none, and a lost preview silences both rather than passing vacuously. M11 drives the v1 body, whose naive assertion CANNOT FAIL — v1 recurses into v2, so `PhysicalSaved` is byte-identical — and asserts the one field that distinguishes them, the `threshold` v1 forces `Some(..)` and today's v2 leaves `None`, read back off the wire with `V1_THRESHOLD = 7` so the value exists nowhere else in the run. Both variants are driven by ONE `cargo run` (v2 at chunk 64, v1 at chunk 1), so nothing was traded away. SIX mutations run across the two, each file restored and `diff`ed byte-identical; two SEPARATE defects fell out of them and are fixed — a refusal of a frame the coordinator was waiting on was a log line that then burned the whole 95 s budget to die naming the state instead of the cause, and every FAILING run leaked its stub child (the PASS block's 15 `bail!`s are `return`s that fire before the reaping — the first draft of that accounting said 31 and said they were inside the loop, and review corrected both), which after three failures made the next run die at `TTYPort::pair: No such device or address`. **INGEST ONTO A DEVICE HOLDING NOTHING IS NOW CLOSED TOO, 2026-09-12 (M12, commit 7ba6ea4), and this cell said "DEFER stands" until then.** `hostcheck` announces `ALL_DEVICES = 10` and cuts a nine-device keygen roster out of `announced[..N_DEVICES]`, so `announced[N_DEVICES]` is blank **BY CONSTRUCTION** — identification is ASSIGNMENT, from one expression on one lap at the `BeginKeygen` site it already owns, so no back-channel is needed and nothing is trusted to a device about the thing under test. That device is then handed the FIRST device's sheet, types the 25 words in through the letter picker (198 keypresses) and CONSOLIDATES them onto a flash that held nothing. **What it buys is ONE new falsifiable assertion, not the two §9 item 12 commissioned it for:** the `Some`/`None` discrimination on the re-report. The share-image half of M7e and the `index != r.share_index` bound both stay OVER-DETERMINED — see the M12 block in `hostcheck/src/main.rs` for the mechanism that shadows each, and §9 item 12 for the three claims this turned out to have got wrong. Zero device code, zero flash, zero test-count movement; harness 10.11 s -> 12.38 s. **What the gate STILL does not cover: nothing has run on silicon.** |
+| 5 | Mono UI | **8 screens** (§4.2), mono `DrawTarget`, ~850 LOC ported from `frostsnap_widgets` | manual, on hardware | 🟡 **written and host-verified; the manual-on-hardware gate is untouched.** **This row read "⬜ pending — largest single item" until 2026-09-10**, by which time `hal/src/ui.rs` was 5,541 lines rendering all eight screens with real callers (§9 item 16 — which was itself PARTLY closed that day and only fully closed on 2026-09-12, when address verification got its caller; the parenthetical here read "closed the same day" until then) and `tools/pixel-check.py` was checking them against an independent framebuffer decoder. Nothing was ported from `frostsnap_widgets` in the end — the ~850 LOC estimate was never drawn on; the screens are written against `ui::Frame` directly, and the one upstream artefact reused is the idea of a distractor quiz, deliberately **not** its implementation (§7 cap notes). What the gate still means here is the part a host cannot do: whether 16 px is legible on a physical OLED, and whether the keypad's hold-to-confirm feels right (§9 item 15). It inherits §8.1 defect 12: `user_prompt()`'s `None` is a **refusal**, not a rendering fallback — now enforced, since `SignPages`/`prompt_screen` funnel through one renderability gate. |
 | 6 | Callgate integration | SE1/SE2 identity, PIN, rate limiting; ABI already determined (§5, DECISIONS.md decision 2) | hardware | ⬜ pending |
-| 7 | Nonce durability | read-back-verified writes as `Result` not `assert!`, power-loss testing | fault injection | ⬜ pending — `TestNorFlash` does **not** model power loss (§7) |
+| 7 | Nonce durability | read-back-verified writes as `Result` not `assert!`, power-loss testing | fault injection | 🟡 **first half DONE and now PINNED BY NAME; second half narrowed to a 3-line helper — and one REAL DEFECT found, with zero coverage.** **This row read "⬜ pending — `TestNorFlash` does not model power loss (§7)" until 2026-09-12**, which understated what had landed and mis-stated what remained. (a) The read-back-verified writes are `Result` and are no longer only asserted: `a_refused_nonce_advance_reports_write_verify_failed_and_leaves_the_index_unadvanced` reaches the comparison NON-VACUOUSLY (§9 item 4), and deleting the comparison returns `Ok` carrying another session's shares for an advance that never reached flash. (b) POWER LOSS / TORN WRITES is what remains, and its entire increment is a 3-line `FakeFlash::refuse_programs_after(k: u32)` mirroring `FaultyNorFlash::fail_write_after` — plus the chunk-boundary measurement, now MEASURED: a `SecretNonceSlot` with 6 signature shares is **297 B** against `BUFFER_SIZE = 256`, so the boundary falls 256 B in and the two A/B copies program **76** doublewords (2 × 38 = one full 32-doubleword chunk plus a 41 B tail padded to 48 = 6), i.e. `BincodeFlashWriter::write`'s multi-chunk branch is entered for the first time by any test in this file. With `signing_state: None` the value is 65 B, pads to 72, and programs 18. (c) **AND A REAL DEFECT, which is the load-bearing part of this row now:** in `frostsnap_embedded/src/ab_write.rs`'s `AbSlot::try_write`, swapping the two `try_write` calls so the **LIVE** copy is erased first passes EVERY test in the tree — hal's 16 integration tests and `frostsnap_embedded`'s 17. From a `CommittedSingleCopy` state the two copies hold DIFFERENT values, so erasing the live one and then failing rolls the nonce index **BACK** to the older copy's — the device re-derives a nonce for which a signature share has already been emitted, which is the affine break that solves for the share. The comment at `try_write` asserts the correct ordering ("Write the *older* slot first") and **nothing enforces it**. `ab_write::test::fault_between_the_two_copies_reports_committed_and_the_new_value_is_live` does NOT own this claim, contrary to what a design report assumed: after a `Committed` write both copies hold the same value, so the erase order is unobservable. It only becomes observable from `CommittedSingleCopy`, which no test then follows with a further refused write — which is exactly what `refuse_programs_after(k)` buys. **Schedule (c) explicitly; do not leave it inside this row's general wording.** |
 
 Phases 1–4 carry no brick risk. Phase 5 is the largest single item.
 
@@ -1159,8 +1160,27 @@ is there. All three are recorded with their reasoning in `vendor/README.md`.
    justification for saying it need not was arithmetically false: 512 K of
    `FLASH_FS` is now partitioned, and the map lives in `hal/src/lib.rs`'s `memmap`
    with `const` asserts rather than here, so it cannot drift from the code that
-   obeys it: identity at offset 0 (8 KiB), nonce slots at 8 KiB (32 KiB), the rest
-   `FS_FREE_OFFSET` and reserved. Every offset and length is a multiple of the
+   obeys it: identity at offset 0 (8 KiB), nonce slots at 8 KiB (32 KiB), the SHARE
+   record at 40 KiB (16 KiB, `FS_SHARE_OFFSET`), the device NAME record at 56 KiB
+   (16 KiB, `FS_NAME_OFFSET`, carved out and reserved but not yet written), and the
+   remaining 440 K unclaimed from `FS_FREE_OFFSET` at 72 KiB.
+   **This sentence read "the rest `FS_FREE_OFFSET` and reserved" straight after the nonce
+   region until 2026-09-12, i.e. it said no region for shares existed** — false since
+   `store::ShareStore` landed, and doubly ironic in a sentence whose own premise is that
+   the map "cannot drift from the code that obeys it". `AUDIT-2026-09-10.md` had already
+   recorded the corrected layout. The knock-on this stale claim had elsewhere is worth
+   recording, because it cost a whole assertion pair: `firmware/examples/stub.rs` carried
+   the same belief ("firmware's job is to write these to flash, and NOTHING DOES YET --
+   there is no `FLASH_FS` region for shares"), and on the strength of it drained
+   `session.signer.staged_mutations()` looking for `KeyMutation::SaveShare` — which
+   **NEVER MATCHED ONCE**, because `store::ShareStore::persist_staged` had already consumed
+   and cleared them as `Session::run`'s FIRST statement (`firmware/src/lib.rs:1898-1900`,
+   `firmware/src/store.rs:421`). Probed at **308 drain calls per harness run, every one
+   `staged=0`**. So the `saved` map stayed empty and BOTH conditions on it were vacuous —
+   the latch advancing the stub's `STATE` to `SharesSaved` and the "every share belongs to
+   ONE access structure" check never fired — until commit 7ba6ea4 switched the source to
+   `signer.held_shares()`, at which point `saved` reaches 9 on all three passes for the
+   first time. A stale layout claim in this document is what a harness reasoned from. Every offset and length is a multiple of the
    **8 KiB `DBANK0_PAGE`**, not of the 4 KiB `ERASE_SIZE`, and that is the whole
    point: it is what makes an identity-region erase unable to reach the nonce region
    even if the real `DBANK` turns out to be 0 (item 3 above, still open).
@@ -1170,9 +1190,14 @@ is there. All three are recorded with their reasoning in `vendor/README.md`.
    tree does not yet have" until 2026-09-10.** Both are wrong now: `firmware/link.x`
    exists (10 link-time `ASSERT`s, two of which pin the `FLASH_TEXT`/`FLASH_FS`
    boundary at `0x0818_0000`), so adding a `.ramfunc` output section is an edit to an
-   existing file rather than new work; and the margin is not 44 K but **1,048,656 B** —
-   the linked image is 377,192 B of a 1,425,408-byte `FLASH_TEXT`. The 44 K figure came
-   from the *rlib sum*, which overestimates the image by 2.4×. What is still unresolved
+   existing file rather than new work; and the margin is not 44 K but **1,045,760 B** —
+   the linked image is 379,648 B of a 1,425,408-byte `FLASH_TEXT` (`cargo build
+   --release`), and the margin is that subtraction so the two cannot drift apart again.
+   The 44 K figure came from the *rlib sum*, which overestimates the image by ~2.4×.
+   **This sentence read "the margin is not 44 K but **1,048,656 B** — the linked image is
+   377,192 B" until 2026-09-12, and the two halves did not agree with each other:**
+   1,425,408 − 377,192 is 1,048,216, while 1,048,656 is 1,425,408 − 376,752, i.e. the
+   margin was left behind when the image beside it was updated one image earlier. What is still unresolved
    is the actual question — whether the flash driver must execute from RAM — and that is
    bench work. Pinned as `flash::RAM_EXECUTION_IS_UNRESOLVED`.
 5. **ECC is unhandled.** An uncorrectable double-bit error on a nonce read raises
@@ -1217,7 +1242,7 @@ named test that was supposed to catch them, 0 survivors, 0 hangs.** The list is 
 | `fifo_read` writes the trailing whole word past `len` (ST's `USB_ReadPacket` bug) | `fifo_read_does_not_write_past_len` |
 | `fifo_read` refuses an oversize packet *before* draining the FIFO | `fifo_read_drains_the_whole_packet_even_when_it_refuses` |
 | `fifo_read` drops the oversize refusal entirely | the same pair |
-| `fifo_write` returns `Ok` when its spin countdown expires | `fifo_write_reports_a_timeout_rather_than_dropping_bytes` |
+| `fifo_write` returns `Ok` when its spin countdown expires | `fifo_write_gives_up_instead_of_spinning_when_the_fifo_never_drains` (`hal/src/usb.rs:2640`; asserts `Err(UsbError::FifoTimeout)` on a `SimPort::wedged()` AND `port.written().len() == 0`). **This cell named `fifo_write_reports_a_timeout_rather_than_dropping_bytes` until 2026-09-12; NO SUCH TEST EXISTS**, and `AUDIT-2026-09-10.md` had already said so |
 | `fifo_write` writes without re-checking `DTXFSTS` for space | `SimPort`'s own assert — the "test double no more permissive than the hardware" rule paying for itself |
 | `Setup::recipient` masks 2 bits, as ST's `USB_REQ_RECIPIENT_MASK` does | `reserved_recipients_are_not_aliased` |
 | SET_ADDRESS masks to `0x7f` instead of refusing | `set_address_is_range_checked_rather_than_masked` |
@@ -1225,7 +1250,7 @@ named test that was supposed to catch them, 0 survivors, 0 hangs.** The list is 
 | SET_CONFIGURATION accepts any `wValue`; SET_FEATURE acknowledges; DEVICE_QUALIFIER answered | three separate control-dispatch tests |
 | `ep0_xfer_size` uses the wide `XFRSIZ` field width; PKTCNT bound dropped | `ep0_xfer_size_is_narrower_than_every_other_endpoint` |
 | `rx_status` truncates BCNT to 8 bits; PKTSTS mask lets DPID leak | two `rx_status` tests |
-| `fifo_words` truncates instead of rounding up | `fifo_words_rounds_up` |
+| `fifo_words` truncates instead of rounding up | `fifo_read_does_not_write_past_len` (`hal/src/usb.rs:2570`) — and **only** through its `&dest[..len] == payload` assert. **This cell named `fifo_words_rounds_up` until 2026-09-12; NO SUCH TEST EXISTS.** Worth stating what the real pairing is, because it is weaker than the name suggested: that test AND `fifo_write_pads_the_final_partial_word` (`:2616`) both compute their word-count expectation *from* `fifo_words` itself, so **their word-count assertions cannot see this mutation at all** — the payload comparison is the whole of the coverage. Pairing re-derived by READING on 2026-09-12 (and independently by `AUDIT-2026-09-10.md`); the mutation has not been re-run since |
 | `DIEPTXF2` overlaps `DIEPTXF0` | `the_fifo_partition_fits_and_does_not_overlap` (the `const _` block cannot see this one) |
 | `wTotalLength` off by one; `line_coding` byte order swapped; strings Latin-1 not UTF-16LE | three descriptor tests |
 | `UsbToken::take()` hands out the peripheral every time | `the_peripheral_is_handed_out_once` |
@@ -1317,16 +1342,72 @@ discarded, against **~850 LOC** reusable.
    outside the protected segment runs while armed. The handler enters with
    `cpsid i`, matching `modckcc.c:104`, but source alone does not establish that
    an entry from exception/handler mode — possibly on a different stack, and the
-   gate switches to its own (`startup.S:139-145`) — satisfies the firewall. If it
+   gate switches to its own (`startup.S:137-138`, the `mov r10, sp` / `mov sp, r9` pair — **this said `:139-145` until 2026-09-12**, which is the `push {r10, lr}` / `bl firewall_dispatch` / `pop` window and contains no stack switch; DECISIONS.md's `startup.S:122-158` for the same fact was right) — satisfies the firewall. If it
    does not, the result is a firewall reset: benign here (same outcome as the
    intended reset) but it means the DFU fallback silently never works even on dev
    units. **Confirm on an RDP≠2 dev unit that a deliberate panic lands in DFU.**
-4. **Which flash-error paths actually panic?** The §6.3 priority-2 and -3 sites
-   cannot be shown reachable without a fault-injecting harness. `TestNorFlash`
-   models no failures. Build one on the existing doubles —
-   `MemoryNonceSlot` (`device_nonces.rs:501-514`) and `TestNorFlash`
-   (`frostsnap_embedded/src/test.rs`) — that injects write failures and records
-   which of the 13 enumerated sites fire.
+4. **Which flash-error paths actually panic? — STILL OPEN, but NARROWED, and its
+   PREMISE WAS WRONG.** This item read, until 2026-09-12: *"The §6.3 priority-2 and -3
+   sites cannot be shown reachable without a fault-injecting harness. `TestNorFlash`
+   models no failures. Build one on the existing doubles — `MemoryNonceSlot`
+   (`device_nonces.rs:501-514`) and `TestNorFlash` (`frostsnap_embedded/src/test.rs`) —
+   that injects write failures and records which of the 13 enumerated sites fire."*
+   **THE HARNESS DOES NOT NEED BUILDING: it exists twice, and both copies are already
+   gated.** Two of its three citations were also wrong. `MemoryNonceSlot` is at
+   `device_nonces.rs:648`, not `:501-514` (which is `AbSlots::get_or_create`'s tail); and
+   `"TestNorFlash models no failures"` is true of `TestNorFlash` itself and FALSE of the
+   tree.
+
+   What exists:
+   - `FaultyNorFlash`/`FaultyError` in `vendor/frostsnap/frostsnap_embedded/src/test.rs`
+     (`fail_erase_after`, `fail_write_after`, `heal`, `erase_count`, `write_count`) drives
+     **5** fault tests — 3 in `ab_write::test`, 2 in `nonce_slots::test` — all inside the
+     `frostsnap_embedded --features std` gate (17 tests). It is **`#[cfg(test)]`**
+     (`frostsnap_embedded/src/lib.rs:9-11`), so it is unreachable from `hal`/`firmware`
+     **and it is WEAKER THAN THE HARDWARE**: it delegates to `TestNorFlash::write`, which
+     `copy_from_slice`s with no clear-bits-only rule at `WRITE_SIZE = 4` — a double more
+     permissive than the silicon, i.e. the §8.1 defect-5 class. **Use `FakeFlash`.**
+   - `hal/src/flash.rs`'s `fake::FakeFlash` (`refuse_programs_now`, `refuse_erases_now`,
+     `heal`, `scribble`, `programs`, `erases`) drives **4 of hal's 16 integration tests**,
+     up from 2 (commit 2a055f7). **Say which metric:** that is FAULT-INJECTING tests
+     (`rg -c 'refuse_programs_now|refuse_erases_now|\.scribble\('` = 4). "Tests backed by
+     `FakeFlash` at all" is **12 of 16** (`rg -c 'FakeFlash::new'`). The lane that landed
+     those four first reported "7 of 16" and its reviewer disproved it with a one-line
+     grep; both numbers are written here so the next reader does not re-derive either.
+     Two of the four new tests inject NO fault and use the counters as an observable only.
+
+   **Four of the §6.3 priority-2 sites now have named tests reaching them**, all in
+   `hal/tests/integration_frostsnap_over_hal.rs`:
+   `an_unreadable_nonce_slot_refuses_to_sign_instead_of_halting` (`SlotUnreadable` — and it
+   scribbles `0xff`, not `0x00`, deliberately: at `0x00` the slot DECODES under Fixint and
+   the live `assert_eq!(.., "wrong stream id")` fires from the test's own SETUP, i.e. the
+   fixture would produce the brick), `empty_sign_sessions_are_refused_before_anything_reaches_flash`
+   (the `let-else -> Err(Overflow)` backstop that replaced two upstream panics),
+   `a_retry_of_the_same_signing_session_returns_the_cached_shares_without_advancing`, and
+   `a_refused_nonce_advance_reports_write_verify_failed_and_leaves_the_index_unadvanced`
+   (the read-back comparison, reached NON-VACUOUSLY with a stale `SigningState` for a
+   DIFFERENT session).
+
+   **STILL OPEN:** the read-back's `read_slot()`-returns-`None` leg and `ab_write.rs`'s
+   `EncodeError` leg both need a TORN multi-chunk write, whose whole increment is a 3-line
+   `FakeFlash::refuse_programs_after(k)` mirroring `FaultyNorFlash::fail_write_after`.
+   **MUST NOT GET A TEST:** `read_back_state.signing_state.ok_or(WriteVerifyFailed)?` is
+   unreachable BY CONSTRUCTION — the equality check one line above has just proved
+   `read_back_state == with_signatures`, and `with_signatures.signing_state` is `Some` in
+   both branches. And `assert_eq!(.., "wrong stream id")` is unreachable through `AbSlots`
+   (`AbSlots::get` filters an unreadable slot one call earlier and yields `Overflow`) but is
+   a LIVE panic through the trait method — so the vendored comment justifying it names the
+   wrong window, which is recorded in the new test's doc rather than by editing `vendor/`.
+
+   **TWO MEASUREMENT LESSONS FROM THAT ROUND, both worth more than the tests:**
+   (i) `last_write_outcome()` CANNOT distinguish "no write was attempted" from "a write that
+   succeeded" — a self-healing mutation inside the `SlotUnreadable` arm re-writes onto
+   already-erased cells, so the recorded outcome is `Some(Committed)`, byte-identical to its
+   value before the call, and the mutation is GREEN. The `FakeFlash` program/erase COUNTERS
+   are the leg that catches it. (ii) The obvious shape of the headline test — a slot with
+   `signing_state: None` — makes the headline mutation GREEN, because the `ok_or` two lines
+   below catches the stale `None` and returns the identical variant. "Reach the site" is not
+   the same as "be the only site that can fire".
 5. ~~**PSRAM capacity is unverified from Coldcard source.**~~ **CLOSED as declined,
    2026-08-20.** It is in the source: **8 MiB at `0x9000_0000`**, configured by the
    bootloader's `psram_setup()` (`mk4-bootloader/psram.h`; called `main.c:150`).
@@ -1355,7 +1436,12 @@ discarded, against **~850 LOC** reusable.
 
    What remains unproven is interop on *silicon*: this is two host processes.
 
-### 8.3 Phase-4 register — two vendored defects found by mutating the device
+### 8.3 Phase-4 register — five vendored defects found by mutating the device
+
+**This heading read "two vendored defects" until 2026-09-12**, when implementing screen 8
+(address verification) turned up three more, all DEVICE-side, all reproduced or
+shadowed-by-a-reproduced-sibling, and all routed around rather than fixed. See the second
+table below and the qualification on "COORDINATOR-side" that follows the first.
 
 Nine device-side mutations were run against the M3/M5 harness and all nine failed the
 run. **One** of them failed the *wrong way* — by panicking inside the **upstream**
@@ -1398,6 +1484,34 @@ sibling checkout, where 13 is.)
 Both are candidates to report upstream. Defect 13 is the more serious: it is an
 unguarded `expect` on attacker-controlled input, which is exactly the class §8.1
 catalogued on the device side, sitting on the host side of the same protocol.
+
+#### And three DEVICE-side ones, found 2026-09-12 while implementing screen 8
+
+**"Both are COORDINATOR-side and are NOT in the device image" above is true of defects 13
+and 14 and is NOT true of this section.** These three sit in the vendored code the DEVICE
+links, on the `ScreenVerify::VerifyAddress` path and the BIP-32 path conversion beside it.
+They are not in the shipped image today — `--gc-sections` drops them, because
+`Session::recv_core` never calls `FrostSigner::recv_coordinator_message` for that variant
+and nothing in the tree formats a `DerivationPath`. **The device is safe because it is
+ROUTED AROUND, not because upstream is fixed.** Per the standing PUNT EVERYTHING UPSTREAM
+rule (§6.3, decision 6) nothing is being filed; these are recorded because a future edit
+that "simplifies" the dispatch arm into a fall-through re-arms defect 15 in one line, and
+because `vendor/README.md`'s panic-site table had no row for any of them. Each was
+verified symbol by symbol against the vendored tree on 2026-09-12, not taken from a
+report. `device.rs` is byte-identical to upstream `d8b0525`; `tweak.rs` differs only by
+decision 3, which does not touch the site.
+
+| # | Defect | Site | Trigger | Effect |
+|---|---|---|---|---|
+| 15 | `.expect("cannot verify address on key that doesn't support bitcoin")` on `wallet_network(..)`, **after** the key-existence check has already passed | `vendor/frostsnap/frostsnap_core/src/device.rs`, `FrostSigner::recv_coordinator_message`'s `ScreenVerify(ScreenVerify::VerifyAddress { .. })` arm (cited by SYMBOL — the arm is ~`:383-414` today and vendored line numbers rot on every re-vendor) | **ONE WIRE FRAME.** `wallet_network` returns `Some` only for `KeyPurpose::Bitcoin(network)` and `None` for `Test` and `Nostr`, and the arm's own `self.keys.get(&key_id)` check has ALREADY returned a clean `Error::signer_invalid_message` for an unknown key — so the only way to reach this `expect` is a key the device DOES hold whose purpose is not Bitcoin | device **panics** = reset loop = **brick**. **REPRODUCED as a panic at `device.rs:411:22`, 2026-09-12**, by replacing our own dispatch arm with a fall-through. Routed around, not fixed: `Session::recv_core`'s `ScreenVerify` arm destructures the payload and RETURNS before the fall-through to `signer.recv_coordinator_message`, and `Session::verify_prompt` does the same lookup as `.ok_or(Refusal::AddressVerify)?`. **That `return` is the whole safety story**, which is why the mutation that deletes it is a named test |
+| 16 | `bitcoin::Address::from_script(&spk.spk(), network).expect("has address form")` | same file, same arm, the line immediately after defect 15 (`:414`) | a script with no address form for the chosen network | device panics = brick. Not independently reproduced — defect 15 fires first on the only route in — so it is recorded as LIVE-but-shadowed. Routed around by the same `return`; our `Session::verify_prompt` spells it `.map_err(\|_\| Refusal::Undisplayable)?` |
+| 17 | `ChildNumber::from_normal_idx(path_segment).expect("valid normal derivation index")` | `vendor/frostsnap/frostsnap_core/src/tweak.rs`, `<DerivationPath as DerivationPathExt>::from_normal_path_segments` (`:456` in the vendored copy; the line differs upstream because decision 3 inserts `bip341_taptweak_key_only` above it — cite the SYMBOL) | ANY index with bit 31 set. `impl From<BitcoinBip32Path> for DerivationPath` (`:96-106`) chains `bip32_path.index` straight in, and `BitcoinBip32Path.index` is a raw `pub index: u32` (`:75-78`) that is `bincode::Decode`, i.e. wire-constructible with any `u32`. `ChildNumber::from_normal_idx` errs for `>= 2^31`, so **half of all coordinator-sendable indices** reach it | device panics = brick. **REPRODUCED as `valid normal derivation index: InvalidChildNumber(4294967295)`, 2026-09-12.** It has **NO in-tree caller** — `firmware/src/lib.rs` composes a `ui::Buf::<16>` of `"Recv #"` plus the decimal index precisely so it never formats a `DerivationPath` — and the mutation that writes the naive version is a named test that fires only on the `u32::MAX` fixture, not the index-0 one |
+
+The SHAPE these three share, and it is the phase-4 lesson: **a vendored `expect` we route
+around is one `=> {}` away from being a vendored `expect` we execute.** Defect 15's
+reachability is not hypothetical and does not need a corrupt frame — an ordinary
+`KeyPurpose::Test` keygen, which is what `hostcheck` itself does, plus one
+`VerifyAddress` frame, is the whole recipe.
 
 #### Opened by phase 3
 
@@ -1470,7 +1584,7 @@ catalogued on the device side, sitting on the host side of the same protocol.
    out, and on this board that is not a free choice: SRAM is not zeroed but *filled*
    with `0xdeadbeef` by the bootloader (`main.c:42,47,130`), the top 8 K at
    `BL_SRAM_BASE = 0x2009_e000` belongs to the bootloader and is **wiped on every
-   callgate entry and exit** (`startup.S:124-134,148-156`), and item 5 below — PSRAM —
+   callgate entry and exit** (`startup.S:124-134,148-157` — **the exit range read `148-156` until 2026-09-12**, one line short of the loop's own `bne wipe_loop2` at `:157`), and item 5 below — PSRAM —
    would change the size available by an order of magnitude if it were characterised.
    A heap whose extent is picked before those three are settled is picked wrong.
 
@@ -1904,13 +2018,32 @@ catalogued on the device side, sitting on the host side of the same protocol.
     arithmetic above needs no correction, having already been corrected once from seven.
     But "split `N_DEVICES` into two constants" understates it: `announced` is the keygen
     ROSTER at five sites, not a counter, and the split additionally needs (a) a way for
+    `hostcheck` to **ASSIGN** the blank device. **(a) READ "IDENTIFY" AND CONCLUDED THE
+    PROTOCOL COULD NOT SUPPLY IT, until 2026-09-12: the premise was true and the conclusion
+    was FALSE**, and it was the largest error in this cost estimate. It read: *"a way for
     `hostcheck` to IDENTIFY the blank device, which the protocol cannot supply because all
-    ten flashes are blank before keygen; (b) a loosening of the fail-closed per-device
+    ten flashes are blank before keygen."* `hostcheck` OWNS `BeginKeygen`, so it does not
+    identify the blank device, it DECIDES which one it is: `roster = announced[..N_DEVICES]`
+    and `blank = announced[N_DEVICES]` come out of ONE expression on ONE lap at the
+    `BeginKeygen` site, so they cannot disagree, and the choice is then re-checked against
+    the coordinator's own `contains_device`. No back-channel, and nothing trusted to a
+    device — a harness that asked the devices which one was blank would be trusting them
+    about the thing under test. (b) a loosening of the fail-closed per-device
     `None =>` arm in the `HeldShares2` handler, which is the only place a tenth device
     makes an EXISTING assertion weaker; and (c) a second, shorter phase sequence, because
     M7b and M7c cannot run on a share-less device at all — upstream refuses `DisplayBackup`
-    and `CheckBackup` for a share it does not hold, which surfaces as `Fault::Signer` and
-    the stub's `die(2)`. `Restore`'s `share_index` is not an `Option`, so the struct cannot
+    and `CheckBackup` for a share it does not hold. **THE CONCLUSION IS RIGHT AND THE
+    MECHANISM WAS WRONG: this read "which surfaces as `Fault::Signer` and the stub's
+    `die(2)`" until 2026-09-12.** It never gets that far. The refusal is COORDINATOR-side,
+    in `request_device_display_backup` and `request_device_check_backup`'s
+    `device_to_share_index.get(&device_id).ok_or(ActionError::StateInconsistent("device does
+    not have share in key"))` (`frostsnap_core/src/coordinator/restoration.rs`, cited by
+    symbol), which runs BEFORE any `CoordinatorSend::ToDevice` is built — **no frame is ever
+    written and the stub never sees a `DisplayBackup`.** MEASURED by starting the blank leg
+    at `Phase::Reveal`: `DisplayBackupProtocol::new / state inconsistent: device does not
+    have share in key`, exit 1. The device-side refusals do exist and are unreachable from
+    this harness, so an implementer looking for `Fault::Signer` would be reading the wrong
+    process. `Restore`'s `share_index` is not an `Option`, so the struct cannot
     even be constructed for a device that has none.
 
     THIRD, AND IT IS A SUPERSET RATHER THAN AN ALTERNATIVE: the cross-device ingest that
@@ -1936,17 +2069,64 @@ catalogued on the device side, sitting on the host side of the same protocol.
     is covered at Tier 1 by `consolidation_persists_the_share_before_it_acks`, which
     reopens the store after a real reset.
 
-    **RECOMMENDATION: BUILD NOTHING HERE.** The payoff is already pinned at Tier 1 on a
-    blank flash with a foreign share by `a_device_ready_to_consolidate`,
+    **BUILT, 2026-09-12, commit 7ba6ea4 — M12.** ~+130 lines across two HARNESS files
+    (`hostcheck/src/main.rs` and `firmware/examples/stub.rs`), zero device code, **zero
+    flash, zero test-count movement**, harness wall clock 10.11 s -> 12.38 s. TEN devices
+    announce and NINE do the keygen; the tenth reaches the verified signature holding
+    nothing at all, is handed the 25 words the FIRST device's glass drew, types them back
+    through the letter picker (198 keypresses), saves them, and CONSOLIDATES them onto a
+    flash that held nothing — then describes the record to a coordinator that had never
+    given it one.
+
+    **WHAT IT ACTUALLY BUYS IS ONE ASSERTION, NOT TWO, and this item commissioned it for
+    two.** `blank_reported_empty` — the `Some`/`None` discrimination on the re-report —
+    becomes falsifiable, because on leg 1 the device consolidates its OWN share back onto
+    itself, so a consolidation that acked without reaching the signer is GREEN there.
+    **The SHARE-IMAGE half of M7e does NOT become falsifiable and this item claimed it
+    would:** the vendored device's own `Consolidate` handler refuses a wrong image before
+    any prompt exists (`expected_image != actual_image || secret_share.index !=
+    consolidate.share_index`, `frostsnap_core/src/device/restoration.rs`), so on BOTH legs
+    the coordinator's comparison is a second opinion. Nor does `index != r.share_index`
+    become falsifiable: `check_physical_backup` takes the index FROM the device's own claim
+    (`phase.backup.share_image.index`) and then requires it on the polynomial, so every
+    one-line corruption is `ShareImageIsWrong` first, with a better message. Only handing
+    over the WRONG SHEET reaches that bail, and that needs a SECOND reveal in the room —
+    which the stub's `sheet_read` now REFUSES, deliberately, so the rule cannot be added by
+    accident. So of the two assertions commissioned here, ONE arrived, by a different
+    mechanism than the one recorded.
+
+    **THE COUNTED-CONDITION ESTIMATE OF TWELVE IS A FLOOR — THERE ARE FIFTEEN.** The three
+    unnamed are the stub's `blank_flashes()` `(0..N_DEVICES)`, the stub's wire-EOF
+    `saved.len() == N_DEVICES` (a SEPARATE site from the `announced_save` latch), and
+    `hostcheck`'s `Destination::All => N_DEVICES`. The estimate also omitted the one place
+    an EXISTING assertion loses its teeth in a way a constant cannot fix: leg 2's
+    `FinishedConsolidation` makes the coordinator record the blank device as a TENTH
+    shareholder, so the PASS-block roster-size check had to MOVE into the loop (one-shot on
+    the lap `kg.finished` becomes `Some`, as `devices().count() == N_DEVICES` AND
+    `!contains_device(blank)`) rather than have its constant changed. Writing `ALL_DEVICES`
+    at PASS and calling it the roster check would have DELETED the only check that the
+    keygen finalized with the right roster.
+
+    **WITHDRAWN 2026-09-12. This paragraph read:** *"RECOMMENDATION: BUILD NOTHING HERE."*
+    The payoff it pointed at is real and still stands as Tier-1 coverage on a
+    blank flash with a foreign share — `a_device_ready_to_consolidate`,
     `consolidation_persists_the_share_before_it_acks` and
-    `a_consolidate_under_a_different_polynomial_is_refused`. What deferring loses, in one
-    checkable sentence: no COORDINATOR-DRIVEN evidence exists for an ingest onto a device
+    `a_consolidate_under_a_different_polynomial_is_refused`. What it said deferring would
+    lose was: *"no COORDINATOR-DRIVEN evidence exists for an ingest onto a device
     holding no share, so the two named assertions stay unfalsifiable in this
-    configuration and the gap stays a fidelity gap rather than a correctness one. If it
-    is ever wanted, stage the SHEET PLUMBING first (a cross-device ingest), because it is
-    needed by both designs while the roster split is needed by only one. The upgrade path
-    is a tenth blank session plus a `KEYGEN_DEVICES`/`ALL_DEVICES` split in `hostcheck`,
-    plus (a), (b) and (c) above.
+    configuration and the gap stays a fidelity gap rather than a correctness one."* Half of
+    that is now closed — the coordinator-driven evidence exists — and the OTHER HALF WAS
+    ALREADY TRUE OF THE BUILT VERSION TOO, which is the finding: building it did not make
+    both named assertions falsifiable, only one. Its sequencing advice was right and was
+    followed: the SHEET PLUMBING went first. `N_DEVICES` was deliberately NOT renamed to
+    `KEYGEN_DEVICES` (40-plus occurrences, most inside format strings; a mechanical rename
+    would have flipped the seven conditions that must stay at 9 and weakened all seven at
+    once), so `N_DEVICES` now names something narrower than it reads and its own doc says
+    so on line one. `EnterPhysicalBackup` at the blank device was NOT driven either: it
+    would add a tenth `refused=DataErase` and fail the exact `refused_erase.len() !=
+    N_DEVICES` — MEASURED, by starting leg 2 at `Phase::Erase`, and the claim given up ("a
+    device holding nothing also refuses an erase") is strictly weaker than the one the nine
+    already make.
 
     **BOTH REMAINING ADMITTED BODIES ARE NOW DRIVEN, 2026-09-12 (M10 and M11).** The
     paragraph this replaces is kept below because it is what the correction is against,
@@ -2243,20 +2423,29 @@ catalogued on the device side, sitting on the host side of the same protocol.
     not evidence**, and a green report from an agent whose gates never compiled the file
     is worth nothing — check the counts, not the claim.
 
-22. **181 `cfg(target_arch = "arm")` blocks were invisible to every LINT in this project.
-    Now they are linted; they are still never executed.** Re-measured 2026-09-10:
-    usb 88, flash 22, `firmware/src/main.rs` 15, panic 13, callgate 11, keypad 8,
+22. **184 `cfg(target_arch = "arm")` blocks were invisible to every LINT in this project.
+    Now they are linted; they are still never executed.** Re-measured 2026-09-12:
+    usb 88, flash 22, `firmware/src/main.rs` 18, panic 13, callgate 11, keypad 8,
     display 8, rng 6, `firmware/src/lib.rs` 4, `firmware/src/entry.rs` 4,
-    `hal/src/lib.rs` 1, `ui.rs` 1. Every test, clippy and rustdoc command here runs
-    `--target aarch64-apple-darwin`, so none of that code was ever compiled under a lint.
+    `hal/src/lib.rs` 1, `ui.rs` 1 = **184**, from
+    `rg -c 'cfg\(target_arch = "arm"\)' hal/src/*.rs firmware/src/*.rs`. Every test,
+    clippy and rustdoc command here runs `--target aarch64-apple-darwin`, so none of that
+    code was ever compiled under a lint.
 
     **This heading and its breakdown disagreed with each other twice, which is the
-    defect this whole audit exists to catch.** It read 152 until 2026-09-08 and **169
-    until 2026-09-10**, while the body carried a *2026-09-02* per-file breakdown
-    (keypad 8, display 8, usb 85, flash 20, panic 13, rng 6, callgate 5,
+    defect this whole audit exists to catch.** It read 152 until 2026-09-08, **169
+    until 2026-09-10** and **181 until 2026-09-12**, while the body carried a *2026-09-02*
+    per-file breakdown (keypad 8, display 8, usb 85, flash 20, panic 13, rng 6, callgate 5,
     `main.rs` 7 = 152) that summed to neither. The trail further down the item recorded
     the 181 re-count on 2026-09-10 and the heading was not brought with it. Both the
-    heading and the breakdown above are now the same measurement, taken together.
+    heading and the breakdown above are now the same measurement, taken together, and
+    the sum is written out so the next reader can check it in one line. **What moved
+    between 181 and 184 was `firmware/src/main.rs` alone, 15 → 18** (the 15 was already
+    stale at 181 — it was 17 on 2026-09-10 and every OTHER per-file figure in that
+    breakdown reproduced exactly, which is what made a wrong total read as freshly
+    measured; the further +1 is a comment added by a63eaa7). This is the same shape as
+    README's `268 total` headline that this document records as its canonical failure:
+    a breakdown that checks, under a total that does not.
 
     **The original wording of this item overstated the hole, and correcting it is worth
     more than repeating it.** `cargo build --release` does compile those blocks, and it
@@ -2292,11 +2481,61 @@ catalogued on the device side, sitting on the host side of the same protocol.
     it fails with 298 errors. Cost, measured not estimated: 8 s cold, 2.4 s incremental,
     0.22 s warm — the cheapest gate here.
 
-    **The count is a snapshot, not a bound, and it has moved twice:** 152 → **169** on
-    2026-09-08 (the first recount said 164, missing `entry.rs` and `hal/src/lib.rs`
-    entirely) → **181** on 2026-09-10: usb 88, flash 22, main.rs 15, panic 13, callgate
-    11, keypad 8, display 8, rng 6, `firmware/src/lib.rs` 4, `firmware/src/entry.rs` 4,
-    `hal/src/lib.rs` 1, `ui.rs` 1. Do not chase the number — the gate is a whole-target
+    **QUALIFICATION on "0 warnings", added 2026-09-12 because four lanes reported it
+    differently.** The claim that holds is **0 hits in `hal/src` and `firmware/src`** — which
+    is why both device clippy lines above are written with `grep -cE "hal/src|firmware/src"`
+    rather than a bare exit code. Clippy ALSO reports warnings inside
+    `vendor/frostsnap`, and they are pre-existing: **MEASURED 2026-09-12 on
+    `cargo clippy --target aarch64-apple-darwin -p coldsnap_hal --features
+    fake-flash,test-seam --all-targets`, exactly 15** — `frostsnap_comms` 11,
+    `frost_backup` 3, `frostsnap_macros` 1, every one of them
+    `uninlined_format_args`, and `grep -cE 'hal/src|firmware/src'` over that log is **0**.
+    (Beware counting the log: a bare `grep -c '^warning'` gives 18, because each crate's
+    "generated N warnings" SUMMARY line also starts with `warning`. Three of the 18 are
+    summaries.) Lanes reporting 18 on the device profiles were counting the same way. They
+    are vendored, and per PUNT
+    EVERYTHING UPSTREAM they stay. "0 warnings everywhere" is true of `cargo build
+    --release` and is NOT true of clippy over vendored code; say which.
+
+    **AND THERE IS NO `-D warnings` ANYWHERE.** `.cargo/config.toml` sets only
+    `-C target-cpu=cortex-m4` and `-C link-arg=-Tfirmware/link.x`, and the only crate-level
+    denies are `#![deny(unsafe_op_in_unsafe_fn)]`. So `cargo build --release` exits **0**
+    with an `unused_mut` or `unused_imports` warning. Two mutations in this round were
+    described in comments as "already a build failure" on that basis; **they are not** —
+    exit 0 with a warning is a 0-warnings-gate failure read by a HUMAN. Any pin whose sole
+    claimed defence is a warning is undefended against a CI that checks exit codes. (Both of
+    those two mutations turned out to be caught by an exact-text pin anyway, which is the
+    other half of the correction: the lane understated its own coverage.)
+
+    **TWO WAYS A SOURCE PIN GOES SOFT, both found 2026-09-12 and both worth reading before
+    writing another one.**
+      - **`contains` on a pattern FRAGMENT tests that a pattern is PRESENT, never that it is
+        ALONE.** `the_consent_gate_uses_the_page_it_was_given_and_demands_the_last_one`
+        pinned `confirm_at`'s accepting arm with a bare
+        `arms.contains("Ok(Shown::Page { last: true }) => {}")`. Widening the arm by
+        ALTERNATION — `Ok(Shown::Info) | Ok(Shown::Page { last: true }) => {}` — leaves the
+        needle intact, and that mutation ran **GREEN on all 120 lib tests** while the pin
+        that exists to forbid exactly this did not fire. It was writable before the
+        address-verification work and would have passed then too, so this is a PRE-EXISTING
+        fail-open in the pin, not a regression. Fixed by anchoring the needle to the WHOLE
+        LINE (leading newline + indent), so a `| `-prefixed form no longer matches;
+        re-verified in BOTH directions, including that the pin's own originally documented
+        mutation still fails. `hal/src/keypad.rs`'s
+        `the_scan_order_is_actually_shuffled_at_the_only_call_site` is the same shape and
+        nobody has swept the class.
+      - **`production_source()` splits `include_str!("main.rs")` on the FIRST `#[cfg(test)]`,
+        so DOC COMMENTS above that point are production source as far as every counted pin
+        is concerned.** Writing `glass.take()` longhand in a doc comment fails
+        `a_parked_prompt_is_serviced_once_per_iteration_and_never_in_a_loop` with
+        `left: 2, right: 1` on an otherwise-green tree. The code says so in place now.
+
+    **The count is a snapshot, not a bound, and it has moved three times:** 152 → **169**
+    on 2026-09-08 (the first recount said 164, missing `entry.rs` and `hal/src/lib.rs`
+    entirely) → **181** on 2026-09-10 → **184** on 2026-09-12: usb 88, flash 22,
+    main.rs 18, panic 13, callgate 11, keypad 8, display 8, rng 6, `firmware/src/lib.rs` 4,
+    `firmware/src/entry.rs` 4, `hal/src/lib.rs` 1, `ui.rs` 1 = 184. (The 181 breakdown
+    said `main.rs` 15; it was 17 that day and is 18 now. Nothing else moved.)
+    Do not chase the number — the gate is a whole-target
     compile, so it covers however many there are. **`firmware/src/quiz.rs` contributes
     0**, which is not an accident: a pure module is exhaustively host-testable, and a
     `cfg` in one would put a security property where no host test can reach it.
@@ -2454,7 +2693,16 @@ catalogued on the device side, sitting on the host side of the same protocol.
     hoisting: the only gate that can see this class is a host test, and a host test cannot
     reach inside `boot`. What it does: `reveal_step` adds one to a cursor
     that is already one ahead, so a human is shown pages 0, 2, 4, 6 and then asked "Wrote
-    down all 25 words?" over **12 words that were never drawn**. They say yes,
+    down all 25 words?" over **13 words that were never drawn** (12 of the 25 reach the
+    glass). **THE TWO HALVES WERE SWAPPED HERE UNTIL 2026-09-12:** this sentence read
+    "over **12 words that were never drawn**", and commit 3ccc891's subject says the
+    mutation "showed a human 13 of 25 words" — both have it backwards, and the pushed
+    commit cannot be edited, so the correction lives here. It re-derives from
+    `ui::BackupPages::page` without a build: page 0 is `BackupPage::ShareIndex` and carries
+    NO word, so drawn pages 2, 4 and 6 carry words 5-8, 13-16 and 21-24 = **12 shown**,
+    while pages 1, 3, 5 and 7 carry 1-4, 9-12, 17-20 and word 25 alone = **13 never
+    drawn**. Page 7 holding only word 25 is why the split is 12/13 and not 12/12. The page
+    SET was always right; only the counts were wrong. They say yes,
     `CommsMisc::BackupRecorded` reaches the coordinator, and the app records a backup that
     cannot restore the share. This is requirement 5's own class — a share-shaped screen
     that is not what it claims — and no gate could see it because every line of `boot` is
@@ -2490,9 +2738,20 @@ catalogued on the device side, sitting on the host side of the same protocol.
     MEASURED green on firmware tests, both device clippy profiles and `cargo build
     --release` at 0 warnings — because `reveal_draw` is then handed page+1 and pairs it
     CONSISTENTLY with the cursor, so the new value test sees nothing wrong, and the body pin
-    only says `show_backup_page` does not BUILD a `Reveal`. Drawn pages become 1, 3, 5, 7:
-    16 of 25 words shown, the recorded question asked over the 9 that were not, same
-    unrestorable backup. Only the START call (`, 0,`) was pinned; the count pin
+    only says `show_backup_page` does not BUILD a `Reveal`. The drawn pages are
+    0, 2, 4, 6 AGAIN — the same 12 of 25 words shown and the same 13 never drawn as the
+    original defect, byte for byte the same symptom, because the START call is pinned at
+    page 0 and only the STEP is shifted: the cursor begins at `Reveal::Page(0)`,
+    `reveal_step` yields 1, the mutated call draws 1 + 1 = 2, then 4, then 6, then 8 =
+    `BACKUP_END`, which ends the reveal. Same unrestorable backup.
+    **WITHDRAWN 2026-09-12, quoted so the correction is visible:** this read "Drawn pages
+    become 1, 3, 5, 7: 16 of 25 words shown, the recorded question asked over the 9 that
+    were not, same unrestorable backup." Wrong page set and wrong counts. The code
+    comment above the step-call pin in `firmware/src/main.rs` carried the same error in a
+    worse form — "16 of 25 words shown ... over the 12 that were never on the glass", which
+    is 28 words of 25 and is the cheapest tell that nobody re-derived it. The MUTATION was
+    always caught by the pin; only the symptom prose was wrong.
+    Only the START call (`, 0,`) was pinned; the count pin
     (`show_backup_page(` == 2) is blind to an argument. Closed by one more exact-text
     assertion on the step call, and RE-MEASURED: the mutation now fails
     `every_exit_from_the_reveal_takes_the_words_off_the_glass` by name.
@@ -2508,6 +2767,37 @@ catalogued on the device side, sitting on the host side of the same protocol.
     `refuse`, `idle`) are NOT hoisted and that is deliberate: none has a page cursor to
     mispair, both entry and quiz already delegate composition to the value-tested
     `entry_frame`/`quiz_frame`, and their surviving pairings are pinned by exact text.
+    RE-CONFIRMED 2026-09-12 (a63eaa7) by tracing a mutation for each of the five: the
+    reasoning holds and no severity-1 leak survives in them.
+
+    **BUT THE COUNT WAS WRONG, AND THE MISCOUNT IS WHAT HID THE REAL HOLE.** "The five
+    other" — six with `show_backup_page` — undercounts by three. `boot` nests **NINE**
+    functions that put pixels on the glass: `hold`, `draw_prompt`, `draw_batch`,
+    `take_glass`, `refuse`, `idle`, `show_backup_page`, `show_entry_page`, `show_quiz`.
+    (Precisely: nine nested fns, **eight** of which take a panel by argument — `hold(reason:
+    &str) -> !` opens its own through `display::PanelToken::take().map(PanelToken::open)`.
+    The review round corrected this lane's own first phrasing, which said all nine took a
+    panel.) The three never counted were `hold`, `draw_prompt` and `draw_batch` — and
+    **BOTH mutations that survived every gate lived in `draw_prompt`**, the one that was
+    never on the list, so the omission was not cosmetic. Both are now pinned inside the
+    existing `every_exit_from_the_reveal_takes_the_words_off_the_glass`, so no test count
+    moved:
+      - deleting `draw_prompt`'s `if matches!(shown, Ok(Shown::Nothing)) { return None; }`
+        reads as a pure simplification, because the `_ => None` arm four lines below returns
+        the same value — and it blanks the panel on every completed keygen
+        (`FinalizeKeyGen` maps to `Ok(Shown::Nothing)`) and drops any live reveal, entry or
+        quiz with it. The pin also catches the widening to `Ok(Shown::Nothing) | Err(_)`.
+      - HOISTING `draw_prompt`'s `take_glass` call above the composition parks a consent
+        prompt over a BLANK screen: the frame reaches the glass empty, the composed prompt
+        screen never reaches it at all, and `draw_batch` still parks the prompt and its
+        confirm digit — a consent question answerable with nothing on the glass. MEASURED
+        green before the pin: firmware 168/168 exit 0, `cargo build --release` at 0 warnings
+        and a `.text` **24 B SMALLER**, so it reads as a free simplification. Pinned by an
+        ordering assert scoped to `draw_prompt`'s own body text, not by a bare `find` over
+        the image. **The design report had traced this exact edit and declined to pin it on
+        the grounds that it is "instantly visible at a bench". A bench is not a gate** —
+        `pixel-check` and `hostcheck` both drive examples rather than `boot`, so nothing in
+        this project could see it.
 
     **BOTH OF THOSE ARE NOW PINNED, 2026-09-08.** Each was an inline expression inside
     a `cfg`-arm block; each is now a pure `const fn` with a host test that checks the
@@ -2733,27 +3023,41 @@ catalogued on the device side, sitting on the host side of the same protocol.
     second blitter path, because nothing about the 8×8 table can be scaled *down*. The
     two screens §4.2 wanted it for no longer want it: screen 5 (backup display) is
     paginated and its rows carry `mark_sensitive` noise that a 4-px glyph would compete
-    with, and screen 8 (address verification) is **refused** by the dispatch, so it has
-    nothing to draw (item 16). And the only question that would justify it — whether a
+    with, and screen 8 (address verification) is now IMPLEMENTED and
+    draws a 62-or-64-char bech32m address across four rows, so it is the ONE screen with
+    a real argument for a narrower face (item 16). **This clause read "is **refused** by
+    the dispatch, so it has nothing to draw" until 2026-09-12.** It still does not change
+    the decision: the legibility question is the bench's, not a host test's. And the only question that would justify it — whether a
     4-px-wide glyph is legible at all on this OLED — cannot be answered by any host
     test, which makes it the wrong thing to build before the bench. The 8×8 cell already
     gives 128 characters per screen against `FontSmall`'s 72, so capacity is not the
     argument either. Decide it with an eye on the panel, not from here.
 
-16. **PARTLY CLOSED 2026-09-10 — SEVEN of the eight §4.2 screens have callers.
-    This item's heading read "the UI is fully linked; all eight screens have callers"
-    and its body ended "nothing in `ui` is gc-sectioned out any more"; both were
-    written on 2026-09-10 and both were wrong the same day.** Screen 8, **address
-    verification**, has no caller: `ui::address_verify` is
-    referenced only by `hal/examples/ui_render.rs`, `firmware/examples/simulator.rs`
-    and the test `address_verify_is_refused` (`firmware/src/lib.rs`'s tests) — and
-    `llvm-nm --defined-only` finds **zero** `address_verify` or `pin_entry` symbols in
-    the linked image, so both are still gc-sectioned out. That is consistent, not a
-    bug: the dispatch **refuses** `ScreenVerify` with `Refusal::AddressVerify`
-    (`firmware/src/lib.rs:1165`), so the screen has nothing to draw for. The honest
-    statement is that every §4.2 screen the device *acts on* is linked, and the one it
-    refuses is not — and that this item is itself the fourth instance of the heading
-    -contradicts-body defect this document keeps producing.
+16. **CLOSED 2026-09-12 — ALL EIGHT §4.2 screens have real callers, and screen 8 was
+    the last one.** `Session::verify_prompt` and `prompt_screen_at`'s
+    `DeviceToUserMessage::VerifyAddress` arm now draw `ui::address_verify` (ce62444), so
+    `coldsnap_hal::ui::address_block` is a standalone OUTLINED symbol at 248 B in the
+    linked image where it previously had none. `pin_entry` is still gc-sectioned out and
+    that is still correct — there is no PIN.
+
+    **WITHDRAWN 2026-09-12. This item read, until then:** *"PARTLY CLOSED 2026-09-10 —
+    SEVEN of the eight §4.2 screens have callers. … Screen 8, **address verification**,
+    has no caller: `ui::address_verify` is referenced only by
+    `hal/examples/ui_render.rs`, `firmware/examples/simulator.rs` and the test
+    `address_verify_is_refused` (`firmware/src/lib.rs`'s tests) — and `llvm-nm
+    --defined-only` finds **zero** `address_verify` or `pin_entry` symbols in the linked
+    image, so both are still gc-sectioned out. That is consistent, not a bug: the
+    dispatch **refuses** `ScreenVerify` with `Refusal::AddressVerify`
+    (`firmware/src/lib.rs:1165`), so the screen has nothing to draw for."* Every clause
+    of that is now false: the dispatch ADMITS `ScreenVerify::VerifyAddress`, the
+    `llvm-nm` zero-symbol evidence no longer reproduces for `address_verify`, and the
+    test it cites was RENAMED to
+    `verify_address_for_a_key_this_device_does_not_hold_is_refused`.
+    `Refusal::AddressVerify` now means one thing only: `FrostSigner::wallet_network` for
+    that `master_appkey`'s `KeyId` returned `None`, i.e. the device does not hold the key
+    or the key's purpose is not `KeyPurpose::Bitcoin(..)`. The new screen returns
+    `Shown::Info` — drawn, authorises nothing, prints no confirm digit — and
+    `Session::confirm_at` refuses it through an untouched arm.
     Until 2026-08-25 `boot()` referenced neither `ui` nor `display`, so
     `--gc-sections` dropped both entirely: **0** symbols, and the image was
     byte-identical at 99,684 B before and after ~3,000 lines of UI — the same trap
@@ -2761,8 +3065,8 @@ catalogued on the device side, sitting on the host side of the same protocol.
     screen (§9 item 14) fixed that for the parts it reaches: **101,416 B = 7.11%**,
     `+1,732 B`, of which `.rodata` `+924 B` is the **measured** font-table cost
     against the 768 B source count. What is still dropped is everything nothing
-    calls yet — sign approval, backup display and entry, address verification, the
-    quiz. **Substantially closed 2026-08-25:** a real `FrostSigner` in `boot()` took
+    calls yet — sign approval, backup display and entry, address verification (which
+    stayed dropped until 2026-09-12), the quiz. **Substantially closed 2026-08-25:** a real `FrostSigner` in `boot()` took
     the image to **282,080 B = 19.79%**, a 2.78× jump, with `rust-bitcoin` going 1 → 14
     symbols. Proof it is `boot()` that pulls it in: deleting the single `session.recv`
     call drops `.text` by 142,916 B and `bitcoin` back to 1. **Fully closed
@@ -2884,8 +3188,8 @@ catalogued on the device side, sitting on the host side of the same protocol.
 | Rust toolchain | 1.88.0 (upstream pin) + `thumbv7em-none-eabihf` |
 | C cross-compiler | clang 21 (`/opt/homebrew/opt/llvm/bin/clang`) — still required, decision 4 |
 | Decisions record | [DECISIONS.md](DECISIONS.md), dated 2026-08-12 |
-| Flash, as built | **899,400 B = 63.1%** of `FLASH_TEXT` as an rlib sum, re-measured in a clean target dir **2026-09-10** (**this row read 860,898 B = 60.4% until then**, which was the 2026-08-19 figure, taken before the UI, the keypad, the share store, 25-word entry, the quiz and the `coldsnap_firmware` crate existed; the two C-secp and rust-bitcoin components are byte-identical, and the whole +38,502 is `libcoldsnap_hal.rlib` 15,873 → **30,627** plus `libcoldsnap_firmware.rlib` **21,000**, a crate absent from every earlier row). Headroom on that sum is **526,008 B**. Earlier: 860,898 on 2026-08-19 (844,229 at phase 0; +5,101 panic sites, +253 for §8.1 defects 10–12, **+15,873 `coldsnap_hal` rlib** — of which +3,461 is phase 3's `comms.rs` + `usb.rs` — less −4,482 instantiations that moved between rlibs; all with LTO off, so upper bounds). **This row read 893,099 B = 62.7% until 2026-08-19**, on the strength of a +32,513 B growth attributed to `comms::decode_body`; that does not reproduce clean and is retracted — see README "Flash budget". The live `./target` glob measures 1,311,110 B = 92.0% from 131 rlibs against a clean 48, which is the artefact to suspect first.  **The linked image is measured, and the rlib sum above overestimates it by ~2.9×:** `firmware/` links at **377,256 B = 26.47%** of `FLASH_TEXT` (`/usr/bin/objdump -h` after `cargo build --release`, re-measured 2026-09-12 in a CLEAN target dir, `.text` `0x4deb0`; **this read 377,192 B = 26.46%** at 2026-09-11 and 376,752 B = 26.43% at 2026-09-10), because LTO plus `--gc-sections` keeps only what is reachable. `llvm-nm` finds **190** frostsnap/secp/schnorr/bitcoin symbols (frostsnap 118, bitcoin 34, schnorr 28, secp256k1 22) and **22** `coldsnap_hal::ui` symbols, re-measured 2026-09-10 — **this pair read 267 and 17 until then** and neither reproduced; README carried the same pair, so both were copied rather than re-derived. The trajectory, each step a real caller appearing rather than a code addition: 11,604 B when `boot()` polled USB but touched no `comms` · 94,304 B with `Link::poll` + `decode_body` · 99,684 B with `identity` · 101,416 B once the identity-hold screen gave `ui`/`display` a caller · 282,080 B once a real `FrostSigner` was constructed and dispatched to · 297,064 B once the remaining §4.2 consent screens got honest callers · 331,116 B with the keypad driver and real consent · 362,288 B once `DisplayBackup`, `mark_sensitive` and the persistent share store landed · 372,688 B once 25-word entry made restore possible · 376,752 B once `CheckBackup` became a real 8-question quiz behind its own consent digit (+4,064 B: +32 B of `ui.rs` screens, +2,232 B when `firmware/src/quiz.rs` first acquired a caller and its generics were instantiated, +1,800 B for the `main.rs` event-loop arm) · **377,192 B** once the keygen check stopped printing a fixed `1=match` and started printing the randomised `press_legend(confirm)` (+440 B: a `Buf<16>` legend build and a call replacing a 12-byte literal). · **377,256 B** once `reveal_draw` hoisted the reveal's screen/cursor pairing out of `boot` into a value-tested module item (§9 item 22) and the three restoration consent screens started REFUSING a row that does not fit instead of drawing a clipped one (+64 B net: +104 B for those two, less 40 B when the review round deleted a vacuous legend-length comparison and turned an early `return` into a value). That +440 was DISPUTED on review as +444, and **the dispute is SETTLED as of 2026-09-12: BOTH readings were correct and neither party named the cargo invocation.** `cargo build --release` gives `.text 0x4de70` (377,192 B); `cargo build --release -p coldsnap_firmware` gives `.text 0x4de74` (377,196 B). Reproduced in a CLEAN private target dir, both figures, both stable, and the two artifacts' `-C metadata` hashes are the same there as in the live tree — the 0x4de74 binary was still on disk at `target/thumbv7em-none-eabihf/release/deps/`. CAUSE, measured rather than hypothesised: `frostsnap_comms` is a WORKSPACE MEMBER, so the all-members build compiles it with its own `default` feature while `-p coldsnap_firmware` compiles it only as a dependency, where the workspace dep says `default-features = false`. `default = []` has NO CODE BEHIND IT, so the two units compile IDENTICAL source and differ only in the metadata hash cargo derives from the feature list — which changes every generic instantiation's symbol hash, hence function ordering under `lto = "fat"`, hence inter-function ALIGNMENT PADDING. Both binaries hold exactly **807 `.text` symbols totalling 318,780 B of code**; the difference is 312 B of padding against 308 B, and ZERO bytes of code. `.rodata`, `.data` and `.vector_table` are byte-identical. `firmware/link.x`'s `.text : ALIGN(4)` quantises the section, so the smallest observable difference is exactly 4 B. **CONSEQUENCE FOR THE RECIPE, and it is the actionable part: a flash figure is only meaningful with its invocation named.** Every figure in this document is the `cargo build --release` side, which is what README's "Test" section runs. Also settled by the same experiment: "incremental readings have disagreed by 4 B" does NOT reproduce — two clean builds in separate private target dirs and the in-tree incremental build produced a BYTE-IDENTICAL ELF (sha256 `938d317f56…`), so under `codegen-units = 1`, `lto = "fat"`, `incremental = false` this build is bit-for-bit reproducible. `.bss` is byte-identical across all of it at `0x2000_8034..0x2001_8058`, and nothing on the quiz path allocates, so the ~5,024 B arena margin is unchanged. **This cell said "`EnterPhysicalBackup`, `SavePhysicalBackup`, `SavePhysicalBackup2`, `Consolidate` and the naming flows are refused rather than implemented (§9), so their code is absent" until 2026-09-10. All five are IMPLEMENTED and ADMITTED**, which is part of why the image is 376,752 B: `Session::recv` passes each of them through to the signer (`firmware/src/lib.rs:1106-1110` for the four restoration variants, `:935` for `Naming(NameCommand::Preview)`), each behind its own consent digit, with `ToUserRestoration::EnterBackup` and `ConsolidateBackup` handlers at `:1334` and `:1358`. What IS refused, and where the absent code actually is: `Upgrade` (`Refusal::FirmwareUpgrade`), `DataErase`, `Challenge` (the genuine check) and `ScreenVerify` (address verification) — `firmware/src/lib.rs:993-995,1165`. Still not the ceiling: address verification is the one §4.2 screen whose *dispatch* refuses, and a PIN would add the SE1 paths that are currently bound but gc-sectioned out. Read the rlib rows for the MARGINAL cost of a change, never as a prediction of image size. |
-| Host tests passing | **568** = hal 284 (267 lib + 5 smoke + 12 integration) + firmware 168 (116 lib + 52 bin) + vendored 116 (`frostsnap_core` 63 + `comms` 10 + `embedded` 17 with `--features std`, 15 without + `frost_backup` 19 + `macros` 7), re-verified 2026-09-12 against every gate, all exit 0; **565** before this round's THREE new host tests (the consent-row fit refusal, its propagation through `prompt_screen_at`, and the reveal cursor's pairing); **530** before the `CheckBackup` quiz (+6 hal, +29 firmware); 357 before the gap-closing pass; 355 before the signing pipeline; 344 on 2026-08-25 before `FrostSigner`; the firmware gate is now a SUM of two `test result` lines, 11 lib + 14 bin; 341 on 2026-08-24, +40 for `ui.rs`; 268 until 2026-08-24, which never counted `coldsnap_firmware`'s 14; +19 for `identity`; 204 at the phase-2 gate, 253 at the end of phase 3, 261 before §9 item 7(c)'s three outer-leg tests, 264 before the three inner-leg `decode_body` tests, 267 before the pin on the vendored `MAX_MESSAGE_ALLOC_SIZE`; `frostsnap_core` no longer needs an allowlist, `frost_backup` still does — §7) |
+| Flash, as built | **899,400 B = 63.1%** of `FLASH_TEXT` as an rlib sum, re-measured in a clean target dir **2026-09-10** (**this row read 860,898 B = 60.4% until then**, which was the 2026-08-19 figure, taken before the UI, the keypad, the share store, 25-word entry, the quiz and the `coldsnap_firmware` crate existed; the two C-secp and rust-bitcoin components are byte-identical, and the whole +38,502 is `libcoldsnap_hal.rlib` 15,873 → **30,627** plus `libcoldsnap_firmware.rlib` **21,000**, a crate absent from every earlier row — **but the two deltas sum to 35,754 (14,754 + 21,000), so 2,748 B of that +38,502 is UNATTRIBUTED. Flagged 2026-09-12 rather than reconciled by invention:** 899,400 − 860,898 = 38,502 is right and each component's own internal split checks (27,636 + 2,991 = 30,627; 18,912 + 2,088 = 21,000), so either the hal delta is understated or a third rlib moved. Re-run `tools/measure-flash.py` into a CLEAN target dir before quoting the split). Headroom on that sum is **526,008 B**. Earlier: 860,898 on 2026-08-19 (844,229 at phase 0; +5,101 panic sites, +253 for §8.1 defects 10–12, **+15,873 `coldsnap_hal` rlib** — of which +3,461 is phase 3's `comms.rs` + `usb.rs` — less −4,482 instantiations that moved between rlibs; all with LTO off, so upper bounds). **This row read 893,099 B = 62.7% until 2026-08-19**, on the strength of a +32,513 B growth attributed to `comms::decode_body`; that does not reproduce clean and is retracted — see README "Flash budget". The live `./target` glob measures 1,311,110 B = 92.0% from 131 rlibs against a clean 48, which is the artefact to suspect first.  **The linked image is measured, and the rlib sum above overestimates it by ~2.4×:** `firmware/` links at **379,648 B = 26.6343%** of `FLASH_TEXT` (`/usr/bin/objdump -h` after `cargo build --release` — `.vector_table` `0x40` + `.text` `0x4e7e0` + `.rodata` `0xe2bc` + `.data` `0x24`; re-measured 2026-09-12 in the MAIN checkout after the four-lane merge; margin **1,045,760 B**), because LTO plus `--gc-sections` keeps only what is reachable. **The ratio in this sentence read `~2.9×` until 2026-09-12 and was simply wrong arithmetic** — 899,400 / 377,256 = 2.384, and README's "Flash budget" said `2.39×` in the same document set; against today's image it is 899,400 / 379,648 = 2.369. **The image read 377,256 B = 26.47% until 2026-09-12** (and 377,192 B = 26.46% at 2026-09-11, 376,752 B = 26.43% at 2026-09-10). **Do NOT take an absolute image figure from a report written in a worktree under `.claude/worktrees/`:** the longer absolute path is embedded ~11 times in panic `Location` strings and inflates `.rodata` by ~424 B while leaving `.text` and `.bss` exact — see the traps note in §9 item 22's neighbourhood. Three of this round's four lanes reported 377,680 B for an unchanged image for exactly that reason, and one of them concluded the 377,256 record was stale. It was not. `llvm-nm` finds **190** frostsnap/secp/schnorr/bitcoin symbols (frostsnap 118, bitcoin 34, schnorr 28, secp256k1 22) and **22** `coldsnap_hal::ui` symbols, re-measured 2026-09-10 — **this pair read 267 and 17 until then** and neither reproduced; README carried the same pair, so both were copied rather than re-derived. The trajectory, each step a real caller appearing rather than a code addition: 11,604 B when `boot()` polled USB but touched no `comms` · 94,304 B with `Link::poll` + `decode_body` · 99,684 B with `identity` · 101,416 B once the identity-hold screen gave `ui`/`display` a caller · 282,080 B once a real `FrostSigner` was constructed and dispatched to · 297,064 B once the remaining §4.2 consent screens got honest callers · 331,116 B with the keypad driver and real consent · 362,288 B once `DisplayBackup`, `mark_sensitive` and the persistent share store landed · 372,688 B once 25-word entry made restore possible · 376,752 B once `CheckBackup` became a real 8-question quiz behind its own consent digit (+4,064 B: +32 B of `ui.rs` screens, +2,232 B when `firmware/src/quiz.rs` first acquired a caller and its generics were instantiated, +1,800 B for the `main.rs` event-loop arm) · **377,192 B** once the keygen check stopped printing a fixed `1=match` and started printing the randomised `press_legend(confirm)` (+440 B: a `Buf<16>` legend build and a call replacing a 12-byte literal). · **377,256 B** once `reveal_draw` hoisted the reveal's screen/cursor pairing out of `boot` into a value-tested module item (§9 item 22) and the three restoration consent screens started REFUSING a row that does not fit instead of drawing a clipped one (+64 B net: +104 B for those two, less 40 B when the review round deleted a vacuous legend-length comparison and turned an early `return` into a value). · **379,648 B** once address verification stopped being refused and got a real caller (`Session::verify_prompt` + `prompt_screen_at`'s `VerifyAddress` arm, ce62444): **+2,392 B**, `.text` +2,352 and `.rodata` +40, attributed symbol by symbol with `llvm-nm --print-size` over both images rather than predicted — +1,366 B `coldsnap_hal::comms::Link::drain` (the new `verify_prompt` and dispatch arm, inlined: THIS is the feature), +1,298 B `<bitcoin::Address as Display>::fmt` and +248 B `coldsnap_hal::ui::address_block` becoming OUTLINED shared symbols, less 668 B as `coldsnap_firmware::prompt_screen_at` gave up its inline copies of both. So ~878 B of it is outlining rather than new functionality. NOT a new dependency edge: `bitcoin::address::Address::from_script` is byte-identical at 342 B in BOTH images, so it was already linked, and no BIP-32 HMAC-SHA512 chain appears — `derive_xonly_key` and `bip341_taptweak_key_only` were already reachable through `sign_ack`. Zero new crates; `bitcoin =0.32.8` was already a non-optional dependency of `frostsnap_core`. That +440 was DISPUTED on review as +444, and **the dispute is SETTLED as of 2026-09-12: BOTH readings were correct and neither party named the cargo invocation.** `cargo build --release` gives `.text 0x4de70` (377,192 B); `cargo build --release -p coldsnap_firmware` gives `.text 0x4de74` (377,196 B). Reproduced in a CLEAN private target dir, both figures, both stable, and the two artifacts' `-C metadata` hashes are the same there as in the live tree — the 0x4de74 binary was still on disk at `target/thumbv7em-none-eabihf/release/deps/`. CAUSE, measured rather than hypothesised: `frostsnap_comms` is a WORKSPACE MEMBER, so the all-members build compiles it with its own `default` feature while `-p coldsnap_firmware` compiles it only as a dependency, where the workspace dep says `default-features = false`. `default = []` has NO CODE BEHIND IT, so the two units compile IDENTICAL source and differ only in the metadata hash cargo derives from the feature list — which changes every generic instantiation's symbol hash, hence function ordering under `lto = "fat"`, hence inter-function ALIGNMENT PADDING. Both binaries hold exactly **807 `.text` symbols totalling 318,780 B of code**; the difference is 312 B of padding against 308 B, and ZERO bytes of code. `.rodata`, `.data` and `.vector_table` are byte-identical. `firmware/link.x`'s `.text : ALIGN(4)` quantises the section, so the smallest observable difference is exactly 4 B. **CONSEQUENCE FOR THE RECIPE, and it is the actionable part: a flash figure is only meaningful with its invocation named.** Every figure in this document is the `cargo build --release` side, which is what README's "Test" section runs. Also settled by the same experiment: "incremental readings have disagreed by 4 B" does NOT reproduce — two clean builds in separate private target dirs and the in-tree incremental build produced a BYTE-IDENTICAL ELF (sha256 `938d317f56…`), so under `codegen-units = 1`, `lto = "fat"`, `incremental = false` this build is bit-for-bit reproducible. `.bss` is byte-identical across all of it at `0x2000_8034..0x2001_8058`, and nothing on the quiz path allocates, so the ~5,024 B arena margin is unchanged. **This cell said "`EnterPhysicalBackup`, `SavePhysicalBackup`, `SavePhysicalBackup2`, `Consolidate` and the naming flows are refused rather than implemented (§9), so their code is absent" until 2026-09-10. All five are IMPLEMENTED and ADMITTED**, which is part of why the image is 376,752 B: `Session::recv` passes each of them through to the signer (`firmware/src/lib.rs:1106-1110` for the four restoration variants, `:935` for `Naming(NameCommand::Preview)`), each behind its own consent digit, with `ToUserRestoration::EnterBackup` and `ConsolidateBackup` handlers at `:1334` and `:1358`. What IS refused, and where the absent code actually is: `Upgrade` (`Refusal::FirmwareUpgrade`), `DataErase` and `Challenge` (the genuine check) — cited by SYMBOL, in `Session::recv_core`'s refusal arms in `firmware/src/lib.rs`. **`ScreenVerify` (address verification) was on this list until 2026-09-12 and is not refused any more** (ce62444, §9 item 16): the dispatch admits it, `Session::verify_prompt` draws the address, and the +2,392 B in the trajectory above is what it cost. So a PIN's SE1 paths are what remains bound-but-gc-sectioned, and address verification is no longer the ceiling. Read the rlib rows for the MARGINAL cost of a change, never as a prediction of image size. |
+| Host tests passing | **576** = hal 288 (267 lib + 5 smoke + 16 integration) + firmware 172 (120 lib + 52 bin) + vendored 116 (`frostsnap_core` 63 + `comms` 10 + `embedded` 17 with `--features std`, 15 without + `frost_backup` 19 + `macros` 7), re-verified 2026-09-12 against every gate, all exit 0; **568** earlier the same day, before hal's integration file went 12 → 16 (`device_nonces`' post-write half: `SlotUnreadable`, the empty-`sessions` `Overflow` backstop, the cached-retry branch and the read-back `WriteVerifyFailed` comparison — 2a055f7) and `firmware/src/lib.rs` went 116 → 120 lib (address verification — ce62444; a fifth name in that commit is a RENAME of `address_verify_is_refused`, not an addition, which is why it is +4 and not +5, and hal stayed at 284 there because its scraper test was renamed and extended in place); **565** before the round before that's THREE new host tests (the consent-row fit refusal, its propagation through `prompt_screen_at`, and the reveal cursor's pairing); **530** before the `CheckBackup` quiz (+6 hal, +29 firmware); 357 before the gap-closing pass; 355 before the signing pipeline; 344 on 2026-08-25 before `FrostSigner`; the firmware gate is now a SUM of two `test result` lines, 11 lib + 14 bin; 341 on 2026-08-24, +40 for `ui.rs`; 268 until 2026-08-24, which never counted `coldsnap_firmware`'s 14; +19 for `identity`; 204 at the phase-2 gate, 253 at the end of phase 3, 261 before §9 item 7(c)'s three outer-leg tests, 264 before the three inner-leg `decode_body` tests, 267 before the pin on the vendored `MAX_MESSAGE_ALLOC_SIZE`; `frostsnap_core` no longer needs an allowlist, `frost_backup` still does — §7) |
 
 Vendored crates live in `vendor/frostsnap/` with upstream commit recorded in
 `vendor/README.md`, which also carries the local-modifications table. Changes are

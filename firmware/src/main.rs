@@ -66,14 +66,20 @@
 //! (`stm32/sigheader.py:30`, `256*1024`), and
 //! `signit.py:295,305` pads it to 512 and then, on the Mk4/Mk5 branch, to **4096**
 //! (`verify.c:106`: the installer erases 4 K pages). The measured body is
-//! **377,192 B**, 115,048 B over the floor, and signit pads it by **3,736 B**
-//! (`align_to(377_192, 512) = 377_344`, then `align_to(377_344, 4096) = 380_928` — the 4 K
-//! branch is the one Mk4/Mk5 take, and it is **no longer a no-op**). **This read 376,760 /
-//! 114,616 / 72 B and "`align_to(.., 4096)` is the same number" until 2026-09-12**, when
-//! `reveal_draw` and the consent-row refusals took the image past a 4 K boundary; README's
-//! "Packaging" section carried the same chain and was corrected in the same pass. The old
-//! text's agreement between the two branches was a coincidence of one image, and it ended
-//! — which is exactly what its README counterpart had hedged about and nobody re-checked.
+//! **379,584 B**, 117,440 B over the floor, and signit pads it by **1,344 B**
+//! (`align_to(379_584, 512) = 379_904`, then `align_to(379_904, 4096) = 380_928` — the 4 K
+//! branch is the one Mk4/Mk5 take, and it is **no longer a no-op**). The BODY is the image
+//! minus the 64-byte `.vector_table`: 379,648 − 64. **This read 377,192 / 115,048 /
+//! 3,736 B earlier on 2026-09-12, and 376,760 / 114,616 / 72 B with "`align_to(.., 4096)`
+//! is the same number" until then**, when `reveal_draw` and the consent-row refusals took
+//! the image past a 4 K boundary and then address verification took it past another;
+//! README's "Packaging" section carried the same chain and was corrected in the same pass.
+//! The 2026-09-10 text's agreement between the two branches was a coincidence of one
+//! image, and it ended — which is exactly what its README counterpart had hedged about and
+//! nobody re-checked. **The padded body is 380,928 either side of this change, so
+//! `firmware_length` is unmoved at 397,312.** Note that 377,192 was simultaneously the
+//! correct BODY figure here and a STALE IMAGE figure in PLAN.md: they are two variables
+//! sixty-four bytes apart, and a blanket replace of one corrupts the other.
 //! Padding is signit's job; never hand it a pre-padded body.
 //!
 //! Those three numbers were 282,016 / 19,872 / 608 before the dispatch,
@@ -769,12 +775,22 @@ enum RevealScreen {
 ///
 /// What the mutation does is skip every other page —
 /// [`reveal_step`] adds one to a cursor that is already one ahead — so a human is shown
-/// pages 0, 2, 4, 6 and then asked "Wrote down all 25 words?" over **12 words that were
+/// pages 0, 2, 4, 6 and then asked "Wrote down all 25 words?" over **13 words that were
 /// never drawn**. They say yes, `CommsMisc::BackupRecorded` goes to the coordinator, and
 /// the app records a backup that cannot restore the share. No gate could see it because
 /// every line of `boot` is `cfg(target_arch = "arm")` (PLAN.md §9 item 22) and the stub's
 /// own reveal walk (`firmware/examples/stub.rs`) calls `Session::show_backup` directly
 /// rather than through this file.
+///
+/// **THE TWO HALVES WERE SWAPPED HERE UNTIL 2026-09-12.** The sentence above read
+/// "over **12 words that were never drawn**", and commit 3ccc891's subject says the
+/// mutation "showed a human 13 of 25 words" — both have it backwards. 12 is the number
+/// SHOWN and 13 the number never drawn, and it re-derives from `ui::BackupPages::page` in
+/// a minute: page 0 is `ui::BackupPage::ShareIndex` and carries NO word, so the drawn
+/// pages 2, 4 and 6 carry words 5-8, 13-16 and 21-24 = **12 shown**, while the pages
+/// never drawn — 1, 3, 5, 7 — carry 1-4, 9-12, 17-20 and word 25 on its own = **13 never
+/// drawn**. Page 7 holding only word 25 is why the halves are 12 and 13 rather than 12
+/// and 12. The page SET (0, 2, 4, 6) was always right; only the counts were wrong.
 ///
 /// Hoisting is what makes it visible, and it is the same remedy the eight routers above
 /// already use: `the_reveal_cursor_names_the_page_that_was_drawn` checks the pairing by
@@ -3482,7 +3498,10 @@ mod tests {
     /// left firmware tests, hal tests, both device clippy profiles, `cargo build --release`
     /// at 0 warnings, `tools/pixel-check.py` PASS all 7 and the `hostcheck` harness at
     /// exit 0 — while showing a human pages 0, 2, 4, 6 and then asking "Wrote down all 25
-    /// words?" over **12 words never drawn**. See [`reveal_draw`].
+    /// words?" over **13 words never drawn** (12 of the 25 reach the glass). See
+    /// [`reveal_draw`], whose doc carries the derivation and the withdrawal: this read
+    /// "**12 words never drawn**" until 2026-09-12, which is the SHOWN count, not the
+    /// never-drawn one.
     ///
     /// Walked over EVERY page rather than one, and one past the end, because the defect is
     /// an off-by-one and a single sample at page 0 would pass under `page * 1` or
@@ -3911,9 +3930,10 @@ mod tests {
         // AND ITS POSITION, which the assertion above does NOT cover — the residue that
         // came with it, measured rather than argued about. HOISTING
         // `take_glass(panel, &frame, glass);` to the line after `ui::Frame::new()` leaves
-        // the guard, the count, the flash gate and all 168 tests GREEN (measured: `cargo
-        // test -p coldsnap_firmware` exit 0, `cargo build --release` exit 0 with 0
-        // warnings and `.text` 24 B SMALLER), and it is the worst edit in this function:
+        // the guard, the count, the flash gate and all tests GREEN -- 168 of 168 at the
+        // time it was measured on 2026-09-12, 172 today (measured: `cargo test -p
+        // coldsnap_firmware` exit 0, `cargo build --release` exit 0 with 0 warnings and
+        // `.text` 24 B SMALLER), and it is the worst edit in this function:
         // the frame reaches the glass BLANK, the composed prompt screen never reaches it
         // at all, and `draw_batch` still parks the prompt and its digit — a consent
         // question that is answerable with nothing on the glass, which is the one thing
@@ -4223,10 +4243,24 @@ mod tests {
         // sees nothing wrong, and neither does the body pin, which only says
         // `show_backup_page` does not BUILD a `Reveal`.
         //
-        // The symptom is the original defect exactly: drawn pages become 1, 3, 5, 7, so a
-        // human is shown 16 of 25 words and then asked "Wrote down all 25 words?" over
-        // the 12 that were never on the glass, and `CommsMisc::BackupRecorded` tells the
-        // coordinator the backup was taken.
+        // The symptom is the original defect exactly, and that is literal: the drawn pages
+        // are 0, 2, 4, 6 AGAIN, so a human is shown 12 of 25 words and then asked "Wrote
+        // down all 25 words?" over the 13 that were never on the glass, and
+        // `CommsMisc::BackupRecorded` tells the coordinator the backup was taken. The
+        // START call one assertion above is pinned at page 0, so the cursor begins at
+        // `Reveal::Page(0)`; `reveal_step`'s `Answer::Next` arm then yields 1 and the
+        // mutated call draws 1 + 1 = 2, then 4, then 6, then 8 = `BACKUP_END`, which ends
+        // the reveal. Only the STEP is shifted, never the start.
+        //
+        // WITHDRAWN 2026-09-12, and quoted so the correction is visible: this comment read
+        // "drawn pages become 1, 3, 5, 7, so a human is shown 16 of 25 words and then
+        // asked "Wrote down all 25 words?" over the 12 that were never on the glass".
+        // Wrong three ways and internally impossible — 16 + 12 = 28 of 25 words. The page
+        // set is {0, 2, 4, 6} because of the pinned start, and the split is 12 shown / 13
+        // never drawn (`ui::BackupPages::page` gives page 0 no word and page 7 only word
+        // 25; see `reveal_draw`'s doc). Commit 3ccc891 carries the same error and cannot
+        // be edited, so the correction lives here. The MUTATION is still caught by the
+        // assertion below; only this prose was wrong.
         //
         // Pinned textually because that is all that is available: this line is inside
         // `boot`, so no host gate compiles it, and the arithmetic is on the ARGUMENT

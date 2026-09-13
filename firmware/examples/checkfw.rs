@@ -18,7 +18,11 @@
 //! Two things it deliberately does NOT do:
 //!
 //! * It does not reimplement the signed range. `coldsnap_firmware::firmware_digest`
-//!   owns it (`firmware/src/lib.rs:615`, hashing `verify.c:80-89`'s two spans);
+//!   owns it (`coldsnap_firmware::firmware_digest`, cited by symbol, hashing
+//!   `verify.c:80-89`'s two spans; **this said `firmware/src/lib.rs:615` until
+//!   2026-09-12** and located `pub struct Session`, which has itself since moved to
+//!   `:647` while `pub fn firmware_digest` is at `:2956` — the second reason to cite the
+//!   symbol);
 //!   this file only adds the OUTER SHA-256, because that function is single-hash
 //!   by deliberate coordinator convention while `fw_check` is double
 //!   (`verify.c:226`). Two implementations of the range would be two things to
@@ -388,7 +392,7 @@ fn check(secp: &Secp256k1<secp256k1::VerifyOnly>, image: &[u8]) -> Vec<(bool, St
                 memmap::FW_BODY_ALIGN,
                 image.len()
             ),
-            "firmware/src/lib.rs:615",
+            "coldsnap_firmware::firmware_digest",
         ),
         Some(inner) => {
             let fw_check: [u8; 32] = Sha256::digest(inner.0).into();

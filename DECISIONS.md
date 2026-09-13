@@ -33,7 +33,7 @@ Frostsnap's UI stack is not portable to it:
 
 | | Frostsnap (ESP32 device) | Coldcard Mk4 |
 |---|---|---|
-| Panel | 240×280 ST7789 SPI | 128×64 SSD1306 SPI, 40 MHz (`shared/display.py:19-20,32-35,44`) |
+| Panel | 240×280 ST7789 SPI | 128×64 SSD1306 SPI, 40 MHz (`shared/display.py:19-20,32-35,44` for the geometry and pin setup; the **40 MHz is not at any of those lines** — `:32` is a bare `machine.SPI(1)` with no baud rate — it is `shared/ssd1306.py:214`, `rate = 40_000_000 if not self.is_mk5 else 10_000_000`, so Mk4 takes the 40 MHz branch and Mk5 10 MHz. Corrected 2026-09-12) |
 | Pixels | 67,200 | 8,192 |
 | Colour | `Rgb565` (`frostsnap_widgets/src/lib.rs:241`) | 1-bit `MONO_VLSB`, 1,024-byte buffer (`shared/ssd1306.py:33,40,43`) |
 | Fonts | Gray4 anti-aliased, min 15 px line height (`frostsnap_fonts/src/noto_sans_14_light.rs:6`) | 1-bit bitmap, 14/21/6 px (`shared/zevvpeep.py:33,132,329`) |
@@ -55,7 +55,7 @@ touch surface. It also forecloses reusing Frostsnap's 6×3 chunked-address grid
 18×4 characters.
 
 **Not foreclosed.** The `Widget`/`DynWidget` *contract* is not intrinsically
-colour-bound: `Widget::Color` is an associated type (`lib.rs:230-232`),
+colour-bound: `Widget::Color` is an associated type (`Widget::Color` in `frostsnap_widgets/src/lib.rs`, cited by symbol — **this said `lib.rs:230-232` until 2026-09-12 and was NEVER right**: `type Color: WidgetColor;` is at `:227` inside `pub trait Widget` at `:225`, while `:230-232` is `fn draw`'s doc and signature. Not sibling drift — that file is byte-identical between `0bbc18be` and the sibling's HEAD),
 `VecFramebuffer` already bit-packs `BinaryColor`
 (`vec_framebuffer.rs:230-237,366`) and `ColorInterpolate` already has a
 `BinaryColor` impl that thresholds at 50% (`widget_color.rs:42-50`). The trait
@@ -204,9 +204,20 @@ rebase conflict surface, and to be deleted together with the `bitcoin` dep.
 **Decision.** Retain `bitcoin = "=0.32.8"`, features `["serde",
 "secp-lowmemory"]`.
 
+**Position amended 2026-09-12 (ce62444), zero new packages.** `bitcoin` is now a normal
+`[dependencies]` entry of `coldsnap_firmware`, not a `[dev-dependencies]` one, because
+`DeviceToUserMessage::VerifyAddress` carries an `Address<NetworkChecked>` and nothing
+re-exports the crate — so implementing screen 8 needs the name in scope in the library.
+This costs NO package and NO feature unification: `bitcoin =0.32.8` was already a
+non-optional dependency of `frostsnap_core`, and both declarations are
+`{ workspace = true }`, i.e. the same pin and the same feature set. `Cargo.lock` is
+unchanged. The flash cost of the FEATURE (not of the dependency) is +2,392 B and is
+attributed symbol by symbol in PLAN.md §10.
+
 **Rationale.** 327,408 bytes **measured** (re-confirmed unchanged 2026-09-10),
-23.0% of `FLASH_TEXT`, and it fits: **63.1%** as an rlib sum today, or 26.43% as the
-linked image. (This read "it fits at 59.2% total", the phase-0 figure.) It provides consensus-critical taproot sighash, which is the last
+23.0% of `FLASH_TEXT`, and it fits: **63.1%** as an rlib sum today, or 26.6343% as the
+linked image (379,648 B, `cargo build --release`, re-measured 2026-09-12; **this read
+26.43% until then**). PLAN.md §10 is the authority for the image figure. (This read "it fits at 59.2% total", the phase-0 figure.) It provides consensus-critical taproot sighash, which is the last
 thing worth reimplementing. `secp-lowmemory` already solved the flash problem
 that mattered — `ECMULT_WINDOW_SIZE=4`, `ECMULT_GEN_PREC_BITS=2`
 (`secp256k1-sys-0.10.1/build.rs:34-36`), shrinking the C library 92% from
@@ -247,7 +258,8 @@ but only with per-crate feature flags and a test allowlist. A plain
 
 **The table below is the 2026-08-12 snapshot and is kept as such; it said "what passes
 today" until 2026-09-10, by which point every row had moved.** Current, re-verified
-2026-09-10: **565** = `coldsnap_hal` 284 + `coldsnap_firmware` 165 + vendored 116
+2026-09-12: **576** = `coldsnap_hal` 288 + `coldsnap_firmware` 172 + vendored 116
+(**this read 565 = hal 284 + firmware 165, re-verified 2026-09-10, until 2026-09-12**)
 (`frostsnap_core` **63** across 13 targets, `frostsnap_comms` 10, `frostsnap_embedded`
 **17** with `--features std` / 15 without, `frost_backup` 19, `frostsnap_macros` 7).
 PLAN.md §7 Tier 1 is the maintained table; this one is history.
@@ -463,7 +475,7 @@ implementations. The following survived as confirmed defects anyway:
    Both production `LocalSpk` vectors have odd-y internal keys, so this was the
    common case, not an edge case.
 
-   `odd_y_internal_keys_tweak_to_the_same_output` (`tweak.rs:573`) closes it by
+   `odd_y_internal_keys_tweak_to_the_same_output` (in `frostsnap_core/src/tweak.rs`, cited by symbol — **this said `tweak.rs:573` until 2026-09-12**, which is inside the fn's own doc block; the fn is at `:583`, which is what PLAN.md §8 row 1b and `vendor/README.md` both already said, so this file was the outlier) closes it by
    asserting the *property* rather than a fixture: `P` and `-P` share an x
    coordinate, so BIP-341 must tweak both to the same output key. Verified
    load-bearing — with the `lift_x` deletion applied it FAILS (3 failed vs the
@@ -490,6 +502,9 @@ implementations. The following survived as confirmed defects anyway:
    backward-compat guards.
 4. ~~**One new clippy warning, contradicting a "clippy clean" claim.**~~
    **FIXED.** `bitcoin_transaction.rs:524` raised `clippy::uninlined_format_args`
+   (that citation no longer locates anything: `:524` is `pub fn spk` now and the `format!`
+   is at `:590`. Not renumbered inside this struck-through item — the number is part of
+   the correction record)
    from `alloc::format!("{:x}", spk)`; now `alloc::format!("{spk:x}")`. Neither
    changed file raises a clippy finding on the device or host+tests target.
 5. ~~**Interop was not run.**~~ **RUN, 2026-08-18; this item read "has not been
@@ -620,8 +635,10 @@ frame per segment; `Debug` is cut to `DEBUG_MESSAGE_LIMIT` = 256 B on a UTF-8
 boundary; and an over-large `HeldShares2` is refused **whole** as
 `CommsError::FrameTooLong`, never truncated, because dropping shares from a
 restoration reply would tell the coordinator a share does not exist. There is an
-event loop (`firmware/src/main.rs` step 10), a bin target that links at 376,752 B,
-and a production caller of `encode_frame` (`Outbox::encode`, `lib.rs:445`). Each cap
+event loop (`firmware/src/main.rs` step 10), a bin target that links at 379,648 B
+under `cargo build --release` (**this read 376,752 B until 2026-09-12**; PLAN.md §10 is
+the authority), and a production caller of `encode_frame` (`Outbox::encode`, by symbol —
+the `lib.rs:445` that stood here no longer locates it). Each cap
 has a named test that fails when it is removed — four mutations, four caught,
 2026-09-10; see PLAN.md §7 for the list. The device no longer builds a frame over a
 bound and then has its own encoder refuse it.
@@ -636,5 +653,5 @@ bound and then has its own encoder refuse it.
 | Coldcard commit | `0431fd2b`, MIT (firmware); `hardware/` proprietary |
 | Rust toolchain | 1.88.0 (`rust-toolchain.toml`) + `thumbv7em-none-eabihf` |
 | C cross-compiler | clang 21, `/opt/homebrew/opt/llvm/bin/clang` (still required — decision 4) |
-| Flash, as built | **899,400 bytes = 63.1%** of `FLASH_TEXT` 1,425,408 (`stm32/COLDCARD_MK4/layout.ld:17`) as an rlib sum with LTO off, re-measured **2026-09-10**; the **linked image** is **376,752 bytes = 26.43%**, which is the number that decides fit and is 2.4× smaller because of LTO plus `--gc-sections`. Trail: 844,229 at phase 0, 857,125 at the phase-2 gate, 860,898 on 2026-08-19 — **this row read 860,898 = 60.4% until 2026-09-10**, i.e. before the UI, the keypad, the share store, 25-word entry, the quiz and the `coldsnap_firmware` crate existed. The 893,099 figure was NOT a bad measurement: it is correct for a tree where the vendored `MAX_MESSAGE_ALLOC_SIZE` (32,768) differed from `comms::ENCAPS_DECODE_LIMIT` (20,480), which made `BINCODE_CONFIG` and `ENCAPS_CONFIG` distinct types and monomorphised the whole `CoordinatorSendBody` decode tree twice. Aligning the two constants collapsed the duplicate, worth 32,201 B; net cost of bounding both decode legs is +312 B. Confirmed by reverting the constant and reproducing 893,099 exactly — PLAN.md §10 is the authority. |
-| Host tests passing | **565** = hal 284 + firmware 165 + vendored 116, re-verified 2026-09-10, every gate exit 0 (**this read 268 until then** — the 2026-08-19 figure, which never counted `coldsnap_firmware` at all; 164 when this file was written; 204 at the phase-2 gate; 253 at the end of phase 3; 259 before decision 7 added two `comms` tests; 261 before PLAN.md §9 item 7(c) added three outer-leg decode-limit `comms` tests; 264 before the three inner-leg `decode_body` tests; 267 before the pin on the vendored `MAX_MESSAGE_ALLOC_SIZE`, 2026-08-19); only `frost_backup/tests/descriptor_match.rs` is excluded (decision 5) |
+| Flash, as built | **899,400 bytes = 63.1%** of `FLASH_TEXT` 1,425,408 (`stm32/COLDCARD_MK4/layout.ld:17`) as an rlib sum with LTO off, re-measured **2026-09-10**; the **linked image** is **379,648 bytes = 26.6343%** under `cargo build --release` (re-measured 2026-09-12; **this read 376,752 bytes = 26.43% until then**, two images stale), which is the number that decides fit and is ~2.4× smaller because of LTO plus `--gc-sections`. A flash figure is only meaningful with its cargo INVOCATION named — `-p coldsnap_firmware` differs by 4 B, and PLAN.md §10 records why. Trail: 844,229 at phase 0, 857,125 at the phase-2 gate, 860,898 on 2026-08-19 — **this row read 860,898 = 60.4% until 2026-09-10**, i.e. before the UI, the keypad, the share store, 25-word entry, the quiz and the `coldsnap_firmware` crate existed. The 893,099 figure was NOT a bad measurement: it is correct for a tree where the vendored `MAX_MESSAGE_ALLOC_SIZE` (32,768) differed from `comms::ENCAPS_DECODE_LIMIT` (20,480), which made `BINCODE_CONFIG` and `ENCAPS_CONFIG` distinct types and monomorphised the whole `CoordinatorSendBody` decode tree twice. Aligning the two constants collapsed the duplicate, worth 32,201 B; net cost of bounding both decode legs is +312 B. Confirmed by reverting the constant and reproducing 893,099 exactly — PLAN.md §10 is the authority. |
+| Host tests passing | **576** = hal 288 (267 lib + 5 smoke + 16 integration) + firmware 172 (120 lib + 52 bin) + vendored 116, re-verified 2026-09-12, every gate exit 0 (**this read 565 = hal 284 + firmware 165 until 2026-09-12**, and **268 until 2026-09-10** — the 2026-08-19 figure, which never counted `coldsnap_firmware` at all; 164 when this file was written; 204 at the phase-2 gate; 253 at the end of phase 3; 259 before decision 7 added two `comms` tests; 261 before PLAN.md §9 item 7(c) added three outer-leg decode-limit `comms` tests; 264 before the three inner-leg `decode_body` tests; 267 before the pin on the vendored `MAX_MESSAGE_ALLOC_SIZE`, 2026-08-19); only `frost_backup/tests/descriptor_match.rs` is excluded (decision 5) |
