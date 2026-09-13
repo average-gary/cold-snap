@@ -551,10 +551,12 @@ fn name_tag(body: &[u8]) -> [u8; 8] {
 /// The device name, on flash at [`memmap::FS_NAME_OFFSET`], as two A/B copies of
 /// one fixed-shape record.
 ///
-/// A separate region from the share on purpose: the loss consequences differ —
-/// the share is unrecoverable on this port (`DisplayBackup` and every physical
-/// backup path are refused), a name is retyped in five seconds — and separate
-/// regions mean a rename can never erase a sector the share lives in.
+/// A separate region from the share on purpose: the loss consequences differ — a
+/// lost share is recoverable only from a 25-word backup the holder had already
+/// taken (`Session::recv_core` admits `DisplayBackup` and the restore flow, but the
+/// device keeps no second copy and there is no recovery install), a name is retyped
+/// in five seconds — and separate regions mean a rename can never erase a sector the
+/// share lives in.
 ///
 /// Fixed shape, no `String` and no `Vec` on flash, for the reason `store`'s docs
 /// give at length: bincode's `Vec<u8>::decode` runs `alloc::vec![0u8; len]` on a
@@ -803,7 +805,8 @@ impl<'a, F: NorFlash + fmt::Debug> Session<'a, F> {
     /// Not `new_random`, and not `MemoryNonceSlot`: a signer whose nonces do not
     /// survive a power cycle would re-issue nonces after a reset, and FROST
     /// nonce reuse is a key leak. `load_slots` reads every slot to recover
-    /// `last_used`, so this is also where a torn nonce write is noticed.
+    /// `last_used`, and a slot too torn to decode is silently DROPPED from that
+    /// maximum — `AbSlots::new` `filter_map`s it out — not noticed here.
     ///
     /// Call `identity::load_or_create` **before** this — it wants
     /// `&mut F`, and the partition takes a shared borrow of the same `RefCell`
@@ -1875,9 +1878,10 @@ impl<'a, F: NorFlash + fmt::Debug> Session<'a, F> {
     /// (`coordinator/keys.rs:74-78`) and then presents the wallet as complete, so
     /// a power cut between the ack and the write leaves it believing `n` shares
     /// exist when `n-1` do: every later signing session that needs this device to
-    /// reach `t` fails, and with `DisplayBackup` and every physical-backup path
-    /// refused on this port the share cannot be reconstructed. The threshold is
-    /// silently short and the coins are unspendable. Upstream orders it the same
+    /// reach `t` fails, and the device keeps no second copy and has no recovery
+    /// install, so the share cannot be reconstructed unless the holder had already
+    /// taken the 25-word backup `recv_core` does admit. The threshold is silently
+    /// short and the coins are unspendable. Upstream orders it the same
     /// way (`esp32_run.rs:588-600` writes, then `:618-624` sends).
     ///
     /// On failure this returns before the loop, so the ack never reaches the
@@ -3313,10 +3317,24 @@ mod tests {
     #[test]
     fn nothing_but_the_outbox_truncating_arm_may_construct_a_debug_send() {
         let src = include_str!("lib.rs");
+        // `split_once`, not `split(..).next()`: the latter is INFALLIBLE, so the
+        // `expect` that used to stand here could not detect the condition its message
+        // named ("the test module is behind cfg(test)"), and a cut that found nothing
+        // returned the WHOLE file — this module's own needle literals included, which
+        // is the fail-open direction for a count.
+        //
+        // The message below claims only the None condition, because that is all
+        // `split_once` can report, and MEASURED 2026-09-13 it is not the condition
+        // that matters: spell the marker wrongly and the split still lands, on the
+        // NEXT occurrence of the misspelling — this literal itself. What actually
+        // detects a failed cut is the count directly below. Under
+        // `.split_once("#[cfg(tset)]")` it read 4 rather than 2 and this test failed
+        // by name, exit 101. That is the guard; a second assertion saying so would be
+        // a duplicate of a fact the count already holds.
         let production = src
-            .split("#[cfg(test)]")
-            .next()
-            .expect("the test module is behind cfg(test)");
+            .split_once("#[cfg(test)]")
+            .expect("`#[cfg(test)]` occurs nowhere in this file, not even as this literal")
+            .0;
         let sites = production.matches("DeviceSendBody::Debug {").count();
         assert_eq!(
             sites, 2,
@@ -4609,6 +4627,26 @@ mod tests {
     ///
     /// The lesson generalises to every source pin in this tree: `contains` on a
     /// pattern fragment tests that the pattern is PRESENT, never that it is ALONE.
+    ///
+    /// # And that anchor was NOT enough either — 2026-09-13, the same hole one door down
+    ///
+    /// The record above stands as written; what it got wrong was its own remedy. A
+    /// leading-newline-and-indent anchor makes the pinned arm a WHOLE LINE, which closes
+    /// widening by ALTERNATION and does nothing about widening by ADDED ARM: insert
+    /// `Ok(Shown::Page { last: false }) => {}` as a new line ABOVE the pinned one and
+    /// that byte sequence is still there, `unreachable_patterns` stays quiet because the
+    /// pinned arm is still reachable, and "only the last page may authorise" is exactly
+    /// as false as before. The catch-all needle was worse: unanchored, it also survived
+    /// commenting the arm out above a live `Ok(_) => {}`. (A third claim stood here until
+    /// 2026-09-13 — that `arms` had no right-hand bound, so a moved `match prompt {` would
+    /// have let it match its own literal in this module — and it was FALSE both ways:
+    /// `arms` came from `call` came from `body`, both `nth(1)` middle segments, so at the
+    /// base commit `call` was lines 1313-2570 and this module starts at 4644. The real
+    /// hazard is that `split(..).next()` widens the region SILENTLY.) Both are now ONE
+    /// `assert_eq!` on the arm block BY VALUE, between a
+    /// `split_once` on the `) {` that opens it and a `split_once` on the `}` that closes
+    /// it. The general rule the paragraph above reaches for is not "anchor the needle",
+    /// it is: an exclusivity claim needs a bound on BOTH sides of the region it is about.
     #[test]
     fn the_consent_gate_uses_the_page_it_was_given_and_demands_the_last_one() {
         let src = include_str!("lib.rs");
@@ -4620,29 +4658,48 @@ mod tests {
             .split("prompt_screen_at(")
             .nth(1)
             .expect("confirm_at must gate on prompt_screen_at");
-        let args = call
-            .split("\n        ) {")
-            .next()
-            .expect("the gate call must be a multi-line call");
+        // `split_once`, not `split(..).next()`: `Split::next()` is INFALLIBLE — over an
+        // empty haystack it still yields `""` — so the `expect` that used to stand here
+        // could not detect the condition its message named, and a vanished `) {` would
+        // silently WIDEN the region to the whole of `call` instead of failing. (Not to
+        // EOF: `call` is a `nth(1)` middle segment and was already right-bounded.) One
+        // `split_once` bounds the argument list on the right AND opens the arm block, and
+        // it can fail: that byte sequence is written here with `\n` ESCAPES, so unlike the
+        // `#[cfg(test)]` cut above this needle cannot be satisfied by its own literal.
+        let (args, block) = call
+            .split_once("\n        ) {\n")
+            .expect("confirm_at's gate call spans no lines: no `) {` at this indent");
         assert!(
             args.trim_end().ends_with("\n            page,"),
             "confirm_at must render the page it was handed, not a fixed one; got \
              arguments:{args}"
         );
-        let arms = call
-            .split("match prompt {")
-            .next()
-            .expect("the gate's arms come before the prompt match");
-        assert!(
-            arms.contains("\n            Ok(Shown::Page { last: true }) => {}\n"),
-            "only the last page may authorise, and it must be the WHOLE arm — an \
-             alternation like `Ok(Shown::Info) | Ok(..)` waves a second render outcome \
-             through the same gate; got:{arms}"
-        );
-        assert!(
-            arms.contains("Ok(_) => return Err(Fault::NotConfirmable),"),
-            "every other render outcome must refuse — a no-screen prompt and a \
-             deleted screen arm look identical from here; got:{arms}"
+        // RIGHT-BOUNDED, which the old `split("match prompt {").next()` was not: that form
+        // is infallible too, so a moved `match prompt {` silently WIDENED `arms` to the
+        // rest of `call` — measured at the base commit, `call` was lines 1313-2570 and this
+        // module starts at 4644, so it never ran to EOF and never reached the needle's own
+        // literal. The hazard is the SILENCE, not a self-match.
+        //
+        // This message too claims only the None condition. Some later `}` at this indent
+        // will nearly always exist, so what checks that this is the RIGHT one — the brace
+        // that closes the gate's own match — is the value comparison below, not the
+        // `expect`.
+        let arms = block
+            .split_once("\n        }\n")
+            .expect("no `}` at this indent anywhere below the gate call")
+            .0;
+        assert_eq!(
+            arms.lines().collect::<Vec<_>>(),
+            [
+                "            Ok(Shown::Page { last: true }) => {}",
+                "            Ok(_) => return Err(Fault::NotConfirmable),",
+                "            Err(refusal) => return Err(Fault::Refused(refusal)),",
+            ],
+            "the renderability gate must be exactly these three arms and no others: a \
+             LAST page authorises, every other Ok refuses as NotConfirmable, and a \
+             Refusal propagates. Compared BY VALUE because `contains` on one arm proves \
+             it is present, never that it is alone — see the mutation record above; \
+             got:{arms}"
         );
     }
 

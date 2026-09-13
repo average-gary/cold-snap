@@ -3154,12 +3154,35 @@ mod tests {
             "the prompt arm must not bind the prompt: a `match prompt` here is how a \
              per-screen key gets back in, and the keygen check is the screen it got in on"
         );
+        // AND IT IS THE ONLY ARM. The `contains` above proves the unbinding arm is
+        // PRESENT, never that it is ALONE. MEASURED 2026-09-13: a GUARDED arm inserted
+        // ABOVE it — `Consent::Prompt(p, confirm) if matches!(p,
+        // DeviceToUserMessage::CheckKeyGen { .. }) => { if key == b'1' { Answer::Yes }
+        // else { Answer::No } }` — leaves that needle intact, raises no
+        // `unreachable_patterns` (the unguarded arm stays reachable), and restored the
+        // fixed `b'1'` on the one anti-MITM screen with ALL 172 firmware tests GREEN,
+        // exit 0. The count is what closes it: under the same mutation it reads 3 and
+        // this test fails by name.
+        assert_eq!(
+            src.matches("Consent::Prompt(").count(),
+            2,
+            "two mentions and no more: `boot` builds it and `answer`'s ONE arm reads \
+             it; a third is a per-screen rule"
+        );
         // The constant itself, by definition site. One that nothing reads would be
         // harmless; one that something reads is this defect returning.
         assert!(
             !src.contains("const KEYGEN_MATCH_KEY"),
             "the fixed keygen key is back; ui::keygen_check prints a ConfirmDigit"
         );
+        // RECORDED CEILING, not a gap to close by needle surgery. This is the right
+        // FILE — git says the const lived here (added cc933b5, removed 574121c) — but a
+        // one-token respelling evades it three ways: `static KEYGEN_MATCH_KEY`, a rename,
+        // or reintroduction in `hal/src/ui.rs`, which `production_source()` does not
+        // read. What actually stops all three is the count above plus
+        // `only_the_rendered_digit_confirms`, which drives this arm over all 256 bytes:
+        // a fixed key can only take effect through a second `Consent::Prompt` arm, and
+        // there are two mentions and no more.
     }
 
     /// **The page rule.** On a page that is not the last of its set, NOTHING
@@ -3772,33 +3795,65 @@ mod tests {
         // consents to a reveal and then draws nothing, or one that consents to an
         // ingest and then refuses every key.
         let src = production_source();
-        assert!(
-            src.contains("ToUserRestoration::DisplayBackup { .. } => Some(Grant::Reveal),"),
-            "the one variant that grants a reveal must be named, and be the only one"
+        // THE WHOLE ARM BLOCK, BY VALUE, bounded on BOTH sides — the tool `firmware::lib`
+        // built for its renderability gate, for the same reason. Four `contains` needles
+        // stood here until 2026-09-13, and a `contains` on one arm proves the arm is
+        // PRESENT, never that it is ALONE: MEASURED, a guarded arm inserted above
+        // `DisplayBackup` — `ToUserRestoration::DisplayBackup { ref phase, .. } if
+        // core::ptr::eq(phase, phase) => None,` — left all four intact with no
+        // `unreachable_patterns` and ALL 172 firmware tests GREEN, exit 0, and none of the
+        // three counts below can see it either because it issues no grant. The guard is a
+        // tautology the compiler cannot fold, which keeps the arm below reachable; any
+        // predicate on the variant's own fields does the same. `split_once`, not
+        // `split(..).next()`: the latter is infallible, so a vanished delimiter would
+        // widen the region silently instead of failing. Named cost: the four arms are
+        // non-overlapping, so their ORDER is semantically free and a harmless reorder
+        // fails this too — that is the price of an exclusivity claim.
+        let arms = src
+            .split_once("    match **restoration {\n")
+            .expect("no `match **restoration {` at this indent in the production half")
+            .1
+            .split_once("\n    }\n")
+            .expect("no `}` at this indent anywhere below `grants`'s match")
+            .0;
+        assert_eq!(
+            arms.lines().collect::<Vec<_>>(),
+            [
+                "        ToUserRestoration::DisplayBackup { .. } => Some(Grant::Reveal),",
+                "        ToUserRestoration::EnterBackup { .. } => Some(Grant::Entry),",
+                "        ToUserRestoration::CheckBackup { .. } => Some(Grant::Check),",
+                "        ToUserRestoration::BackupSaved { .. } | ToUserRestoration::ConsolidateBackup(_) => None,",
+            ],
+            "`grants` must be exactly these four arms and no others: one grants a reveal \
+             of all 25 words, one an ingest, `CheckBackup` grants a QUIZ and not a reveal \
+             — the copy-paste one token away answers a request for one word of three with \
+             all 25 in plain — and the reply and the consolidation grant nothing at all; \
+             got:{arms}"
         );
-        assert!(
-            src.contains("ToUserRestoration::EnterBackup { .. } => Some(Grant::Entry),"),
-            "the one variant that grants an ingest must be named, and be the only one"
+        // AND EACH GRANT IS ISSUED ONCE AND DISPATCHED ONCE, which the block above cannot
+        // hold: it says nothing about `boot`'s half. Two mentions each — `grants` issues
+        // it, `boot`'s dispatch reads it — so a third is a second site handing out a
+        // reveal. This is also what the three `Grant` variants being distinct VALUES buys,
+        // and it is why three `assert_ne!`s on them stood here for part of 2026-09-13 and
+        // were deleted the same day: `Grant` is three fieldless variants under a derived
+        // `PartialEq`, so a duplicate discriminant is `error[E0081]` and those asserts
+        // could not fail.
+        assert_eq!(
+            src.matches("Some(Grant::Reveal)").count(),
+            2,
+            "`grants` issues the reveal once and `boot` dispatches it once; a third is \
+             a second variant granting a reveal"
         );
-        // THE ARM THAT MATTERS MOST. `CheckBackup` grants a QUIZ, and the value it
-        // grants is spelled here so that the copy-paste — `Some(Grant::Reveal)`, one
-        // token away — cannot pass. That mutation answers a request for one word of
-        // three with all 25 in plain, on a consent screen that said "check".
-        assert!(
-            src.contains("ToUserRestoration::CheckBackup { .. } => Some(Grant::Check),"),
-            "the quiz must grant a quiz, and must be named so it cannot grant a reveal"
+        assert_eq!(
+            src.matches("Some(Grant::Entry)").count(),
+            2,
+            "`grants` issues the ingest once and `boot` dispatches it once"
         );
-        assert!(
-            src.contains(
-                "ToUserRestoration::BackupSaved { .. } | ToUserRestoration::ConsolidateBackup(_) => None,"
-            ),
-            "the reply and the consolidation must grant no flow at all"
+        assert_eq!(
+            src.matches("Some(Grant::Check)").count(),
+            2,
+            "`grants` issues the quiz once and `boot` dispatches it once"
         );
-        // The three grants are different values, so no arm can accidentally hand a
-        // reveal's screen to an entry or to a quiz.
-        assert_ne!(Grant::Reveal, Grant::Entry);
-        assert_ne!(Grant::Reveal, Grant::Check);
-        assert_ne!(Grant::Entry, Grant::Check);
     }
 
     /// **Every exit from the reveal takes the words off the glass** — the leak this
@@ -3986,8 +4041,22 @@ mod tests {
             "a flash that refused the share earns the same screen as a policy refusal, \
              and the same end of the flow"
         );
+        // THE ARM, not the bare assignment. This needle named `RevealStep::Park` in its
+        // MESSAGE and not in its needle, which is the defect its siblings at the entry and
+        // the quiz do not have. MEASURED 2026-09-13: with the arm emptied to
+        // `RevealStep::Park => {}` and `glass = Some(Flow::Reveal(state));` moved into the
+        // `RevealStep::Show` arm, the old bare needle was intact, the `glass =` count did
+        // not move, and ALL 172 firmware tests were GREEN, exit 0 — while a parked reveal
+        // dropped its cursor and left 25 words lit with nothing tracking them, which is
+        // requirement 5's leak.
+        //
+        // AND ANCHORED, like the entry's refuse arm: MEASURED 2026-09-13, the bare needle
+        // was satisfied from inside a `// ` prefixing the live arm while a
+        // `RevealStep::Park => {}` below it re-parked nothing, and `glass =` stayed at 13
+        // because the commented copy is counted — all 172 GREEN, exit 0. The leading `\n`
+        // plus the 20-space indent (measured) puts `// ` on the anchor instead.
         assert!(
-            src.contains("glass = Some(Flow::Reveal(state))"),
+            src.contains("\n                    RevealStep::Park => glass = Some(Flow::Reveal(state)),\n"),
             "`RevealStep::Park` must re-park the SAME state — the same page, and on \
              the recorded question the same digit — without redrawing it"
         );
@@ -4158,10 +4227,32 @@ mod tests {
         );
         // And the pad read must be handed the *rendered* `last`, not a literal,
         // together with the prompt and the digit that frame was drawn with.
+        //
+        // The leading `match ` is load-bearing and is not decoration. MEASURED: the bare
+        // `ask(keypad.as_mut(), &mut entropy, consent, last)` occurs TWICE in the
+        // production half — the parked-prompt read this test is about, and the flow read,
+        // which reaches it as `let verdict = ask(..);`. So replacing the PARKED call's
+        // `last` with a literal `true` left the bare needle satisfied by the other site,
+        // the `ask(` count at 2 and ALL 172 firmware tests GREEN, exit 0, while the digit then
+        // confirmed on a page that never printed it — `the_digit_confirms_only_on_the_last
+        // _page`'s own "one press of the right key in five signed it". `match ` is what
+        // makes the needle unique, and the call site's comment already promises the line
+        // is `cargo fmt`-stable for exactly this kind of reason.
         assert!(
-            src.contains("ask(keypad.as_mut(), &mut entropy, consent, last)")
+            src.contains("match ask(keypad.as_mut(), &mut entropy, consent, last) {")
                 && src.contains("let consent = Consent::Prompt(&prompt, confirm);"),
             "the gate must be told which page the frame showed, and with which digit"
+        );
+        // And the needle above pins the NAME `last`, not its value. MEASURED: inserting
+        // `let last = last.max(true);` one line above the call left the needle verbatim,
+        // the `ask(` count at 2, no `unused_variables` (the destructured `last` is still
+        // read) and ALL 172 firmware tests GREEN, exit 0 — while the digit confirmed on a
+        // page that never printed it. Zero today; `let (prompt, confirm, page, last)` and
+        // `let (consent, last) = ..` are tuple patterns and do not match this needle.
+        assert_eq!(
+            src.matches("let last").count(),
+            0,
+            "nothing may rebind `last` between the render and the pad read"
         );
         // The two device-driven flows read the pad with NO digit and NO prompt, which
         // is what makes `Answer::Yes` unreachable while a share is on the glass — being
@@ -4207,18 +4298,35 @@ mod tests {
             src.contains("let grant = grants(&prompt);"),
             "the grant must be read off the prompt that was answered"
         );
+        // EACH NEEDLE CARRIES THE ARM'S FIRST BODY LINE. The bare arm HEADERS were what
+        // stood here, and a header only says the arm exists: MEASURED, SWAPPING the
+        // bodies of the `Some(Grant::Reveal)` and `Some(Grant::Check)` arms left all
+        // three headers, the start-page pin below and both counts (`show_backup_page(`
+        // 2, `show_quiz(` 3) intact, and ALL 172 firmware tests GREEN, exit 0 — while a
+        // CheckBackup consent then draws all 25 words
+        // in plain, which is the exact failure `grants` exists to prevent. Production's
+        // own comments say "THE REVEAL STARTS HERE, and only here"; these are what make
+        // that true. Indents measured: arm 32 spaces, body 36.
         assert!(
-            src.contains("match grant {") && src.contains("Some(Grant::Reveal) => {"),
-            "the reveal must start behind that grant"
+            src.contains("match grant {")
+                && src.contains(
+                    "Some(Grant::Reveal) => {\n                                    glass = show_backup_page(&mut session, 0, panel, &mut entropy)"
+                ),
+            "the reveal must start behind that grant, and it is the reveal's own screen \
+             that starts there — a reveal must also begin on the share-index page"
         );
         assert!(
-            src.contains("Some(Grant::Entry) => {"),
+            src.contains(
+                "Some(Grant::Entry) => {\n                                    glass = show_entry_page(&session, panel, &mut entropy)"
+            ),
             "the entry must start behind that grant, and not behind a library fact: \
              `session.entry_screen().is_some()` here would resurrect an abandoned entry \
              on the next unrelated consent"
         );
         assert!(
-            src.contains("Some(Grant::Check) => {"),
+            src.contains(
+                "Some(Grant::Check) => {\n                                    glass = show_quiz("
+            ),
             "the quiz must start behind that grant, for the entry's reason: a quiz grant \
              read out of the library would resurrect an abandoned quiz — three candidates \
              of a share the coordinator has stopped asking about — on the next unrelated \
@@ -4229,10 +4337,14 @@ mod tests {
         // its index is unrestorable — a silent way to hand out 25 useless words. The
         // entry starts on the share-index page too, which is `wordentry`'s own
         // `Stage::Index` and needs no argument here.
-        assert!(
-            src.contains("show_backup_page(&mut session, 0, panel, &mut entropy)"),
-            "a reveal must begin on the share-index page"
-        );
+        //
+        // NO SEPARATE ASSERTION HERE any more. What held this was
+        // `src.contains("show_backup_page(&mut session, 0, panel, &mut entropy)")`, and
+        // that string is now a STRICT SUBSTRING of the `Some(Grant::Reveal)` needle
+        // above, which pins the same call at the same page under its own arm. A pin that
+        // cannot fail unless another pin in the same test fails first is not coverage,
+        // it is a second reading of one fact — deleted rather than kept, and the fact is
+        // named here so nobody restores it. Same call as commit d5628df.
         // AND THE STEP CALL PASSES THE CURSOR UNCHANGED. This is the second of the two
         // call sites the count above pins, and it was the ONE PLACE the whole
         // `reveal_draw` hoist did not cover — found by adversarial review, 2026-09-12,
@@ -4281,15 +4393,39 @@ mod tests {
     /// `the_only_consent_call_passes_the_page_that_was_drawn` is 3 — the call site
     /// plus that test's own two literals.
     ///
-    /// Three tests read this and all three exist for one reason: `boot` is
-    /// `#[cfg(target_arch = "arm")]`, so PLAN.md §9 item 22 applies and no gate in
-    /// this tree compiles a line of it. A source pin is the weakest useful thing
-    /// that can fail when one of the shapes inside it changes.
+    /// **13 call sites across 12 tests** read this, and every one of them exists for
+    /// one reason: `boot` is `#[cfg(target_arch = "arm")]`, so PLAN.md §9 item 22
+    /// applies and no gate in this tree compiles a line of it. A source pin is the
+    /// weakest useful thing that can fail when one of the shapes inside it changes.
+    ///
+    /// The count was "Three tests" until 2026-09-13, and it is 13 CALLS: two of them
+    /// (`session.quiz_key(` and `CheckStep::Ack`) live in one test, which is why the
+    /// tests are 12. No `rg` recipe is quoted for it on purpose — a grep on the name
+    /// also finds this definition and every comment that mentions the helper, so the
+    /// figure it returns moves whenever anyone writes prose about it. That is not
+    /// hypothetical: the first draft of this paragraph quoted such a total and its own
+    /// two sentences falsified it twice in a row.
     fn production_source() -> &'static str {
+        // `split_once`, not `split(..).next()`: the latter is infallible, so a cut that
+        // found nothing would silently hand every pin below the WHOLE file, this
+        // module's own needle literals included — which is the fail-open direction for
+        // the `contains` pins, since each needle then matches itself. The message claims
+        // only the `None` condition, because that is all `split_once` can report.
+        //
+        // And that condition is NOT what a broken cut looks like, MEASURED 2026-09-13:
+        // respell the marker and the split still lands, on the FIRST occurrence of the
+        // misspelling — which is this COMMENT, a few lines above the code literal (no count
+        // quoted: rewriting this paragraph would rot it), so the
+        // cut moves DOWN into the test module and the pins below start matching their own
+        // needles. What actually detects a broken cut is those pins. Under
+        // `.split_once("#[cfg(tset)]")` NINE named tests fail, exit 101 — re-measured
+        // 2026-09-13; this read EIGHT and omitted
+        // `the_passed_quiz_screen_is_dismissed_by_any_key_and_acks_nothing`. A separate
+        // assertion saying "the cut worked" would restate what those nine already hold.
         include_str!("main.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .expect("split always yields one")
+            .split_once("#[cfg(test)]")
+            .expect("`#[cfg(test)]` occurs nowhere in this file, not even as this literal")
+            .0
     }
 
     /// **The parked prompt is serviced once per iteration and never in a loop** —
@@ -4391,15 +4527,55 @@ mod tests {
     #[test]
     fn the_panic_counter_clear_stays_behind_both_of_its_conditions() {
         let src = production_source();
+        // THE CALL, not one spelling of it. This counted the LITERAL
+        // `clear_counter(Counter::Panic)` until 2026-09-13, so a SECOND, unconditional
+        // clear reached through a local (`let which = Counter::Panic;`) was invisible to
+        // it AND to the block needle below, and ALL 172 firmware tests stayed GREEN,
+        // exit 0 (MEASURED) with the panic budget zeroed on every loop iteration — M9's
+        // brick by another route. The other call is named too, because deleting it makes
+        // room for an aliased Panic clear inside a total of 2: total 2 + `RngFault` by
+        // name + the block below accounts for both calls, so a `Counter::Panic` count
+        // beside them could never be the only assertion to fail.
         assert_eq!(
-            src.matches("clear_counter(Counter::Panic)").count(),
-            1,
-            "one clear site, at the bottom of the loop"
+            src.matches("clear_counter(").count(),
+            2,
+            "two clear sites in the production half: the RNG fault's and the panic \
+             budget's — a third is a clear this test cannot see the guard of"
         );
+        assert_eq!(
+            src.matches("clear_counter(Counter::RngFault)").count(),
+            1,
+            "the other clear must stay the RNG fault's, spelled in full"
+        );
+        // THE WHOLE BLOCK, not the `if` header. A header pinned beside a count of 1 says
+        // "the condition exists somewhere and the clear exists somewhere"; it does not
+        // say the clear is BEHIND the condition. MEASURED: move `let _ =
+        // clear_counter(Counter::Panic);` below the closing brace and the old header
+        // needle, the count of 1 and ALL 172 firmware tests stayed GREEN, exit 0, while the
+        // panic budget is zeroed on
+        // EVERY loop iteration — a bounded reset loop becomes unbounded, and at RDP=2
+        // with DFU hardware-impossible and no PIN that is a PERMANENT BRICK. Indents
+        // measured: 8 / 12 / 12 / 8.
         assert!(
-            src.contains("if handled_frame && !cleared && !health.in_reset_loop() {"),
-            "the clear must require a decoded FRAME and a unit that is not already \
-             in a bounded reset loop"
+            src.contains(
+                "if handled_frame && !cleared && !health.in_reset_loop() {\n            cleared = true;\n            let _ = clear_counter(Counter::Panic);\n        }"
+            ),
+            "the clear must sit INSIDE the guard that requires a decoded FRAME and a \
+             unit that is not already in a bounded reset loop, and must latch `cleared` \
+             in the same block — outside it, the reset budget never runs out"
+        );
+        // The guard's INPUT. Everything above pins the guard's TEXT: MEASURED, flipping
+        // the loop-local initialiser to `let mut handled_frame = true;` left both needles
+        // and ALL 172 firmware tests GREEN, exit 0, while an EMPTY poll clears the budget
+        // on a unit that decoded nothing — the second failure mode this test's own doc
+        // names. The set site carries its 28-space indent so it cannot leave the
+        // decoded-frame arm for the `MagicBytes` arm or for above the `match`.
+        assert!(
+            src.contains("let mut handled_frame = false;")
+                && src.contains("\n                            handled_frame = true;\n"),
+            "the flag must start FALSE on every iteration and be set ONLY inside the \
+             decoded-frame arm — otherwise `handled_frame` is true on a poll that \
+             decoded nothing and the guard above stops requiring a frame"
         );
     }
 
@@ -4846,9 +5022,20 @@ mod tests {
             all.contains("CHECKSUM"),
             "the failure must say what failed: {all}"
         );
+        // THE WHOLE SENTENCE, both rows, adjacent — not the bare `"25"` that stood here.
+        // MEASURED: `all.contains("25")` was satisfied by the FOOTER alone
+        // (`frame.text(0, ui::ROWS - 1, "any key=word 25")`), so deleting the two rows
+        // that actually make the claim — `"All 25 words"` and `"are still held."` — left
+        // ALL 172 firmware tests GREEN, exit 0: row 0 still said CHECKSUM, the word-material
+        // scan was
+        // unaffected and `entry_frame` still returned true. The screen would then tell a
+        // human their 25 words had failed a checksum and nothing about them being kept.
+        // `rows` is joined with `\n`, so rows 2 and 3 are adjacent in `all` and one
+        // needle bounded on both sides holds the sentence and its ORDER.
         assert!(
-            all.contains("25"),
-            "the failure must say the words are kept: {all}"
+            all.contains("All 25 words\nare still held."),
+            "the failure must say the words are kept, in the two rows that say it and \
+             not in the footer: {all}"
         );
         // NO `row.chars().count() <= ui::COLS` here: `row_text` walks `0..ui::COLS`, so
         // every row it returns is at most `ui::COLS` chars however the screen was drawn.
@@ -4933,9 +5120,23 @@ mod tests {
             "`EntryStep::Park` and `Typed::Unchanged` re-park without redrawing, and \
              nothing else may"
         );
+        // ANCHORED, both of them, and the anchor is what makes them falsifiable.
+        // MEASURED 2026-09-13: with the bare `contains` forms these two carried, commenting
+        // the live `EntryStep::Park` arm out and putting `EntryStep::Park => {}` under it
+        // left ALL 172 firmware tests GREEN (exit 0) — the needle matched from inside the
+        // `// `, and the count above stayed at 2 because the commented copy is still text.
+        // A `Wait` mid-entry would then re-park NOTHING: the flow cursor is dropped while
+        // the typed prefix stays lit, which is the reveal's leak in the entry's clothing.
+        // The leading `\n` plus the indent (24 and 28, measured at the two production
+        // sites) puts `// ` on the anchor instead. Both forms are unique in the file.
+        // The residue, stated because no textual needle closes it: a `/* */` block comment
+        // that keeps the indentation leaves these bytes intact. That ceiling is shared by
+        // every `src.contains` pin in this file and is recorded once, in PLAN.md.
         assert!(
-            src.contains("EntryStep::Park => glass = Some(Flow::Entry),")
-                && src.contains("Ok(Typed::Unchanged) => glass = Some(Flow::Entry),"),
+            src.contains("\n                        EntryStep::Park => glass = Some(Flow::Entry),\n")
+                && src.contains(
+                    "\n                            Ok(Typed::Unchanged) => glass = Some(Flow::Entry),\n"
+                ),
             "an unchanged entry screen must not be redrawn"
         );
         // BOTH endings draw. `Typed::Ended` is the 25th word or a back-out, and it draws
@@ -4955,9 +5156,29 @@ mod tests {
         );
         // And a fault on the completing keypress draws the refusal, through `take_glass`,
         // which drops the cursor in the same statement.
+        //
+        // ANCHORED BY DEPTH, and that is what makes it this test's claim. The bare line
+        // occurs THREE times in the production half — the consent site at 20 spaces, THIS
+        // one at 28, the quiz's at 32 — so the bare needle was satisfied by any survivor.
+        // MEASURED 2026-09-13, two variants, and the second is the one that matters:
+        //
+        //   * REPLACE this arm with `Err(_fault) => {}`: exit 101, but by the QUIZ test's
+        //     `matches(..).count() == 3`, which drops to 2. The tree caught it — for a
+        //     reason that has nothing to do with the entry.
+        //   * COMMENT this arm out and put `Err(_fault) => {}` under it: the count stays
+        //     at 3 and the bare needle still matched inside the `// `, so ALL 172 firmware
+        //     tests were GREEN, exit 0 — a `Fault::Store` mid-entry drawing nothing and
+        //     leaving the flow cursor live with the typed prefix on the glass.
+        //
+        // Deliberately NOT a count: a count holds "three exist", never "one is HERE". The
+        // leading `\n` plus the 28-space indent is unique to the entry arm, and it defeats
+        // the comment-out too, because `// ` occupies the anchor.
         assert!(
-            src.contains("Err(_fault) => refuse(panel.as_mut(), &mut glass),"),
-            "a fault mid-entry must refuse on the glass and drop the cursor"
+            src.contains(
+                "\n                            Err(_fault) => refuse(panel.as_mut(), &mut glass),\n"
+            ),
+            "a fault mid-entry must refuse on the glass and drop the cursor — this is \
+             the ENTRY's arm, at its own depth, not the consent's or the quiz's"
         );
         // The cancel guard: the coordinator can drop the grant without drawing anything,
         // so the loop asks the library whether the entry is still live BEFORE routing the
