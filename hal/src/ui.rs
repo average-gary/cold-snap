@@ -5104,7 +5104,19 @@ mod tests {
         .unwrap();
         let footer = row_text(&f, FOOTER_ROW);
         assert_eq!(footer, format!("pg 25/25 {QUIZ_REFUSE_LEGEND}"));
-        assert!(footer.len() <= COLS, "footer {footer:?} is wider than the panel");
+        // NO `footer.len() <= COLS` HERE, deliberately, and it was DELETED on 2026-09-12
+        // rather than never written: `assert!(footer.len() <= COLS, "footer {footer:?} is
+        // wider than the panel")` stood on this line and could not fail, for two
+        // independent reasons. `row_text` walks `0..COLS` and right-trims, so a readback is
+        // at most `COLS` chars however the screen was drawn; and the `assert_eq!` one line
+        // above pins the same value exactly, so a wider footer fails THERE first.
+        //
+        // It is the class commit 7591d2c swept, and that commit's claim that "the two
+        // survivors in the tree are both on SOURCE strings" was FALSE while this one stood.
+        // What covers the property is the module-scope `const _: () = { .. }` block's
+        // `"pg NN/NN ".len() + QUIZ_REFUSE_LEGEND.len() <= COLS`, which is `error[E0080]` on
+        // every target including the device build — so widening `QUIZ_REFUSE_LEGEND` by one
+        // character fails the BUILD, not one host test.
     }
 
     /// A re-asked position is visibly a re-ask, and the way it says so mentions the
