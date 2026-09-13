@@ -488,7 +488,10 @@ const PRESS: &[u8] = b"Press (";
 /// avoid — `NEXT_LEGEND` (`(9)next`, not `9=next`), `BACKUP_NEXT_LEGEND`,
 /// `BACKUP_BACK_LEGEND` and `PIN_FOOTER` — with the reason spelled out at each of
 /// them and enforced by a named test,
-/// `no_pin_screen_advertises_a_consent_key_to_the_stub_scraper`. Those decisions are
+/// `no_screen_that_authorises_nothing_advertises_a_consent_key_to_the_stub_scraper`
+/// (RENAMED from `no_pin_screen_advertises_a_consent_key_to_the_stub_scraper` by 74d9bcb,
+/// when address verification joined the screens it covers; this citation named the old
+/// name until 2026-09-13). Those decisions are
 /// live: retiring the recognizer would silently retire their reason, and the next
 /// person to write `9=next` on a page that cannot consent would have nothing telling
 /// them not to. It costs three lines and cannot fail open — a screen it matched by
