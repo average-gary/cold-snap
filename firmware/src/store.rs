@@ -33,7 +33,8 @@
 //! `frostsnap_embedded::NorFlashLog` cannot be constructed over this flash at
 //! all: `nor_flash_log.rs:5` fixes `WORD_SIZE = 4` and `:16` asserts
 //! `assert_eq!(WORD_SIZE, S::WRITE_SIZE)`, while `StmFlash::WRITE_SIZE` is 8
-//! (`hal/src/flash.rs:323`). Under `panic = "abort"` that assert is a boot brick.
+//! (`flash::WRITE_SIZE`; this cited `hal/src/flash.rs:323` until 2026-09-14, which is
+//! one arm of `FLASH_SR_ERRORS`). Under `panic = "abort"` that assert is a boot brick.
 //! `hal/src/flash.rs:16-102` and `flash::assert_nor_flash_log_is_unusable` already
 //! record the verdict.
 //!
@@ -41,8 +42,10 @@
 //! does not put the share in the log either. `MutationLog::push` intercepts
 //! `SaveShare`/`Save`/`Save2` and diverts them to an `AbSlot` — "we only store one
 //! secret share at a time" — and `AbSlot` is *already proven over this exact
-//! geometry* by `hal/tests/integration_frostsnap_over_hal.rs:171-201`, including
-//! the tail-padding case. So this module is a **thin adapter over vendored code**:
+//! geometry* by `ab_slot_round_trips_over_the_hal_geometry` in
+//! `hal/tests/integration_frostsnap_over_hal.rs`, including
+//! the tail-padding case (the 37-byte payload). Cited as `:171-201` until 2026-09-14,
+//! a range that ended ON that test's `#[test]` line and covered none of its body. So this module is a **thin adapter over vendored code**:
 //! no `NorFlashLog` patch, no append log of our own, no compaction, no wear
 //! management. What is new here is only the record shape and its integrity check.
 //!
@@ -80,7 +83,7 @@
 //! and, with the `ponytail:` ceiling below, a torn save loses the ONLY share.
 //!
 //! `StmFlash::write` programs `bytes.chunks_exact(WRITE_SIZE)` in **ascending**
-//! order (`hal/src/flash.rs:1256`) and `BincodeFlashWriter` streams a `[u8; N]` in
+//! order (`hal/src/flash.rs`, the loop in `write`) and `BincodeFlashWriter` streams a `[u8; N]` in
 //! byte order, so putting the checksum in the final doubleword buys exactly
 //! `hal/src/identity.rs`'s commit-word-last property for free: a tear anywhere in
 //! the record leaves the tail at `0xff`, the checksum fails, and [`ShareStore::load`] answers
@@ -871,7 +874,7 @@ mod tests {
 
     /// MUTATION-VERIFY (skip the commit word). Move the checksum anywhere but the
     /// end of the record and this fails. Program order is ascending
-    /// (`hal/src/flash.rs:1256`), so only a trailing checksum is guaranteed to be
+    /// (`hal/src/flash.rs`, the loop in `write`), so only a trailing checksum is guaranteed to be
     /// the last thing on flash — which is the whole reason a tear is detectable.
     #[test]
     fn the_checksum_occupies_the_last_doubleword() {

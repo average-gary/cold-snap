@@ -170,7 +170,8 @@ use crate::callgate;
 /// we redraw, without re-entering the callgate.
 pub const TRNG_BYTES: usize = 32;
 
-/// Bytes SE1 returns (`dispatch.c:588`).
+/// Bytes SE1 returns (`dispatch.c:587`, `buf_io[0] = 32;` — this read `:588`, the
+/// `break` under it, until 2026-09-14; the `:593` below was always right).
 pub const SE1_BYTES: usize = 32;
 
 /// Bytes SE2 returns (`dispatch.c:593`) — only 8.

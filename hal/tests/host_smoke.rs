@@ -145,7 +145,8 @@ fn entropy_is_not_default_constructible() {
     // Same for the seed itself -- a Default ProvenSeed is an all-zero seed.
     assert!(!(&&Probe::<coldsnap_hal::rng::ProvenSeed>(PhantomData)).is_default());
 
-    // Source byte counts, per dispatch.c:588 and :593. SE2 yields only 8.
+    // Source byte counts, per dispatch.c:587 and :593. SE2 yields only 8.
+    // (`:588` here until 2026-09-14 -- the same off-by-one `rng.rs` carried.)
     assert_eq!(coldsnap_hal::rng::SE1_BYTES, 32);
     assert_eq!(coldsnap_hal::rng::SE2_BYTES, 8);
     assert_eq!(coldsnap_hal::rng::SEED_BYTES, 32);

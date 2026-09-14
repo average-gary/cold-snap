@@ -355,7 +355,8 @@ pub const GPIOD_PUPDR: *mut u32 = (GPIOD_BASE + 0x0C) as *mut u32;
 /// `GPIOD->BSRR`, offset `0x18` (`stm32l4s5xx.h:624`).
 ///
 /// Row select is one write here and never a read-modify-write of `ODR`:
-/// `display.rs:409-412`'s argument, and the bootloader drives `PD2` on this same
+/// `display::bsrr_write`'s SAFETY argument (this cited `display.rs:409-412` until
+/// 2026-09-14, which is `GPIOA_BASE`), and the bootloader drives `PD2` on this same
 /// port (`sdcard.c:74-83`).
 pub const GPIOD_BSRR: *mut u32 = (GPIOD_BASE + 0x18) as *mut u32;
 

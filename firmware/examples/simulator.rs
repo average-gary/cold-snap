@@ -25,7 +25,13 @@
 //!    at the shipped geometry, flash-backed nonce slots) and feeds it real
 //!    `CoordinatorSendBody` messages, then renders exactly what `main.rs`'s loop
 //!    renders for the result: `ui::refusal` on `Err(Fault::Refused(_))`, and
-//!    NOTHING on any other fault (`main.rs:600-607`). The device id on the standby
+//!    NOTHING on any other fault. **"Exactly" OVERSTATES it, MEASURED 2026-09-14:
+//!    `main.rs`'s arm is `Err(Fault::Refused(_) | Fault::Store(_)) => refuse(..)`,
+//!    which `main.rs`'s own source pin holds against exactly the narrowing to
+//!    `Refused` alone, so a `Fault::Store` draws the refusal ON THE DEVICE and
+//!    leaves this program's screen unchanged. Cited as `main.rs:600-607` until
+//!    2026-09-14 — the tail of `answer`, which is not the render at all.** The
+//!    device id on the standby
 //!    frame is that session's real `DeviceId`.
 //!
 //! WHAT IS SYNTHETIC, stated because a sim that blurs this is worse than none:
@@ -41,9 +47,18 @@
 //! arrows (`coldcard-firmware/unix/simulator.py:499-511`; keyboard arrows are
 //! remapped onto `9`/`7`/`8`/`5` at `:1035-1037`). Paging is `5`/`8` because
 //! PLAN.md §4.2 says so, `1`/`y` is OK and `x` is cancel because that is what the
-//! `ui` hint rows already say. There is NO keypad driver in this tree
-//! (`firmware/src/main.rs:81-85`), so the mapping below is this file's proposal,
-//! not a port of shipped code.
+//! `ui` hint rows already say. The mapping below is this file's proposal, not a port
+//! of shipped code.
+//!
+//! **This said "There is NO keypad driver in this tree (`firmware/src/main.rs:81-85`)"
+//! until 2026-09-14, and BOTH halves were wrong.** `hal::keypad` is a real 4x3 matrix
+//! driver (cols `PB0`-`PB2` in, rows `PD8`-`PD11` open-drain out) with a `DECODER` of
+//! `y0x987654321`, landed by `cc933b5` — after this file — and `main.rs` opens it via
+//! `keypad::KeypadToken`. The cited lines are the `377,192`-body-vs-image paragraph and
+//! were never about the pad. What IS still true is that the keys DIFFER: on the device
+//! `ui::NEXT_KEY` is `9` and `ui::BACK_KEY` is `7`, both const-asserted out of
+//! `ui::CONFIRM_CHARSET`, and `main.rs`'s `answer` routes `5` and `8` to `Answer::No`.
+//! So `5`/`8` paging here is a TERMINAL convention this program owns, not the firmware's.
 //!
 //! Run it (TERMINAL front-end — no install, works over ssh):
 //!   cargo run --target aarch64-apple-darwin -p coldsnap_firmware \
@@ -149,7 +164,7 @@ fn frame(draw: impl FnOnce(&mut Frame)) -> Frame {
 /// lines and a keypress can redraw it without scrolling the screen away.
 ///
 /// Deliberately reads back through the public `Frame::pixel` — the same accessor
-/// `hal/examples/ui_render.rs:129` uses — rather than decoding glyphs out of the
+/// `hal/examples/ui_render.rs`'s `art` uses — rather than decoding glyphs out of the
 /// text layer. Decoding would agree with the font table even if the blit were
 /// wrong; this shows what the panel would be handed.
 fn art(f: &Frame) -> String {
@@ -257,7 +272,7 @@ impl Write for WireLog {
 /// The one thing the gated `hal` tests do NOT cover: what actually lands on the
 /// display fd.
 ///
-/// `hal/src/ui.rs:1583` (`mono_vlsb_corner_pixels_map_to_exact_bytes`) already
+/// `hal/src/ui.rs`'s `mono_vlsb_corner_pixels_map_to_exact_bytes` already
 /// pins the MONO_VLSB mapping itself and rejects a transpose, a reversed bit
 /// order, row-major, an off-by-one page and inversion, so this does not re-test
 /// geometry. It tests the pipe contract:
@@ -817,7 +832,7 @@ const WORDS: [&str; 25] = [
 ];
 
 /// A deterministic `Entropy` through the real `mix_sources` seam. Copied from
-/// `examples/stub.rs:242` — same 12 lines, same reason: a `ProvenSeed` has no
+/// `firmware/examples/stub.rs`'s own `entropy` — same 12 lines, same reason: a `ProvenSeed` has no
 /// other constructor, so even a fixture passes three `check_source` calls.
 fn entropy(salt: u8) -> Entropy {
     let varying = |len: usize, salt: u8| {
@@ -1074,7 +1089,7 @@ fn ui_scenes() -> Vec<Scene> {
     scenes.push(Scene::shown(
         "6 backup entry: share index then 25 word pages",
         "the share-index gate is the whole state machine (EntryPages::cursor). \
-         There is no keypad driver in this tree, so the typed 'partial' is a \
+         this program has no keypad, so the typed 'partial' is a \
          fixture, not a T9 model",
         entry_pages,
     ));
@@ -1130,9 +1145,14 @@ fn ui_scenes() -> Vec<Scene> {
     scenes
 }
 
-/// Scenes driven by a REAL `Session`, rendered exactly the way `main.rs`'s loop
-/// renders them: `ui::refusal` for `Err(Fault::Refused(_))`, and no screen change
-/// at all for anything else.
+/// Scenes driven by a REAL `Session`, rendered the way `main.rs`'s loop renders them:
+/// `ui::refusal` for `Err(Fault::Refused(_))`, and no screen change at all for
+/// anything else.
+///
+/// **NOT "exactly", and the gap is one variant:** `main.rs`'s arm is
+/// `Err(Fault::Refused(_) | Fault::Store(_))`, so a `Fault::Store` refuses on the glass
+/// there and changes nothing here. The `Err(f)` arm below, and its "leaves the screen
+/// UNCHANGED" note, are therefore right for every fault but that one.
 fn session_scenes(
     session: &mut Session<'_, DebugFlash<FakeFlash>>,
     rng: &mut Entropy,
@@ -1239,8 +1259,9 @@ WHAT THIS DOES NOT PROVE -- nothing here has touched hardware
     frame that is legible here can be unreadable on a 0.9-inch OLED.
   * SPI1, chip select, DMA, timing, refresh rate: not exercised at all.
   * the bootloader handoff, the callgate, RDP=2, the vector table: not exercised.
-  * the keypad: there is NO keypad driver in this tree. The key map below is a
-    proposal (PLAN.md 4.2's 5/8 paging), not a port.
+  * the keypad: `hal::keypad` IS a real driver, but nothing here drives it. The key map
+    below is this program's own terminal convention (5/8 paging), NOT the firmware's --
+    on the device `ui::NEXT_KEY` is 9, `ui::BACK_KEY` is 7, and 5 and 8 both mean No.
   * the release profile: this builds `dev`, where `overflow-checks = true`.
     Arithmetic that panics here WRAPS in the shipped image.
   * the two consent screens' prompts: keygen-check and test-message parameters are
@@ -1377,7 +1398,8 @@ fn show(scene: &Scene, page: usize, msg: &str) -> String {
 
 fn main() {
     // Real flash at the shipped geometry, real identity record, real Session --
-    // the same three lines `examples/stub.rs:268-297` uses, for the same reason:
+    // the same three lines `firmware/examples/stub.rs` uses (`blank_flashes` for the two
+    // flash ones, `open_sessions` for `load_or_create`), for the same reason:
     // a MemoryNonceSlot signer would prove nothing about this firmware.
     let sectors = memmap::FS_FREE_OFFSET as usize / ERASE_SIZE;
     let flash = RefCell::new(DebugFlash(FakeFlash::new(sectors)));
