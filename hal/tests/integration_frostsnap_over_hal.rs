@@ -58,7 +58,9 @@ use frostsnap_core::schnorr_fun::frost::{
 use frostsnap_core::schnorr_fun::fun::prelude::*;
 use frostsnap_core::schnorr_fun::Message;
 use frostsnap_core::{SignSessionId, Versioned};
-use frostsnap_embedded::{AbSlot, AbWriteOutcome, FlashPartition, NonceAbSlot, SECTOR_SIZE};
+use frostsnap_embedded::{
+    AbSlot, AbWriteOutcome, FlashPartition, NonceAbSlot, ABWRITE_BINCODE_CONFIG, SECTOR_SIZE,
+};
 use rand_core::RngCore;
 
 // ---------------------------------------------------------------------------
@@ -312,17 +314,23 @@ fn refused_flash_leaves_the_previous_nonce_state_readable() {
 /// refusal is still ARMED for a FURTHER write from it, which is the only way the
 /// erase order becomes observable.
 ///
-/// WHAT IS NOT PINNED HERE, and it is a decision rather than an omission (PLAN.md
-/// phase-7 row): the ROLLBACK symptom. A `CommittedSingleCopy` reached by a
-/// refused PROGRAM leaves the loser copy BLANK, because `Slot::try_write` erases
-/// before it writes, so under the swap BOTH copies are lost and `read` is `None`.
-/// On hardware a `CommittedSingleCopy` from a refused ERASE instead leaves the
-/// loser holding the OLD value at a SPENT index, and there the same one-line
-/// ordering error rolls the index BACK rather than losing it — and THAT is the
-/// affine break: two challenges over one nonce solve for the secret share, because
-/// the material is the same and only the index was rewound. Pinning that would need a
-/// `refuse_erases_after(k)` companion plus ~25 lines and it falsifies the SAME
-/// mutation, so it buys a second name for coverage that already exists.
+/// WHAT IS NOT PINNED HERE, AND NOW IS, one test below: the ROLLBACK symptom. A
+/// `CommittedSingleCopy` reached by a refused PROGRAM — the only kind this test can
+/// build — leaves the loser copy BLANK, because `Slot::try_write` erases before it
+/// writes, so under the swap BOTH copies are lost and `read` is `None`. A
+/// `CommittedSingleCopy` from a refused ERASE instead leaves the loser holding the
+/// OLD value at a SPENT index, and there the same one-line ordering error rolls the
+/// index BACK rather than losing it — and THAT is the affine break: two challenges
+/// over one nonce solve for the secret share, because the material is the same and
+/// only the index was rewound.
+///
+/// This doc used to argue the gap away ("it falsifies the SAME mutation, so it buys a
+/// second name for coverage that already exists"). The arithmetic was right and the
+/// conclusion was wrong: `refuse_erases_after` plus
+/// `a_further_refused_write_after_an_erase_refused_single_copy_does_not_roll_the_index_back`
+/// now exist, both tests DO go red on this one swap, and the second one is kept
+/// anyway because a fail-CLOSED total loss and a fail-OPEN index rewind are not the
+/// same finding to whoever reads the failure. Do not re-collapse them.
 #[test]
 fn a_refused_write_after_a_single_copy_write_erases_the_older_copy_not_the_live_one() {
     let flash = RefCell::new(FakeFlash::new(4));
@@ -394,6 +402,166 @@ fn a_refused_write_after_a_single_copy_write_erases_the_older_copy_not_the_live_
         flash.borrow().programs,
         programs,
         "a refused program still reached flash"
+    );
+}
+
+/// One A/B copy's `(index, value)` read straight off its own sector, with `u32::MAX`
+/// — the "slot is empty" sentinel (`ab_write.rs:151`, `:171`) — left VISIBLE instead
+/// of mapped to `None`.
+///
+/// This is the only non-destructive PER-COPY read that exists. `AbSlot::read`
+/// returns the CURRENT copy and drops the index, `current_slot_and_index` is
+/// private, and `Slot`/`SlotValue` are private to `frostsnap_embedded`. The probe
+/// pattern `a_torn_multi_chunk_write_makes_the_slot_unreadable_and_refuses_to_sign`
+/// uses — a second `AbSlot` over the same sectors — cannot help here: `AbSlot::new`
+/// asserts `n_sectors >= 2` (`ab_write.rs:26`), so it can only ever be aimed at a
+/// PAIR, and a pair is exactly what hides which copy is which.
+///
+/// Decoding a `(u32, u32)` through the real `FlashPartition::bincode_reader` at the
+/// real `ABWRITE_BINCODE_CONFIG` is byte-for-byte how `Slot::read` decodes
+/// `SlotValue { index, value }`: same two fields, same order, fixint little-endian.
+/// So a layout or config change surfaces here as a wrong number or a decode failure
+/// rather than as a hand-rolled offset that has silently rotted.
+fn ab_copy(flash: &RefCell<FakeFlash>, sector: u32) -> (u32, u32) {
+    bincode::decode_from_reader::<(u32, u32), _, _>(
+        FlashPartition::new(flash, sector, 1, "ab-copy-probe").bincode_reader(),
+        ABWRITE_BINCODE_CONFIG,
+    )
+    .expect("eight bytes of a 4096-byte sector always decode as two fixint u32s")
+}
+
+/// THE ROLLBACK, which is a different security failure from the total loss the
+/// ordering test above asserts. An ERASE-refused `CommittedSingleCopy` leaves the
+/// loser copy holding the OLD value at the OLD index; a further refused write must
+/// then still not rewind what the device reads back.
+///
+/// `a_refused_write_after_a_single_copy_write_erases_the_older_copy_not_the_live_one`
+/// names this symptom as deliberately unpinned and calls it "a second name for
+/// coverage that already exists". That note is right on the coverage arithmetic and
+/// WRONG on the security question. Both tests do fail on the same one-line swap of
+/// the two `Slot::try_write` calls in `AbSlot::try_write` — EXPECTED, stated here so
+/// nobody reads the double failure as a surprise — but they assert different
+/// consequences, and only one of the two is the affine break:
+///
+/// * The sibling's asymmetry comes from a refused PROGRAM, so its loser copy is
+///   BLANK: `Slot::try_write` runs `self.flash.erase_all()?` as its FIRST statement,
+///   and that erase had already succeeded. Under the swap a further refused write
+///   loses BOTH copies, `read_slot()` is `None`, and `AbSlots::get_or_create` takes
+///   its `None => initialize(..)` arm — FRESH `ratchet_prg_seed_material`, back at
+///   index 0 — so the same index now yields a DIFFERENT nonce. Total loss, and it
+///   fails CLOSED.
+/// * The asymmetry HERE comes from a refused ERASE, so the loser copy still holds
+///   the old value at the old index. Under the swap a further refused write erases
+///   the LIVE copy and `current_slot_and_index` falls back to the SPENT index, under
+///   the SAME ratchet material. Two challenges over one nonce solve for the secret
+///   share. Nothing else in the tree reaches this state, and `refuse_erases_after`
+///   did not exist before this test.
+///
+/// MEASURED, and it corrects the obvious way to write this: keeping the ERASE
+/// refusal ARMED for step (c) leaves the swap GREEN. With every erase refused, the
+/// further write's first-attempted slot fails its `erase_all` under either
+/// orientation, no cell is mutated, and both orders read back identically — a
+/// `NotCommitted` that proves only that a refusal refuses. The erase refusal has to
+/// be HEALED and a PROGRAM refusal armed in its place, so the further write's erase
+/// SUCCEEDS on whichever copy the order reaches first — destroying it — and only the
+/// program fails. That asymmetry is the entire test.
+///
+/// Steps (a) and (b) are swap-INVARIANT by construction: every per-copy assertion is
+/// over an unordered `BTreeSet`, so it holds whichever sector each copy lands in and
+/// cannot smuggle in an assertion about the order it is meant to be the precondition
+/// for.
+#[test]
+fn a_further_refused_write_after_an_erase_refused_single_copy_does_not_roll_the_index_back() {
+    // An erased sector. Erase leaves 0xff and `u32::MAX` is the empty sentinel, so a
+    // blank copy decodes to it in BOTH fields.
+    const BLANK: (u32, u32) = (u32::MAX, u32::MAX);
+
+    let flash = RefCell::new(FakeFlash::new(4));
+    let slot = AbSlot::new(FlashPartition::new(&flash, 0, 2, "coldsnap-nonce"));
+
+    // (a): two committed writes, so both copies are equal and the index has advanced.
+    assert_eq!(slot.try_write(&11u32), AbWriteOutcome::Committed);
+    let erases_before = flash.borrow().erases;
+    assert_eq!(slot.try_write(&22u32), AbWriteOutcome::Committed);
+    // DERIVED from the write just measured, never hardcoded, for the reason the
+    // sibling gives: a stale constant schedules the fault PAST the end of the write,
+    // and then (b) asserts only that a successful write succeeded.
+    let per_copy_erases = (flash.borrow().erases - erases_before) / 2;
+    assert!(
+        per_copy_erases > 0,
+        "no erases measured, so the schedule below is blind"
+    );
+
+    // (b): let the FIRST copy's erase through and refuse the SECOND's. Two borrows in
+    // one expression is "already mutably borrowed" at RUNTIME, hence the `let`.
+    let refuse_from = flash.borrow().erases + per_copy_erases;
+    flash.borrow_mut().refuse_erases_after(refuse_from);
+    let outcome = slot.try_write(&33u32);
+    assert!(
+        matches!(outcome, AbWriteOutcome::CommittedSingleCopy(_)),
+        "expected CommittedSingleCopy, got {outcome:?}"
+    );
+
+    // THE PRECONDITION, and it is the whole discrimination from the sibling: BOTH
+    // copies decode, at DIFFERENT indexes, the loser still holding the OLD value. The
+    // program-scheduled route cannot produce this — its loser is BLANK — so asserting
+    // only the `CommittedSingleCopy` variant would make this test a rename.
+    assert_eq!(
+        BTreeSet::from([ab_copy(&flash, 0), ab_copy(&flash, 1)]),
+        BTreeSet::from([(1u32, 22u32), (2u32, 33u32)]),
+        "not the rollback precondition: a copy is BLANK (u32::MAX in both fields) or \
+         both sit at one index, and then (c) below has no spent index to rewind to"
+    );
+    // A refused erase must not be COUNTED, or every schedule derived from `erases` is
+    // off by the number of refusals. Nothing else in the tree pins this.
+    assert_eq!(
+        flash.borrow().erases,
+        refuse_from,
+        "the refused erase was counted"
+    );
+    assert_eq!(
+        slot.read::<u32>(),
+        Some(33),
+        "the surviving copy is not live, so (c) below has nothing left to lose"
+    );
+
+    // (c): THE ASSERTION. Heal the erase refusal — see the MEASURED note above,
+    // leaving it armed makes the swap GREEN — and refuse PROGRAMS in its place, so
+    // the further write's erase lands on whichever copy the order reaches first.
+    flash.borrow_mut().heal();
+    flash.borrow_mut().refuse_programs_now();
+    let outcome = slot.try_write(&44u32);
+    assert!(
+        matches!(outcome, AbWriteOutcome::NotCommitted(_)),
+        "expected NotCommitted, got {outcome:?}"
+    );
+
+    // ON THE INDEX AS WELL AS THE VALUE, and FIRST because it is the stronger of the
+    // two forms: `AbSlot::read` drops the index, and the index is the security
+    // property — a value assertion alone would pass a rewind that happened to carry
+    // the same value. MEASURED as the assertion the swap trips: it reports
+    // `{BLANK, (1, 22)}`, i.e. index 2 rewound to the SPENT 1.
+    assert_eq!(
+        BTreeSet::from([ab_copy(&flash, 0), ab_copy(&flash, 1)]),
+        BTreeSet::from([BLANK, (2u32, 33u32)]),
+        "ROLLBACK: the refused write erased the LIVE copy, so the newest index on \
+         flash fell back to the SPENT one. On the nonce path that is a rewound index \
+         over UNCHANGED `ratchet_prg_seed_material`, i.e. one nonce under two \
+         challenges, which is the affine solve for the secret share"
+    );
+    // The same fact in the caller's terms. DOMINATED by the assertion above under the
+    // ordering swap, and kept anyway for one reason that is not redundancy: it is the
+    // only leg here that pins the SELECTION, i.e. that `current_slot_and_index` ranks
+    // the blank copy's `None` below the live copy's `Some` rather than reading the
+    // sector it just erased. MEASURED to fire alone on the selection mutation
+    // `if b_index > a_index` -> `if a_index > b_index` — though at the (b) read above,
+    // which reaches that comparison first. `refused_flash_leaves_the_previous_nonce_state_readable`
+    // and the sibling's step (d) also pin the selection from a blank/live pair, so
+    // deleting this line would lose no coverage, only the caller-facing name for it.
+    assert_eq!(
+        slot.read::<u32>(),
+        Some(33),
+        "the device would consume the rolled-back value"
     );
 }
 

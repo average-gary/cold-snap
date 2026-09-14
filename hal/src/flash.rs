@@ -1394,13 +1394,17 @@ impl NorFlash for StmFlash {
 /// * offsets and lengths must be [`WRITE_SIZE`]/[`ERASE_SIZE`]-aligned and in
 ///   bounds, via the same [`check_bounds`] the real driver uses.
 ///
-/// Power loss is modelled only at PROGRAM GRANULARITY, via
-/// `FakeFlash::refuse_programs_after` — inline code and NOT an intra-doc link,
+/// Power loss is modelled at PROGRAM granularity via
+/// `FakeFlash::refuse_programs_after` and at PAGE-ERASE granularity via
+/// `FakeFlash::refuse_erases_after` — inline code and NOT intra-doc links,
 /// because the type is declared inside this module and so is not in scope at the
 /// module doc, and `cargo doc --no-deps` at 0 warnings is a gate. A refusal
 /// scheduled part way through a multi-chunk `BincodeFlashWriter` write tears that
 /// write, which is what the A/B ordering pin in
-/// `hal/tests/integration_frostsnap_over_hal.rs` needs. What stays true, and is
+/// `hal/tests/integration_frostsnap_over_hal.rs` needs; the erase-scheduled form is
+/// what that file's ROLLBACK pin needs, because `Slot::try_write` erases before it
+/// writes, so a refused PROGRAM leaves the loser A/B copy BLANK while a refused
+/// ERASE leaves it holding the OLD value at the OLD index. What stays true, and is
 /// the reason the tear is still not the silicon's: a refused program is
 /// ALL-OR-NOTHING — the check runs before any cell is touched — so a tear lands
 /// only on a 256-byte buffer boundary, never mid-doubleword and never as a
@@ -1458,7 +1462,7 @@ pub mod fake {
         /// the partition layout. That crate's fault flash is `#[cfg(test)]` and so
         /// unreachable from here, which is why this exists.
         pub fn refuse_programs_now(&mut self) {
-            self.refuse_programs_from = Some(self.programs);
+            self.refuse_programs_after(self.programs);
         }
 
         /// Refuse every program from the `doublewords`'th onward, so a fault can
@@ -1482,8 +1486,41 @@ pub mod fake {
         }
 
         /// Refuse every erase from the current count onward, reporting `WRPERR`.
+        ///
+        /// Both `_now` forms delegate to their `_after` form rather than assigning the
+        /// field, so the equivalence each `_after` doc states — "`now` is `after(the
+        /// current count)`" — is held by the compiler instead of by a second copy of
+        /// the same line that can drift away from it.
         pub fn refuse_erases_now(&mut self) {
-            self.refuse_erases_from = Some(self.erases);
+            self.refuse_erases_after(self.erases);
+        }
+
+        /// Refuse every erase from the `erases`'th onward, so a fault can land
+        /// BETWEEN the two page erases of one A/B update rather than before both.
+        ///
+        /// Units are PAGES, and that is NOT the same unit
+        /// [`FakeFlash::refuse_programs_after`] takes: [`FakeFlash::erases`]
+        /// accumulates `len / ERASE_SIZE` per call, so one
+        /// `FlashPartition::erase_all` over an n-sector partition counts n, whereas
+        /// `programs` counts DOUBLEWORDS. The first erase whose PRE-call count has
+        /// reached `erases` is refused, and every one after it;
+        /// `refuse_erases_now()` is this called with the current `erases`.
+        ///
+        /// The point of the counted form is the state the program-scheduled form
+        /// CANNOT reach. `Slot::try_write` runs `erase_all()?` as its first
+        /// statement, so an `AbWriteOutcome::CommittedSingleCopy` reached by
+        /// refusing the second copy's PROGRAM leaves that copy BLANK, while one
+        /// reached by refusing its ERASE leaves it holding the OLD value at the OLD
+        /// index. Only the second makes an index REWIND observable, and a rewind
+        /// under unchanged ratchet material is the affine nonce break — see
+        /// `a_further_refused_write_after_an_erase_refused_single_copy_does_not_roll_the_index_back`
+        /// in `hal/tests/integration_frostsnap_over_hal.rs`.
+        ///
+        /// `AbWriteOutcome` is inline code, not an intra-doc link: `frostsnap_embedded`
+        /// is a DEV-dependency (`hal/Cargo.toml:131`), so `cargo doc -p coldsnap_hal`
+        /// cannot resolve it and a link here would be a rustdoc warning, which is a gate.
+        pub fn refuse_erases_after(&mut self, erases: u32) {
+            self.refuse_erases_from = Some(erases);
         }
 
         /// Stop refusing. The cells are untouched, so a test can inspect exactly
