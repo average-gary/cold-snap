@@ -168,7 +168,14 @@ pub enum RngSource {
 
 impl RngSource {
     /// Bytes this source returns in `buf[0]`. SE1 = 32, SE2 = 8
-    /// (`dispatch.c:588`, `:593`).
+    /// (`dispatch.c:587`, `:593` — the two `buf_io[0] = N;` statements).
+    ///
+    /// **The SE1 half read `:588` until 2026-09-14, and the pair is worth a note
+    /// because only ONE half was wrong.** `:587` is `buf_io[0] = 32;` and `:588` is
+    /// the `break;` after it, while `:593` really is `buf_io[0] = 8;` (its `break`
+    /// is `:594`). So this was not a systematic off-by-one — one citation pointed at
+    /// the assignment and the other at the terminator, which is the tell that the
+    /// pair was written by reading one case and inferring the other's offset.
     ///
     /// Named `byte_count`, not `len`: this is a fixed per-source constant, not a
     /// collection length, and `len` without `is_empty` is a clippy lint.
@@ -338,7 +345,9 @@ pub fn parse_rng_response(source: RngSource, buf: &[u8], out: &mut [u8]) -> Resu
     if buf.len() < RNG_BUF_LEN || out.len() != want {
         return Err(Errno::SHORT_READ);
     }
-    // buf[0] is the gate's own count (dispatch.c:588, :593). Trusting it
+    // buf[0] is the gate's own count (dispatch.c:587, :593 — the two
+    // `buf_io[0] = N;` statements; the SE1 half read :588, the `break`, until
+    // 2026-09-14). Trusting it
     // blindly is what Coldcard does (callgate.py:116-122); we require it to be
     // exactly what this source promises.
     if usize::from(buf[0]) != want {

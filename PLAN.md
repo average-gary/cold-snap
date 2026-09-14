@@ -2307,14 +2307,21 @@ reachability is not hypothetical and does not need a corrupt frame — an ordina
         and requires `show_backup` to answer `Err(Refused(DisplayBackup))` afterwards),
         `a_cancelled_ceremony_cannot_be_acked_as_recorded`,
         `cancel_drops_a_live_quiz_and_a_pass_acks_once`, `cancel_drops_a_half_typed_backup`.
-      - **THE FIFTH, `pending_name`, has the coverage but not the RECORD.**
-        `a_previewed_name_is_neither_written_nor_announced` ends with a live falsifiable
-        `assert_eq!(session.pending_name(), None)` after a `Cancel`, so deleting
-        `self.pending_name = None` fails it TODAY — but that test's own MUTATION-VERIFY note
-        names a DIFFERENT mutation ("Save or announce the name from the `Naming` arm"). A
-        false record of a true fact, which is the class 9d199df spent 64 corrections on.
-        **STILL OPEN as of 2026-09-13**: it is a one-sentence edit inside
-        `firmware/src/lib.rs`, which was not in the doc lane's write set this round.
+      - **THE FIFTH, `pending_name`, had the coverage but not the RECORD — CLOSED
+        2026-09-14.** `a_previewed_name_is_neither_written_nor_announced` ends with a live
+        falsifiable `assert_eq!(session.pending_name(), None)` after a `Cancel`, and that
+        test's MUTATION-VERIFY note named a DIFFERENT mutation ("Save or announce the name
+        from the `Naming` arm") — a false record of a true fact, which is the class 9d199df
+        spent 64 corrections on. **This read "STILL OPEN as of 2026-09-13" until
+        2026-09-14**, because the one-sentence edit lives in `firmware/src/lib.rs`, which
+        was not in the doc lane's write set that round. The note now records BOTH facts, and
+        the second one is MEASURED rather than asserted: deleting `self.pending_name = None;`
+        from the `Cancel` arm gives `cargo test --target aarch64-apple-darwin -p
+        coldsnap_firmware` **exit 101, EXACTLY ONE named failure**,
+        `a_previewed_name_is_neither_written_nor_announced`, `left: Some("cold-1") right:
+        None`. One failure and not two is the load-bearing part: it confirms this test is
+        the ONLY witness, so the ordinal in this list is now a fact about the tree rather
+        than an inference from reading.
       - **THE SIXTH, `signer.clear_tmp_data()`, has NO assertion anywhere on the `Cancel`
         path.** `cancel_is_handled_and_silent` — the test the withdrawn count listed as the
         fifth witness — opens a FRESH session with no half-finished state and asserts only

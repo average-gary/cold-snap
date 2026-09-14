@@ -3021,8 +3021,15 @@ mod tests {
         )))
     }
 
-    /// Copied from `hal/examples/stub.rs`: a deterministic `Entropy` through the
-    /// real `mix_sources` seam.
+    /// Copied from `firmware/examples/stub.rs`: a deterministic `Entropy` through
+    /// the real `mix_sources` seam.
+    ///
+    /// **This said `hal/examples/stub.rs` until 2026-09-14; there is no such file**
+    /// (`ls hal/examples` = `heap_lifo.rs`, `heap_profile.rs`, `ui_render.rs`). The
+    /// same wrong path was corrected at `hal/src/lib.rs`'s `FS_NONCE_LEN` and
+    /// `hal/src/heap.rs`'s `MEASURED_ARENA_FOOTPRINT_BYTES` on 2026-09-13 and this
+    /// third site was missed — two of three, which is the N-1-of-N shape that pass
+    /// was commissioned to find, inside the commit that named it.
     fn entropy(salt: u8) -> Entropy {
         let varying = |len: usize, salt: u8| {
             let mut b = [0u8; 32];
@@ -4736,9 +4743,21 @@ mod tests {
     /// preview that wrote would erase the region per keystroke and a preview that
     /// prompted would demand one keypress per letter.
     ///
-    /// MUTATION-VERIFY. Save or announce the name from the `Naming` arm and this
-    /// fails: a coordinator would be able to name this device with no human
-    /// involved at all.
+    /// MUTATION-VERIFY, and it holds TWO separate facts — the second one was
+    /// unrecorded until 2026-09-14.
+    ///
+    /// 1. Save or announce the name from the `Naming` arm and this fails: a
+    ///    coordinator would be able to name this device with no human involved at all.
+    /// 2. **This test is also the only witness for the `Cancel` arm's
+    ///    `self.pending_name = None;` clearing.** Delete that one line and the closing
+    ///    `assert_eq!(session.pending_name(), None)` below fails — MEASURED, exit 101,
+    ///    this test by name. It matters because `cancel_is_handled_and_silent` is NOT
+    ///    a witness for any of the six clearings: it asserts only `prompts.is_empty()`
+    ///    and `out.frames() == 0`, so all six can be deleted and it stays green. The
+    ///    register's `Cancel` accounting is therefore FOUR clearings with a named
+    ///    mutation-verified test, this one as the fifth, and `clear_tmp_data` as the
+    ///    sixth with no assertion anywhere — not the "five of six" it read until
+    ///    2026-09-13.
     #[test]
     fn a_previewed_name_is_neither_written_nor_announced() {
         let flash = fs_flash();
