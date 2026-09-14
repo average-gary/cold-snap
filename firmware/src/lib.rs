@@ -520,7 +520,7 @@ const NAME_DOMAIN: &str = "coldsnap/device-name/v1";
 /// `name_len` at 0, the UTF-8 bytes at 1, zero padding, then the checksum in the
 /// final doubleword — the same commit-last shape as `store`'s share record and
 /// `identity`'s `MAGIC`, and for the same reason: `StmFlash::write` programs
-/// doublewords in ascending order (`hal/src/flash.rs:1256`), so a tear leaves the
+/// doublewords in ascending order (`hal/src/flash.rs`, the loop in `write`), so a tear leaves the
 /// tail at `0xff` and the record reads as absent rather than as a truncated name.
 const NAME_OFF: usize = 1;
 const NAME_TAG_OFF: usize = 64;
@@ -983,8 +983,20 @@ impl<'a, F: NorFlash + fmt::Debug> Session<'a, F> {
             }
 
             // The coordinator abandoned whatever it had started. Dropping the
-            // half-finished keygen/backup state matters: keeping it makes the
-            // next legitimate message fail on a stale state.
+            // half-finished keygen/backup state matters, but NOT for the reason this
+            // comment used to give ("keeping it makes the next legitimate message fail
+            // on a stale state") — MEASURED FALSE, and in the dangerous direction.
+            // Every read of the signer's tmp state is a map lookup whose HIT is the
+            // SUCCESS path: keygen is `tmp_keygen_phase*.insert` /
+            // `remove(&keygen_id)` (`device/keygen.rs:141,174,231,276`), so a stale
+            // phase blocks neither a fresh `keygen_id` nor a repeat of the same one
+            // (probed: `Begin`, `Cancel`, then `Begin` under both ids, all `Ok` with
+            // this line deleted); restoration is
+            // `tmp_loaded_backups.remove(&share_image)` on save and `get` on
+            // consolidate (`device/restoration.rs:88,134`). So stale tmp data fails
+            // OPEN: without this line a `SavePhysicalBackup2` that must be REFUSED
+            // instead persists the abandoned ceremony's plaintext `ShareBackup`.
+            // `cancel_drops_a_typed_in_share_before_it_can_be_saved` is the witness.
             CoordinatorSendBody::Cancel => {
                 self.signer.clear_tmp_data();
                 // Including the previewed name: it belonged to the flow that was
@@ -4754,10 +4766,13 @@ mod tests {
     ///    this test by name. It matters because `cancel_is_handled_and_silent` is NOT
     ///    a witness for any of the six clearings: it asserts only `prompts.is_empty()`
     ///    and `out.frames() == 0`, so all six can be deleted and it stays green. The
-    ///    register's `Cancel` accounting is therefore FOUR clearings with a named
-    ///    mutation-verified test, this one as the fifth, and `clear_tmp_data` as the
-    ///    sixth with no assertion anywhere — not the "five of six" it read until
-    ///    2026-09-13.
+    ///    register's `Cancel` accounting is therefore SIX of six as of 2026-09-14: four
+    ///    that already had one, this test as the fifth, and
+    ///    `cancel_drops_a_typed_in_share_before_it_can_be_saved` as the sixth for
+    ///    `clear_tmp_data` — not the "five of six" it read until 2026-09-13, and not
+    ///    the "five witnessed, sixth unwitnessed" this paragraph itself read before the
+    ///    sixth landed. Each of the six deletions fails exactly one test, its own;
+    ///    measured over all six.
     #[test]
     fn a_previewed_name_is_neither_written_nor_announced() {
         let flash = fs_flash();
@@ -4937,7 +4952,8 @@ mod tests {
 
     /// A torn or scribbled name region reads as NO NAME, never as a truncated
     /// name: the checksum is the last doubleword of the record, and program order
-    /// is ascending (`hal/src/flash.rs:1256`).
+    /// is ascending (`hal/src/flash.rs`, the loop in `write`; cited as `:1256` — the
+    /// `# Panics` line of the same fn — at four sites until 2026-09-14).
     ///
     /// MUTATION-VERIFY. Delete the `tag != name_tag(body)` arm from
     /// `NameStore::load` and this fails: the 0xff tail decodes as a name whose
@@ -7566,6 +7582,80 @@ mod tests {
         );
     }
 
+    /// **A CANCELLED CEREMONY'S TYPED-IN SHARE CANNOT BE SAVED.** The witness for the
+    /// SIXTH clearing in `recv`'s `Cancel` arm, `self.signer.clear_tmp_data()` — the
+    /// only one of the six with nothing asserting on it before this test, which is why
+    /// `cancel_is_handled_and_silent` stayed green with all six deleted.
+    ///
+    /// No `vendor/` accessor was needed for it. `tmp_loaded_backups` is private and
+    /// `FrostSigner` exposes no reader, but it does not have to: `SavePhysicalBackup2`
+    /// is `tmp_loaded_backups.remove(&share_image)` and errors on a MISS
+    /// (`device/restoration.rs:88-119`), so the map's emptiness is visible through
+    /// `Session::recv`'s ordinary `Result`. `a_device_ready_to_consolidate` drives this
+    /// exact prefix and the save SUCCEEDS there, so the `Cancel` is the only difference
+    /// between the two.
+    ///
+    /// The clearing FAILS OPEN, which is why it is the one that matters most on this
+    /// path: without it the save lands and stages a `Mutation::Restoration` carrying
+    /// the abandoned ceremony's plaintext `ShareBackup` — a share a human typed for a
+    /// ceremony the coordinator dropped, persisted under whatever `key_name` and
+    /// threshold the NEXT coordinator chose. That is the opposite direction from the
+    /// one the `Cancel` arm's comment used to claim; see the note there.
+    ///
+    /// MUTATION-VERIFY. Drop `self.signer.clear_tmp_data();` from the `Cancel` arm and
+    /// this is the ONLY test that fails (exit 101, 1 failed / 120 passed), on
+    /// `BackupSaved`: the save returns `Ok`.
+    ///
+    /// CONTROLS, all five run. Dropping any ONE of the other clearings instead leaves
+    /// this test GREEN and fails exactly its own witness — `self.pending_name = None`
+    /// -> `a_previewed_name_is_neither_written_nor_announced`, `self.reveal = None` ->
+    /// `a_reveal_grant_ends_with_its_pages_and_is_revoked_by_cancel`,
+    /// `self.record_pending = false` -> `a_cancelled_ceremony_cannot_be_acked_as_recorded`,
+    /// `self.entry = None` -> `cancel_drops_a_half_typed_backup`, `self.check = None` ->
+    /// `cancel_drops_a_live_quiz_and_a_pass_acks_once`, one failure each. So the six
+    /// clearings partition cleanly over six witnesses with no overlap, and this one
+    /// names the sixth: by the time a share is fully entered, `entry_key`'s `take` has
+    /// already dropped the entry and no other grant was ever issued, so the signer's
+    /// tmp data is the ONLY state `Cancel` has left to clear here.
+    #[test]
+    fn cancel_drops_a_typed_in_share_before_it_can_be_saved() {
+        let flash = fs_flash();
+        let mut rng = entropy(163);
+        let secret = identity::load_or_create(&mut *flash.borrow_mut(), &mut rng).unwrap();
+        let mut session = Session::open(&flash, &secret).unwrap();
+        let mut out = Outbox::new(session.device_id());
+        let share = a_share_to_type_in(&mut rng);
+
+        consent_to_an_entry(&mut session, &mut rng, &mut out, 19);
+        type_index(&mut session, &mut out, share.index);
+        let step = type_words(&mut session, &mut out, &share.words);
+        assert_eq!(typed(&step), "Ended", "a real 25-word share must checksum");
+
+        session
+            .recv(CoordinatorSendBody::Cancel, &mut rng, &mut out)
+            .expect("Cancel is handled");
+
+        let fault = session
+            .recv(save_request(&share), &mut rng, &mut out)
+            .expect_err("a cancelled ceremony's share must not be savable");
+        // NARROWING, not decoration, and falsifiable on its own: make the dispatch
+        // return `Err(Fault::Refused(..))` for `SavePhysicalBackup2` and the `expect_err`
+        // above still passes while this line fails — MEASURED. It is what stops a
+        // firmware-side blanket refusal from passing as evidence that `clear_tmp_data`
+        // ran.
+        assert!(
+            matches!(fault, Fault::Signer(_)),
+            "expected the signer to find nothing to save, got {fault:?}"
+        );
+        // No `out.frames()` assertion here, deliberately. It would be DOMINATED by the
+        // `expect_err` above — under the mutation this test exists for, the save returns
+        // `Ok` and the frames line is never reached — and the fact it would state is
+        // already pinned for this exact message by
+        // `save_physical_backup2_without_an_entered_backup_is_refused_by_the_signer`'s
+        // "a refused message must not answer". A second copy would be an assertion that
+        // cannot fail.
+    }
+
     /// Backing out of the share index ends the entry and sends NOTHING.
     ///
     /// Silence is the honest wire behaviour and not a gap: `DeviceRestoration` has no
@@ -7704,8 +7794,12 @@ mod tests {
         assert!(matches!(fault, Fault::NotConfirmable), "got {fault:?}");
     }
 
-    /// Cancel is handled and silent: it clears half-finished state without
-    /// answering.
+    /// Cancel is handled and answers NOTHING.
+    ///
+    /// It asserts nothing about the six clearings and is not a witness for any of them:
+    /// all six can be deleted and this stays green (measured). Each has its own named
+    /// witness; they are listed on
+    /// `cancel_drops_a_typed_in_share_before_it_can_be_saved`.
     #[test]
     fn cancel_is_handled_and_silent() {
         let flash = fs_flash();
