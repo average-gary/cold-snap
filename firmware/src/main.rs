@@ -112,12 +112,15 @@
 //! # What is deliberately NOT brought up
 //!
 //! * **No clock, PWR or RCC work here.** `usb::bring_up` enables `OTGFSEN`,
-//!   `PWREN` and `PWR_CR2.USV` itself (`hal/src/usb.rs:1755-1790`); the 48 MHz
+//!   `PWREN` and `PWR_CR2.USV` itself (`usb::enable_clocks`; cited as
+//!   `hal/src/usb.rs:1755-1790` until 2026-09-14, a range that is
+//!   `deactivate_endpoints` plus that fn's first two lines and stops BEFORE the
+//!   `PWREN`/`USV` writes it names); the 48 MHz
 //!   CLK48 source is assumed live from the bootloader's PLLSAI1-Q and is
 //!   programmed by nobody in this tree. That is a documented gap in [`usb`], not
 //!   one this file papers over.
 //! * **No back key on a prompt.** `ui::SignPages`' footer advertises `(9)next`
-//!   and nothing else (`hal/src/ui.rs:879`), so on a *prompt* `7` — even though
+//!   and nothing else (`ui::NEXT_LEGEND`), so on a *prompt* `7` — even though
 //!   `ui::BACK_KEY` names it — is a key the glass never offers, and an
 //!   unadvertised key must not be a hidden command: [`answer`] refuses it like
 //!   any other wrong key. The backup pages are the one screen whose footer does
@@ -178,7 +181,8 @@
 //!   `4`, `6`). The quiz's are [`ui::QUIZ_KEYS`], `1`/`2`/`3`, and **all three** are in
 //!   the charset. There is no byte-level separation to lean on in either case, unlike
 //!   [`ui::NEXT_KEY`]/[`ui::BACK_KEY`] which are const-asserted off the charset
-//!   (`hal/src/ui.rs:1069-1076`). [`Consent::Entry`] and [`Consent::Quiz`] are the whole
+//!   (`hal/src/ui.rs`'s `const _: ()` block over `CONFIRM_CHARSET`). [`Consent::Entry`]
+//!   and [`Consent::Quiz`] are the whole
 //!   separation, and both are UNIT variants: no digit to accept and no prompt to hand
 //!   `Session::confirm_at`, so [`Answer::Yes`] is unreachable while a share is being
 //!   typed or a candidate is being picked — the same type-level argument
@@ -402,9 +406,10 @@ enum Consent<'a> {
     /// worse rather than better: the quiz's answer keys are [`ui::QUIZ_KEYS`] (`1`,
     /// `2`, `3`) and **all three are members of [`ui::CONFIRM_CHARSET`]** (`12346`), so
     /// a keypress alone cannot say whether a human meant "candidate 2" or "confirm".
-    /// There is no const-assert to fall back on either — `hal/src/ui.rs:1069-1076`
+    /// There is no const-assert to fall back on either — `hal/src/ui.rs`'s `const _: ()`
+    /// block over `CONFIRM_CHARSET`
     /// asserts only that `NEXT_KEY` and `BACK_KEY` stay *out* of the charset, and
-    /// `hal/src/ui.rs:2503-2515` asserts only that a quiz key is not also a paging,
+    /// its `const _: ()` block over `QUIZ_KEYS` asserts only that a quiz key is not also a paging,
     /// cancel or OK key. This variant is the whole separation: with no
     /// [`ui::ConfirmDigit`] in scope there is nothing to accept, and with no prompt
     /// there is nothing to hand `Session::confirm_at`, so [`Answer::Yes`] is
@@ -421,7 +426,7 @@ enum Consent<'a> {
 ///
 /// **FAIL CLOSED.** Exactly one key confirms — the one the screen printed — and
 /// everything else is [`Answer::No`], which is a refusal and not a retry. That is
-/// [`ui::ConfirmDigit::accepts`]'s own contract (`hal/src/ui.rs:914`,
+/// [`ui::ConfirmDigit::accepts`]'s own contract (its whole body is
 /// `key == self.0`) and Coldcard's rule at its highest-stakes approval
 /// (`shared/hsm_ux.py:66`, `self.refused = (ch != confirm_char)`). A loop that
 /// waited for a *valid* key instead of refusing an invalid one would let a human
@@ -1083,7 +1088,7 @@ fn entry_frame(
 /// means.
 ///
 /// Two states rather than a unit variant, and the second one is not decoration:
-/// `ui::backup_quiz_passed`'s footer prints `(x)done` (`hal/src/ui.rs:2457`), so a key
+/// `ui::backup_quiz_passed`'s footer prints `(x)done` (`ui::QUIZ_DONE_LEGEND`), so a key
 /// has to be able to dismiss that screen. `Session::quiz_key` cannot serve it — the
 /// pass DROPPED the quiz, so every later call refuses — and a refusal drawn over
 /// "Quiz passed" would be a screen saying CANNOT DISPLAY for a quiz that displayed
@@ -3232,7 +3237,9 @@ mod tests {
     /// Clamping is `shared/ux.py:237-247`'s own behaviour (page-down is a `min()`),
     /// and it cannot fail open: `Answer::Wait` authorises nothing, re-parks the same
     /// frame, and `ui::NEXT_KEY` is const-asserted out of `CONFIRM_CHARSET`
-    /// (`hal/src/ui.rs:891-902`) so it is not a key any screen can ask for. The cost
+    /// (`hal/src/ui.rs`'s `const _: ()` block over `CONFIRM_CHARSET`; this cited
+    /// `:891-902`, the `standby` doc, until 2026-09-14) so it is not a key any screen
+    /// can ask for. The cost
     /// of the alternative is real: one over-press at the end of a 67-page
     /// transaction would drop the prompt and the coordinator would have to re-issue
     /// the whole request.
@@ -3267,7 +3274,7 @@ mod tests {
     }
 
     /// `ui::BACK_KEY` is **not** a hidden command on a prompt. No prompt footer
-    /// advertises it (`hal/src/ui.rs:879` prints `(9)next` and nothing else), so on
+    /// advertises it (`ui::NEXT_LEGEND` is `(9)next` and nothing else), so on
     /// a prompt it is refused like any other key the glass did not offer — on
     /// either page of a set, and whatever digit was drawn.
     ///
@@ -4214,9 +4221,25 @@ mod tests {
             1,
             "the consent call must pass the drawn page, exactly once"
         );
+        // ANCHORED at its measured 16-space indent, 2026-09-14. The count directly above
+        // reads 1 either way, because a `// `-commented copy of this line still contains the
+        // counted needle — that is the trap this whole pass was about: a count of 1 is
+        // SATISFIED BY A DEAD COPY, so it stops a second live call and says nothing about the
+        // first having been commented out.
+        //
+        // MEASURED: comment this line out and put the same arm with
+        // `page.saturating_sub(1)` under it. ALL 172 firmware tests GREEN exit 0, AND
+        // `cargo build --release` exit 0 with ZERO warnings. The signer is then asked about
+        // a page the human never reached — the second of the two failure modes this test's
+        // own doc names, and the one that is a signature on a screen nobody read rather than
+        // a refusal. `session.confirm(` staying at 0 does not see it either: the mutated call
+        // is still `confirm_at`.
         assert!(
-            src.contains("Answer::Yes => match session.confirm_at(prompt, page,"),
-            "Answer::Yes must be the only thing in front of it"
+            src.contains(
+                "\n                Answer::Yes => match session.confirm_at(prompt, page,"
+            ),
+            "Answer::Yes must be the only thing in front of it, at the depth the live arm \
+             sits at"
         );
         // The page-0 wrapper is fail-closed for a paged request, but using it here
         // would silently refuse every real transaction.
@@ -4238,8 +4261,27 @@ mod tests {
         // _page`'s own "one press of the right key in five signed it". `match ` is what
         // makes the needle unique, and the call site's comment already promises the line
         // is `cargo fmt`-stable for exactly this kind of reason.
+        // AND THE READ IS ANCHORED at its measured 12-space indent, 2026-09-14. The `ask(`
+        // count does NOT hold this: a `// `-commented copy is still text, so it supplies one
+        // of the two occurrences and the count reads 2 whether the live call is there or not.
+        //
+        // MEASURED 2026-09-14, and this is the worst mutation found in this file: comment
+        // this line out, put `let _ = (consent, last);` and `match Answer::Yes {` under it,
+        // and the arms below attach to a constant. ALL 172 firmware tests GREEN exit 0, AND
+        // `cargo build --release` exit 0 with ZERO warnings — the `let _` is what keeps the
+        // two bindings live, so nothing in the tree objects. EVERY parked prompt then
+        // auto-confirms with no key pressed and no human present: `confirm_at` is reached on
+        // a signing request, a `DisplayBackup`, an `EnterBackup` and a `CheckBackup` alike.
+        // That is the whole consent gate, gone, in an edit that ships.
+        //
+        // The second conjunct is deliberately left BARE, and the reason is a measurement
+        // rather than symmetry: commenting it out and putting `let consent = Consent::Pages;`
+        // under it fails `cargo build --release` with "variant `Prompt` is never constructed"
+        // plus an unfulfilled lint expectation — 2 warnings against a 0-warnings gate — so
+        // the device build is what holds it. This is `Consent::Prompt`'s only construction
+        // site in the image.
         assert!(
-            src.contains("match ask(keypad.as_mut(), &mut entropy, consent, last) {")
+            src.contains("\n            match ask(keypad.as_mut(), &mut entropy, consent, last) {\n")
                 && src.contains("let consent = Consent::Prompt(&prompt, confirm);"),
             "the gate must be told which page the frame showed, and with which digit"
         );
@@ -4261,14 +4303,39 @@ mod tests {
         // `the_entry_screen_answers_every_byte_as_a_keystroke`; what is pinned here is
         // that `boot` gets the pair from `flow_consent` rather than writing its own, so
         // the tested function is the one on the device.
+        // ANCHORED at the measured 12-space indent, 2026-09-14, and the mutation is quoted in
+        // the SHIPPING form because the first one measured here was not: commenting this line
+        // out and putting `let (consent, last) = (Consent::Quiz, true);` under it does leave
+        // ALL 172 firmware tests GREEN at exit 0, but it also makes `flow_consent`,
+        // `reveal_consent` and three `Consent` variants dead, which is 3 warnings against the
+        // 0-warnings `cargo build --release` gate. So that variant is held by the device
+        // build, not by this pin.
+        //
+        // The form this anchor is the ONLY witness for keeps the function live:
+        // `let (consent, last) = (Consent::Quiz, flow_consent(flow).1);`. MEASURED — 172
+        // firmware tests GREEN exit 0 AND `cargo build --release` exit 0 with ZERO warnings.
+        // All three backup screens are then answered by the QUIZ's rule, so the recorded
+        // question can never reach `Answer::Yes` and the ack it gates becomes unreachable,
+        // and the pairing the value tests drive is no longer the pairing on the device. No
+        // count in this module sees it: the counted needle is the whole arm
+        // `Flow::Check(_) => (Consent::Quiz, true),`, which an inline tuple does not contain.
         assert!(
-            src.contains("let (consent, last) = flow_consent(flow);"),
+            src.contains("\n            let (consent, last) = flow_consent(flow);\n"),
             "the backup screens must take their consent kind from `flow_consent`"
         );
         assert!(
             src.contains("Flow::Reveal(state) => reveal_consent(state),"),
             "`flow_consent` must delegate the reveal to the function its own tests drive"
         );
+        // This one stays BARE, and so do the three other single-line arm pins in this module
+        // that sit in HOST-COMPILED functions rather than in `boot` (`answer`'s unbinding
+        // prompt arm, `reveal_draw`'s `Ok(true)` pairing, `reveal_consent`'s recorded arm).
+        // Reason, MEASURED 2026-09-14: commenting this arm out and putting
+        // `Flow::Reveal(_) => (Consent::Quiz, true),` under it fails
+        // `a_share_on_the_glass_is_paged_with_no_digit` by name, exit 101 — BY VALUE, at the
+        // assertion that compares `flow_consent(Flow::Reveal(state))` against
+        // `reveal_consent(state)` for every state. `boot`'s lines have no such witness, which
+        // is the whole reason they are the ones that got anchored in this pass.
         assert_eq!(
             src.matches("Consent::Pages,").count(),
             1,
@@ -4294,8 +4361,25 @@ mod tests {
         // constant, and a constant `None` is a device that consents to a reveal, or to
         // an ingest, and then draws nothing — which is exactly the state the reveal was
         // repaired from.
+        // ANCHORED at the measured 12-space indent, 2026-09-14, and the paragraph above is
+        // what makes that necessary: it names a constant `None` as the fail-open, and the bare
+        // needle did not hold it. Two variants were measured and only the second is this
+        // anchor's alone:
+        //
+        //   * `let grant = None;` under a commented-out copy — 172 firmware tests GREEN exit
+        //     0, and all three `Some(Grant::..)` counts still 2, but `cargo build --release`
+        //     then reports `grants` and `Grant` as never used: 2 warnings against a 0-warnings
+        //     gate. Held by the device build.
+        //   * `let grant = grants(&prompt).and(None);` under a commented-out copy — 172
+        //     firmware tests GREEN exit 0 AND `cargo build --release` exit 0 with ZERO
+        //     warnings, because the call is still there and only its result is thrown away.
+        //     Nothing else in the tree sees this one.
+        //
+        // Either way a `DisplayBackup` consent takes the `None` arm, `prompts` is empty on
+        // that leg by the library's design, and the device says yes to a reveal and draws
+        // nothing: the exact state the reveal was repaired from.
         assert!(
-            src.contains("let grant = grants(&prompt);"),
+            src.contains("\n            let grant = grants(&prompt);\n"),
             "the grant must be read off the prompt that was answered"
         );
         // EACH NEEDLE CARRIES THE ARM'S FIRST BODY LINE. The bare arm HEADERS were what
@@ -4307,6 +4391,13 @@ mod tests {
         // in plain, which is the exact failure `grants` exists to prevent. Production's
         // own comments say "THE REVEAL STARTS HERE, and only here"; these are what make
         // that true. Indents measured: arm 32 spaces, body 36.
+        // `match grant {` is LEFT BARE, and the reason is a measurement, not the arm needles
+        // beside it. MEASURED 2026-09-14: comment it out and put `match None {` under it —
+        // which passes all three `Some(Grant::..)` counts and all 172 firmware tests — and
+        // `cargo build --release` reports "unused variable: `grant`", 1 warning against a
+        // 0-warnings gate. The anchor added to `let grant = grants(&prompt);` above is what
+        // makes that reliable: `grant` is bound by a line that is now pinned at its own depth,
+        // and this is its only read, so severing the read cannot be done quietly.
         assert!(
             src.contains("match grant {")
                 && src.contains(
@@ -4378,10 +4469,27 @@ mod tests {
         // `boot`, so no host gate compiles it, and the arithmetic is on the ARGUMENT
         // rather than inside the function a value test can call. `reveal_step` is what
         // produces `page`, and it is checked by value.
+        // THE WHOLE ARM, at measured indents (20 / 24 / 28 / 32 / 24 / 20), and NOT the
+        // bare call line this carried until 2026-09-14. The bare needle pinned the call's
+        // TEXT; it said nothing about what may run BETWEEN the arm header that binds `page`
+        // and the call that consumes it, which is where the arithmetic actually goes.
+        //
+        // MEASURED 2026-09-14: `let page = page.saturating_add(1);` inserted as the first
+        // statement of this arm left the bare needle verbatim, left `show_backup_page(` at
+        // 2, `glass =` at 13 and `session.show_backup(` at 1, raised no `unused_variables`
+        // (the shadowed binding is read on the next line) and left ALL 172 firmware tests
+        // GREEN, exit 0 — reproducing the page-skip described at length above, drawn pages
+        // 0, 2, 4, 6 and a human asked "Wrote down all 25 words?" over 13 that were never
+        // on the glass. The block form is also what defeats the `// `-from-inside variant,
+        // because the leading `\n` plus the 20-space indent is then occupied by the comment
+        // marker; a bare needle survives that even though the count does not move.
         assert!(
-            src.contains("glass = show_backup_page(&mut session, page, panel, &mut entropy)"),
+            src.contains(
+                "\n                    RevealStep::Show(page) => {\n                        if let Some(panel) = panel.as_mut() {\n                            glass = show_backup_page(&mut session, page, panel, &mut entropy)\n                                .map(Flow::Reveal);\n                        }\n                    }\n"
+            ),
             "the reveal's step call must pass the cursor `reveal_step` produced, \
-             UNCHANGED -- any arithmetic here skips pages and no other gate can see it"
+             UNCHANGED, and nothing may sit between the arm that binds it and the call \
+             that draws it -- any arithmetic here skips pages and no other gate can see it"
         );
     }
 
@@ -4422,10 +4530,39 @@ mod tests {
         // 2026-09-13; this read EIGHT and omitted
         // `the_passed_quiz_screen_is_dismissed_by_any_key_and_acks_nothing`. A separate
         // assertion saying "the cut worked" would restate what those nine already hold.
-        include_str!("main.rs")
+        let prod = include_str!("main.rs")
             .split_once("#[cfg(test)]")
             .expect("`#[cfg(test)]` occurs nowhere in this file, not even as this literal")
-            .0
+            .0;
+        // THE SOUNDNESS PRECONDITION OF EVERY DEPTH ANCHOR BELOW, held ONCE, here, so that
+        // every consumer inherits it and no future pin can skip it. A `/* */` block comment
+        // that preserves indentation leaves a depth-anchored needle's bytes — the leading
+        // `\n`, the indent, the line, the trailing `\n` — entirely INTACT, so it defeats the
+        // anchor that a `// ` prefix cannot.
+        //
+        // MEASURED 2026-09-14: wrapping the live `EntryStep::Park => glass =
+        // Some(Flow::Entry),` arm in a `/* */` at its own 24-space indent and putting
+        // `EntryStep::Park => {}` under it left ALL 172 firmware tests GREEN, exit 0. That
+        // is the residue `every_exit_from_the_entry_takes_the_words_off_the_glass` recorded
+        // as a ceiling it could not close; this closes it for every pin in this module at
+        // once, which is why it lives here and not beside any one of them.
+        //
+        // `0` was MEASURED and not assumed: `/*` occurs nowhere in this file's production
+        // half today, so this is a fail-CLOSED guard on a fact that already holds and not a
+        // retroactive style rule. What it COSTS: a deliberate future block comment above
+        // the cut — or a `/*` inside a production string literal or doc example — is a
+        // FALSE RED. That is annoying, it is one line to fix (`// ` line comments), and it
+        // forces a human to read this paragraph before spending an anchor, which is the
+        // trade. The alternative is a silent hole under all 86 pins.
+        assert_eq!(
+            prod.matches("/*").count(),
+            0,
+            "a block comment in the production half keeps its indentation, so it leaves \
+             every depth-anchored needle in this module satisfied by bytes that no longer \
+             compile: use `// ` line comments above the cut, or re-measure every anchored \
+             pin against it"
+        );
+        prod
     }
 
     /// **The parked prompt is serviced once per iteration and never in a loop** —
@@ -4448,6 +4585,15 @@ mod tests {
     #[test]
     fn a_parked_prompt_is_serviced_once_per_iteration_and_never_in_a_loop() {
         let src = production_source();
+        // LEFT BARE on purpose, and the reason is a measurement rather than the count below.
+        // MEASURED 2026-09-14: comment this line out and put
+        // `while let Some((prompt, confirm, page, last)) = core::mem::take(&mut parked) {`
+        // under it — chosen because `core::mem::take` dodges the `parked.take()` count — and
+        // the build FAILS OUTRIGHT, at the host as well as on the device: "error: `while...
+        // else` loops are not supported". The `} else if let Some(flow) = glass.take() {` that
+        // this branch chains into is what makes any `while` here a compile error, so the
+        // exclusivity pin below and this one hold each other. No anchor can be stronger than
+        // a build failure.
         assert!(
             src.contains("if let Some((prompt, confirm, page, last)) = parked.take() {"),
             "the parked prompt must be serviced by ONE `if let`; a `while let` here \
@@ -4465,8 +4611,20 @@ mod tests {
         // two are mutually exclusive and an iteration still reads the pad at most
         // once. `if` instead of `else if` here would be two reads (100 ms) whenever
         // a coordinator parked a prompt while a backup was up.
+        //
+        // ANCHORED at the measured 8-space indent, 2026-09-14. The `glass.take()` count below
+        // does not hold it: a `// `-commented copy supplies the single occurrence it demands.
+        // MEASURED — comment this line out, and put a bare `}` plus
+        // `if let Some(flow) = core::mem::take(&mut glass) {` under it: 172 firmware tests
+        // GREEN exit 0 AND `cargo build --release` exit 0 with ZERO warnings, so it ships. The
+        // two branches stop being exclusive, and the cost is not only the second 100 ms read:
+        // the `Answer::Yes` arm above SETS `glass` when it starts a reveal, an entry or a
+        // quiz, so the same iteration would immediately take that cursor and read the pad
+        // again — the press that authorised the flow gets a second interpretation under a
+        // different `Consent`, and page 0 of a share can be dismissed by the key that asked
+        // for it.
         assert!(
-            src.contains("} else if let Some(flow) = glass.take() {"),
+            src.contains("\n        } else if let Some(flow) = glass.take() {\n"),
             "the backup flows must be the `else` of the parked prompt, not a second `if`"
         );
         assert_eq!(
@@ -4491,12 +4649,34 @@ mod tests {
         // that is routed is the verdict the pad just gave, against the state that is on
         // the glass. A second `ask` inside one of the arms would be the starvation this
         // test exists to prevent.
+        // THE READ AND THE REVEAL'S ROUTING ARM ARE BOTH ANCHORED, at their measured 12- and
+        // 16-space indents, 2026-09-14. The `ask(` count above holds neither: a
+        // `// `-commented copy still contains `ask(`, so the count reads 2 with the live call
+        // gone. MEASURED, both mutations GREEN across ALL 172 firmware tests at exit 0 AND
+        // `cargo build --release` at exit 0 with ZERO warnings, so both would ship:
+        //
+        //   * comment the read out, put `let _ = (consent, last);` and
+        //     `let verdict = Answer::Next;` under it — every backup flow then advances with
+        //     no key pressed, so a reveal pages itself through the share and the entry and
+        //     the quiz walk themselves forward while nobody is at the device.
+        //   * comment the reveal arm out and put `match reveal_step(state, Answer::Wait,
+        //     BACKUP_END)` under it — the pad IS read and its verdict is discarded, so every
+        //     press on a reveal page re-parks the same state: a page of the share stays lit
+        //     with no key that ends it and the ack can never be sent.
+        //
+        // `entry_step(verdict)` is deliberately left BARE, and the reason is MEASURED
+        // 2026-09-14 rather than argued: commenting it out and putting `EntryStep::End` under
+        // it fails `every_exit_from_the_entry_takes_the_words_off_the_glass` by name, at its
+        // cancel-guard needle, exit 101. That needle carries this same call INSIDE its block
+        // at interior indents, and a multi-line needle is immune to `// ` on any line but its
+        // first. Deleting the call outright is a build failure instead — the `if` it is the
+        // value of would then yield `()`.
         assert!(
-            src.contains("let verdict = ask(keypad.as_mut(), &mut entropy, consent, last);")
-                && src.contains(
-                    "Flow::Reveal(state) => match reveal_step(state, verdict, BACKUP_END) {"
-                )
-                && src.contains("entry_step(verdict)"),
+            src.contains(
+                "\n            let verdict = ask(keypad.as_mut(), &mut entropy, consent, last);\n"
+            ) && src.contains(
+                "\n                Flow::Reveal(state) => match reveal_step(state, verdict, BACKUP_END) {\n"
+            ) && src.contains("entry_step(verdict)"),
             "the flow's one pad read must feed `reveal_step` and `entry_step`, against \
              the state that is on the glass"
         );
@@ -4570,8 +4750,20 @@ mod tests {
         // on a unit that decoded nothing — the second failure mode this test's own doc
         // names. The set site carries its 28-space indent so it cannot leave the
         // decoded-frame arm for the `MagicBytes` arm or for above the `match`.
+        // ANCHORED 2026-09-14, and this is the one anchor in the file whose consequence is a
+        // BRICK rather than a leak. The bare form was defeated by the same `// `-from-inside
+        // edit that its own sibling on the next line was already anchored against: MEASURED,
+        // commenting the initialiser out and putting `let mut handled_frame = true;` under it
+        // left this needle satisfied from inside the comment, left the set-site anchor
+        // matching the live 28-space arm, left `clear_counter(` at 2 and the whole-block
+        // needle above intact, and ALL 172 firmware tests GREEN, exit 0 — while an EMPTY poll
+        // then clears the panic budget on every iteration, so the counter can never climb to
+        // `PANIC_RESET_THRESHOLD` and the bounded reset loop this test's doc describes becomes
+        // unbounded. At RDP=2 with DFU hardware-impossible and no PIN that unit is finished.
+        // The 8-space indent is measured and is the loop-local's own depth, so the anchor also
+        // says the initialiser did not move out of the loop.
         assert!(
-            src.contains("let mut handled_frame = false;")
+            src.contains("\n        let mut handled_frame = false;\n")
                 && src.contains("\n                            handled_frame = true;\n"),
             "the flag must start FALSE on every iteration and be set ONLY inside the \
              decoded-frame arm — otherwise `handled_frame` is true on a poll that \
@@ -4761,7 +4953,8 @@ mod tests {
     ///
     /// The overlap is real and there is no constant to lean on: `1`, `2`, `3`, `4` and
     /// `6` are live entry keys AND members of [`ui::CONFIRM_CHARSET`], unlike
-    /// [`ui::NEXT_KEY`]/[`ui::BACK_KEY`] which `hal/src/ui.rs:1069-1076` const-asserts
+    /// [`ui::NEXT_KEY`]/[`ui::BACK_KEY`], which `hal/src/ui.rs`'s `const _: ()` block
+    /// over `CONFIRM_CHARSET` const-asserts
     /// out of it. So what is checked here is that the two alphabets are separated by the
     /// [`Consent`] variant and by nothing else:
     ///
@@ -5101,8 +5294,23 @@ mod tests {
             1,
             "one place delivers a keystroke, so only it can end an entry"
         );
+        // ANCHORED at its measured 24-space indent, 2026-09-14. The count of 1 directly above
+        // cannot hold this, and the reason is the one this pass turned on: a `// `-commented
+        // copy of this line still contains `session.entry_key(`, so it SUPPLIES the single
+        // occurrence the count demands. A count of 1 is satisfied by a dead copy.
+        //
+        // MEASURED: comment this line out and put `EntryStep::Key(_key) => match
+        // Ok::<Typed, Fault>(Typed::Unchanged) {` under it. ALL 172 firmware tests GREEN exit
+        // 0, AND `cargo build --release` exit 0 with ZERO warnings, so it ships. The first
+        // keypress of an entry then delivers nothing and re-parks nothing — `glass` was
+        // already taken by `glass.take()` — so the typed prefix and the previous word stay
+        // lit with the flow cursor gone and no key left that ends them. Requirement 5's leak
+        // on keypress one, from the arm whose own comment calls itself "the whole point of
+        // the branch".
         assert!(
-            src.contains("EntryStep::Key(key) => match session.entry_key(key, &mut outbox) {"),
+            src.contains(
+                "\n                        EntryStep::Key(key) => match session.entry_key(key, &mut outbox) {\n"
+            ),
             "the keystroke must sit directly behind `EntryStep::Key` and carry that key"
         );
         // Two calls to the drawing function: the start, and every accepted keypress.
@@ -5129,9 +5337,10 @@ mod tests {
         // the typed prefix stays lit, which is the reveal's leak in the entry's clothing.
         // The leading `\n` plus the indent (24 and 28, measured at the two production
         // sites) puts `// ` on the anchor instead. Both forms are unique in the file.
-        // The residue, stated because no textual needle closes it: a `/* */` block comment
-        // that keeps the indentation leaves these bytes intact. That ceiling is shared by
-        // every `src.contains` pin in this file and is recorded once, in PLAN.md.
+        // The residue this used to record — a `/* */` block comment that keeps the
+        // indentation leaves these bytes intact — IS NOW CLOSED, and not here: the guard
+        // sits inside `production_source` itself, so every pin in this module inherits it.
+        // It was MEASURED green against this very arm before it was closed; see there.
         assert!(
             src.contains("\n                        EntryStep::Park => glass = Some(Flow::Entry),\n")
                 && src.contains(
@@ -5503,7 +5712,7 @@ mod tests {
     ///
     /// Two properties in one, because they are the same shape. The screen exists at all
     /// because `ui::backup_quiz_passed`'s footer prints `(x)done`
-    /// (`hal/src/ui.rs:2457`), and a legend naming a key that does nothing is the failure
+    /// (`ui::QUIZ_DONE_LEGEND`), and a legend naming a key that does nothing is the failure
     /// mode this file's const asserts exist to prevent. It is generous — every byte
     /// dismisses, not just `x` — because there is nothing on it a further press could
     /// change: the words are already off the glass (that screen takes a `usize` and
@@ -5732,10 +5941,27 @@ mod tests {
             "`CheckStep::Park` and `Checked::Unchanged` re-park without redrawing, and \
              nothing else may"
         );
+        // ANCHORED, both of them, and the anchor is what makes them falsifiable. The
+        // entry's identical pair was anchored on 2026-09-13 and the quiz's two were left
+        // bare; this is the same defect at the same depth-plus-one.
+        //
+        // MEASURED 2026-09-14: with the bare `contains` forms these two carried, commenting
+        // the live `CheckStep::Park` arm out and putting `CheckStep::Park => {}` under it
+        // left ALL 172 firmware tests GREEN, exit 0 — the needle matched from inside the
+        // `// `, and the count above stayed at 2 because the commented copy is still text.
+        // A `Wait` mid-quiz would then re-park NOTHING: the flow cursor is dropped while
+        // the three candidate rows stay lit, one of them the true word at the position
+        // being asked, which is requirement 6's leak with no key left that ends it. The
+        // leading `\n` plus the indent (24 and 32, measured at the two production sites)
+        // puts `// ` on the anchor instead. Both forms are unique in the file.
         assert!(
-            src.contains("CheckStep::Park => glass = Some(Flow::Check(state)),")
-                && src.contains("Ok(Checked::Unchanged) => glass = Some(Flow::Check(state)),"),
-            "an unchanged quiz screen must not be redrawn"
+            src.contains(
+                "\n                        CheckStep::Park => glass = Some(Flow::Check(state)),\n"
+            ) && src.contains(
+                "\n                                Ok(Checked::Unchanged) => glass = Some(Flow::Check(state)),\n"
+            ),
+            "an unchanged quiz screen must not be redrawn — and these are the QUIZ's two \
+             arms, at their own depths, not the entry's"
         );
         // BOTH ENDINGS DRAW. A pass draws the "8 of 25 words matched" screen over the
         // candidates and keeps the glass for it; giving up draws standby. Neither leaves
@@ -5747,8 +5973,19 @@ mod tests {
             ),
             "a passed quiz must draw the passed screen over the candidates"
         );
+        // ANCHORED for its siblings' reason, and the count above cannot stand in for it:
+        // `idle(&session, panel)` is pinned at 7 in the reveal's test, and a commented copy
+        // is still one of the seven. MEASURED 2026-09-14: with the bare form, commenting
+        // this arm out and putting `None => {}` under it left ALL 172 firmware tests GREEN,
+        // exit 0 — a human who pressed `x` to give up on the quiz then gets NO redraw, so
+        // the three candidates stay on the glass while `show_quiz` is never called and the
+        // cursor is gone. The 44-space indent is measured; it is the deepest anchor in this
+        // file and it is what says this `None` is the quiz's ending and not some other
+        // `Option`'s.
         assert!(
-            src.contains("None => idle(&session, panel),"),
+            src.contains(
+                "\n                                            None => idle(&session, panel),\n"
+            ),
             "a quiz the human gave up on must draw standby, and send nothing"
         );
         assert!(
