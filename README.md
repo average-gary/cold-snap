@@ -794,6 +794,49 @@ correct the −4,482 term to −4,558 — is deliberately NOT applied: it was wr
 retired 16,669 breakdown, and against THIS one it would drop the sum another 76 B and
 WIDEN the residual to 4,076. A term nobody can re-measure is not moved to make a total look
 tidy.
+
+**THE 1,252 B IS NOW LOCALISED — 2026-09-16, by rebuilding the ROOT COMMIT — AND IT IS THE
+SAME DEFECT AS PLAN.md §10's −76 B.** `73695f1` (2026-08-26) is this repo's only root
+commit, it builds clean on the same `1.88.0` pin, and it measures **880,024 B** with
+`libcoldsnap_hal` **25,667**, `libcoldsnap_firmware` **6,584** and
+`liblinked_list_allocator` **2,748** —
+`git worktree add --detach /private/tmp/cs-hist-aaaaaaaaaaaa 73695f1`, then
+`CARGO_TARGET_DIR=/private/tmp/cs-t-init CARGO_PROFILE_RELEASE_LTO=false cargo build
+--release` (exit 0), then `python3 tools/measure-flash.py
+'/private/tmp/cs-t-init/thumbv7em-none-eabihf/release/deps/*.rlib'` (exit 0, 50 rlibs, 43
+with allocatable sections). The worktree path is **33 characters, the same length as the
+main checkout's**, because panic `Location` strings embed it; the calibration is that HEAD
+measured the same way at the same path reproduces **899,707** and every component of the
+trajectory row above to the byte. PLAN.md §10 carries the full derivation. What it yields
+here: **the third-party rlib sum is an invariant 845,025 B**, measured twice — by
+subtraction at both trees, and directly by
+`cargo build --release -p frostsnap_core -p frostsnap_comms -p frostsnap_embedded
+-p frost_backup` at the root commit (exit 0), which measures `ALL, as built` = **845,025**.
+So this table's own total closes to residual **ZERO** without any narrative terms at all:
+845,025 + 30,627 + 21,000 + 2,748 = **899,400**, and equivalently
+**844,229 + 796 + 30,627 + 21,000 + 2,748 = 899,400**, where **+796 = 845,025 − 844,229** is
+the measured movement of the whole third-party set from the phase-0 baseline to today.
+
+**The six terms above are left exactly as they stand, and the residual is now a NAMED
+mismatch rather than a hole.** The four third-party terms sum to +5,101 +253 −4,482 −1,328 =
+**−456** against that measured **+796**, and 796 − (−456) = **1,252**. Three of the four
+are confirmed exactly: 844,229 + 5,101 = **849,330** and 849,330 − 4,482 = **844,848**, both
+of which `vendor/README.md` records independently, the second as its "vendored crates only"
+ledger row — so `844,229`, `+5,101` and `−4,482` close on a figure this paragraph never
+cites, residual zero, and `AUDIT-2026-09-10.md:713-714`'s prescription to move `−4,482` to
+`−4,558` is **refuted** rather than merely declined. The two terms that do not survive
+measurement are `+253`, where the measured vendored movement over the interval it covers is
+**844,848 → 845,025 = +177** and **253 − 177 = 76**, which is PLAN.md §10's residual exactly;
+and **`−1,328 of other net movement`, which has NO measured counterpart anywhere** — the
+third-party sum is *invariant* at 845,025 across both the 860,898 and the 899,400 trees, so
+there was zero third-party movement in that interval and no room for a −1,328. Drop that one
+term and this breakdown overshoots by exactly the **76 B** §10 already carries, and
+**1,328 − 76 = 1,252** is the whole of the difference between the two documents' holes. They
+were never two defects: this file's breakdown is §10's plus one spurious term. **Nothing is edited on the strength of that**: the terms cannot be
+split further, because the trees behind `844,229` and `844,848` both predate the root commit
+and are not in git, so which of the two survives and by how much is unrecoverable. Residual
+stated, per the standing rule.
+
 Every number is measured with LTO **off**, so they are upper bounds — `lto =
 "fat"` collapses the duplicated monomorphisations. See `vendor/README.md` for the
 per-change split.
@@ -810,7 +853,16 @@ self-inconsistency and the flag was never applied. **Both sets close internally*
 (14,612 + 953 = 15,565 → +3,467 → 860,592; 14,606 + 953 = 15,559 → +3,461 → 860,586), so
 arithmetic cannot pick between them and the phase-3 tree can no longer be rebuilt: the 6 B
 difference in one `.text` figure is **unresolvable**. Adopted on designated authority, not
-on evidence, and recorded here rather than picked silently.) That buys `comms.rs` +
+on evidence, and recorded here rather than picked silently. **CLOSED PERMANENTLY 2026-09-16,
+on proof.** `73695f1` is this repo's ROOT COMMIT and it already carries BOTH sets in the one
+tree — `15,559` / `14,606` / `860,586` here and `15,565` / `14,612` / `860,592` in
+`vendor/README.md` (`git grep -c -F '15,559' 73695f1` → `README.md:1`;
+`git grep -c -F '15,565' 73695f1` → `README.md:1`, `vendor/README.md:2`; same for the
+`.text` and total pairs). The disagreement therefore predates the first commit, so there is
+no earlier tree, diff or message in this repository that could say which figure came off a
+measurement and which was copied; and the root commit measures **880,024 B**, so it is not
+the 857,125 tree either. The question is not open, it is **unrecoverable**, and the
+authority-based choice stands because it is the only one available.) That buys `comms.rs` +
 `usb.rs`, descriptors and all. (Both rlib figures are the phase-3-era ones and are
 kept as the marginal cost of that change; the rlib is **30,627 B** today.) The
 4,096-byte reassembly buffer is not part of it: it is SRAM, held inline in a `Link`

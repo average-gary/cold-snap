@@ -146,6 +146,28 @@ re-measure of the whole tree is **860,898**. PLAN.md §10 is the authority.) Spl
 | the same, after phase 3 (`comms.rs` + `usb.rs`) | **860,592** |
 | the same, clean re-measure 2026-08-19 (adds `decode_body`, the lowered `MAX_MESSAGE_ALLOC_SIZE`) | **860,898** |
 
+**A TRAJECTORY ROW ON THE FIRST ROW, NOT a correction of it — 2026-09-16.** The
+`vendored crates only` build measures **845,025** at the repo's ROOT COMMIT `73695f1`
+(2026-08-26), against the **844,848** recorded above: **+177 B** of vendored movement between
+the tree that ledger row was taken on and the first tree in git. Command, in a private target
+dir at a worktree path 33 characters long so the main checkout and the panic `Location`
+strings are both undisturbed: `CARGO_TARGET_DIR=/private/tmp/cs-t-vend
+CARGO_PROFILE_RELEASE_LTO=false cargo build --release -p frostsnap_core -p frostsnap_comms
+-p frostsnap_embedded -p frost_backup` (exit 0) then `python3 tools/measure-flash.py
+'/private/tmp/cs-t-vend/thumbv7em-none-eabihf/release/deps/*.rlib'` (exit 0). **The 844,848
+row is not touched, and it is load-bearing exactly as written:** 844,229 + 5,101 = 849,330
+and 849,330 − 4,482 = **844,848**, so this row independently confirms `../PLAN.md` §10's
+phase-0 baseline, its `+5,101` panic-site term and its `−4,482` instantiation-movement term,
+all three to the byte and with no per-rlib table needed. That is why `AUDIT-2026-09-10.md:713-714`'s
+prescription to move `−4,482` to `−4,558` is refused: it would break an identity that closes.
+**And the +177 is where §10's −76 B residual actually lives** — §10's chain supplies `+253`
+over this interval where the measurement supplies `+177`, and 253 − 177 = 76. Which of the
+253 is vendored and which is `coldsnap_hal`'s `flash.rs` cannot be split from here, because
+the tree behind 844,848 predates the root commit and is not in git. **845,025 is also
+invariant:** the whole third-party rlib set measures 845,025 at the root commit AND at HEAD,
+which is what makes 860,898, 880,024, 899,400 and 899,707 all decompose over it with residual
+zero (`../PLAN.md` §10).
+
 **Every row above is an rlib sum with LTO off, and the linked image overestimates by
 ~2.4×.** For the image figure itself, **defer to `../PLAN.md` §10** — the same way the
 rlib clause below already does. Keeping a live image figure in this deliberately
@@ -182,6 +204,19 @@ bytes both times. Do **not** read 15,565 as the on-device cost of the HAL: LTO i
 off for this measurement, so each rlib carries its own copy of the
 `sha2`/`rand_chacha`/`bincode` generic instantiations it uses, and `lto = "fat"`
 collapses them. It is an upper bound.
+
+**The 6-byte disagreement over this figure is CLOSED PERMANENTLY as of 2026-09-16, and this
+file's `15,565` / `14,612` / `+3,467` / `860,592` set keeps the designated authority
+`../README.md` gave it.** `../README.md` carried `15,559` / `14,606` / `+3,461` / `860,586`
+until 2026-09-13. Both sets close internally, so arithmetic never could pick; what is new is
+that neither can EVER be traced. `73695f1` is the repo's ROOT COMMIT and **both** sets are
+already present in that one tree — `git grep -c -F '15,565' 73695f1` returns
+`README.md:1`, `vendor/README.md:2` and `git grep -c -F '15,559' 73695f1` returns
+`README.md:1`, with the `.text` and total pairs split the same way — so the split predates
+the first commit and no tree, diff or commit message in this repository postdates the
+measurement that produced either figure. The phase-3 tree is not in git: the root commit
+measures **880,024 B** as an rlib sum, not 857,125 and not 860,592 (`../PLAN.md` §10 has the
+build and the commands). Provenance here is **unrecoverable, not merely unresolved.**
 
 Negative controls, all measured: collapsing `CommittedSingleCopy` into
 `NotCommitted` fails exactly 1 of 14 embedded tests; removing the skip bound
