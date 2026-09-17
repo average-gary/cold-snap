@@ -769,7 +769,26 @@ pub enum SubCallCost {
     /// authority to bind it without a bench session on an expendable unit.**
     Counted,
     /// Writes a slot, sets a PIN, installs firmware, wipes or never returns.
-    /// Permanent. Must not appear in this tree at all.
+    /// Permanent.
+    ///
+    /// **Must not appear as an `arg2` at any `call` site, and must not be
+    /// bound as a constant.** Both halves are enforced, and by the same test —
+    /// `no_counted_or_destructive_selector_is_reachable_from_this_module` — but
+    /// the scope is narrower than the "must not appear in this tree at all" this
+    /// doc claimed until 2026-09-17: that test reads **one file**, `callgate.rs`,
+    /// and nothing checks the rest of the tree. What makes the narrower scope
+    /// sufficient today is that `raw` has exactly one caller (`call`, also
+    /// asserted there), so `callgate.rs` is the only file that can enter the
+    /// gate at all. A direct `raw` call from another module would be outside
+    /// every check named here.
+    ///
+    /// The enforcement is a frozen `(selector, arg2)` census plus a frozen count
+    /// of this file's top-level `u32` constants, NOT a list of forbidden names:
+    /// the name-needle form it replaced was bypassable by spelling the upgrade
+    /// sub-call's constant with an extra word in the middle. (This paragraph
+    /// cannot quote either spelling: that test's surviving name tripwires read
+    /// this half of the file, and naming them here would self-trip it — MEASURED
+    /// while writing this, exit 101.)
     Destructive,
     /// Not a `case` in `dispatch.c:346-383`; falls to `default: rv = ENOENT`
     /// and is inert.
@@ -1711,14 +1730,65 @@ mod tests {
         assert!(login_attempt_permitted(u32::MAX));
     }
 
+    /// Every `call(` site in the production half, as the `(selector, arg2)`
+    /// expressions it passes.
+    ///
+    /// Parsed STRUCTURALLY — off the argument position, not off any identifier —
+    /// which is the whole point: a renamed constant changes the census instead of
+    /// slipping past a needle that spelled the old name. All five sites are
+    /// formatted identically by `rustfmt`'s output shape (`call(` alone on its
+    /// line at 8 spaces of indent, one argument per line), and the census below
+    /// pins the count, so a site written any other way reads as a REMOVED site
+    /// and is just as loud.
+    fn gate_call_sites(src: &str) -> impl Iterator<Item = (&str, &str)> {
+        src.split("        call(\n").skip(1).map(|tail| {
+            let mut args = tail.split(',');
+            let selector = args.next().unwrap_or("").trim();
+            // `call(selector, buf, len, min_len, arg2)`: skip three, take the
+            // fourth after the selector.
+            let arg2 = args.nth(3).unwrap_or("").trim();
+            (selector, arg2)
+        })
+    }
+
     /// Source-reading guard. The bindings above live partly inside
     /// `cfg(target_arch = "arm")`, which **no gate in this project compiles**
     /// (PLAN.md §9 item 22), so the only way to enforce "we bound nothing
     /// counted or destructive" is to read the file.
     ///
     /// Only the production half of the file is searched — the source is cut at
-    /// the `cfg(test)` attribute — so the needles below cannot match this test's
-    /// own text and self-trip.
+    /// the `cfg(test)` attribute — so the census and the needles below cannot
+    /// match this test's own text and self-trip.
+    ///
+    /// # This was a list of NAME needles until 2026-09-17, and names are evadable
+    ///
+    /// Two defects were measured in that form. (1) The list contained
+    /// `"PIN_SUBCALL_UPGRADE"`, but neither `PIN_SUBCALL_FW_UPGRADE` nor
+    /// `PIN_SUBCALL_FIRMWARE_UPGRADE` — the two names an implementer of the
+    /// upgrade path would actually reach for — CONTAINS that substring, so the
+    /// refusal was bypassed by naming. (2) The list contained
+    /// `"SELECTOR_HIGHWATER"`, which appeared **nowhere in the tree except as its
+    /// own needle**, while the selector it meant (21, whose `arg2 = 2` is the
+    /// one-way OTP downgrade-protection burn) has been bound as
+    /// [`SELECTOR_OTP`] and called all along. It read as protecting a one-way
+    /// burn and protected nothing; the census's selector-21 row is what protects
+    /// it now, by pinning that site's `arg2` to
+    /// [`OTP_SUBCALL_READ_COUNTER0`].
+    ///
+    /// What replaced them is two frozen NUMBERS and one frozen LIST, none of
+    /// which a rename moves:
+    ///
+    /// * the exact `(selector, arg2)` census of every gate call site
+    ///   ([`gate_call_sites`]);
+    /// * the count of top-level `u32` constants, i.e. of everything in this file
+    ///   that could *be* a selector or an `arg2` — so declaring a new one under
+    ///   any name at all reddens this test even before it is called;
+    /// * the count of direct [`raw`] call sites, so every gate entry keeps
+    ///   funnelling through [`call`] and its [`validate_buf`] /
+    ///   [`check_pin_subcall`] checks.
+    ///
+    /// The name needles are KEPT below, but as a fast readable tripwire for the
+    /// obvious spellings and no longer as the protection.
     ///
     /// If you are here because this test failed: it is not in your way, it is
     /// the review. Binding a `Counted` or `Destructive` sub-call needs a bench
@@ -1732,6 +1802,79 @@ mod tests {
         assert!(
             src.contains("pub fn read_mcu_key_usage") && !src.contains("fn pin_error_codes"),
             "the cut must keep all production code and drop the test module"
+        );
+
+        // ---- THE CALL-SITE CENSUS -------------------------------------------
+        //
+        // Every gate entry this file makes, in file order. The selector VALUES
+        // behind these names are pinned by
+        // `selector_and_subcall_constants_match_dispatch_c` above, so this list
+        // is about which (selector, sub-call) pairs are REACHABLE, not about
+        // spelling.
+        //
+        // Adding a row means binding a new gate sub-call. Do not add one to make
+        // this test pass. `pin_subcall_cost` classifies selector 18's arg2 2 and
+        // 3-8 as Counted or Destructive and NONE of them may appear here; for
+        // selector 21, arg2 2 is the one-way OTP highwater burn and only 3 (a
+        // counter read) may.
+        const CENSUS: [(&str, &str); 5] = [
+            ("SELECTOR_READ_RNG", "source.arg2()"),
+            ("SELECTOR_ENTER_DFU", "ENTER_DFU_ARG2_SAFE"),
+            ("SELECTOR_PIN", "PIN_SUBCALL_SETUP"),
+            ("SELECTOR_OTP", "OTP_SUBCALL_READ_COUNTER0"),
+            ("SELECTOR_MCU_KEY_USAGE", "0"),
+        ];
+        let mut seen = 0;
+        for site in gate_call_sites(src) {
+            assert!(
+                seen < CENSUS.len(),
+                "a NEW gate call site {site:?} was added -- selector/sub-call \
+                 pair number {} in a file whose census is {}. Justify it against \
+                 `pin_subcall_cost` before touching this number.",
+                seen + 1,
+                CENSUS.len()
+            );
+            assert_eq!(
+                site, CENSUS[seen],
+                "gate call site {seen} CHANGED: a rename or a different arg2 is \
+                 the same event as a new binding",
+            );
+            seen += 1;
+        }
+        assert_eq!(
+            seen,
+            CENSUS.len(),
+            "a gate call site was REMOVED or reformatted so this census cannot \
+             see it -- which would leave the remaining sites unguarded"
+        );
+
+        // ---- THE BINDING CENSUS ---------------------------------------------
+        //
+        // `call` takes `selector: u32` and `arg2: u32`, so a top-level `u32`
+        // constant is the only thing in this file that can BE either. Freezing
+        // the count is what makes the guard evasion-proof: declaring
+        // `PIN_SUBCALL_FW_UPGRADE`, `PIN_SUBCALL_FIRMWARE_UPGRADE` or
+        // `ANYTHING_AT_ALL: u32` reddens this test on the DECLARATION, without
+        // this file naming any of them. (`usize`/`i32`/`Errno` constants are
+        // excluded because they cannot reach `call` without a cast, and a cast at
+        // a call site changes the census above.)
+        assert_eq!(
+            src.lines()
+                .filter(|l| l.starts_with("pub const") && l.contains(": u32 = "))
+                .count(),
+            16,
+            "a top-level u32 constant was added or removed. Every one of these is \
+             a potential selector or arg2; say which gate sub-call it names and \
+             what `pin_subcall_cost` calls it."
+        );
+
+        // Every gate entry must funnel through `call`, which is where
+        // `validate_buf` and `check_pin_subcall` are. A second direct `raw` call
+        // site would be a gate entry with neither.
+        assert_eq!(
+            src.matches("unsafe { raw(").count(),
+            1,
+            "`raw` must be reached from exactly one place, `call`"
         );
 
         // Exactly one selector-18 call site, and it passes the free sub-call.
@@ -1754,12 +1897,18 @@ mod tests {
             "check_pin_subcall must be defined once and called once"
         );
 
-        // Identifiers and magic values for things nothing here may ever call:
-        // selector 23 (fast wipe, arg2 0xBeef), 24 (fast brick, arg2 0xDead --
-        // destroys the pairing secret permanently), 19/1 and 19/100-102 (bag
-        // number, flash lockdown), 21/2 (OTP highwater), 22 (trick PINs; the
-        // gate wipes the mcu key before it even looks at arg2), 3 (never
-        // returns), and selector 18's six unsafe sub-calls.
+        // Magic values and the OBVIOUS identifiers for things nothing here may
+        // ever call: selector 23 (fast wipe, arg2 0xBeef), 24 (fast brick, arg2
+        // 0xDead -- destroys the pairing secret permanently), 19/1 and 19/100-102
+        // (bag number, flash lockdown), 22 (trick PINs; the gate wipes the mcu
+        // key before it even looks at arg2), 3 (never returns), and selector 18's
+        // six unsafe sub-calls.
+        //
+        // A TRIPWIRE, NOT THE GUARD -- see this test's docs. Each of these is
+        // evadable by choosing another name, which is what the two censuses above
+        // exist for; `"SELECTOR_HIGHWATER"` was dropped from this list because
+        // the selector it named was already bound as `SELECTOR_OTP`, so it
+        // advertised a protection it did not provide.
         for frag in [
             "0xDead",
             "0xDEAD",
@@ -1769,7 +1918,6 @@ mod tests {
             "SELECTOR_LOCKDOWN",
             "SELECTOR_LOGOUT",
             "SELECTOR_BAG",
-            "SELECTOR_HIGHWATER",
             "PIN_SUBCALL_LOGIN",
             "PIN_SUBCALL_CHANGE",
             "PIN_SUBCALL_FETCH",
