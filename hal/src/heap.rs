@@ -304,9 +304,24 @@
 //!    callgate wipes it on every entry **and** exit (`startup.S:124-134,148-157`)
 //!    and [`crate::callgate`] enters it for every SE operation. This is a hard
 //!    refusal, independent of allocator choice.
-//! 4. **PSRAM is uncharacterised** (PLAN.md §9 item 5). If it lands, the available
-//!    size changes by an order of magnitude and the allocator choice changes with
-//!    it.
+//! 4. ~~**PSRAM is uncharacterised** (PLAN.md §9 item 5). If it lands, the
+//!    available size changes by an order of magnitude and the allocator choice
+//!    changes with it.~~ **STRUCK 2026-09-17: it was never true of this
+//!    repository, and it contradicted this file's own item 4 nine screens up.**
+//!    PSRAM is characterised and the question is CLOSED as *declined*, not
+//!    deferred — 8 MiB at `0x9000_0000`, configured by the bootloader's
+//!    `psram_setup()` (`mk4-bootloader/psram.h`; called `main.c:150`), recorded as
+//!    [`crate::memmap::PSRAM_BASE`]/[`crate::memmap::PSRAM_LEN`] and closed in
+//!    PLAN.md §9 item 5 on 2026-08-20 — the same day the sentence above dated its
+//!    own measurements to. Nothing about the region is open on PSRAM's account:
+//!    usable internal SRAM is 647,168 B against a 64 KiB heap, so placement was
+//!    never short of space, and adopting PSRAM would mean inheriting the
+//!    OSPI/QUADSPI state the bootloader leaves configured for no measured
+//!    benefit. **The reason this mattered:** an "order of magnitude" of unclaimed
+//!    headroom is the kind of sentence a later reader treats as licence to grow
+//!    the arena. There is no such headroom, and [`crate::psram`] is the only
+//!    module that names PSRAM at all — as bounds on a firmware burn, never as
+//!    memory to allocate from.
 //!
 //! # What is not here, and why
 //!
@@ -335,9 +350,14 @@
 //! `#[global_allocator]` is a one-line swap in one file, so nothing is locked in
 //! by waiting. What *is* still owed before any of them ships is a line-by-line
 //! review of its `unsafe` code (PLAN.md §1's rule; download counts are not a
-//! substitute), and the choice itself flips on PSRAM. Adding the dependency now
+//! substitute). Adding the dependency now
 //! would buy a type nothing can register, at the cost of an unreviewed
 //! allocator in the manifest.
+//!
+//! **"and the choice itself flips on PSRAM" was struck from that sentence
+//! 2026-09-17**, for the reason item 4 of "The region" now gives: PSRAM was
+//! closed as *declined* on 2026-08-20, so there is no pending PSRAM answer for
+//! any choice to flip on. The rest of the paragraph stands as written.
 //!
 //! # What phase 5's `main` must write
 //!
