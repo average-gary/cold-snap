@@ -1,9 +1,13 @@
 //! Bounds on a firmware-upgrade burn, and the one defect they exist to stop.
 //!
 //! Nothing here calls the callgate, stages an image, or receives a byte. Every
-//! item is either **pure arithmetic** or an **accessor with no production
-//! caller**, landed before any code exists that could reach it, because the
-//! failure it guards is not recoverable: it erases the share.
+//! item is either **pure arithmetic** or an **accessor**, and the accessor's
+//! production caller is `firmware/src/upgrade.rs` — **this read "an accessor with
+//! no production caller, landed before any code exists that could reach it" until
+//! 2026-09-17**, when phase 3 landed that caller. The reason the bounds were
+//! landed early is unchanged: the failure they guard is not recoverable, because
+//! it erases the share. What is still true, and it is the load-bearing half: no
+//! callgate sub-call is bound, so bytes can reach PSRAM and nothing can burn them.
 //!
 //! # The defect, read from Coinkite's source
 //!
@@ -73,15 +77,23 @@
 //! * **No `arg2 = 7` binding and no PIN.** `arg2 = 7` stays
 //!   [`crate::callgate::SubCallCost::Destructive`] and unbound. [`MappedPsram`]
 //!   can move bytes into PSRAM and [`readback_selftest`] can prove the silicon
-//!   kept them, but nothing in `hal` or in `firmware` calls either. MEASURED, and
-//!   stated as the command so it can be re-run: `rg -n
-//!   'MappedPsram|readback_selftest' hal/src firmware/src` matches this file and
-//!   ONE doc line in `hal/src/lib.rs` (`memmap::PSRAM_BASE`'s "read and written
-//!   by no production code"), and `llvm-nm` on the release ELF matches `psram`
-//!   zero times — `--gc-sections` drops all of it, which is why the ARM image is
-//!   unmoved at 379,648 B.
-//! * **No staging, no receive path, no USB.** Writing bytes into PSRAM and
-//!   deciding which bytes to write are separate jobs, and only the first is here.
+//!   kept them, but nothing in `hal` or in `firmware` **burns** either.
+//!
+//!   **This paragraph read "nothing in `hal` or in `firmware` calls either",
+//!   with an `rg` recipe and an "ARM image unmoved at 379,648 B", until
+//!   2026-09-17.** That went false the moment phase 3 landed: the production
+//!   caller is now `firmware/src/upgrade.rs`, which owns a [`MappedPsram`], runs
+//!   [`readback_selftest`] at admission and [`Psram::write`] per chunk. What is
+//!   still true and is the load-bearing half: **no callgate sub-call is bound**,
+//!   so bytes can reach PSRAM and nothing can burn them, and
+//!   [`check_burn_len`] — the selector-18/7 gate — still has no caller outside this
+//!   file's own `#[cfg(test)]` assertions, i.e. none in any build that can reach
+//!   hardware.
+//! * **No staging state machine, no receive path, no USB.** Writing bytes into
+//!   PSRAM and deciding which bytes to write are separate jobs, and only the
+//!   first is here. The second is `firmware/src/upgrade.rs`'s `Stager`, which
+//!   reaches this module through [`Psram`], [`readback_selftest`],
+//!   [`staged_burn_len`] and [`PSRAM_STAGE_OFFSET`] and through nothing else.
 
 use crate::memmap;
 
@@ -467,9 +479,46 @@ pub trait Psram {
     /// [`PsramError::OutOfBounds`] per [`check_read`];
     /// [`PsramError::NotOnThisTarget`] from [`MappedPsram`] off ARM.
     fn read(&mut self, offset: u32, out: &mut [u8]) -> Result<(), PsramError>;
+
+    /// The first `len` bytes of the staging window, as one contiguous slice.
+    ///
+    /// `len` is bytes from [`PSRAM_STAGE_OFFSET`]. This exists so that
+    /// `firmware::firmware_digest` — which wants one `&[u8]` and already bounds
+    /// the header's length field three ways before using it
+    /// (`firmware/src/lib.rs:3029-3034`; **this pin read `:2998-3003` until
+    /// 2026-09-17** — it was authored against pre-edit numbering and never
+    /// re-derived) — can be applied to a staged image with
+    /// **no second implementation of the bootloader's signed range**. The
+    /// duplication of the offset-24 length field is already recorded as REAL at
+    /// the docs of [`FW_LENGTH_FIELD_OFFSET`]; a third home was refused here.
+    ///
+    /// The default body is a refusal, so an implementor with no contiguous window
+    /// fails CLOSED: no view, no digest, no staged image. It must never be
+    /// `Ok(&[])` — see [`Psram::write`]'s own note on why `Ok` must not be read
+    /// as "bytes moved".
+    ///
+    /// `&self` and not `&mut self` deliberately: the borrow checker is then what
+    /// stops a view being held across a [`Psram::write`], which is the whole
+    /// aliasing argument for [`MappedPsram`]'s `from_raw_parts`.
+    ///
+    /// # Errors
+    ///
+    /// [`PsramError::OutOfBounds`] per [`check_read`];
+    /// [`PsramError::NotOnThisTarget`] from [`MappedPsram`] off ARM and from this
+    /// default body.
+    fn view(&self, len: u32) -> Result<&[u8], PsramError> {
+        let _ = len;
+        Err(PsramError::NotOnThisTarget)
+    }
 }
 
-/// The memory-mapped PSRAM at [`memmap::PSRAM_BASE`]. **No production caller.**
+/// The memory-mapped PSRAM at [`memmap::PSRAM_BASE`].
+///
+/// **Its production caller is `firmware/src/upgrade.rs`'s `Stager`, constructed at
+/// `firmware/src/main.rs`'s boot step 6d — this read "No production caller." until
+/// 2026-09-17.** Nothing burns what lands here: no callgate sub-call is bound, and
+/// [`check_burn_len`] — the selector-18/7 gate — still has no caller outside this
+/// file's own tests.
 ///
 /// # Why no token
 ///
@@ -584,6 +633,35 @@ impl Psram for MappedPsram {
                 *byte = unsafe { core::ptr::read_volatile((base + i) as *const u8) };
             }
             Ok(())
+        }
+    }
+
+    fn view(&self, len: u32) -> Result<&[u8], PsramError> {
+        // OUTSIDE the `cfg` below, for the reason `write` states above: a refusal
+        // under a `cfg` fails OPEN on the target where the `cfg` is off, and this
+        // is the bound that keeps a view off the bootloader's recovery header.
+        check_read(PSRAM_STAGE_OFFSET, len as usize)?;
+
+        // `return` is load-bearing -- see `write`.
+        #[cfg(not(target_arch = "arm"))]
+        #[allow(clippy::needless_return)]
+        {
+            return Err(PsramError::NotOnThisTarget);
+        }
+
+        #[cfg(target_arch = "arm")]
+        {
+            // SAFETY: `PSRAM_BASE .. + PSRAM_STAGE_LEN` is inside the 8 MiB the
+            // bootloader memory-mapped at `psram.c:208` before this crate ran, and
+            // `PSRAM_STAGE_OFFSET + PSRAM_STAGE_LEN <= PSRAM_LEN` is const-asserted
+            // in the block below. `len` passed `check_read`, so the slice ends
+            // inside that window. `&self` and not `&mut self` means no `write` --
+            // which takes `&mut self` -- can be live for as long as this slice is,
+            // so it aliases no mutable access. Same pattern and the same argument
+            // as the flash digest in `firmware/src/main.rs`'s step 8c.
+            Ok(unsafe {
+                core::slice::from_raw_parts(memmap::PSRAM_BASE as *const u8, len as usize)
+            })
         }
     }
 }
@@ -754,7 +832,7 @@ const _: () = {
 /// increment's to edit.
 #[cfg(any(test, feature = "fake-flash"))]
 pub mod fake {
-    use super::{check_read, check_write, Psram, PsramError};
+    use super::{check_read, check_write, Psram, PsramError, PSRAM_STAGE_OFFSET};
 
     extern crate alloc;
     use alloc::boxed::Box;
@@ -888,6 +966,27 @@ pub mod fake {
             let (start, end) = self.span(offset, out.len())?;
             out.copy_from_slice(&self.cells[start..end]);
             Ok(())
+        }
+
+        fn view(&self, len: u32) -> Result<&[u8], PsramError> {
+            // The device's bound FIRST, through the same checker `MappedPsram::view`
+            // uses. DOMINATED BY `FakePsram::new` AND NO TEST CAN SEE IT: `new`
+            // panics above `PSRAM_STAGE_LEN`, so any `len` this refuses is one the
+            // capacity below refuses too, and both answer `OutOfBounds`. MEASURED
+            // 2026-09-17: deleting this line left all 316 hal tests GREEN, exit 0.
+            //
+            // Kept, and labelled rather than deleted, for the one reason that is not
+            // circular: `new`'s cap and `new`'s own test are one edit apart -- writer
+            // and reader move together, which is the exact failure UPGRADE-PLAN §7
+            // records -- and if that cap is ever relaxed this line becomes the live
+            // check. Do NOT read it as covered.
+            check_read(PSRAM_STAGE_OFFSET, len as usize)?;
+            // Then the fake's own capacity. `get` and not an index, because a
+            // capacity overrun in a test is a refusal to report, not a panic to
+            // debug -- and `OutOfBounds` is the same variant the silicon's bound
+            // produces, so a caller cannot tell the two apart and cannot come to
+            // depend on which one fired.
+            self.cells.get(..len as usize).ok_or(PsramError::OutOfBounds)
         }
     }
 }
@@ -1376,6 +1475,79 @@ mod tests {
         // both targets. `readback_selftest` refuses an empty SPAN instead.
         assert_eq!(psram.write(0, &[]), Ok(()));
         assert_eq!(psram.read(0, &mut []), Ok(()));
+    }
+
+    /// [`Psram::view`] shows nothing off ARM rather than something wrong, and its
+    /// window bound runs BEFORE it reports missing hardware.
+    ///
+    /// The ordering is host-observable because the two refusals are different
+    /// VARIANTS, which is the same trick
+    /// `the_mapped_accessor_checks_the_access_before_it_reports_no_hardware` uses:
+    /// move `check_read` inside the `cfg(target_arch = "arm")` block and the
+    /// over-window leg below turns from `OutOfBounds` into `NotOnThisTarget`,
+    /// which is a refusal that fails OPEN on ARM — a `from_raw_parts` reaching
+    /// past PSRAM's lower half and over the bootloader's recovery header.
+    ///
+    /// MEASURED 2026-09-17: deleting that `check_read` from [`MappedPsram::view`]
+    /// reddens this test at `left: Err(NotOnThisTarget)` / `right: Err(OutOfBounds)`
+    /// (exit 101, 1 of 292 failed), and replacing [`Psram::view`]'s default body with
+    /// `Ok(&[])` reddens the `NoView` leg at `left: Ok([])`.
+    ///
+    /// **THE FAKE'S LEGS PIN ITS OWN CAPACITY AND NOTHING MORE, and this doc claimed
+    /// otherwise until 2026-09-17.** It said they pin the same ordering — "the
+    /// DEVICE's window bound runs before the double's own capacity, so the double
+    /// cannot show a window the silicon refuses" — and that claim is
+    /// **unfalsifiable**, not merely untested. MEASURED: deleting `check_read` from
+    /// `FakePsram::view` left all 316 hal tests GREEN, exit 0. It cannot do
+    /// otherwise: `FakePsram::new` PANICS above [`PSRAM_STAGE_LEN`]
+    /// (`a_fake_larger_than_the_staging_window_is_a_test_bug`), so
+    /// `self.cells.len() <= PSRAM_STAGE_LEN` always, so any `len` that
+    /// [`check_read`] refuses is a `len` the capacity refuses too — and both produce
+    /// the same [`PsramError::OutOfBounds`] variant, deliberately, so no leg can
+    /// ever tell which one fired. The property is real; it is enforced at
+    /// CONSTRUCTION and not at access, and `new`'s own `#[should_panic]` test is its
+    /// pin. See the label at that `check_read`'s call site for why the redundant
+    /// line is kept anyway.
+    #[test]
+    fn the_view_off_arm_shows_nothing_rather_than_something_wrong() {
+        let mapped = MappedPsram;
+        // The window bound, not masked by the missing hardware.
+        assert_eq!(
+            mapped.view(PSRAM_STAGE_LEN + 4),
+            Err(PsramError::OutOfBounds)
+        );
+        // Only a LEGAL length gets as far as "there is no PSRAM here". So a host
+        // build stages nothing through `MappedPsram` — the trap this module's
+        // `write` doc names, in the one place a `Stager` could have mistaken an
+        // `Ok` for progress.
+        assert_eq!(mapped.view(4), Err(PsramError::NotOnThisTarget));
+        // And the exact end of the window is legal, so the bound is not off by one
+        // in the tighter direction either.
+        assert_eq!(
+            mapped.view(PSRAM_STAGE_LEN),
+            Err(PsramError::NotOnThisTarget)
+        );
+
+        // The double: its last addressable byte is IN the view.
+        let mut fake = fake::FakePsram::new(64);
+        assert_eq!(fake.write(60, &[7; 4]), Ok(()));
+        assert_eq!(fake.view(64).map(|v| v[60..].to_vec()), Ok(vec![7; 4]));
+        // One past its capacity is a refusal and not a panic.
+        assert_eq!(fake.view(65), Err(PsramError::OutOfBounds));
+
+        // The default body is a refusal, so an implementor that forgets `view`
+        // cannot hand a caller a digest of nothing. Spelled with a type that
+        // implements the other two methods and nothing else.
+        struct NoView;
+        impl Psram for NoView {
+            fn write(&mut self, _offset: u32, _bytes: &[u8]) -> Result<(), PsramError> {
+                Ok(())
+            }
+            fn read(&mut self, _offset: u32, _out: &mut [u8]) -> Result<(), PsramError> {
+                Ok(())
+            }
+        }
+        assert_eq!(NoView.view(4), Err(PsramError::NotOnThisTarget));
     }
 
     /// The pattern depends on every address bit the window has, so an aliased

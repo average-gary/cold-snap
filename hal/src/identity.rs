@@ -151,8 +151,14 @@ impl core::fmt::Debug for IdentitySecret {
 /// firmware's hold safe is that its call site binds the `Ok` payload, so the
 /// `Err` arm must unify with `IdentitySecret` and therefore has to diverge —
 /// enforced by the type checker, not by this doc comment. The hold is also
-/// **dark**: it sits above USB bring-up, so a device that cannot prove which
-/// device it is never enumerates. See `firmware/src/main.rs` step 8b.
+/// **dark**, though **not** because of ordering — **this read "it sits above USB
+/// bring-up, so a device that cannot prove which device it is never enumerates"
+/// until 2026-09-17**, and USB is boot step 6c now, ~190 lines ABOVE the hold. It
+/// is dark because the hold never polls `cdc`, and `Cdc::poll` is what services
+/// SETUP, USB reset, `ENUMDNE` and SET_LINE_CODING — so enumeration never
+/// COMPLETES: no handshake answered, no frame decoded. What a host sees is one
+/// attach event. See `firmware/src/main.rs` step 8b's `Err` arm for the whole
+/// argument and step 6d for what re-closes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IdentityFault {
     /// A record was committed and no longer verifies, or its commit word is

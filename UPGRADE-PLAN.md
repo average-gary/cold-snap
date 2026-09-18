@@ -246,13 +246,21 @@ ARM accessor with word-aligned writes, plus a host double that **refuses an unal
 permits an unaligned read**. Allocation-free — the heap has 5,024 B spare of 65,536 and a staged
 image is ~388 KiB.
 
-**Phase 3 — staging over the existing transport.**
-Admit `EnterUpgradeMode` / `PrepareUpgrade2` / chunks; stream 97 × 4,096 B into PSRAM's lower half;
+**Phase 3 — staging over the existing transport. LANDED 2026-09-17 (§7b), hardened §7c, fixed §7d
+2026-09-18. Current gate figures are in §7d.**
+Admit `EnterUpgradeMode` / `PrepareUpgrade2` / chunks; stream the image into PSRAM's lower half;
 verify the digest on-device before spending anything. Early USB per §3.7. No callgate call yet.
 Testable end-to-end on the host through `hostcheck` + `examples/stub.rs`.
+*Correction to this paragraph's own arithmetic: "97 × 4,096 B" is the size of ONE artifact, not a
+constant. The size arrives on the wire and `hostcheck`'s M13 deliberately drives 262,656 B
+= 64 × 4,096 + 512, because a 97 × 4,096 exact fit cannot fail the ack arithmetic or the short
+tail and would be the vacuous test.*
 
-**Phase 4 — the coord-contrib gate.** The `SharedKey` check of §1.2. **Needs a wire-size and heap
-measurement first** — see §5.
+**Phase 4 — the coord-contrib gate. BLOCKED on one measurement.** The `SharedKey` check of §1.2.
+**Needs a wire-size measurement first** — see §5 item 3. The heap half of that item is no longer
+outstanding: §7d MEASURED the arena at 60,512 B of 65,536 with 5,024 B spare against the
+staging tree, so what is left is how many bytes a `SharedKey`-carrying upgrade message costs on the
+wire and in the decode arena.
 
 **Phase 5 — the PIN login (18/2), conditional on `PA_IS_BLANK` being clear.** Only after phase 4.
 Debugged on the phase-0 bench unit.
@@ -271,8 +279,13 @@ by then run on the same silicon.
 2. **Does RDP=2 disable SWD on STM32L4S5?** Not citable from either repo; needs RM0432 §3.5. The
    "RDP=2 is the only thing protecting the plaintext identity secret" claim rests on it.
 3. **Does a `SharedKey`-carrying upgrade message fit `FRAME_LIMIT` 4,096 and the heap?**
-   `MEASURED_ARENA_FOOTPRINT_BYTES` is already 60,512 of 65,536. Measure by extending
-   `firmware/examples/heap_session.rs` plus a wire-size measurement in the §7 style. **Gates phase 4.**
+   **Half settled 2026-09-18 (§7d).** The arena baseline is no longer inherited: with the whole
+   staging path in the tree it MEASURES 60,512 B of 65,536, **5,024 B spare**, peak requested 54,496 B,
+   0 allocator refusals — run, not argued (`cargo run --release --target aarch64-apple-darwin -p
+   coldsnap_firmware --example heap_session --features="coldsnap_hal/test-seam,frostsnap_core/coordinator"`).
+   What is STILL OPEN, and it is what actually gates phase 4: the WIRE-SIZE measurement for a
+   `SharedKey`-carrying upgrade message, plus the decode-arena cost of admitting one, measured by
+   extending `firmware/examples/heap_session.rs` in the §7 style. **Gates phase 4.**
 4. **Consent UX for the burn.** Read upstream's own device UX for precedent before inventing one.
    Fallback is the physical key-hold of §3.7.
 5. **The `.dfu` must be on a contiguous FAT SD card in the slot before the burn is confirmed.**
@@ -300,6 +313,10 @@ by then run on the same silicon.
 
 ## 7. PHASES 1 AND 2 — LANDED 2026-09-17, verified by the orchestrator
 
+**Read §7d first for the current gate figures.** This section is the 2026-09-17 landing record and
+its table is left at the values measured that day; phase 3 (§7b) has since moved the image and the
+test counts.
+
 `hal/src/psram.rs` (NEW), `hal/src/lib.rs`, `hal/src/callgate.rs` (tests + one doc), `hal/src/heap.rs`
 (docs), `PLAN.md` (one line). Verified independently of the lanes' own reports:
 
@@ -313,8 +330,13 @@ by then run on the same silicon.
 | ARM warnings | 0 | **0** |
 | clippy, `hal/src`+`firmware/src` | 0 | **0** (the 18 hits in a workspace-wide run are all `uninlined_format_args` inside `vendor/`) |
 
-`psram.rs` has **no production caller** — `rg 'psram::' hal/src firmware/src` outside the module
-itself returns one doc reference and nothing else — which is why the image did not move.
+`psram.rs` had **no production caller on 2026-09-17** — `rg 'psram::' hal/src firmware/src` outside
+the module itself returned one doc reference and nothing else — which is why the image did not move
+*in this phase*. **Phase 3 (§7b) falsified that**: `firmware/src/main.rs` now constructs
+`psram::MappedPsram` and hands it to `upgrade::run`, so the same recipe returns 27 hits today and the
+image moved to 379,940 B. Past tense throughout since 2026-09-18; it read as a present-tense claim
+with a re-runnable recipe until then, which is the strongest form of pin this tree has and the one
+form that cannot be left dated-but-unqualified.
 
 **The finding that matters, and it settles §3.10 by measurement rather than by argument: the OLD
 guard survived BOTH required mutations GREEN.** A renamed upgrade constant (`PIN_SUBCALL_FW_UPGRADE`)
@@ -348,6 +370,378 @@ the bootloader's recovery header at `PSRAM_BASE + PSRAM_LEN - 2048` is unnameabl
 
 ---
 
+## 7b. PHASE 3 — LANDED 2026-09-17, hardened §7c, fixed §7d 2026-09-18
+
+**Read §7d first for the current gate figures.** This section's table is the 2026-09-17 landing
+record and is left at its measured values; §7c re-ran its mutations independently and §7d applied
+seven confirmed review findings and re-measured every gate.
+
+`firmware/src/upgrade.rs` (NEW, the `Stager` + `Wire` + `run`), `hal/src/psram.rs` (`Psram::view`,
+two impls, one test, two module-doc rewrites), `firmware/src/lib.rs` (`pub mod upgrade`, three
+now-false doc comments rewritten, **no behavioural change**), `firmware/src/main.rs` (USB and the
+pad moved to steps 6b/6c, new step 6d, `BootRng`/`upgrade_requested`, four new tests, seven comment
+rewrites, one false pin fixed), `firmware/examples/stub.rs` (`STUB_UPGRADE` leg + `StdioWire`),
+`hostcheck/src/main.rs` (M13, three legs), `firmware/examples/checkfw.rs` (one stale pin).
+
+| gate | before | after |
+|---|---|---|
+| hal (`--features fake-flash,test-seam`) | 315 | **316** |
+| firmware | 173 | **191** (135 lib + 56 bin) |
+| vendored | 116 | **116** |
+| sweep total | 604 | **623** |
+| ARM image | 379,648 B | **380,040 B** (+392 B) |
+| ARM warnings | 0 | **0** |
+| clippy, `hal/src`+`firmware/src` | 0 | **0** |
+| `hostcheck` | `M1+…+M12 PASS` | **`M1+…+M12+M13 PASS`** |
+
+**THE INVOCATION IS PART OF THE IMAGE FIGURE**: `RUSTFLAGS="-C target-cpu=cortex-m4 -C
+link-arg=-Tfirmware/link.x" cargo build --release`, in the MAIN checkout, summing
+`.vector_table 0x40 + .text 0x4e908 + .rodata 0xe31c + .data 0x24` from `objdump -h`. That is the
+same invocation the 379,648 B baseline was taken with. Margin on `FLASH_TEXT` (1,425,408 B) is
+**1,045,368 B**; the image is 26.6618% flash-resident. **The image moved for the expected reason**:
+`psram.rs` gained its first production caller, so `--gc-sections` no longer drops it, and
+`upgrade.rs` is new.
+
+**Heap: unchanged, and that is an argument FROM CONSTRUCTION, not a measurement.** `Stager` is a
+fixed-size struct with a `[u8; 4]` carry, chunk bytes are written straight from the wire slice, and
+`upgrade.rs` names no `Vec`, `Box`, `collect` or `alloc` above its test cut (pinned by
+`nothing_in_this_module_can_answer_a_message_or_allocate`). `run`'s `Link` is 4,096 B of `boot`'s
+frame against 548,776 B of measured stack runway. Nothing re-measured
+`MEASURED_ARENA_FOOTPRINT_BYTES`: it is pinned only by a `const _: ()` block in `hal/src/heap.rs`
+with **no named runtime test**, and the measurement lives in `firmware/examples/heap_session.rs`,
+an example that is not in the gate and refuses to run under the debug profile.
+
+### Mutations RUN, not read: 19 device-side + 4 leg-level = 23 CAUGHT, plus 4 survived-green below
+
+**The counts in this heading read "18 device-side + 4 leg-level" and "All 18 restored
+byte-identical" until 2026-09-17**, when the hardening pass counted the table: it has **19**
+device-side rows and 4 leg-level, i.e. 23 caught, and with the four survived-green results below
+that is **27 mutations run**. The implementing agent's own summary said "22 run, 21 caught, 4
+survived" — three mutually inconsistent figures in the one section whose purpose is the count. The
+authoritative figures are: **27 run, 23 caught, 4 survived-green**, plus the 8 in §7c.
+
+All 23 restored byte-identical (sha256 before == after, checked per run). Each row's "caught by" is
+the named test that failed, with the assertion it failed at.
+
+| mutation | caught by |
+|---|---|
+| `size > BURN_LEN_MAX` → `> PSRAM_STAGE_LEN` | `prepare_refuses_a_size_that_would_burn_past_flash_fs`, exit 101 |
+| delete the `TooSmall` arm | `prepare_refuses_an_image_below_the_bootloaders_floor`, `Ok(())`/`Err(TooSmall)` |
+| `% FW_BODY_ALIGN` → `% WRITE_ALIGN` | `prepare_refuses_a_size_the_burn_cannot_align` |
+| route `PrepareUpgrade` into the `PrepareUpgrade2` arm | `the_legacy_prepare_is_refused_before_a_byte_moves` |
+| let `feed` write while `Prepared` | `chunks_are_refused_until_enter_upgrade_mode`, `Ok(1)`/`Err(OutOfOrder)` |
+| allow `EnterUpgradeMode` from `Idle` | `enter_upgrade_mode_is_refused_before_a_prepare` |
+| drop the `r == size` case from `acks_at` | `every_chunk_is_acked_once_…` at `Ok(64)`/`Ok(65)`, **plus 3 more** |
+| return the ack before `verify` | `every_chunk_is_acked_once_…` at `Ok(0)`/`Err(Digest)` |
+| `write(OFFSET + written, ..)` → `write(OFFSET, ..)` | 5 tests, incl. `staged_bytes_land_at_the_offset_they_arrived_at` |
+| delete the `received + n > size` guard | `a_byte_after_the_announced_size_is_refused_and_stores_nothing` |
+| delete the `declared != size` comparison | `the_header_length_must_agree_with_the_announced_size`, `Ok(1)`/`Err(LengthDisagreement)` |
+| write `bytes` straight through, no carry | `a_word_split_…_as_one_chunk` at `Err(Psram(NotAligned))` |
+| remove `readback_selftest` from `admit` | `staging_on_a_target_with_no_psram_refuses_rather_than_reporting_success` |
+| drop `self.written = 0` on re-prepare | `re_preparing_over_a_verified_image_clears_the_verdict_first`, `Err(Psram(OutOfBounds))` |
+| `use crate::Session;` above the cut | `nothing_in_this_module_can_answer_a_message_or_allocate`, `1`/`0` |
+| move `view`'s `check_read` inside the ARM `cfg` | `the_view_off_arm_shows_nothing_rather_than_something_wrong` (hal), `NotOnThisTarget`/`OutOfBounds` |
+| move the USB block back below step 8b | `usb_comes_up_above_entropy_flash_and_identity` |
+| `if upgrade_requested(..)` → `if true` | `the_upgrade_listener_is_gated_on_the_physical_hold` |
+| `UPGRADE_HOLD_KEY` `b'y'` → `b'q'` | `the_hold_key_is_one_the_pad_can_actually_report` |
+| *(leg-level)* drop the `r == size` case | M13 positive leg, `64 ack(s) … expected exactly 65` |
+| *(leg-level)* return the ack before `verify` | M13 negative leg, `65 ack(s) … expected exactly 64` |
+| *(leg-level)* restore the single-`Option` callback | M13 coalesced leg, `0 ack(s) … expected 65` |
+| *(leg-level)* `received == size` → `>= size - 4096` | M13 negative leg, `63 ack(s)` — **dominates** the leg it was written for |
+
+### FOUR SURVIVED-GREEN / WITHDRAWN RESULTS, and they are the point of this section
+
+1. **`self.state = State::Idle` on re-prepare is DEAD.** Deleting it left all 191 firmware tests
+   GREEN, exit 0. Every exit from that arm assigns the state anyway — three bounds and the
+   self-test all go through `refuse`, and success assigns `Prepared` — so the invariant holds by
+   exhaustion over four paths rather than unconditionally. The line is KEPT and labelled (a fifth
+   path is one `?` away and a stale `Staged` is what a future phase would burn), and
+   `re_preparing_over_a_verified_image_clears_the_verdict_first`'s doc was **corrected** to name
+   the `written = 0` mutation it actually catches. Its `Prepared` assertion is the weak leg.
+2. **The 100 ms gap after `EnterUpgradeMode` proves nothing on a pty.** M13's first draft asserted
+   that deleting it reddens the positive leg, because cold-snap's buffering `Link::poll` would eat
+   chunk 0's head. Deleting it left every leg GREEN — a pty delivers separate writes as separate
+   reads. The sleep is kept for parity with `usb_serial_manager.rs:681-682` and is labelled
+   unproven at its call site. **§3.5's reuse story is intact; the mitigation story was not
+   testable here and now says so.**
+3. **A fourth M13 leg was DELETED for domination.** It wrote both frames and chunk 0's head
+   together and asserted no ack arrived (MEASURED: 0 acks, correct). Every device mutation that
+   could make it fire is caught by the NEGATIVE leg first, so it read like coverage. Replaced by
+   the coalesced-ADMISSION leg, which is uniquely falsifiable.
+4. **A green M13 hid an intermittent bug in its own handshake.** Re-sending magic is correct (the
+   device's `scan_magic` consumes the FIRST magic frame without calling `on_frame`, so one send
+   never gets a reply) but left a second `MAGIC_REPLY` in the `BufReader` that nothing could
+   consume — `read_for_magic_bytes` stops at the first pattern end and `anything_to_read()` asks
+   the port, not the buffer. Its first byte is `0x00`, read as chunk 0's ack. Failed ~1 run in 3.
+   Fixed with a `raw_read` drain. **Only a leg that switches to raw byte reads can see this.**
+
+### §7c — the HARDENING pass, 2026-09-17: 27 mutations RE-RUN independently, 8 new
+
+Every mutation in the table above was re-applied from scratch by a second agent that read the
+source, not the table, and each was reverted with a **sha256 before == after** check inside the same
+harness run (a `finally` block, so a failed gate cannot leave a mutated tree). All 23 reproduced
+their claimed verdict, and both survived-green source claims reproduced too. Eight mutations the
+table did not have:
+
+| new mutation | caught by |
+|---|---|
+| `Psram::view`'s default body → `Ok(&[])` | `the_view_off_arm_shows_nothing_rather_than_something_wrong` (hal), `Ok([])`/`Err(NotOnThisTarget)` |
+| **`FW_LENGTH_FIELD_OFFSET` 24 → 28** | **5 upgrade tests**, at `Err(Unreadable)`/`Ok(65)` — see below. RE-MEASURED 2026-09-18 after §7d's refusal remap: **4** upgrade tests, at `Err(LengthDisagreement)`/`Ok(65)`. The header-length test stopped reddening because it now EXPECTS `LengthDisagreement` on a garbage field, which is the correct verdict either way; the other four still catch it |
+| `firmware_digest`'s `header_end - 64` → `- 60` | 6 tests, incl. `every_chunk_is_acked_once_…` at `Err(Digest)` |
+| the no-pad arm `return false` → `return true` | `a_pad_that_will_not_open_cannot_arm_the_upgrade_listener`, `assert !upgrade_requested(None)` |
+| `BootRng`'s `wrapping_add(0x9e37_79b9)` → `add(0)` | same test, `1`/`1`, "a constant source would fix the scan order" |
+| `BootRng::fill_bytes` → a no-op | same test, "fill_bytes wrote nothing" |
+| delete `wire.write(&comms::MAGIC_REPLY)` | M13 `stage_session`, "never answered the magic handshake in 5s" |
+| delete `check_read` from `FakePsram::view` | **NOTHING — survived green, see below** |
+
+**§7's oldest finding is now CLOSED, and this is the load-bearing result of the pass.** §7 records
+`FW_LENGTH_FIELD_OFFSET` 24 → 28 surviving its required mutation GREEN, because the hal fixture was
+built from the same constant its reader used. Under the new `upgrade` tests that mutation reddens
+**five** tests, because `upgrade.rs`'s fixtures write the length field at the literal `16_280` while
+`staged_burn_len` reads it through the constant. Writer and reader no longer move together. The
+`- 64` row proves the same thing for the signature punch-out: `announce()` is an independent
+implementation of the signed range, so widening the hole in production reddens rather than tracking.
+
+**A FIFTH SURVIVED-GREEN RESULT, and it is unfalsifiable rather than untested.** Deleting
+`check_read` from `FakePsram::view` left all 316 hal tests GREEN, exit 0. It cannot do otherwise:
+`FakePsram::new` PANICS above `PSRAM_STAGE_LEN`, so `cells.len() <= PSRAM_STAGE_LEN` always, so any
+`len` that `check_read` refuses the capacity refuses too — and both answer the same `OutOfBounds`
+variant, deliberately, so no leg can ever tell which fired. The test's doc CLAIMED that leg pinned
+the ordering ("the DEVICE's window bound runs before the double's own capacity"); that claim was
+false and has been rewritten. The line is kept and labelled at its call site, for the one
+non-circular reason: `new`'s cap and `new`'s own `#[should_panic]` test are one edit apart — writer
+and reader again — and if that cap is relaxed this line becomes the live check. `MappedPsram::view`'s
+`check_read`, which is the one that matters, IS covered.
+
+Also swept, with nothing found: **no new `const _: ()` block** was added by phase 3, so no named
+runtime test in it is dominated by an `E0080`; **no `#[cfg]`-gated refusal that fails open on the
+other target** — `upgrade.rs` has no `cfg` outside its test module, and `MappedPsram::view`'s bound
+is outside its `cfg` and proven so by mutation; **zero `assertions_on_constants`**, verified by
+planting one `assert!(true)` and confirming clippy fires on it, so the tally stays at 24. The
+hardening pass's own edits are comment-only: hal 316 / firmware 191 / sweep 623 unchanged, ARM image
+unchanged at 380,040 B with 0 warnings, `cargo doc` 0 warnings, hostcheck `M13 PASS` 3/3.
+
+### Two REAL defects the mutation work found, in production code
+
+* **`upgrade::run` dropped an admission frame.** The callback recorded the admitted message in one
+  `Option`, so two `Upgrade` frames in a single 64-byte read left only the second admitted —
+  `EnterUpgradeMode` from `Idle`, i.e. `Refuse::OutOfOrder` and an upgrade that could never start.
+  Invisible to M13 until the coalesced leg existed, because a pty separated the writes. Fixed by
+  admitting inside the callback (`admit` touches neither `link` nor the wire, so it is sound there).
+* **`Stager::feed` clobbered a part-filled carry.** Step 3's unconditional
+  `self.carry_len = tail.len()` zeroed a carry step 1 had just topped up, so feeding one byte at a
+  time dropped three of every four bytes and the transfer ended in `Refuse::Unreadable` (**re-measured
+  2026-09-18 after §7d's refusal remap: `Refuse::LengthDisagreement`; the defect is unchanged, only its
+  diagnosis moved**). Caught by
+  `a_word_split_…`'s `step 1` leg, which is the whole reason that test streams at 1, 2 and 3.
+
+### Honestly noted
+
+* **`Refuse::Psram(_)` has no reachable test.** After admission every write is proven word-aligned
+  and inside a span `readback_selftest` already checked. Defence in depth, stated as such.
+  (`a_word_split_…` and the extra-bytes test DO observe it, but only under mutation.)
+* **`Refuse::Unreadable` WAS NOT unreachable after admission, and this bullet claimed it was until
+  2026-09-18.** The reasoning quoted here ("`declared == size` implies all three of
+  `firmware_digest`'s bounds") is sound for the `firmware_digest` `None` arm and was never sound for
+  the `staged_burn_len` arm above it, which mapped ALL FIVE `StageError`s to `Unreadable` — three of
+  them driven by a streamed, coordinator-supplied header field. So the variant fired on ordinary
+  hostile input while its own doc said it could not, and `Refuse::LengthDisagreement` — the variant
+  §3.2 exists for — was reachable only for a declared length inside `[BURN_LEN_MIN, size]`, which is
+  the narrow slice its one test leg happened to use. FIXED in §7d: `TooSmall | TooLarge | Truncated`
+  now answer `LengthDisagreement`, `NotInStagingWindow`/`HeaderUnreadable`/no-view keep `Unreadable`,
+  and those three ARE unreachable after admission (`size >= FW_MIN_BODY_LEN > 16_384` and
+  `size <= BURN_LEN_MAX < PSRAM_STAGE_LEN`). Still an arm and never an `expect`.
+* **`impl Wire for usb::Cdc` is read-verified only.** `run`'s loop executes on the host solely
+  through `StdioWire`; the three-line `Cdc` impl never runs in any gate.
+* **`MappedPsram::view`'s ARM `from_raw_parts` leg is read-verified only**, pinned to the identical
+  shipped pattern in `main.rs`'s step 8c flash digest.
+* **`upgrade_requested`'s pad READ is read-verified only; its DECISION is not, since §7d.**
+  `KeypadToken::open` cannot produce a `Keypad` off ARM, so no host test can call `read_key`. The
+  decision was split out as `arms_upgrade(Result<Event, KeypadError>) -> bool` — the shape `answer`
+  already had — and `only_the_ok_dome_arms_the_upgrade_listener` drives it over all twelve `DECODER`
+  bytes plus `MultiKey`, `Unsettled`, `AllUp` and both `KeypadError`s. **Until then the accept
+  condition was pinned by NOTHING**: widening it to `| Ok(Event::MultiKey)` — which is what the
+  driver reports for a wet or shorted pad — survived the entire firmware suite green.
+* **Two M13 refusals were caught with the wrong diagnosis before `read_ack` learned that a gone
+  child is "no ack"**: `Broken pipe` rather than the ack count, because `run` returns on
+  `Outcome::Staged` and the stub exits before a missing ack can time out.
+* **The consent gate is an ENTRY gate, not a per-message gate.** The human authorises "reflash this
+  device this boot", not a digest. Named as a `ponytail:` ceiling on `upgrade_requested`; a
+  digest-confirm screen belongs to the phase that burns.
+* **There is no timeout on the chunk stream** (upstream has none either; the only one in the
+  protocol lives on the host). A torn transfer leaves the device in `Streaming` forever, where it
+  does not feed `Link::poll` at all, so recovery is a POWER CYCLE. MEASURED as an M13 leg-ordering
+  constraint. Safe only because this phase cannot burn.
+* **A unit that dies at `panic!("entropy fail-closed")` or `panic!("flash geometry")` WITHOUT a key
+  held has no upgrade path.** Step 6d sits above both, so a held key still reaches the listener.
+  Converting those panics into listening holds is decision-sized and is not this phase.
+
+### §7d — the FIX pass, 2026-09-18: seven confirmed review findings applied, 5 mutations RUN
+
+An adversarial review of §7b/§7c produced nine findings that each survived two independent
+skeptics. Seven were applied; two are recorded below as deliberate non-fixes. Two of the seven
+CHANGED BEHAVIOUR and therefore needed tests, and both tests were mutation-verified in the §7c
+harness (one exact-string mutation, gate run, revert inside a `finally` block, `sha256 before ==
+after` asserted per run).
+
+| gate | before (§7c) | after (§7d) |
+|---|---|---|
+| hal (`--features fake-flash,test-seam`) | 316 | **316** (292 + 5 + 19) |
+| firmware | 191 | **192** (135 lib + 57 bin) |
+| vendored | 116 | **116** (macros 7 + embedded 17 + comms 10 + core 63 + `frost_backup` 19) |
+| sweep total | 623 | **624** |
+| ARM image | 380,040 B | **379,940 B** (−100 B; +292 B net over the 379,648 B phase-2 baseline) |
+| ARM warnings | 0 | **0** |
+| clippy, `hal/src`+`firmware/src` | 0 | **0** |
+| heap arena high-water | 60,512 B (argued) | **60,512 B of 65,536, 5,024 B spare (MEASURED)** |
+| `hostcheck` | `M13 PASS` | **`M1+M2+M3+M5+M7+M8+M9+M12+M13 PASS`, exit 0, 5/5 runs** |
+
+**THE INVOCATION IS PART OF THE IMAGE FIGURE**: `RUSTFLAGS="-C target-cpu=cortex-m4 -C
+link-arg=-Tfirmware/link.x" cargo build --release`, in the MAIN checkout, summing
+`.vector_table 0x40 + .text 0x4e8a4 + .rodata 0xe31c + .data 0x24` from `/usr/bin/objdump -h`.
+Margin on `FLASH_TEXT` (1,425,408 B) is **1,045,468 B**; the image is 26.6548% flash-resident. The
+−100 B is `upgrade_requested`'s decision becoming an exhaustive `arms_upgrade` match plus `verify`'s
+refusal mapping gaining one arm — i.e. this pass ADDED source and the image got smaller, which is
+why it is measured and not predicted.
+
+**HEAP: MEASURED THIS TIME, and that is the one baseline §7b could only argue.** §7b said "unchanged
+by construction, not by measurement" because `firmware/examples/heap_session.rs` is not in the gate.
+It was RUN: `cargo run --release --target aarch64-apple-darwin -p coldsnap_firmware --example
+heap_session --features="coldsnap_hal/test-seam,frostsnap_core/coordinator"`. Arena footprint
+high-water **60,512 B of 65,536, 5,024 B spare**, peak requested 54,496 B in ≤ 30 simultaneous
+blocks, live-between-frames 17,844 B, 0 allocator refusals, largest free block after dropping the
+`Session` 65,520 B of 65,536 (so it still coalesces). `heap.rs`'s binding assert re-evaluates to
+17,844 + 8,192 + 20,480 + 8,160 = 54,676 vs 65,536, slack 10,860 B. Unchanged from the 2026-09-17
+baseline to the byte — which is what "the staging path allocates nothing" predicted, now on evidence.
+
+#### The two behaviour changes, and their mutations
+
+| mutation | caught by |
+|---|---|
+| revert `verify`'s `TooSmall \| TooLarge \| Truncated => LengthDisagreement` arm to `Err(_) => Unreadable` (i.e. restore the pre-fix production code) | `the_header_length_must_agree_with_the_announced_size`, exit 101, 134/1, `left: Err(Unreadable)` / `right: Err(LengthDisagreement)` on the `declared = 0` leg |
+| widen `arms_upgrade` with `Ok(keypad::Event::MultiKey) => true` | `only_the_ok_dome_arms_the_upgrade_listener`, exit 101, 56/1, "MultiKey is not a decision to reflash" |
+| `Ok(keypad::Event::Down(k)) => k == UPGRADE_HOLD_KEY` → `Ok(keypad::Event::Down(_)) => true` | same test, exit 101, 56/1, `'0' must not arm the listener`, `left: true` / `right: false` |
+
+Plus two RE-RUNS of §7b/§7c mutations whose recorded verdict the refusal remap invalidated, so the
+table stays true rather than merely plausible:
+
+| re-run mutation | recorded verdict | re-measured 2026-09-18 |
+|---|---|---|
+| `FW_LENGTH_FIELD_OFFSET` 24 → 28 | 5 upgrade tests at `Err(Unreadable)` | **4** upgrade tests at `Err(LengthDisagreement)`, exit 101, 131/4 — `a_word_split_…`, `every_chunk_is_acked_once_…`, `re_preparing_over_a_verified_image_…`, `staged_bytes_land_…`. §7's oldest finding stays CLOSED: writer and reader still do not move together |
+| drop `feed`'s `!rest.is_empty()` carry guard | 1 test at `Err(Unreadable)` | 1 test at `Err(LengthDisagreement)`, exit 101, 134/1, `a_word_split_across_two_packets_lands_the_same_bytes_as_one_chunk`'s `step 1` leg |
+
+**Coverage NOTE, stated rather than buried: the 24 → 28 mutation now reddens 4 tests instead of 5.**
+`the_header_length_must_agree_with_the_announced_size` stopped catching it, because reading a garbage
+field at the wrong offset now produces the same `LengthDisagreement` that test expects — which is the
+CORRECT verdict for a garbage length, so the test is right and its coverage of THAT mutation is
+simply redundant with four others. Net coverage is up: the test went from one leg to five.
+
+#### The seven findings applied
+
+1. **`Refuse::Unreadable`'s "Unreachable after admission" was FALSE, and it swallowed most of
+   `LengthDisagreement`'s cases.** `verify` mapped all five `StageError`s to `Unreadable`, and three
+   of them (`TooSmall`, `TooLarge`, `Truncated`) are driven by a streamed, coordinator-supplied
+   header field. So the variant fired on ordinary hostile input — and on any corrupt transfer,
+   since an all-zero header field is `TooSmall` — while its own doc, §7b's "Honestly noted" bullet
+   and `verify`'s reasoning all said it could not. Remapped: those three answer
+   `Refuse::LengthDisagreement`, which is what they mean, and `Unreadable` keeps only the genuinely
+   unreachable legs (`view` failure, `NotInStagingWindow`, `HeaderUnreadable`). The remap is not a
+   taste call — admission pins `BURN_LEN_MIN <= size <= BURN_LEN_MAX` and `view(size)` makes
+   `staged.len() == size`, so each of the three IMPLIES `declared != size`. Fail-closed before and
+   after; what changed is the diagnosis and the truth of the pin.
+2. **The consent gate's ACCEPT condition was pinned by nothing.** The three source-shape tests
+   pinned the call site, the signature, the `None` arm and the constant `UPGRADE_HOLD_KEY == KEY_OK`
+   — never that the constant is the thing MATCHED, and never that any other `Event` is refused.
+   MEASURED: widening the arm to `| Ok(keypad::Event::MultiKey)` survived all 191 firmware tests
+   GREEN with 0 ARM warnings, and `MultiKey` is exactly what the driver reports for a wet or shorted
+   pad — so a damp keypad column would have booted every unit into the pre-`Session` listener and
+   never into `Session::open`. Fixed the way `answer` already is: the decision is now
+   `arms_upgrade(Result<Event, KeypadError>) -> bool`, host-testable, an exhaustive `match` (so a new
+   `Event` variant is an `E0004` rather than a silent `false`), driven over all twelve `DECODER`
+   bytes plus `MultiKey`/`Unsettled`/`AllUp`/`NotOnThisTarget`/`ColumnsStuckLow`.
+3. **Three "No production caller" claims about `psram.rs` were left to rot**, including the exact
+   line `psram.rs`'s own rewritten paragraph had cited as the evidence for them. Corrected with the
+   dated clause at `hal/src/psram.rs`'s module doc (the "accessor with no production caller"
+   sentence), `MappedPsram`'s own doc, `hal/src/lib.rs`'s crate-root module table, and
+   `memmap::PSRAM_BASE`'s doc — the last two in a file that was not in phase 3's diff at all.
+   `check_burn_len`'s "no caller" claim is now scoped to "none outside this file's own
+   `#[cfg(test)]` assertions", which is what it always meant.
+4. **The identity-fault "the hold sits above USB bring-up" claim had FOUR homes; phase 3 rewrote
+   one.** `hal/src/identity.rs`, `hal/src/ui.rs` and `PLAN.md` §9 item 14 all still asserted the
+   ordering as the security property, and `identity.rs` pointed the reader at the `main.rs` site
+   that now contradicts it. All three carry `main.rs`'s replacement argument now: the hold is dark
+   because it never polls `cdc`, not because of ordering. `PLAN.md`'s archived pre-2026-08-25 text
+   also carried "the fix is **not** to bring USB up early"; that prohibition is marked withdrawn,
+   with the reason (at RDP=2 a unit with a damaged identity record otherwise has NO reflash path).
+5. **`PLAN.md` §10 — the section README, DECISIONS.md and §7b all NAME as the authority for the
+   image figure — still said 379,648 B**, so every document that moved to 380,040 B disagreed with
+   the source it cited. All five present-tense `PLAN.md` sites corrected (§10's figure and its
+   `899,400 / image` ratio, `:172`'s "Current:", `:1044`, `:1231`'s margin), each with the dated
+   clause. The historical trail entries — the `secp-lowmemory` both-sides A/B, the trajectory list,
+   the `311a41b` recipe-trap paragraph — are deliberately left alone: they are correction records,
+   not current-state claims.
+6. **`DECISIONS.md` kept 379,648 B in two present-tense sites** while its own Provenance row, edited
+   in the same change, said 380,040 B — one of them sixteen lines below a bullet list that change
+   edited. Both corrected, plus the Provenance row itself, plus its "`-p coldsnap_firmware` differs
+   by 4 B" cross-reference, which §10 had already re-measured at 12 B.
+7. **The mutation tally had four values across four documents.** `PLAN.md` §8.2b's heading and
+   README's register paragraph printed the exact figures §7b had already retracted, and §8.2b was
+   arithmetically impossible on its own face (18 + 4 = 22 run, yet 21 caught + 4 survived = 25).
+   The authoritative accounting is a SUM of three dated passes and is now written as one:
+   **§7b 27 run / 23 caught / 4 survived-green; §7c 8 run / 7 caught / 1 survived-green; §7d 5 run /
+   5 caught / 0 survived = 40 run, 35 caught, 5 survived-green.** README's "three of those four are
+   facts about the HARNESS" is now "four of those five".
+8. **`hostcheck`'s `stream_chunks` had a dead `owed` parameter.** Both callers passed the literal
+   `0`, so its `for i in 0..owed` ack-collection loop executed in no run and `let i = owed + n` was
+   always `n` — six lines of ack accounting inside the one function M13 exists to falsify, reading
+   as covered because the function around it is. It was scaffolding for the fourth M13 leg §7b
+   records as deliberately deleted. Deleted with it. (Nine findings, seven of which are the numbered
+   defects above; this is the ninth and the eighth is folded into item 1's doc sweep.)
+
+#### Deliberately NOT fixed, with reasons
+
+* **`self.state = State::Idle` in `Stager::admit` stays**, still dead, still labelled. Unchanged
+  judgement from §7b/§7c: one line of fail-closed redundancy against a fifth exit path that is one
+  `?` away, on the arm whose job is to stop a stale `Staged` reaching a future burn.
+* **`FakePsram::view`'s `check_read` stays**, still unfalsifiable, still labelled at its call site
+  with the measurement (§7c). `MappedPsram::view`'s — the one that matters — IS mutation-covered.
+
+#### What phase 4 still needs, unchanged by this pass
+
+Nothing in §5 was settled here, with one exception of scope rather than substance: §5 item 3's
+`MEASURED_ARENA_FOOTPRINT_BYTES` half is now a MEASURED 60,512 of 65,536 with 5,024 B spare against
+this tree rather than an inherited figure, so the heap side of the phase-4 gate has a current
+baseline to extend. The wire-size measurement for a `SharedKey`-carrying upgrade message is still
+not done, and it is still what gates phase 4. Also unchanged and still the largest gap: **nothing
+has run on silicon.** `MappedPsram`'s ARM `from_raw_parts`, `Cdc`'s `Wire` impl, `upgrade_requested`'s
+pad read and `readback_selftest` against real OCTOSPI have never executed.
+
+### Corrections to this file made by phase 3
+
+* **§3.5: "our `firmware_digest` … is the shape `PrepareUpgrade2` wants" is too strong.** Both
+  exclude the signature, so they are the same CLASS, but upstream's is a contiguous prefix
+  `sha256(bytes[..firmware_size])` while ours is TWO discontiguous ranges — `[0, 16_320)` then
+  `[16_384, length)` — because the Mk4 signature sits at byte 16,320 of the image rather than
+  appended. Consequence, stated rather than hidden: **a stock coordinator's announced digest will
+  not match ours.** That is the fail-closed direction and costs nothing while the driver is a host
+  tool.
+* **§3.5: "`FIRMWARE_UPGRADE_CHUNK_LEN` == our `FRAME_LIMIT` of 4,096, so DECISIONS.md 7 is
+  untouched" is true for the wrong reason.** Decision 7 is untouched because chunks never enter
+  `Link`'s accumulator AT ALL. The equality is a coincidence; a chunk could not be a frame anyway,
+  since the minimum bincode envelope puts it at ≥ 4,102 B.
+* **§3.7: "the keypad's own tests drive `scan_once` with a trivial counter" is false as written.**
+  That is true of `shuffle_rows`; `scan_once`'s body is ARM-only and NO host test executes it. The
+  conclusion survives — `shuffle_rows` is its only RNG consumer and demonstrably runs off a counter
+  — which is why `BootRng` is four lines and takes no entropy.
+* **§3.7's `hold()` pin `~:1948` is wrong**; the definition is `fn hold(reason: &str) -> !` and it
+  is cited by symbol now. The name is also a trap: `hold` there means "spin forever, dark", while
+  §3.7's "key hold" means a finger on a dome. The new one is `upgrade_requested`.
+* **§3.7 is silent on the fact that a live comment forbade the reordering it proposes.**
+  `main.rs` said "Do NOT resolve a future diagnostic need by moving USB earlier — that trades the
+  security property for a channel." That comment is rewritten with what is now true, including the
+  exact scope of the regression (one attach event; enumeration still never COMPLETES, because
+  `hold` never polls `cdc`) and what re-closes it (step 6d).
+
 ## 8. PROVENANCE
 
 Verified by the orchestrator directly: §1.3, §3.1 (including the field arithmetic), §3.2, §3.3,
@@ -355,3 +749,17 @@ Verified by the orchestrator directly: §1.3, §3.1 (including the field arithme
 Agent-reported and **not** independently verified: the §2 upstream-hardware rows, the ~15 s burn
 duration, `pins.c:1328`'s SE1 write ordering, `se2_handle_bad_pin`'s early return, and §5 item 5.
 Nothing in this file has run on silicon.
+
+**§7b (phase 3) was AGENT-REPORTED and NOT independently re-run when this paragraph was written;
+that is no longer the split, and this read "no second party re-ran them" until 2026-09-18** — which
+contradicted §7c, in this same file, 80 lines above. The split as it now stands. §7b's figures were
+produced by the implementing agent. Its mutation table was independently RE-RUN by a second agent
+(§7c: all 27 re-applied from scratch against the SOURCE rather than the table, 23 reproducing their
+claimed verdict, both survived-green source claims reproducing, one further survivor found, 8 new
+mutations added) and re-measured by the hardening pass (hal 316 / firmware 191 / sweep 623, ARM
+image 380,040 B, `M13 PASS` 3/3). §7d is a third pass, which re-measured the gates again after
+fixing seven confirmed review findings. Still not orchestrator-verified as §7 was. The three legs
+that are read-verified only are named in §7b's own "Honestly noted" list, and the largest single
+gap is unchanged from §7: **nothing has run on silicon.** In particular `MappedPsram`'s ARM
+`from_raw_parts`, `Cdc`'s `Wire` impl and `readback_selftest` against real OCTOSPI have never
+executed.

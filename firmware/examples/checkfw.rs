@@ -21,8 +21,10 @@
 //!   owns it (`coldsnap_firmware::firmware_digest`, cited by symbol, hashing
 //!   `verify.c:80-89`'s two spans; **this said `firmware/src/lib.rs:615` until
 //!   2026-09-12** and located `pub struct Session`, which has itself since moved to
-//!   `:647` while `pub fn firmware_digest` is at `:2956` — the second reason to cite the
-//!   symbol);
+//!   `:670` while `pub fn firmware_digest` is at `:3003` — the second reason to cite the
+//!   symbol. **That figure read `:2956` from 2026-09-12 until 2026-09-17**, when it
+//!   was 47 lines stale: this citation is itself the running demonstration of why the
+//!   symbol is the claim and the line is not);
 //!   this file only adds the OUTER SHA-256, because that function is single-hash
 //!   by deliberate coordinator convention while `fw_check` is double
 //!   (`verify.c:226`). Two implementations of the range would be two things to

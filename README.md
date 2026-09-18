@@ -181,17 +181,22 @@ since `overflow-checks = false` in the shipped profile made the wrap silent whil
 device's only arithmetic validation of it, pre-consent. A second would have made
 phase 5's sign-approval screen reset-loop on an ordinary OP_RETURN output.
 
-All 12 are now addressed, and the whole tree **compiles and its 576 host tests
-pass** (re-measured 2026-09-12; **this read 568 until then**, and 268 until
-2026-09-10, which was the 2026-08-19 figure and never counted `coldsnap_firmware`
-at all) — the flash fixes
+All 12 are now addressed, and the whole tree **compiles and its 624 host tests
+pass** (re-measured 2026-09-18; **this read 623 on 2026-09-17 and 576 from 2026-09-12 until then**, 568
+before that, and 268 until 2026-09-10, which was the 2026-08-19 figure and never
+counted `coldsnap_firmware` at all) — the flash fixes
 and the vendored ones were written in
 sessions with no working shell, so until then they were verified by reading only.
-The full register is **PLAN.md §8.1**, with phase 3's mutation register at §8.2.
+The full register is **PLAN.md §8.1**, with phase 3's mutation register at §8.2 and
+the UPGRADE-PLAN phase-3 (staging) register at §8.2b — 40 mutations run over three
+dated passes, 35 caught, 5 survived-green, and **four of those five are facts about the
+HARNESS rather than about the device**, which is §8.1's lesson pointed at the test rig.
+(**This read "22 mutations run, 4 survived-green, and three of those four" until
+2026-09-18**, quoting figures UPGRADE-PLAN §7b had already retracted.)
 What still blocks the gate is now hardware, not the toolchain: nothing here has run
 on silicon.
 
-See **[DECISIONS.md](DECISIONS.md)** for the seven settled architectural choices —
+See **[DECISIONS.md](DECISIONS.md)** for the eight settled architectural choices —
 including the fact that C libsecp256k1 **remains** in the graph because
 rust-bitcoin is retained, and that "panic → DFU" is impossible on production
 hardware and is now "panic → system reset".
@@ -269,8 +274,17 @@ features because the vendored manifests set `default = []`. **`cargo test
 (`frost_backup/tests/descriptor_match.rs`) wants `frostsnap_coordinator` and
 `miniscript`, neither vendored.
 
-Re-measured 2026-09-12, all passing, **576 total** = `coldsnap_hal` 288 +
-`coldsnap_firmware` 172 + vendored 116. **This read 568 = hal 284 + firmware 168
+Re-measured **2026-09-18**, all passing, **624 total** = `coldsnap_hal` 316 +
+`coldsnap_firmware` 192 + vendored 116. **This headline read 623 = hal 316 + firmware
+191 on 2026-09-17** (UPGRADE-PLAN §7d added `only_the_ok_dome_arms_the_upgrade_listener`,
+which is the pin the consent gate's accept condition did not have) **and 576 = hal 288 +
+firmware 172 from 2026-09-12 until then**, and it was already stale by 604 = hal
+315 + firmware 173 when UPGRADE-PLAN §7's phases 1-2 landed — a figure that never
+reached this file at all, which is the same stale-headline shape the paragraph
+below already describes. The +19 is UPGRADE-PLAN §7b (upgrade staging): 14 in
+`firmware/src/upgrade.rs`, 4 in `firmware/src/main.rs`, 1 in `hal/src/psram.rs`; the
+further +1 is §7d's `only_the_ok_dome_arms_the_upgrade_listener`, in
+`firmware/src/main.rs`. **This read 568 = hal 284 + firmware 168
 earlier the same day**, before hal gained four fault-injecting integration tests
 (`device_nonces`' post-write half, 2a055f7) and firmware gained four address-
 verification tests (ce62444). **This headline read "268 total" until
@@ -285,8 +299,8 @@ cargo test --target $T -p frostsnap_macros                              #   7
 cargo test --target $T -p frostsnap_embedded --features std             #  17  (15 without std)
 cargo test --target $T -p frostsnap_comms    --features coordinator     #  10
 cargo test --target $T -p frostsnap_core     --features coordinator     #  63
-cargo test --target $T -p coldsnap_hal --features fake-flash,test-seam   # 288  (267 lib + 5 + 16)
-cargo test --target $T -p coldsnap_firmware                              # 172  (120 lib + 52 bin)
+cargo test --target $T -p coldsnap_hal --features fake-flash,test-seam   # 316  (292 lib + 5 + 19)
+cargo test --target $T -p coldsnap_firmware                              # 192  (135 lib + 57 bin)
 cargo test --target $T -p frost_backup --lib --test proptest \
   --test specification_tests --test recovery_tests --test error_handling \
   --test checksum_statistics                                            #  19
@@ -340,7 +354,7 @@ See PLAN.md §9 item 12 for what each driven flow does and does not prove.
 
 ```sh
 cargo build --target $T -p coldsnap_firmware --example stub
-(cd hostcheck && cargo run)   # prints "M1+M2+M3+M5+M7+M8+M9+M12 PASS: ..."; failures name the state
+(cd hostcheck && cargo run)   # prints "M1+M2+M3+M5+M7+M8+M9+M12+M13 PASS: ..."; failures name the state
 ```
 
 One more gate, and it is the last one before a bench: `firmware/examples/checkfw.rs`
@@ -571,8 +585,8 @@ be linked into firmware.
 that broke it wholesale were moved to `tools/research-scratch/` (see
 `vendor/README.md`). `frost_backup` still does, for `descriptor_match.rs`.
 
-`coldsnap_hal`'s 288 are 267 lib + 5 in `tests/host_smoke.rs` (target shape and
-link-time invariants) + 16 in `tests/integration_frostsnap_over_hal.rs` — the only
+`coldsnap_hal`'s 316 are 292 lib + 5 in `tests/host_smoke.rs` (target shape and
+link-time invariants) + 19 in `tests/integration_frostsnap_over_hal.rs` — the only
 tests in the tree that wire the **real** `frostsnap_embedded::AbSlot` /
 `frostsnap_core::device_nonces` stack to the HAL's flash geometry and `Entropy`.
 That file is what catches a `WRITE_SIZE`/`SECTOR_SIZE`/`RngCore`-bound mismatch,
@@ -685,12 +699,20 @@ a correction. PLAN.md §10 carries the same settlement.
 
 **Those are rlib sums with LTO off, i.e. upper bounds, and the gap to a real
 linked image is now measured and it is large.** `firmware/` links, and
-`target/thumbv7em-none-eabihf/release/coldsnap_firmware` is **379,648 B = 26.6343%**
-flash-resident (`.vector_table` 64 + `.text` 321,504 + `.rodata` 58,044 + `.data`
-36, from `objdump -h` — `0x40 + 0x4e7e0 + 0xe2bc + 0x24`), re-measured 2026-09-12 in
+`target/thumbv7em-none-eabihf/release/coldsnap_firmware` is **379,940 B = 26.6548%**
+flash-resident (`.vector_table` 64 + `.text` 321,700 + `.rodata` 58,140 + `.data`
+36, from `objdump -h` — `0x40 + 0x4e8a4 + 0xe31c + 0x24`), re-measured **2026-09-18** in
 the MAIN checkout with a real `FrostSigner`, 25-word entry, the `CheckBackup` quiz, the
-keygen check's randomised digit and address verification all linked. Margin on
-`FLASH_TEXT` is **1,045,760 B**. **THE INVOCATION IS PART OF THE FIGURE and this row did not say so
+keygen check's randomised digit, address verification and now firmware-upgrade STAGING
+all linked. Margin on `FLASH_TEXT` is **1,045,468 B**.
+**This row read 380,040 B = 26.6618% / margin 1,045,368 B on 2026-09-17, and
+379,648 B = 26.6343% / margin 1,045,760 B from 2026-09-12 until then.** The +292 B
+net over the 379,648 baseline is UPGRADE-PLAN §7b: `hal/src/psram.rs` gained its first
+production caller, so `--gc-sections` stopped dropping all of it, plus the new
+`firmware/src/upgrade.rs`. The −100 B against 2026-09-17's 380,040 is §7d's fix pass:
+`upgrade_requested`'s decision became an exhaustive `arms_upgrade` match and `verify`'s
+refusal mapping gained one arm. It is the first image move in this project caused by a
+module that had been in the tree, unreferenced, for a whole phase. **THE INVOCATION IS PART OF THE FIGURE and this row did not say so
 until 2026-09-12**: that is `cargo build --release`. A bare
 `cargo build --release -p coldsnap_firmware` gives a `.text` 4 B larger, because
 `frostsnap_comms` is a workspace MEMBER and the two invocations compile it with and
@@ -702,7 +724,7 @@ that, and 376,752 B = 26.43% (`.text` 318,640, `.rodata` 58,012) before that**, 
 the 2026-09-10 figure; note `.rodata` went DOWN by 8 B
 as a 12-byte literal legend was replaced by a composed one, so the +440 is not a pure
 addition. That is **2.4× smaller** than the
-rlib estimate (899,400 / 379,648 = 2.37), because LTO plus `--gc-sections` drops
+rlib estimate (899,400 / 379,940 = 2.37), because LTO plus `--gc-sections` drops
 everything unreferenced. **A figure taken in a git worktree under `.claude/worktrees/`
 reads ~424 B HIGH** — the longer absolute path is embedded ~11 times in panic `Location`
 strings, which lands entirely in `.rodata`; `.text` and `.bss` are the figures to compare
@@ -712,7 +734,7 @@ exactly that reason.
 allocator arena (`ALLOCATOR` at `0x2000_8038`) — so `.bss` is the heap plus eight
 bytes, and `.uninit` is empty. (The ratio read **2.3×** against the 860,898 rlib
 sum; at the re-measured 899,400 it is **2.37×**. **This said 2.39× until 2026-09-13**:
-899,400 / 379,648 = 2.3690, and the same figure nine lines above already read 2.37 while
+899,400 / 379,940 = 2.3672 (it read 2.3690 against the 379,648 image), and the same figure nine lines above already read 2.37 while
 PLAN.md §10 said 2.369 — the archetypal N−1-of-N, corrected at one site in the 2026-09-12
 pass and missed at the other. 2.39 was correct only against the 376,752 image, two images
 back. The "2.3× against 860,898" clause is a correction trail and stays.)
@@ -919,8 +941,10 @@ What survives the retraction is the *generalisation*, which was sound and is wor
 keeping on its own evidence (the allocator discovery, PLAN.md §9 item 7): **an
 rlib-only build hides a cost until something concrete calls it.** What does not
 survive is this instance of it. Headroom on the rlib sum is **526,008 B**
-(1,425,408 − 899,400); on the linked image it is **1,045,760 B**
-(1,425,408 − 379,648). **The image headroom read 1,048,656 B until 2026-09-12** and was
+(1,425,408 − 899,400); on the linked image it is **1,045,468 B**
+(1,425,408 − 379,940). **This read 1,045,368 B against the 380,040 B image on
+2026-09-17, 1,045,760 B against the 379,648 B image from
+2026-09-12 until then**, and **1,048,656 B until 2026-09-12**, which was
 never the subtraction it claimed to be — 1,048,656 is 1,425,408 − 376,752, i.e. it was
 left behind when the image figure moved; PLAN.md §9 item 4 carried the identical defect.
 **The rlib headroom read 564,510 B until 2026-09-10**, against the stale 860,898 total.
@@ -1088,6 +1112,12 @@ hal/src/              coldsnap_hal — the entire hardware surface:
   lib.rs                pub mod memmap — every flash and RAM address, mirrored by
                         link.x's ASSERTs so the two cannot drift
   panic.rs              panic -> NVIC_SystemReset, RTC-backed reset counter
+  psram.rs              the firmware-STAGING window: the lower half of the 8 MiB
+                        OCTOSPI PSRAM the bootloader already memory-mapped, with the
+                        word-aligned-write rule the silicon states, a host double
+                        that refuses an unaligned write, the FLASH_FS burn ceiling,
+                        and readback_selftest. Storage only — no receive path, no USB
+                        (firmware/src/upgrade.rs decides which bytes to write)
   rng.rs                fail-closed 2-source RngCore
   singleton.rs          the take-once guard flash/rng/usb/keypad/display share
   usb.rs                OTG_FS device mode + CDC-ACM (no protocol knowledge)
@@ -1101,8 +1131,9 @@ hal/tests/            host_smoke.rs (target shape and link-time invariants) and
                       frostsnap_embedded::AbSlot / device_nonces stack runs against
                       the HAL's own geometry and Entropy
 firmware/             coldsnap_firmware — the bin crate that LINKS. ARM-only; boot()
-                      is cfg(target_arch = "arm"), so its 165 host tests cover the
-                      host-testable half only:
+                      is cfg(target_arch = "arm"), so its 192 host tests cover the
+                      host-testable half only (this read 191 until 2026-09-18 and 165
+                      until 2026-09-17):
   main.rs               the 16-entry vector table, entry_point, boot() and the event
                         loop. Owns the Outbox that applies the three §7 caps
   entry.rs              the reset path: SCB->VTOR first, then CPACR, .bss, .data
@@ -1113,6 +1144,14 @@ firmware/             coldsnap_firmware — the bin crate that LINKS. ARM-only; 
                         check and an init sentinel that is not 0xdeadbeef
   store.rs              the keygen triple persisted as one 512 B record in a
                         vendored AbSlot; commit word last, so a tear reads Damaged
+  upgrade.rs            firmware-upgrade STAGING: Stager admits PrepareUpgrade2 /
+                        EnterUpgradeMode, streams raw chunks into psram.rs and
+                        verifies the digest read BACK out of it. Reached from boot()
+                        step 6d on a physical OK-key hold and NEVER from Session —
+                        it must work on a device whose flash and identity are broken.
+                        Holds no Session/DeviceId/Outbox, so a share leak is
+                        unanswerable rather than declined. Burns nothing: no callgate
+                        sub-call is bound (DECISIONS.md 8)
   wordentry.rs          25-word share INGEST — the only path that takes a secret in
   quiz.rs               the CheckBackup quiz: 8 of 25 positions, three candidates,
                         distractors chosen so the triple does not identify its answer

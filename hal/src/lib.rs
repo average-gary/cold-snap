@@ -33,7 +33,7 @@
 //! | [`keypad`] | the 4×3 membrane pad: cols `PB0`-`PB2` in, rows `PD8`-`PD11` open-drain out, the `mempad.py:19` decode table, the Tempest row shuffle, and the ghost-rejecting debounce that makes simultaneous keys a **refusal** | [`display`] (the `BSRR` half-word encoders), [`singleton`] |
 //! | [`rng`] | the fail-closed 2-source `RngCore` and its checked constructor | [`callgate`] (SE1/SE2 legs), [`singleton`] |
 //! | [`mod@panic`] | `#[panic_handler]`, `NVIC_SystemReset`, the RTC backup-register counters | [`callgate`] (late DFU fallback) |
-//! | [`psram`] | the ceiling that keeps a firmware-upgrade burn out of `FLASH_FS`, the refusal for the bootloader's decoupled verify-length/burn-length pair, and the word-aligned-write / unaligned-read accessor over the staging window with a host double that is no more permissive than the silicon. **No production caller, by design** | `memmap` |
+//! | [`psram`] | the ceiling that keeps a firmware-upgrade burn out of `FLASH_FS`, the refusal for the bootloader's decoupled verify-length/burn-length pair, and the word-aligned-write / unaligned-read accessor over the staging window with a host double that is no more permissive than the silicon. **Production caller since 2026-09-17: `firmware/src/upgrade.rs`'s `Stager`, entered from boot step 6d; no callgate sub-call is bound, so nothing can burn a staged image. This read "No production caller, by design" until then** | `memmap` |
 //! | [`singleton`] | the one tagged take-once guard `flash`, `rng` and `usb` use | nothing in-crate |
 //! | [`ui`] | the 1,024-byte `MONO_VLSB` framebuffer, the 8x8 glyph blitter and the eight PLAN.md §4.2 screens as **pure** composition + pagination — no registers, so every screen is host-renderable and host-assertable | nothing in-crate |
 //! | [`usb`] | OTG_FS device mode + CDC-ACM: descriptors, control-request dispatch, FIFO plan, packet I/O | [`callgate`] (`with_irq_off`), [`singleton`] |
@@ -352,10 +352,13 @@ pub mod memmap {
     /// Coldcard source. It is in the source, and re-read against `psram.h` for
     /// [`crate::psram`], which asserts both constants in a `const` block.
     ///
-    /// **Read and written by no production code.** [`crate::psram::MappedPsram`]
-    /// is the only accessor over this address and it has no caller; only the
-    /// LOWER HALF is reachable through it, so the bootloader's recovery header at
-    /// `PSRAM_BASE + PSRAM_LEN - 2048` cannot be named.
+    /// Read and written by [`crate::psram::MappedPsram`], the only accessor over
+    /// this address, whose caller is `firmware/src/upgrade.rs` —
+    /// **this read "Read and written by no production code … it has no caller"
+    /// until 2026-09-17**, when phase 3 landed that caller. Only the LOWER HALF is
+    /// reachable through it, so the bootloader's recovery header at
+    /// `PSRAM_BASE + PSRAM_LEN - 2048` still cannot be named, and no callgate
+    /// sub-call is bound, so nothing burns what lands there.
     pub const PSRAM_BASE: u32 = 0x9000_0000;
     /// PSRAM length, 8 MiB (`mk4-bootloader/psram.h`).
     pub const PSRAM_LEN: u32 = 8 * 1024 * 1024;

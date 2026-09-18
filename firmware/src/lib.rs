@@ -90,6 +90,11 @@ pub mod quiz;
 
 pub mod wordentry;
 
+// Firmware-upgrade STAGING, and deliberately NOT reachable from [`Session`] — see
+// its own module docs, and [`Refusal::FirmwareUpgrade`] for what the session still
+// refuses. A plain comment for the same reason `store` has one.
+pub mod upgrade;
+
 use store::{ShareStore, StoreFault};
 
 // The nonce partition, in SECTORS. `FlashPartition::new` takes sectors and every
@@ -154,8 +159,24 @@ impl From<CommsError> for Fault {
 /// cannot do at all, not a thing it failed to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
-    /// `Upgrade`: there is no OTA path on this hardware and there cannot be one.
-    /// RDP=2 makes DFU hardware-impossible and the image is signed-flash-only.
+    /// `Upgrade`: there is no OTA path **through the session**.
+    ///
+    /// **This doc read "there is no OTA path on this hardware and there cannot be
+    /// one" until 2026-09-17**, and phase 3 of UPGRADE-PLAN.md made that false: a
+    /// staging path now exists in [`upgrade`]. What is now true, and it is narrower
+    /// rather than weaker:
+    ///
+    /// * Staging must survive a device whose SE1, SE2, flash and identity are ALL
+    ///   broken, because that is the failure it exists to survive (UPGRADE-PLAN
+    ///   §3.7). So it cannot be reached through a type that only exists once
+    ///   [`Session::open`] has succeeded, and this refusal is what keeps it out.
+    /// * The listener is entered from `main`'s boot, above `Session::open`, on a
+    ///   physical key hold through reset. A device booted normally therefore has
+    ///   exactly one behaviour for an `Upgrade` body, and it is this refusal.
+    /// * Still true, and still the reason RDP=2 matters: nothing here BURNS
+    ///   anything. No callgate sub-call is bound, `pin_firmware_upgrade` (18/7)
+    ///   stays unbound and classified `Destructive`, and DFU stays
+    ///   hardware-impossible (`mk4-bootloader/dispatch.c:150-165` returns `EPERM`).
     FirmwareUpgrade,
     /// `DataErase`: destroys shares. Only ever behind physical consent, and no
     /// such screen or button path exists yet.
@@ -1035,7 +1056,17 @@ impl<'a, F: NorFlash + fmt::Debug> Session<'a, F> {
 
             // All three `CoordinatorUpgradeMessage` variants (`PrepareUpgrade`,
             // `PrepareUpgrade2`, `EnterUpgradeMode`) refuse together: there is no
-            // OTA path on this unit at any version.
+            // OTA path THROUGH THIS TYPE, and there must not be one.
+            //
+            // This comment said "there is no OTA path on this unit at any version"
+            // until 2026-09-17. Staging now exists, in `upgrade::Stager`, and it is
+            // deliberately not reachable from here: it has to work on a device whose
+            // flash and identity are broken, i.e. on a device where this `Session`
+            // could not have been opened at all. `Refusal::FirmwareUpgrade`'s doc
+            // carries the full argument; this arm is unchanged and is now the SOLE
+            // production behaviour for an `Upgrade` body outside that listener, so
+            // `firmware_upgrade_is_refused` guards a live path rather than a
+            // tautology.
             CoordinatorSendBody::Upgrade(_) => Err(Fault::Refused(Refusal::FirmwareUpgrade)),
             CoordinatorSendBody::DataErase => Err(Fault::Refused(Refusal::DataErase)),
             CoordinatorSendBody::Challenge(_) => Err(Fault::Refused(Refusal::GenuineChallenge)),
@@ -3379,8 +3410,15 @@ mod tests {
         }
     }
 
-    /// There is no OTA on this hardware and there cannot be one: RDP=2 makes DFU
-    /// hardware-impossible and the image path is signed-flash-only.
+    /// There is no OTA path through the session, and this is what holds it shut.
+    ///
+    /// **This doc read "There is no OTA on this hardware and there cannot be one"
+    /// until 2026-09-17.** `upgrade::Stager` now stages an image, entered from
+    /// `main`'s boot above `Session::open` on a physical key hold. The body of this
+    /// test is UNCHANGED and it did not weaken: the point of the refusal is now that
+    /// the staging path must be reachable on a device this `Session` could not have
+    /// been constructed on, so a session-side accept would be a second staging path
+    /// and the untested one.
     #[test]
     fn firmware_upgrade_is_refused() {
         assert_eq!(

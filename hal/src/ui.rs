@@ -1600,8 +1600,11 @@ pub fn refusal(frame: &mut Frame) {
 
 /// The screen for "this device cannot prove which device it is".
 ///
-/// PLAN.md §9 item 14: an identity fault holds *dark* — the firmware spins above USB
-/// bring-up so a device that cannot prove its identity never enumerates — and that
+/// PLAN.md §9 item 14: an identity fault holds *dark* — the firmware spins without
+/// ever polling `cdc`, so enumeration never COMPLETES and a device that cannot prove
+/// its identity never answers a handshake (**this read "the firmware spins above USB
+/// bring-up so a device … never enumerates" until 2026-09-17**; USB is boot step 6c
+/// now and the property is carried by the absent poll, not by the ordering) — and that
 /// hold was undiagnosable, indistinguishable from dead silicon at a bench. This is
 /// the screen that fixes it, and it is why §9 item 14 called the identity hold the
 /// first thing phase 5 should draw.

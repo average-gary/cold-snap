@@ -1,7 +1,9 @@
 # cold-snap — architecture decision record
 
-**Status:** decided. These **seven** choices are settled and are not re-litigated
-below. (1-6 were decided 2026-08-12; **7**, the `FRAME_LIMIT` reversal, 2026-08-18.)
+**Status:** decided. These **eight** choices are settled and are not re-litigated
+below. (1-6 were decided 2026-08-12; **7**, the `FRAME_LIMIT` reversal, 2026-08-18;
+**8**, the upgrade-staging path and early USB, 2026-09-17. **This header read "seven"
+until then.**)
 **Date decided:** 2026-08-12
 **Supersedes:** `PLAN.md` §9 open questions 1, 2, 5 (now closed by decisions 1, 4, 2)
 
@@ -216,7 +218,7 @@ attributed symbol by symbol in PLAN.md §10.
 
 **Rationale.** 327,408 bytes **measured** (re-confirmed unchanged 2026-09-10),
 23.0% of `FLASH_TEXT`, and it fits: **63.1%** as an rlib sum today, or 26.6343% as the
-linked image (379,648 B, `cargo build --release`, re-measured 2026-09-12; **this read
+linked image (**379,940 B**, `RUSTFLAGS="-C target-cpu=cortex-m4 -C link-arg=-Tfirmware/link.x" cargo build --release`, re-measured 2026-09-18; **this read 26.6343% / 379,648 B from 2026-09-12 until 2026-09-17 and 26.6618% / 380,040 B until 2026-09-18 — see decision 8 for the +292 B**; **this read
 26.43% until then**). PLAN.md §10 is the authority for the image figure. (This read "it fits at 59.2% total", the phase-0 figure.) It provides consensus-critical taproot sighash, which is the last
 thing worth reimplementing. `secp-lowmemory` already solved the flash problem
 that mattered — `ECMULT_WINDOW_SIZE=4`, `ECMULT_GEN_PREC_BITS=2`
@@ -651,9 +653,17 @@ decision:
   unbounded in count).
 - Hostile field content: an oversized `key_name`, `ScriptBuf`, `Test`, or `Nostr`
   body. None is bounded by anything today.
-- OTA / firmware upgrade frames, the genuine check (`DO_GENUINE_CHECK = false`,
-  and no coordinator-side refusal site exists), and the conch (off: `Downstream`
-  signals VERSION_SIGNAL 2, conch needs 1).
+- The genuine check (`DO_GENUINE_CHECK = false`, and no coordinator-side refusal site
+  exists), and the conch (off: `Downstream` signals VERSION_SIGNAL 2, conch needs 1).
+- **This list included "OTA / firmware upgrade frames" until 2026-09-17, and that is
+  now false — they ARE bounded, in `upgrade::Stager::admit`** (**measured**, decision 8):
+  `size % FW_BODY_ALIGN`, `size >= FW_MIN_BODY_LEN`, `size <= psram::BURN_LEN_MAX`, then
+  a whole-window `readback_selftest`, then per-write `check_write`, then a
+  header-length-vs-wire-size agreement check and a digest recomputed from PSRAM
+  read-back. Note the frames themselves were never the risk: no
+  `CoordinatorUpgradeMessage` variant carries bulk, so the largest one is a `u32` and a
+  32-byte digest. What needed bounding was the byte COUNT they announce, and it is the
+  one number on this wire that can name 1.4 MiB.
 
 **Three device-side caps are IMPLEMENTED, so 4,096 is necessary and now
 sufficient for what the device constructs.** **This paragraph read "REQUIRED and
@@ -666,13 +676,101 @@ frame per segment; `Debug` is cut to `DEBUG_MESSAGE_LIMIT` = 256 B on a UTF-8
 boundary; and an over-large `HeldShares2` is refused **whole** as
 `CommsError::FrameTooLong`, never truncated, because dropping shares from a
 restoration reply would tell the coordinator a share does not exist. There is an
-event loop (`firmware/src/main.rs` step 10), a bin target that links at 379,648 B
+event loop (`firmware/src/main.rs` step 10), a bin target that links at **379,940 B**
+(**this read 379,648 B from 2026-09-12 until 2026-09-17 and 380,040 B until 2026-09-18**, and 376,752 B before that; PLAN.md §10 is the authority)
 under `cargo build --release` (**this read 376,752 B until 2026-09-12**; PLAN.md §10 is
 the authority), and a production caller of `encode_frame` (`Outbox::encode`, by symbol —
 the `lib.rs:445` that stood here no longer locates it). Each cap
 has a named test that fails when it is removed — four mutations, four caught,
 2026-09-10; see PLAN.md §7 for the list. The device no longer builds a frame over a
 bound and then has its own encoder refuse it.
+
+---
+
+## 8. There IS a firmware-upgrade path, it is entered above `Session::open` on a physical key hold, and its chunk stream bypasses the framer
+
+**Decided 2026-09-17** (UPGRADE-PLAN.md §7b). Four parts, and they stand or fall together.
+
+**(a) An OTA staging path exists.** `firmware/src/upgrade.rs` admits `PrepareUpgrade2` and
+`EnterUpgradeMode`, streams the announced bytes into the lower half of PSRAM, and verifies
+a sha256 digest recomputed from PSRAM read-back. **Rationale:** at RDP=2 there is no DFU
+(**read**, `mk4-bootloader/dispatch.c:150-165` returns `EPERM`), no SWD, and
+`sdcard_recovery` restores only the image SE1 already blesses — so the SECOND flash of
+cold-snap was impossible and every iteration cost a device. **What it forecloses:** nothing
+yet, because **nothing is burned**. No callgate sub-call is bound, `pin_firmware_upgrade`
+(18/7) and `login` (18/2) stay unbound and stay classified, and `psram::check_burn_len` —
+the 18/7 gate — has no caller in any build that can reach hardware (only `hal/src/psram.rs`'s
+own `#[cfg(test)]` assertions). A staged image is bytes in RAM that neither channel able to
+describe an image to the bootloader names: the recovery header at `PSRAM_BASE + PSRAM_LEN - 2048`
+is unnameable from the staging window (const-asserted in `hal/src/psram.rs`), and callgate 18/7 is
+unbound. The bootloader DOES read the lower half on a failed-verify boot — `psram_recover_firmware`
+— and that path gates on `verify_world_checksum` against SE1, so it can only replay the image the
+PIN holder already blessed. A torn-burn net, not an install path (UPGRADE-PLAN §3.6).
+
+**(b) It is NOT reachable through `Session`.** `Session::recv` still refuses all three
+`Upgrade` variants, unchanged (**measured**: `firmware_upgrade_is_refused`). **Rationale:**
+staging has to work on a device whose SE1, SE2, flash and identity are ALL broken, because
+that is the failure it exists to survive, and such a device has no `Session` to route
+through. **Consequence:** the listener holds no `Session`, no `DeviceId`, no `Outbox`, no
+`Entropy` and no flash handle, so `RequestHeldShares` — which upstream admits with no
+consent screen and which leaks `key_id`/`threshold`/`share_image` — is not declined there,
+it is **unanswerable**: every device-to-coordinator frame needs a `DeviceId` derived from an
+identity secret that window does not have. That containment is a property of a signature,
+not of a caller's discipline. Its entire outbound vocabulary is `comms::MAGIC_REPLY` and
+`0x11` bytes. **Cost, stated:** the device cannot report a refusal at all; a refusal is an
+ack that does not arrive.
+
+**(c) The chunk stream bypasses `Link` entirely, and that does NOT touch decision 7.**
+Two independent reasons it must (**read**): no `CoordinatorUpgradeMessage` variant carries
+bulk (`vendor/frostsnap/frostsnap_comms/src/lib.rs:310-326`) and adding one is a `vendor/`
+edit we do not make; and even with one, the minimum bincode envelope for
+`ReceiveSerial::Message(CoordinatorSendMessage { Destination::All, body })` is ≥ 6 B, so a
+4,096-byte chunk is ≥ 4,102 B and both `encode_frame` and `Link` refuse it. **Decision 7 is
+untouched because chunks are neither SENT nor REASSEMBLED as frames — NOT because
+`FIRMWARE_UPGRADE_CHUNK_LEN` and `FRAME_LIMIT` are both 4,096, which is a coincidence.**
+Its declared 2 × `FRAME_LIMIT` SRAM cost is unchanged: no third 4,096-byte buffer exists,
+because bytes go from the wire slice to PSRAM with only a `[u8; 4]` carry for a packet
+boundary that splits a word. **What it forecloses:** nothing can be framed on this path
+ever, so progress reporting, resume and chunk maps are all out of reach without an upstream
+change — which is the intended shape (UPGRADE-PLAN §6). **The one property upstream relies
+on that we do not have:** its framer buffers zero bytes, ours buffers, so chunk bytes
+arriving in the same read as `EnterUpgradeMode` are lost. Mitigations, in order: the
+coordinator's own 100 ms gap, and behind it the digest — which is the honest reason the
+cheap digest check is worth having.
+
+**(d) USB comes up ahead of entropy, flash and identity** (step 6c, was step 9), gated by a
+physical OK-key hold at step 6d. **Rationale:** with USB below the four panics, a unit that
+dies at `panic!("entropy fail-closed")` or holds at the identity fault has no reflash path,
+which is exactly the device (a) exists for. The unit is used over USB as ordinary Frostsnap
+devices are, so this changes WHEN it enumerates, not WHETHER. **What it costs, precisely:**
+the identity-fault hold was DARK and is now a device that a host sees ATTACH and fail to
+enumerate — one attach event, because `Cdc::poll` is what services SETUP, USB reset,
+`ENUMDNE` and SET_LINE_CODING and `hold` never polls, so enumeration never COMPLETES, no
+handshake is answered and no frame is ever decoded. **What re-closes it:** the hold at step
+6d. Without a finger on the pad `upgrade::run` is never entered. **What it forecloses:** the
+comment in `main.rs` that said "Do NOT resolve a future diagnostic need by moving USB
+earlier" is withdrawn and rewritten in place — **and it had FOUR homes, not one; the other three
+(`hal/src/identity.rs`, `hal/src/ui.rs` and PLAN.md §9 item 14) were corrected 2026-09-18,
+UPGRADE-PLAN §7d item 4**; converting the two boot panics into listening
+holds is a separate, decision-sized change and is NOT licensed by this one. **Named gap:** a
+unit that hits either panic WITHOUT a key held still has no upgrade path.
+
+**AMENDED 2026-09-18 (UPGRADE-PLAN §7d), and neither amendment changes any part of (a)-(d).**
+Seven confirmed review findings were applied. Two changed behaviour: `Stager::verify` was mapping
+three of `staged_burn_len`'s five errors to `Refuse::Unreadable` — a variant documented as
+unreachable — when all three mean "the header's number is not the announced `size`", so they now
+answer `Refuse::LengthDisagreement`, which is what (a)'s agreement check exists to say; and the
+step-6d hold's ACCEPT condition, which was pinned by no test, is now the host-testable
+`arms_upgrade` with a twelve-key table behind it (widening it to also accept `Event::MultiKey` — a
+wet or shorted pad — had survived the whole suite green). The image measures **379,940 B** after
+both, and the heap arena was MEASURED at 60,512 B of 65,536 rather than argued from construction.
+
+**Not decided here, and deliberately:** the coordinator-contribution gate (UPGRADE-PLAN
+§1.2, blocked on a WIRE-SIZE measurement — the heap half of that item was measured 2026-09-18, §7d), the PIN login (§1.1), on-device signature
+verification (the bootloader does it inside the firewall and only its verdict counts), and
+the burn itself. Also **assumed**, not measured: every ARM leg of this — `MappedPsram`'s
+`from_raw_parts`, `Cdc`'s `Wire` impl, `readback_selftest` against real OCTOSPI, and the
+key-hold read — has never run on silicon.
 
 ---
 
@@ -684,5 +782,5 @@ bound and then has its own encoder refuse it.
 | Coldcard commit | `0431fd2b`, MIT (firmware); `hardware/` proprietary |
 | Rust toolchain | 1.88.0 (`rust-toolchain.toml`) + `thumbv7em-none-eabihf` |
 | C cross-compiler | clang 21, `/opt/homebrew/opt/llvm/bin/clang` (still required — decision 4) |
-| Flash, as built | **899,400 bytes = 63.1%** of `FLASH_TEXT` 1,425,408 (`stm32/COLDCARD_MK4/layout.ld:17`) as an rlib sum with LTO off, re-measured **2026-09-10**; the **linked image** is **379,648 bytes = 26.6343%** under `cargo build --release` (re-measured 2026-09-12; **this read 376,752 bytes = 26.43% until then**, two images stale), which is the number that decides fit and is ~2.4× smaller because of LTO plus `--gc-sections`. A flash figure is only meaningful with its cargo INVOCATION named — `-p coldsnap_firmware` differs by 4 B, and PLAN.md §10 records why. Trail: 844,229 at phase 0, 857,125 at the phase-2 gate, 860,898 on 2026-08-19 — **this row read 860,898 = 60.4% until 2026-09-10**, i.e. before the UI, the keypad, the share store, 25-word entry, the quiz and the `coldsnap_firmware` crate existed. The 893,099 figure was NOT a bad measurement: it is correct for a tree where the vendored `MAX_MESSAGE_ALLOC_SIZE` (32,768) differed from `comms::ENCAPS_DECODE_LIMIT` (20,480), which made `BINCODE_CONFIG` and `ENCAPS_CONFIG` distinct types and monomorphised the whole `CoordinatorSendBody` decode tree twice. Aligning the two constants collapsed the duplicate, worth 32,201 B; net cost of bounding both decode legs is +312 B. Confirmed by reverting the constant and reproducing 893,099 exactly — PLAN.md §10 is the authority. |
-| Host tests passing | **576** = hal 288 (267 lib + 5 smoke + 16 integration) + firmware 172 (120 lib + 52 bin) + vendored 116, re-verified 2026-09-12, every gate exit 0 (**this read 565 = hal 284 + firmware 165 until 2026-09-12**, and **268 until 2026-09-10** — the 2026-08-19 figure, which never counted `coldsnap_firmware` at all; 164 when this file was written; 204 at the phase-2 gate; 253 at the end of phase 3; 259 before decision 7 added two `comms` tests; 261 before PLAN.md §9 item 7(c) added three outer-leg decode-limit `comms` tests; 264 before the three inner-leg `decode_body` tests; 267 before the pin on the vendored `MAX_MESSAGE_ALLOC_SIZE`, 2026-08-19); only `frost_backup/tests/descriptor_match.rs` is excluded (decision 5) |
+| Flash, as built | **899,400 bytes = 63.1%** of `FLASH_TEXT` 1,425,408 (`stm32/COLDCARD_MK4/layout.ld:17`) as an rlib sum with LTO off, re-measured **2026-09-10**; the **linked image** is **379,940 bytes = 26.6548%** under `RUSTFLAGS="-C target-cpu=cortex-m4 -C link-arg=-Tfirmware/link.x" cargo build --release` in the main checkout, re-measured **2026-09-18** (**this read 380,040 bytes = 26.6618% on 2026-09-17**, **379,648 bytes = 26.6343% from 2026-09-12 until then**, and **376,752 bytes = 26.43% before that**, two images stale). The net +292 B is decision 8: `hal/src/psram.rs` gained its first production caller, so `--gc-sections` no longer drops it, plus the new `firmware/src/upgrade.rs`, which is the number that decides fit and is ~2.4× smaller because of LTO plus `--gc-sections`. A flash figure is only meaningful with its cargo INVOCATION named — `-p coldsnap_firmware` differs by 12 B as of 2026-09-17 (**this said 4 B**, which was the 377,192-tree gap), and PLAN.md §10 records why. Trail: 844,229 at phase 0, 857,125 at the phase-2 gate, 860,898 on 2026-08-19 — **this row read 860,898 = 60.4% until 2026-09-10**, i.e. before the UI, the keypad, the share store, 25-word entry, the quiz and the `coldsnap_firmware` crate existed. The 893,099 figure was NOT a bad measurement: it is correct for a tree where the vendored `MAX_MESSAGE_ALLOC_SIZE` (32,768) differed from `comms::ENCAPS_DECODE_LIMIT` (20,480), which made `BINCODE_CONFIG` and `ENCAPS_CONFIG` distinct types and monomorphised the whole `CoordinatorSendBody` decode tree twice. Aligning the two constants collapsed the duplicate, worth 32,201 B; net cost of bounding both decode legs is +312 B. Confirmed by reverting the constant and reproducing 893,099 exactly — PLAN.md §10 is the authority. |
+| Host tests passing | **624** = hal 316 (292 lib + 5 smoke + 19 integration) + firmware 192 (135 lib + 57 bin) + vendored 116, re-verified **2026-09-18** (**this read 623 = firmware 191 on 2026-09-17**; **this read 576 = hal 288 + firmware 172 from 2026-09-12 until then**; UPGRADE-PLAN §7's 604 after phases 1-2 was never carried in this row), every gate exit 0 (**this read 565 = hal 284 + firmware 165 until 2026-09-12**, and **268 until 2026-09-10** — the 2026-08-19 figure, which never counted `coldsnap_firmware` at all; 164 when this file was written; 204 at the phase-2 gate; 253 at the end of phase 3; 259 before decision 7 added two `comms` tests; 261 before PLAN.md §9 item 7(c) added three outer-leg decode-limit `comms` tests; 264 before the three inner-leg `decode_body` tests; 267 before the pin on the vendored `MAX_MESSAGE_ALLOC_SIZE`, 2026-08-19); only `frost_backup/tests/descriptor_match.rs` is excluded (decision 5) |

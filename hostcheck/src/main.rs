@@ -706,6 +706,82 @@
 //!    `STUB_EXPECT_DECLINES` stays at `N_DEVICES` and the pass's own assertions are
 //!    byte-for-byte the ones it made before.
 //!
+//!  M13 (FIRMWARE UPGRADE STAGING -- a RAW, UNFRAMED chunk stream, and a digest verdict
+//!  carried by an ack that does not arrive). [`staging_leg`] runs a fifth pass in its own
+//!  process, with its own pty and `STUB_UPGRADE=1`, driving the device's
+//!  `upgrade::Stager` end to end: magic handshake, `PrepareUpgrade2`,
+//!  `EnterUpgradeMode`, then [`STAGE_SIZE`] bytes as 65 unframed chunks with one
+//!  `raw_read` of exactly one byte after each.
+//!
+//!  WHY IT NEEDS ITS OWN EVERYTHING, and why upstream's own driver cannot be used:
+//!  `UsbSerialManager::run_firmware_upgrade` iterates a `ready` map populated only from
+//!  `available_ports()` filtered on a USB vid/pid, which a pty master with
+//!  `port_name: None` can never enter; and `ValidatedFirmwareBin::new` rejects any image
+//!  without ESP magic `0xE9` at byte 0, so it could never carry a Cortex-M artifact at
+//!  all. `raw_send`/`raw_write`/`raw_read` are public, this file already hand-builds a
+//!  `CoordinatorToDeviceMessage` for M11, and `sha2` is already in scope -- so the leg is
+//!  hand-rolled, which is the same shape a bench tool will have to be. No writer thread
+//!  here on purpose: one `FramedSerialPort` owns both directions, so the ack reads come
+//!  off the same `BufReader` the frames went out on and no desync is possible.
+//!
+//!  WHAT IT PROVES THAT A UNIT TEST CANNOT. (a) The framer BYPASS: the device stops
+//!  feeding `Link::poll` for the duration and picks it back up after, which no host test
+//!  of `Stager` alone can exercise. (b) The 0x11 accounting against a real
+//!  `write_all`-then-`read_exact` lockstep. (c) That the SHORT final chunk is genuinely
+//!  short on the wire -- `std::slice::chunks` yields 512 bytes for the 65th, nothing pads
+//!  it, and the device must not invent a pad byte the digest would cover.
+//!
+//!  WHY [`STAGE_SIZE`] IS 262,656 AND NOT 397,312. Every real Mk4 artifact is a multiple
+//!  of 4,096 (`cli/signit.py:302-306` re-aligns the body), and 397,312 = 97 x 4,096
+//!  exactly -- a run at that size CANNOT fail the ack arithmetic or the tail, so it would
+//!  be the vacuous version. 262,656 = 64 x 4,096 + 512 clears the bootloader's 262,144
+//!  floor, satisfies the digest's 512 alignment, and is `% 4096 != 0`.
+//!
+//!  THE NEGATIVE LEG IS FIRST AND IS THE POINT. A device in this window can never send a
+//!  frame -- every device-to-coordinator message carries a `DeviceId` derived from an
+//!  identity secret the window does not have -- so the ONLY outcome channel is the ack,
+//!  and the refusal is an ack that does not arrive. One flipped byte in chunk 40 must earn
+//!  exactly 64 acks and then silence; the clean image must earn all 65. Both legs run
+//!  against the same child, which also exercises the device's re-prepare-from-`Refused`
+//!  transition.
+//!
+//!  THE THIRD (COALESCED) LEG, AND THE DEFECT THAT PUT IT THERE. Both admission frames
+//!  go out in ONE `raw_write`, so `Link::poll` hands the callback BOTH before returning
+//!  -- which is exactly what happens on USB, two few-dozen-byte frames against a 64-byte
+//!  packet. `upgrade::run` recorded the admitted message in a single `Option` until
+//!  2026-09-17, so the second frame OVERWROTE the first and only `EnterUpgradeMode` was
+//!  admitted, from `Idle`: `Refuse::OutOfOrder`, and an upgrade that could never start.
+//!  MEASURED: with that regression restored, this leg reports `0 ack(s) ... expected 65`.
+//!  Fixed by admitting inside the callback.
+//!
+//!  TWO CLAIMS THIS LEG DOES *NOT* MAKE, both withdrawn by measurement rather than
+//!  argued away:
+//!  - Its first draft asserted that DELETING the 100 ms sleep after `EnterUpgradeMode`
+//!    reddens the positive leg, because cold-snap's buffering `Link::poll` would then eat
+//!    chunk 0's head. **MEASURED 2026-09-17: deleting the sleep left every leg GREEN,
+//!    exit 0** -- a pty delivers separate writes as separate reads, so the race never
+//!    materialises here. The sleep is kept for parity with
+//!    `usb_serial_manager.rs:681-682` and is labelled unproven at its call site.
+//!  - A fourth leg wrote the two frames AND chunk 0's head together and asserted that no
+//!    ack arrived (MEASURED: 0 acks, correct). It was DELETED rather than shipped,
+//!    because every device mutation that could make it fire is caught by the NEGATIVE leg
+//!    first -- dominated, and it would have read like coverage. The head-loss hazard is
+//!    real; what this tree can falsify about it is the coalesced-ADMISSION half.
+//!
+//!  A THIRD DEFECT, in this file: the handshake loop re-sent magic on every poll, which
+//!  is right (the device's `scan_magic` consumes the FIRST magic frame without calling
+//!  `on_frame`, so one send never gets a reply) but left the device's SECOND
+//!  `MAGIC_REPLY` in the `BufReader`. `read_for_magic_bytes` consumes only to the end of
+//!  the first pattern it matches and `anything_to_read()` asks the PORT rather than the
+//!  buffer, so nothing could ever consume the leftover -- whose first byte is `0x00`,
+//!  read as chunk 0's ack. INTERMITTENT, roughly one run in three. `stage_session` now
+//!  drains with `raw_read` until it times out. Only a leg that switches to raw byte
+//!  reads can see this; the ordinary event loop decodes both replies through a framer.
+//!
+//!  NOT PROVEN BY M13, and it is the whole of what phase 3 does not do: no burn, no
+//!  callgate sub-call, no signature check, no PIN. `Outcome::Staged` means bytes are in
+//!  PSRAM with a matching digest and nothing on this device can install them.
+//!
 //! Usage: `hostcheck [path-to-stub-binary]`. Build the stub FIRST and pass the
 //! artifact -- never `cargo run`: the child's stdout IS the wire, and one stray
 //! byte of cargo progress output desynchronises the magic scan permanently.
@@ -2387,8 +2463,26 @@ fn main() -> Result<()> {
     // reassembly is already proven at 1 by the pass above.
     eprintln!("--- pass: DECLINE (every device presses x at the signing screen) ---");
     one_pass(&stub, 64, &t0, Expect::Decline, false).context("pass DECLINE")?;
+    // M13. Its own process and its own pty, so nothing above can be destabilised by
+    // it — see `staging_leg`.
+    eprintln!("--- pass: UPGRADE STAGING (M13) ---");
+    staging_leg(&stub).context("pass UPGRADE STAGING")?;
+    eprintln!(
+        "  pass ok: M13 -- {STAGE_SIZE} B announced as 65 chunks (64 whole plus a 512-byte \
+         SHORT tail, so `% 4096 != 0` is under test and not rounded off)\
+         \n    negative: the corrupted image earned exactly 64 acks and NO 65th, so the final \
+         0x11 IS the digest verdict, recomputed from PSRAM READ-BACK -- and it is the only \
+         outcome channel a device with no identity has, since every frame it could send \
+         would need a `DeviceId` it does not have\
+         \n    positive: the clean image earned all 65 over the same child, so the device \
+         re-prepared out of `Refused`\
+         \n    coalesced: both admission frames in ONE read still stage, which is the defect \
+         a single `Option` in the callback used to hide\
+         \n    and NOTHING WAS BURNED: no callgate sub-call is bound, `check_burn_len` has no \
+         caller, and `Outcome::Staged` means bytes in PSRAM and nothing more"
+    );
     println!(
-        "M1+M2+M3+M5+M7+M8+M9+M12 PASS: real {THRESHOLD}-of-{N_DEVICES} keygen over a roster cut \
+        "M1+M2+M3+M5+M7+M8+M9+M12+M13 PASS: real {THRESHOLD}-of-{N_DEVICES} keygen over a roster cut \
          out of {ALL_DEVICES} announced devices, nonce replenishment and a \
          signature that VERIFIES against the group key, across the pty at both chunk sizes, \
          including the 1-byte case that forces reassembly; the 4-byte code ON THE GLASS equals the \
@@ -2403,9 +2497,374 @@ fn main() -> Result<()> {
          `EraseDevice` driver NEVER completes against this device, which refuses its `DataErase` on \
          the wire; and the TENTH device, which this coordinator left out of the keygen and which \
          reported holding nothing at all, ingested another device's 25 words off its sheet and \
-         CONSOLIDATED them onto a flash that held no share"
+         CONSOLIDATED them onto a flash that held no share; and a {STAGE_SIZE} B firmware image \
+         STAGES into the device's PSRAM over a raw, unframed 65-chunk stream that bypasses the \
+         framer entirely, with the digest recomputed from PSRAM read-back -- a corrupted image \
+         gets 64 acks and silence where the 65th would be, a clean one gets all 65, and NOTHING \
+         IS BURNED because no callgate sub-call is bound"
     );
     Ok(())
+}
+
+/// M13's announced size: 64 x 4,096 + 512, and every digit of it is chosen hostile.
+///
+/// `>= 262,144` (the bootloader's floor), `% 512 == 0` (what the device's digest
+/// demands of the header's length field), and `% 4096 != 0` — so the stream ends in a
+/// 512-byte SHORT final chunk and there are 65 chunks. A 97 x 4,096 exact fit, which
+/// is what a real artifact always is, could not fail the ack arithmetic or the tail
+/// and would be the vacuous version of this whole leg.
+const STAGE_SIZE: u32 = 262_656;
+
+/// Per-ack wall clock. The pty slave's own timeout is [`STAGE_PORT_TIMEOUT`] and
+/// `raw_read` is a `read_exact`, so a missing ack surfaces as a timeout error; this
+/// is the budget for retrying that before calling the ack absent.
+const ACK_DEADLINE: Duration = Duration::from_secs(2);
+
+/// M13's slave timeout. Longer than [`PORT_TIMEOUT`] because the device does a full
+/// PSRAM self-test at admission and a 262 KiB read-back at the end, and neither is
+/// on this leg's critical path to being correct.
+const STAGE_PORT_TIMEOUT: Duration = Duration::from_millis(1_000);
+
+/// A deterministic image of `size` bytes with `size` in its length field.
+///
+/// The offset is the LITERAL `16_280` and the pattern is this function's own. Neither
+/// derives from anything the device computes — and it CANNOT, because `hostcheck`
+/// cannot depend on `coldsnap_firmware` at all (one cargo graph will not hold both
+/// `coldsnap_hal` and upstream `frostsnap_coordinator`). So M13 is an independent
+/// reader of the signed range by CONSTRAINT rather than by care, which is the
+/// strongest form of that property available here.
+fn synth_image(size: u32) -> Vec<u8> {
+    let mut v: Vec<u8> = (0..size as usize).map(|i| (i * 7 + i / 251) as u8).collect();
+    v[16_280..16_284].copy_from_slice(&size.to_le_bytes());
+    v
+}
+
+/// The digest the device must arrive at: sha256 over `[0, 16_320)` then
+/// `[16_384, size)`.
+///
+/// That is the Mk4 bootloader's signed range with the 64-byte RSA signature that sits
+/// INSIDE the header punched out. All four numbers are literals here, so a mutation of
+/// the device's skip window reddens M13 rather than moving with it.
+fn signed_digest(img: &[u8]) -> Sha256Digest {
+    use sha2::Digest as _;
+    let mut h = sha2::Sha256::new();
+    h.update(&img[..16_320]);
+    h.update(&img[16_384..]);
+    Sha256Digest(h.finalize().into())
+}
+
+/// A fresh `STUB_UPGRADE=1` child, its pty and a completed magic handshake.
+///
+/// One per LEG, because `upgrade::run` returns on `Outcome::Staged` and the stub then
+/// exits — MEASURED 2026-09-17 as a `Broken pipe` on the leg after the positive one.
+/// The negative and coalesced legs could share a child; they do not, so that no leg's
+/// result can depend on another leg's residue.
+fn stage_session(stub: &str) -> Result<(FramedSerialPort<Downstream>, Reaped)> {
+    let (master, mut slave) = TTYPort::pair().context("TTYPort::pair for M13")?;
+    slave
+        .set_timeout(STAGE_PORT_TIMEOUT)
+        .context("set_timeout for M13")?;
+    let wire_in = unsafe { OwnedFd::from_raw_fd(master.into_raw_fd()) };
+    let wire_out = wire_in.as_fd().try_clone_to_owned()?;
+
+    let mut cmd = Command::new(stub);
+    cmd.env("STUB_UPGRADE", "1")
+        .stdin(Stdio::from(wire_in))
+        .stdout(Stdio::from(wire_out))
+        .stderr(Stdio::inherit());
+    let child = Reaped(cmd.spawn().with_context(|| format!("spawn {stub} for M13"))?);
+    drop(cmd);
+
+    let mut port: FramedSerialPort<Downstream> =
+        FramedSerialPort::new(Box::new(slave) as Box<dyn SerialPort>);
+
+    // `read_for_magic_bytes` CONSUMES the device's reply out of the very `BufReader`
+    // the ack reads come off, which is why it has to happen here and cannot be skipped:
+    // an unconsumed `MAGIC_REPLY` byte would be read as chunk 0's ack.
+    // MAGIC IS RE-SENT, exactly as a real coordinator does every
+    // `MAGIC_BYTES_PERIOD`, and MORE THAN ONE SEND IS REQUIRED. `Link::poll` consumes
+    // the FIRST magic frame inside `scan_magic` and returns without calling `on_frame`
+    // at all (`hal/src/comms.rs:489-495,530-550`), so the first frame links the device
+    // and the SECOND is the one that produces a reply. MEASURED 2026-09-17: sending
+    // magic once and then only polling times out at `HANDSHAKE_DEADLINE`, every run.
+    let started = Instant::now();
+    loop {
+        if started.elapsed() > HANDSHAKE_DEADLINE {
+            bail!(
+                "M13: the upgrade listener never answered the magic handshake in \
+                 {HANDSHAKE_DEADLINE:?} -- that reply is what puts a port in a coordinator's \
+                 `ready` map, so without it `EnterUpgradeMode` reaches nobody. Delete \
+                 `wire.write(&comms::MAGIC_REPLY)` from `upgrade::run` and this is what reddens"
+            );
+        }
+        port.write_magic_bytes().map_err(|e| anyhow::anyhow!("{e}"))?;
+        if port
+            .read_for_magic_bytes()
+            .context("read_for_magic_bytes")?
+            .is_some()
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(MAGIC_BYTES_PERIOD / 10));
+    }
+
+    // NOW DRAIN EVERY BYTE THE DEVICE HAS ALREADY SENT, and this is a bug fix rather
+    // than hygiene. Re-sending magic means the device replies more than once, and
+    // `read_for_magic_bytes` consumes only up to the END OF THE FIRST PATTERN it
+    // matches; a second `MAGIC_REPLY` sitting in the same `BufReader` fill is left
+    // there, and `anything_to_read()` is then false (it asks the PORT, not the buffer)
+    // so no further call to it will ever consume the leftover. `MAGIC_REPLY`'s first
+    // byte is `0x00` (`hal/src/comms.rs:343`, the bincode variant tag), so that
+    // leftover is read as chunk 0's ack.
+    //
+    // MEASURED 2026-09-17: without this drain, `chunk 0 was answered with 0x00` failed
+    // roughly one run in three. Nothing in the ordinary event loop can see this,
+    // because there both replies go through a framer that decodes them; only a leg that
+    // switches to raw byte reads can. `raw_read` empties the `BufReader` AND the port,
+    // which `read_for_magic_bytes` structurally cannot.
+    //
+    // It costs one `STAGE_PORT_TIMEOUT` per session and buys the leg's determinism.
+    let mut discard = [0u8; 1];
+    loop {
+        match port.raw_read(&mut discard) {
+            Ok(()) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
+            Err(e) => bail!("M13: draining the handshake replies failed: {e}"),
+        }
+    }
+    Ok((port, child))
+}
+
+/// **M13: the upgrade staging leg.** Drive the device's chunk stream over the pty and
+/// assert that the digest verdict is what the final ack means.
+///
+/// Its own `TTYPort::pair`, its own child (`STUB_UPGRADE=1`) and NO WRITER THREAD.
+/// That last one is deliberate: `raw_write` and `raw_read` then share one
+/// `FramedSerialPort` and one `BufReader`, so no desync between the write fd and the
+/// read fd is possible, and `one_pass`/M1-M12 cannot be destabilised by anything here.
+///
+/// The negative leg runs FIRST so one process covers both — the device's `admit`
+/// resets from `Refused`, which its own
+/// `re_preparing_over_a_verified_image_clears_the_verdict_first` pins.
+fn staging_leg(stub: &str) -> Result<()> {
+    let img = synth_image(STAGE_SIZE);
+    let digest = signed_digest(&img);
+
+    // NEGATIVE LEG: one flipped byte in chunk 40, inside the hashed range. Expect 64
+    // acks and NO 65th, because the 65th IS the verdict.
+    let (mut port, _child) = stage_session(stub)?;
+    let mut corrupt = img.clone();
+    corrupt[40 * 4096 + 7] ^= 0x80;
+    let acks = drive_chunks(&mut port, &corrupt, digest)?;
+    if acks != 64 {
+        bail!(
+            "M13 negative leg: {acks} ack(s) for a corrupted image, expected exactly 64 \
+             then silence. A 65th means the digest verdict is NOT gated on the final ack -- \
+             move the ack return above `Stager::verify` and this is what reddens"
+        );
+    }
+
+    // POSITIVE LEG, same child: the clean image, 65 acks. Reusing the child is
+    // deliberate — the device must re-prepare out of `Refused`, which is the transition
+    // `re_preparing_over_a_verified_image_clears_the_verdict_first` pins in a unit test
+    // and this is the only place a coordinator drives it.
+    let acks = drive_chunks(&mut port, &img, digest)?;
+    if acks != 65 {
+        bail!(
+            "M13 positive leg: {acks} ack(s) for a clean image, expected exactly 65 \
+             (64 whole chunks and a 512-byte tail). Drop the `received == size` case from \
+             `Stager::feed`'s `acks_at` and this reddens at 64"
+        );
+    }
+
+    // COALESCED LEG: both admission frames in ONE `raw_write`, then the whole image.
+    //
+    // WHY THIS EXISTS, and it is the leg that caught a real defect. A coordinator's
+    // `PrepareUpgrade2` and `EnterUpgradeMode` are a few dozen bytes each, so they
+    // legitimately arrive in ONE 64-byte read, and `Link::poll` then hands the callback
+    // BOTH frames before returning. `upgrade::run` recorded the admitted message in a
+    // single `Option` until 2026-09-17, so the second overwrote the first and only
+    // `EnterUpgradeMode` was admitted — from `Idle`, i.e. `Refuse::OutOfOrder` and an
+    // upgrade that could never start. Fixed by admitting inside the callback.
+    //
+    // IT MUST BE LAST and it needs its OWN CHILD: the positive leg above ended in
+    // `Outcome::Staged`, at which point `upgrade::run` returns and the stub exits
+    // (MEASURED as a `Broken pipe` here before this took a fresh session).
+    //
+    // NOTE WHAT IS *NOT* ASSERTED HERE, per the domination convention. An earlier
+    // version of this leg wrote the two frames AND chunk 0's head together, to force
+    // the head into `Link`'s private accumulator, and asserted that no ack arrived (it
+    // does not — MEASURED 0 acks). It was DELETED rather than shipped: every device
+    // mutation that could make it fire is caught by the NEGATIVE leg first, so it was
+    // dominated and read like coverage. The head-loss hazard is real and its mitigation
+    // is upstream's 100 ms gap plus the digest; what this tree can falsify is the
+    // COALESCED-ADMISSION half, which is this leg.
+    let (mut port, _child) = stage_session(stub)?;
+    let frames = encode_upgrade_frames(img.len() as u32, digest)?;
+    port.raw_write(&frames).context("coalesced frame write")?;
+    // The same 100 ms upstream leaves after `EnterUpgradeMode`. It is NOT what makes
+    // this leg pass -- MEASURED 2026-09-17, deleting it left every M13 leg GREEN,
+    // because a pty delivers separate writes as separate reads. Kept for parity with
+    // `usb_serial_manager.rs:681-682`, and named as unproven rather than claimed.
+    std::thread::sleep(Duration::from_millis(100));
+    let acks = stream_chunks(&mut port, &img)?;
+    if acks != 65 {
+        bail!(
+            "M13 coalesced leg: {acks} ack(s) when both admission frames arrived in ONE \
+             read, expected 65. Replace `upgrade::run`'s admit-in-callback with a single \
+             `let mut msg = None;` set in the callback and this reddens at 0, because only \
+             the SECOND frame survives and `EnterUpgradeMode` from `Idle` is refused"
+        );
+    }
+
+    Ok(())
+}
+
+/// The two admission frames as BYTES, so they can be written together with chunk 0.
+///
+/// `raw_send` encodes straight into the port, one flush per frame, so it cannot
+/// produce a coalesced write. This uses the same `BINCODE_CONFIG` the port does.
+fn encode_upgrade_frames(size: u32, digest: Sha256Digest) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    for body in upgrade_bodies(size, digest) {
+        bincode::encode_into_std_write(
+            ReceiveSerial::<Upstream>::Message(CoordinatorSendMessage {
+                target_destinations: frostsnap_coordinator::frostsnap_comms::Destination::All,
+                message_body: body.into(),
+            }),
+            &mut out,
+            BINCODE_CONFIG,
+        )
+        .map_err(|e| anyhow::anyhow!("encode upgrade frame: {e}"))?;
+    }
+    Ok(out)
+}
+
+/// `PrepareUpgrade2` then `EnterUpgradeMode`, in the order the coordinator sends them.
+fn upgrade_bodies(size: u32, digest: Sha256Digest) -> [CoordinatorSendBody; 2] {
+    use frostsnap_coordinator::frostsnap_comms::CoordinatorUpgradeMessage as U;
+    [
+        CoordinatorSendBody::Upgrade(U::PrepareUpgrade2 {
+            size,
+            firmware_digest: digest,
+        }),
+        CoordinatorSendBody::Upgrade(U::EnterUpgradeMode),
+    ]
+}
+
+/// Read one ack, or report that it did not arrive inside [`ACK_DEADLINE`].
+///
+/// `Ok(false)` is the REFUSAL CHANNEL and not an error: a device in the pre-Session
+/// window can never send a frame, so a missing ack is the only way it can say no.
+/// A `bail!` here would make every refusal unobservable.
+fn read_ack(port: &mut FramedSerialPort<Downstream>, which: usize) -> Result<bool> {
+    let mut byte = [0u8; 1];
+    let waited = Instant::now();
+    loop {
+        match port.raw_read(&mut byte) {
+            Ok(()) => {
+                if byte[0] != 0x11 {
+                    // STRICTER than the real coordinator, which only logs at DEBUG on
+                    // an unexpected byte. A wrong value is a device sending something
+                    // other than the ready signal, and this leg is the only thing in
+                    // the tree that could notice.
+                    bail!(
+                        "M13: chunk {which} was answered with {:#04x}, not \
+                         FIRMWARE_NEXT_CHUNK_READY_SIGNAL (0x11)",
+                        byte[0]
+                    );
+                }
+                return Ok(true);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                if waited.elapsed() > ACK_DEADLINE {
+                    return Ok(false);
+                }
+            }
+            // A GONE CHILD IS "NO ACK", not a read error, and that distinction is what
+            // makes the count assertions readable. MEASURED 2026-09-17: with `Broken
+            // pipe` treated as an error, mutating `Stager::feed`'s `acks_at` was caught
+            // — but as `chunk 64 ack read failed: Broken pipe` rather than as `64 ack(s)
+            // ... expected exactly 65`, because `upgrade::run` returns on
+            // `Outcome::Staged` and the stub exits before the missing ack can time out.
+            // Real coverage with the wrong diagnosis; this makes the diagnosis the one
+            // the caller's `bail!` was written for.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                return Ok(false);
+            }
+            Err(e) => bail!("M13: chunk {which} ack read failed: {e}"),
+        }
+    }
+}
+
+/// Stream `img` as 4,096-byte chunks in write-then-read-one-byte lockstep, stopping
+/// at the first ack that does not arrive.
+///
+/// `chunks(4096)` yields a SHORT final slice and `raw_write` writes exactly its length,
+/// so the 65th chunk really is 512 bytes on the wire. Nothing pads it — that is the
+/// device's problem, and its answer is to refuse any `size` that would need a pad.
+///
+/// **This took an `owed: usize` and led with a `for i in 0..owed` ack-collection loop
+/// until 2026-09-18.** Both callers passed the literal `0`, so the loop executed in no
+/// run and `let i = owed + n` was always `n` — six lines of ack accounting inside the
+/// one function M13 exists to falsify, unreachable but reading as covered because the
+/// function around it is covered. It was scaffolding for the deleted fourth leg (the
+/// module header above), which was the only caller that could ever have owed an ack up
+/// front. Deleted with the leg it served.
+fn stream_chunks(port: &mut FramedSerialPort<Downstream>, img: &[u8]) -> Result<u32> {
+    let mut acks = 0u32;
+    for (i, chunk) in img.chunks(4096).enumerate() {
+        port.raw_write(chunk)
+            .with_context(|| format!("raw_write chunk {i}"))?;
+        if !read_ack(port, i)? {
+            return Ok(acks);
+        }
+        acks += 1;
+    }
+    Ok(acks)
+}
+
+/// `PrepareUpgrade2` + `EnterUpgradeMode` + the chunk stream, counting acks.
+///
+/// Stops as soon as an ack does not arrive within [`ACK_DEADLINE`], which is what
+/// makes "the device refused" observable at all: this window's device cannot send a
+/// frame — every device-to-coordinator message carries a `DeviceId` derived from an
+/// identity secret it may not have — so a MISSING ack is the entire refusal channel.
+fn drive_chunks(
+    port: &mut FramedSerialPort<Downstream>,
+    img: &[u8],
+    digest: Sha256Digest,
+) -> Result<u32> {
+    for body in upgrade_bodies(img.len() as u32, digest) {
+        port.raw_send(ReceiveSerial::<Upstream>::Message(CoordinatorSendMessage {
+            // `Destination::All` and NOT `to(device_id, ..)`: this window has no
+            // `DeviceId` to address, and `is_destined_to` returns true
+            // unconditionally for `All` without consulting one. That is exactly what
+            // the real coordinator sends `EnterUpgradeMode` with.
+            target_destinations: frostsnap_coordinator::frostsnap_comms::Destination::All,
+            // `.into()` is the encapsulation `ReceiveSerial::Message` carries on the
+            // wire, and the device's `comms::decode_body` is the matching inner decode.
+            message_body: body.into(),
+        }))
+        .map_err(|e| anyhow::anyhow!("raw_send: {e}"))?;
+    }
+
+    // UPSTREAM'S OWN SEPARATION (`usb_serial_manager.rs:681-682`), kept for PARITY and
+    // not because this leg proves anything about it. MEASURED 2026-09-17: deleting this
+    // sleep left every M13 leg GREEN, because two separate `raw_send` writes reach a pty
+    // as two reads. On USB CDC a 64-byte packet really can carry a frame tail and a chunk
+    // head together, and cold-snap's `Link::poll` — unlike upstream's byte-at-a-time
+    // framer — would swallow that head into a private accumulator. The COALESCED LEG
+    // above is what makes that hazard falsifiable; this line is not.
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Nothing written yet, so no acks are owed up front and every chunk goes out here.
+    stream_chunks(port, img)
 }
 
 fn one_pass(

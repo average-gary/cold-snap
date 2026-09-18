@@ -1631,7 +1631,63 @@ fn drive(
     wire.extend_from_slice(&out.take());
 }
 
+/// The upgrade listener's transport, over the same fd 0 / fd 1 the framed loop uses.
+///
+/// A BLOCKING read is correct here and nowhere else in this file: in `STUB_UPGRADE`
+/// mode the stub does nothing but stage, and the host driver is in strict lockstep
+/// (write a chunk, read one ack), so there is no second thing to service and no pty
+/// deadlock to arrange around. That is why there is no `spawn_reader`, no channel and
+/// no `Link` outside `upgrade::run` in this mode.
+struct StdioWire {
+    inp: std::io::StdinLock<'static>,
+    out: std::io::StdoutLock<'static>,
+}
+
+impl coldsnap_firmware::upgrade::Wire for StdioWire {
+    fn read(&mut self, buf: &mut [u8; coldsnap_hal::usb::MAX_PACKET_SIZE]) -> Option<usize> {
+        // `Ok(0)` is EOF on a pipe, which IS the wire closing — the one case
+        // `Wire::read`'s docs say `None` is for. An `Err` is treated the same way
+        // rather than as `Some(0)`: on a pty a read error is not something this
+        // process can survive, unlike `Cdc::poll`'s oversize-packet error.
+        match self.inp.read(buf) {
+            Ok(0) | Err(_) => None,
+            Ok(n) => Some(n),
+        }
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        // Unchunked and flushed. `write_chunked`'s 1 ms-per-chunk pacing exists for
+        // multi-kilobyte frames; every write from the listener is 1 or 8 bytes.
+        let _ = self.out.write_all(bytes);
+        let _ = self.out.flush();
+    }
+}
+
 fn main() {
+    // THE UPGRADE LEG, and it returns rather than falling through: this mode drives
+    // `coldsnap_firmware::upgrade::run` and nothing else, so the nine sessions, the
+    // twelve milestones and every existing assertion are untouched by construction.
+    // hostcheck's M13 spawns its own child with this set.
+    if std::env::var_os("STUB_UPGRADE").is_some() {
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(60) * timeout_scale());
+            die(3, "upgrade watchdog fired: the chunk stream made no progress");
+        });
+        let mut wire = StdioWire {
+            inp: std::io::stdin().lock(),
+            out: std::io::stdout().lock(),
+        };
+        // Sized to the DEVICE's own admission ceiling, so a capacity refusal from
+        // the double can never pre-empt a real refusal from `Stager` — a fake sized
+        // to the image under test would make `Refuse::TooLarge` unreachable and turn
+        // every over-size leg into an `OutOfBounds` from the double instead.
+        let psram =
+            coldsnap_hal::psram::fake::FakePsram::new(coldsnap_hal::psram::BURN_LEN_MAX as usize);
+        let outcome = coldsnap_firmware::upgrade::run(&mut wire, psram);
+        eprintln!("stub: upgrade listener finished: {outcome:?}");
+        return;
+    }
+
     std::thread::spawn(|| {
         std::thread::sleep(DEADLINE * timeout_scale());
         die(3, "watchdog fired: no progress within the deadline");

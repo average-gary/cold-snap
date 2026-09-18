@@ -45,14 +45,21 @@
 //! | 1-4a | VTOR, CPACR, `.bss`, `.data`, `compiler_fence` | [`entry::init_hardware`] |
 //! | 5 | `#[global_allocator]` init | [`alloc::init`] |
 //! | 6 | `BootHealth::read()` — **before any clear** | [`boot`] |
+//! | 6b | `KeypadToken::take().open()` — consent input, best-effort | [`boot`] |
+//! | 6c | `UsbToken::take().open()` — OTG_FS + CDC-ACM | [`boot`] |
+//! | 6d | the OK-key hold → `upgrade::run`, or fall through | [`boot`] |
 //! | 7 | `Entropy::boot(Sources)` — fail-closed | [`boot`] |
 //! | 8 | `StmFlashToken::take().open()` — DBANK geometry | [`boot`] |
 //! | 8b | `identity::load_or_create` — the durable secret, or a hold | [`boot`] |
 //! | 8c | `Session::open` — the flash-backed `FrostSigner`, share reloaded | [`boot`] |
-//! | 8d | `KeypadToken::take().open()` — consent input, best-effort | [`boot`] |
-//! | 9 | `UsbToken::take().open()` — OTG_FS + CDC-ACM | [`boot`] |
 //! | 10 | bounded event loop, then the panic-counter clear | [`boot`] |
 //! | 11 | never returns | `-> !` everywhere |
+//!
+//! **Rows `8d` and `9` were the pad and USB until 2026-09-17**, when both moved to
+//! `6b`/`6c` so that a unit which dies at `panic!("entropy fail-closed")` or holds
+//! at `8b` still has a reflash path — see step 6c's own comment for the five safety
+//! pins and step 6d for what gates the listener. That is the only reordering: 7, 8,
+//! 8b and 8c keep their order and all four panics keep theirs.
 //!
 //! Steps 6-10 are ARM-only because `BootHealth::read`, `bump_counter` and
 //! `clear_counter` are all `#[cfg(target_arch = "arm")]` in the HAL — there are no
@@ -605,6 +612,106 @@ fn answer(
             }
         },
         Ok(keypad::Event::MultiKey) | Err(_) => Answer::No,
+    }
+}
+
+/// The one key that arms the upgrade listener at step 6d: OK.
+///
+/// `b'y'` is what the pad's decoder reports for the OK dome
+/// (`hal/src/keypad.rs:299`), which is asserted by
+/// `the_hold_key_is_one_the_pad_can_actually_report` — a hold key the pad cannot
+/// report is a listener nothing can arm.
+const UPGRADE_HOLD_KEY: u8 = b'y';
+
+/// A counter, and deliberately NOT `Entropy`.
+///
+/// The hold check has to sit above step 7, whose failure IS
+/// `panic!("entropy fail-closed")` — the very fault the listener exists to
+/// survive — so it cannot take an entropy source. It does not need one:
+/// `read_key`, `scan_once` and `shuffle_rows` are all generic over `RngCore`
+/// (`hal/src/keypad.rs:1005,958,660`) and the only consumer inside `scan_once`
+/// is the row shuffle, whose stated purpose is EM defence for PIN ENTRY.
+/// Nothing secret is typed at a hold check, so a predictable scan order leaks
+/// nothing here.
+struct BootRng(u32);
+
+impl rand_core::RngCore for BootRng {
+    fn next_u32(&mut self) -> u32 {
+        // Odd increment so every bit position moves, which is all
+        // `shuffle_rows` asks of it. Wrapping because `overflow-checks = false`
+        // in release and a panic here would be a brick.
+        self.0 = self.0.wrapping_add(0x9e37_79b9);
+        self.0
+    }
+    fn next_u64(&mut self) -> u64 {
+        u64::from(self.next_u32()) << 32 | u64::from(self.next_u32())
+    }
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        for b in dest.iter_mut() {
+            *b = self.next_u32() as u8;
+        }
+    }
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
+        self.fill_bytes(dest);
+        Ok(())
+    }
+}
+
+/// Is the OK key held at power-on?
+///
+/// `Event::Down(UPGRADE_HOLD_KEY)` and nothing else. `MultiKey` (a wet or
+/// shorted pad), `Unsettled`, `AllUp`, any other key, every `Err` and a pad that
+/// would not open at all are NOT armed — the same shape [`ask`] has, where a
+/// missing pad reaches one place and that place cannot approve anything.
+///
+/// ONE `read_key`, no loop: it does `DEBOUNCE_SAMPLES` scans (~50 ms) and
+/// RETURNS whatever it saw rather than waiting (`hal/src/keypad.rs:1005-1021`).
+///
+/// ponytail: ceiling named. What the human authorises here is "reflash this
+/// device this boot", NOT "this digest". Upstream shows the announced digest and
+/// binds it to the bytes that landed (`frostsnap/device/src/ota.rs:300-303,500`);
+/// we cannot show a digest before boot, and a randomised confirm digit would need
+/// an RNG whose failure is the panic this gate sits above. It costs nothing in
+/// this phase because nothing here can burn — no callgate sub-call is bound. The
+/// upgrade path is a digest-confirm screen in the phase that binds selector 18/7,
+/// where a burn is at stake and the panel is guaranteed to be up.
+fn upgrade_requested(pad: Option<&mut keypad::Keypad>) -> bool {
+    let Some(pad) = pad else {
+        // A device with a damaged identity record AND a pad that cannot report a
+        // key stays unrecoverable. Fail-closed, and named rather than hidden: an
+        // ungated upgrade listener on a share-holding device is the evil-maid
+        // hole UPGRADE-PLAN §1.3 exists to close.
+        return false;
+    };
+    arms_upgrade(pad.read_key(&mut BootRng(1)))
+}
+
+/// Does this pad reading arm the listener? [`keypad::Event::Down`] of
+/// [`UPGRADE_HOLD_KEY`] and **nothing else**.
+///
+/// Split out of [`upgrade_requested`] for the reason [`answer`] is split out of
+/// [`ask`]: `KeypadToken::open` cannot produce a `Keypad` off ARM, so a decision
+/// left inside the pad read is testable for the `None` case and for nothing else.
+/// **The accept condition was pinned by no test at all until 2026-09-18** — the
+/// three source-shape tests pinned the call site, the signature and the CONSTANT
+/// (`UPGRADE_HOLD_KEY == KEY_OK`), never that the constant is the thing matched
+/// and never that any other `Event` is refused. Widening the arm to
+/// `| Ok(keypad::Event::MultiKey)` survived the whole firmware suite GREEN, and
+/// `MultiKey` is exactly what the driver reports for a wet or shorted pad
+/// (`hal/src/keypad.rs`'s `Event::MultiKey`) — so a damp keypad column would have
+/// booted every unit straight into the pre-`Session` listener.
+///
+/// An exhaustive `match` and not `matches!`, so a new [`keypad::Event`] variant is
+/// an `E0004` here rather than a silent `false` — the same backstop [`answer`]
+/// carries.
+fn arms_upgrade(read: Result<keypad::Event, keypad::KeypadError>) -> bool {
+    match read {
+        Ok(keypad::Event::Down(k)) => k == UPGRADE_HOLD_KEY,
+        // `MultiKey` is the ghost rejection AND a wet pad; `Unsettled` is a bounce
+        // mid-window; `AllUp` is no finger on the glass; an `Err` is a pad that
+        // cannot be read at all. None of them is a person deciding to reflash.
+        Ok(keypad::Event::MultiKey | keypad::Event::Unsettled | keypad::Event::AllUp) => false,
+        Err(_) => false,
     }
 }
 
@@ -1434,8 +1541,11 @@ pub unsafe extern "C" fn entry_point() -> ! {
 /// Durable-state failures are the third case and neither of the other two: a
 /// damaged identity record, or a stored secret that is not a scalar, is
 /// bit-for-bit identical on the next boot, so they *hold* — see `hold`, which
-/// draws one frame and then spins, above USB bring-up so the device never
-/// enumerates.
+/// draws one frame and then spins and, because it never polls `cdc`, is a device
+/// that never finishes enumerating. **This read "above USB bring-up so the device
+/// never enumerates" until 2026-09-17**: USB is step 6c now, and the property is
+/// carried by the absent poll rather than by the ordering. See the `Err` arm at
+/// step 8b for the whole argument, and for what step 6d re-closes.
 ///
 /// A keypad that will not open is the fourth case and none of the other three:
 /// it neither panics nor holds. See [`ask`] for the argument — the short version
@@ -1464,7 +1574,7 @@ fn boot() -> ! {
         Shown, Typed,
     };
     use coldsnap_hal::panic::{bump_counter, clear_counter, BootHealth, Counter};
-    use coldsnap_hal::{comms, display, flash, identity, rng, usb};
+    use coldsnap_hal::{comms, display, flash, identity, psram, rng, usb};
     use core::cell::RefCell;
     // `Session` is generic over its flash (`Session<'a, F: NorFlash + Debug>`), so
     // the two nested helpers that take one have to name the bound. Nothing else here
@@ -1875,6 +1985,101 @@ fn boot() -> ! {
     // writable for the clear at the bottom of the loop.
     let health = BootHealth::read();
 
+    // --- Step 6b: the pad. -------------------------------------------------
+    // MOVED HERE FROM STEP 8d ON 2026-09-17, and it had to MOVE rather than be
+    // copied: `KeypadToken::take()` is take-once, so an early take that fell through
+    // to a second one would leave `keypad = None` for the rest of the boot, at which
+    // point `ask` returns `Answer::No` forever and the device consents to nothing.
+    // There is exactly one `KeypadToken::take()` in this image.
+    //
+    // Alongside the panel and with the same shape, because the two are one
+    // instrument: the screen asks and the pad answers, and neither alone is
+    // consent. Before USB so `open`'s `ColumnsStuckLow` check — the one that
+    // catches a `GPIOB_MODER` write that did not take, which would otherwise be
+    // a pad reading all twelve keys down forever — runs before any coordinator
+    // can reach us. That sentence was true at step 8d and is stronger here.
+    //
+    // A key HELD at power-on does not trip that check, and step 6d depends on it:
+    // `init_pins` leaves every row at `ROWS_ALL_RELEASED` (Hi-Z) and
+    // `check_idle_columns`'s own doc says nothing in the matrix can then pull a
+    // column down (`hal/src/keypad.rs:625-629`), with `bsrr_write(ROWS_ALL_LOW)`
+    // running only AFTER the check.
+    //
+    // `Option` and best-effort, NOT a `panic!()` like steps 7-9 and NOT a hold
+    // like 8b/8c. The full argument is on `ask`; here is the one line of it that
+    // matters: `None` reaches exactly one place, and that place returns
+    // `Answer::No`.
+    let mut keypad = keypad::KeypadToken::take()
+        .map(keypad::KeypadToken::open)
+        .and_then(Result::ok);
+
+    // --- Step 6c: USB. -----------------------------------------------------
+    // MOVED HERE FROM STEP 9 ON 2026-09-17, above entropy, flash and identity.
+    // This is the ONLY reordering in that change; steps 7, 8, 8b and 8c keep their
+    // order relative to each other and all four panics keep theirs, so every rule
+    // in `panic::boot_sequencing` still holds and `BootHealth::read` is still the
+    // first thing this function does.
+    //
+    // WHY, and it is a survivability argument, not a convenience one: at RDP=2 there
+    // is no DFU (`mk4-bootloader/dispatch.c:150-165` returns `EPERM`), no SWD, and
+    // `sdcard_recovery` restores only the image SE1 already blesses. With USB below
+    // the four panics, a unit that dies at `panic!("entropy fail-closed")` or holds
+    // at step 8b has NO reflash path at all — which is precisely the failure
+    // UPGRADE-PLAN §3.7 says the upgrade listener exists to survive. The device is
+    // used over USB as ordinary Frostsnap devices are, so this changes WHEN it
+    // enumerates and not WHETHER.
+    //
+    // WHY IT IS SAFE, and the second pin is the one that matters, because "a later
+    // step configures the clock" is how a reordering like this normally breaks:
+    //
+    // 1. `UsbToken::open` takes a zero-sized token and nothing else, and `bring_up`
+    //    touches no RNG, no flash and no identity (`hal/src/usb.rs:878-898`).
+    // 2. The 48 MHz CLK48 is programmed by the BOOTLOADER (`clocks.c:170`, called
+    //    unconditionally from `main.c:59`) and by nothing in this tree — see the
+    //    module docs — so no cold-snap step can be its prerequisite.
+    // 3. Every register shared with a step USB now jumps over is a read-modify-write
+    //    of specific bits: `RCC_APB1ENR1.PWREN` is RESTORED to the value found
+    //    (`hal/src/usb.rs:1809-1816`) while `panic.rs`'s `enable_backup_access` sets
+    //    it permanently, and neither clears the other; `RCC_AHB2ENR.OTGFSEN` against
+    //    `rng.rs`'s `RNGEN` and `keypad.rs`'s `GPIOBEN|GPIODEN` is already
+    //    documented as safe on a single-threaded boot (`hal/src/usb.rs:1780-1787`)
+    //    and that argument is order-INDEPENDENT; `configure_pins` writes only the
+    //    PA11/PA12 nibbles (`hal/src/usb.rs:1829-1834`) and the panel's only GPIOA
+    //    register is `BSRR` (`hal/src/display.rs:417-420`).
+    // 4. Four distinct take-once statics, so no new contention.
+    // 5. `panic!("usb bring-up")` still counts: `bump_counter` reaches
+    //    `enable_backup_access` itself, so it does not depend on step 6 having run.
+    //
+    // `open()` runs `bring_up`, which enables `OTGFSEN`/`PWREN`/`USV` itself.
+    // Nothing here fakes the clock.
+    let Some(Ok(mut cdc)) = usb::UsbToken::take().map(usb::UsbToken::open) else {
+        panic!("usb bring-up");
+    };
+
+    // --- Step 6d: the upgrade hold. ----------------------------------------
+    // THE CONSENT GATE, and it is the entry gate rather than a per-message one.
+    // That is what lets the event loop, `Session`, and `Session::recv`'s `Upgrade`
+    // refusal all stay byte-for-byte unchanged: there is exactly one pump and
+    // exactly one stager, and a device booted without a finger on the pad does not
+    // stage at all.
+    //
+    // ABOVE step 7 deliberately. `panic!("entropy fail-closed")` is one of the
+    // faults this listener exists to survive, so a gate below it would be
+    // unreachable on the very unit that needs it. `upgrade_requested` therefore
+    // takes no entropy — see its docs.
+    //
+    // Diverges into a spin rather than falling through, for the same reason `hold`
+    // does: a device that has just been handed ~390 KiB of unverified bytes by a
+    // coordinator must not then continue into a signing session. Power-cycle to
+    // leave. `upgrade::run` returns only on a staged image or a closed wire, and it
+    // burns nothing either way — no callgate sub-call is bound.
+    if upgrade_requested(keypad.as_mut()) {
+        let _ = coldsnap_firmware::upgrade::run(&mut cdc, psram::MappedPsram);
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
     // --- Step 7: entropy, fail-closed. -------------------------------------
     // `take_all()` is the whole `Sources` proof; `Entropy::boot` is the only
     // unconditional constructor, so a stub source cannot reach this line.
@@ -1938,9 +2143,12 @@ fn boot() -> ! {
     // NOT a panic on `Err`, unlike steps 7-9 above, and the failure policy at the
     // top of this function says why: a damaged flash record is stable across
     // resets, so panicking on it spends a bounded counter on an unclearable fault
-    // and ends in `LOCKUP_FOREVER`. The refusal is a hold, and the hold is DARK —
-    // it sits below step 9, so USB never comes up and no coordinator can reach a
-    // device that cannot prove its identity. See the `Err` arm.
+    // and ends in `LOCKUP_FOREVER`. The refusal is a hold, and the hold is still
+    // dark at the protocol layer — not because it sits below USB (it no longer does;
+    // USB is step 6c), but because `hold` never polls `cdc`, so enumeration never
+    // completes and no coordinator can reach a device that cannot prove its
+    // identity. **This read "it sits below step 9, so USB never comes up" until
+    // 2026-09-17.** See the `Err` arm.
     //
     // Placed after step 8 deliberately: flash is already proven open here, so
     // "generated a key but could not persist it" is unreachable rather than
@@ -1955,16 +2163,43 @@ fn boot() -> ! {
         // clear and end in `LOCKUP_FOREVER`, which is indistinguishable from dead
         // silicon at a bench.
         //
-        // Held BEFORE USB, so a device that cannot prove which device it is never
-        // enumerates and a coordinator can never talk to it. `Damaged` in
-        // particular means this device may ALREADY have announced and be holding
-        // the user's shares, so continuing under a fresh identity is the one
-        // outcome that destroys a wallet rather than merely failing.
-        //
-        // The hold stays above USB bring-up: a device that cannot prove which
-        // device it is must never enumerate. Do NOT resolve a future diagnostic
+        // THIS READ "Held BEFORE USB, so a device that cannot prove which device it
+        // is never enumerates and a coordinator can never talk to it", followed by
+        // "The hold stays above USB bring-up ... Do NOT resolve a future diagnostic
         // need by moving USB earlier — that trades the security property for a
-        // channel. The panel is the diagnostic, and it needs no host.
+        // channel", UNTIL 2026-09-17. USB is step 6c now, above this hold. What
+        // replaces those two sentences:
+        //
+        // WHY IT WAS REVERSED. At RDP=2 there is no DFU
+        // (`mk4-bootloader/dispatch.c:150-165` returns `EPERM`), no SWD, and
+        // `sdcard_recovery` restores only the image SE1 already blesses. With USB
+        // below this hold, a device with a damaged identity record has NO reflash
+        // path at all — which is exactly the failure UPGRADE-PLAN §3.7 says the
+        // upgrade listener exists to survive, and this is the device that needs it
+        // most. The unit is used over USB as ordinary Frostsnap devices are, so the
+        // change is WHEN it enumerates, not WHETHER.
+        //
+        // WHAT THIS HOLD STILL PROTECTS, AND IT IS ALMOST ALL OF IT. `Cdc::poll` is
+        // what services SETUP packets, USB reset, `ENUMDNE` and SET_LINE_CODING
+        // (`hal/src/usb.rs:943-1005`), and `hold` never polls anything. So
+        // ENUMERATION NEVER COMPLETES: no magic handshake is answered, no frame is
+        // ever decoded, `Destination::All` reaches nobody, and nothing in this state
+        // can read a share. `Damaged` still means this device may ALREADY have
+        // announced and be holding the user's shares, so continuing under a fresh
+        // identity is still the one outcome that destroys a wallet rather than merely
+        // failing.
+        //
+        // WHAT IT NO LONGER PROTECTS, exactly and completely: the OTG core is
+        // powered and the D+ pull-up is on, so a host sees a device attach and fail
+        // to enumerate. One attach event, in exchange for the only reflash path this
+        // hardware can ever have.
+        //
+        // WHAT RE-CLOSES THE HOLE: the physical OK-key hold at step 6d. Without it
+        // `upgrade::run` is never entered and this hold is dark at the protocol layer
+        // exactly as before. With it, the listener holds no `Session`, no `DeviceId`
+        // and no `Outbox`, so its whole outbound vocabulary is `comms::MAGIC_REPLY`
+        // and 0x11 bytes — see `coldsnap_firmware::upgrade`'s module docs.
+        //
         // PLAN.md §9 item 14: the hold used to be DARK, which is correct
         // fail-closed behaviour but indistinguishable from dead silicon at a
         // bench. Say why, then hold — see `hold`, which diverges, so this arm
@@ -2017,9 +2252,11 @@ fn boot() -> ! {
         Err(_fault) => hold("no valid scalar"),
     };
 
-    // The digest a coordinator sees. Computed once, before USB, over the range the
-    // bootloader signs; `firmware_digest` bounds the header's length field three
-    // ways before using it.
+    // The digest a coordinator sees. Computed once, before the event loop, over the
+    // range the bootloader signs; `firmware_digest` bounds the header's length field
+    // three ways before using it. (This read "before USB" until 2026-09-17; USB is
+    // step 6c now. Nothing about this line depended on the ordering: it takes no
+    // flash token, only a slice over memory-mapped flash.)
     //
     // An all-zero digest when the header is unreadable, never a panic and never a
     // skipped announce: zeros can match no released firmware, so upgrade
@@ -2056,36 +2293,14 @@ fn boot() -> ! {
         .map(display::PanelToken::open)
         .and_then(Result::ok);
 
-    // --- Step 8d: the pad. -------------------------------------------------
-    // Alongside the panel and with the same shape, because the two are one
-    // instrument: the screen asks and the pad answers, and neither alone is
-    // consent. Before USB so `open`'s `ColumnsStuckLow` check — the one that
-    // catches a `GPIOB_MODER` write that did not take, which would otherwise be
-    // a pad reading all twelve keys down forever — runs before any coordinator
-    // can reach us.
+    // One standby frame, before the event loop, so a bench sees a live device
+    // rather than a dark one while it waits for a coordinator. See [`idle`], which
+    // is also what ends a backup reveal — the same screen, drawn from one place.
     //
-    // `Option` and best-effort, NOT a `panic!()` like steps 7-9 and NOT a hold
-    // like 8b/8c. The full argument is on `ask`; here is the one line of it that
-    // matters: `None` reaches exactly one place, and that place returns
-    // `Answer::No`.
-    let mut keypad = keypad::KeypadToken::take()
-        .map(keypad::KeypadToken::open)
-        .and_then(Result::ok);
-
-    // One standby frame, before USB, so a bench sees a live device rather than a
-    // dark one while it waits for a coordinator. See [`idle`], which is also what
-    // ends a backup reveal — the same screen, drawn from one place.
+    // This comment said "before USB" until 2026-09-17; USB is step 6c now.
     if let Some(panel) = panel.as_mut() {
         idle(&session, panel);
     }
-
-    // --- Step 9: USB. ------------------------------------------------------
-    // `open()` runs `bring_up`, which enables `OTGFSEN`/`PWREN`/`USV` itself. The
-    // 48 MHz CLK48 source is NOT programmed by anything in this tree — see the
-    // module docs. Nothing here fakes it.
-    let Some(Ok(mut cdc)) = usb::UsbToken::take().map(usb::UsbToken::open) else {
-        panic!("usb bring-up");
-    };
 
     // --- Step 10: the event loop. ------------------------------------------
     let mut packet = [0u8; usb::MAX_PACKET_SIZE];
@@ -2155,7 +2370,10 @@ fn boot() -> ! {
         // `unwrap_or(0)` and never `?`/`unwrap`: see the failure policy above. A
         // coordinator chooses the packet length.
         // `.min(packet.len())` is defence in depth, not a fix for a known bug:
-        // `usb::CdcPort::poll` is bounded by `hal::usb::fifo_read` today, but that
+        // `usb::Cdc::poll` — this named `usb::CdcPort::poll` until 2026-09-17, and
+        // there is no `CdcPort` anywhere in `hal/src` or `firmware/src`; the type is
+        // `usb::Cdc` (`hal/src/usb.rs:905`) — is bounded by `hal::usb::fifo_read`
+        // today, but that
         // bound lives two crates away from the slice below, and nothing here would
         // notice if it moved. At RDP=2 an out-of-range slice is a `panic!` with
         // `panic = "abort"` and no way to reinstall — permanently dead silicon from a
@@ -2250,7 +2468,8 @@ fn boot() -> ! {
                                 // * It is NOT a panic. Every byte that got here is
                                 //   coordinator-controlled, and a panic is a counted
                                 //   reset with no DFU beyond it (decision 6).
-                                // * It is NOT a hold. A hold above USB is
+                                // * It is NOT a hold. A hold is a boot-time state —
+                                //   steps 6d, 8b and 8c all diverge — so it is
                                 //   unreachable from inside the loop, and a hold
                                 //   here would be worse than the fault: the staged
                                 //   mutations survive in RAM, the identity and the
@@ -4769,6 +4988,209 @@ mod tests {
              decoded-frame arm — otherwise `handled_frame` is true on a poll that \
              decoded nothing and the guard above stops requiring a frame"
         );
+    }
+
+    /// **USB comes up ABOVE entropy, flash and identity** — the whole reason the
+    /// upgrade listener is reachable on the device that needs it.
+    ///
+    /// This is the SILENT-REVERT CATCHER. Moving the USB block back below step 8b
+    /// compiles clean and passes every other gate, because `boot` is compiled by no
+    /// gate — and it takes the reflash path away from precisely the unit that dies at
+    /// `panic!("entropy fail-closed")` or holds at step 8b, which at RDP=2 with DFU
+    /// hardware-impossible is a unit that is finished.
+    ///
+    /// Read off BYTE ORDER over four unrelated literals, so the pin cannot move with
+    /// the thing it pins: a test that asserted "the comment says step 6c" would be
+    /// satisfied by the comment alone.
+    ///
+    /// EVERY NEEDLE IS ASSERTED UNIQUE, and that is not hygiene — it is the defect
+    /// this test shipped with for one run. MEASURED 2026-09-17: the first version
+    /// looked for `panic!("entropy fail-closed")` without its semicolon, and step
+    /// 6c's own comment names that panic three lines above the USB block it
+    /// justifies. So `find` returned the COMMENT's offset, the ordering assertion
+    /// compared USB against a paragraph rather than against a call, and it failed on
+    /// correct code. A comment that mentions a needle is how a source-shape pin gets
+    /// silently inverted; the semicolon is what makes the needle a CALL.
+    #[test]
+    fn usb_comes_up_above_entropy_flash_and_identity() {
+        let src = production_source();
+        let at = |needle: &str| {
+            assert_eq!(
+                src.matches(needle).count(),
+                1,
+                "`{needle}` must occur exactly once in the production half, or the \
+                 ordering below is comparing against whichever mention came first"
+            );
+            src.find(needle).expect("just counted one")
+        };
+        let usb = at("= usb::UsbToken::take()");
+        assert!(
+            usb > at("let health = BootHealth::read();"),
+            "`BootHealth::read` is still the first thing `boot` does — rule 1 of \
+             `panic::boot_sequencing` is not this change's to move"
+        );
+        assert!(
+            usb < at("panic!(\"entropy fail-closed\");"),
+            "USB must come up BEFORE the entropy panic, or a fail-closed RNG is an \
+             unreflashable device"
+        );
+        assert!(
+            usb < at("identity::load_or_create(&mut *flash.borrow_mut()"),
+            "USB must come up BEFORE the identity hold, or a damaged identity record \
+             is an unreflashable device"
+        );
+        // And the pad above USB, because step 6d reads it and `open`'s
+        // `ColumnsStuckLow` check is worth running before a coordinator can reach us.
+        assert!(usb > at("= keypad::KeypadToken::take()"));
+        // ONE take of each, so an early take cannot leave a second site handing out
+        // `None` for the rest of the boot — `ask` would then return `Answer::No`
+        // forever and the device would consent to nothing.
+        assert_eq!(src.matches("keypad::KeypadToken::take()").count(), 1);
+        assert_eq!(src.matches("usb::UsbToken::take()").count(), 1);
+    }
+
+    /// **The upgrade listener is gated on the physical hold**, and it is entered from
+    /// exactly one place.
+    ///
+    /// THE MUTATION: call `upgrade::run` unconditionally. That is an ungated upgrade
+    /// listener on a share-holding device, which is the evil-maid hole UPGRADE-PLAN
+    /// §1.3 exists to close — and it compiles clean, because `boot` is compiled by no
+    /// gate.
+    #[test]
+    fn the_upgrade_listener_is_gated_on_the_physical_hold() {
+        let src = production_source();
+        assert!(
+            src.contains("if upgrade_requested(keypad.as_mut()) {"),
+            "the listener must sit behind the hold check, spelled at its call site"
+        );
+        assert_eq!(
+            src.matches("upgrade::run(").count(),
+            1,
+            "one entry to the listener, so the line above is the only gate there is \
+             to satisfy"
+        );
+        // The gate reads the pad and nothing else. A gate that took `&mut entropy`
+        // would be a gate below `panic!("entropy fail-closed")`, i.e. unreachable on
+        // the unit it exists for.
+        assert!(src.contains("fn upgrade_requested(pad: Option<&mut keypad::Keypad>) -> bool"));
+    }
+
+    /// **A pad that would not open cannot arm the listener**, and the counter the
+    /// hold check runs on does move.
+    ///
+    /// Two legs, and the first is the fail-closed one that matters: a device with a
+    /// damaged identity record AND a pad that cannot report a key stays
+    /// unrecoverable, which is named in `upgrade_requested`'s docs rather than
+    /// papered over. The mutation is `let Some(pad) = pad else { return false }` ->
+    /// `return true`, which is an ungated upgrade listener on every unit whose pad
+    /// failed to open.
+    ///
+    /// HONESTLY NOTED: the pad READ is still read-verified only on the host, because
+    /// `KeypadToken::open` cannot produce a `Keypad` off ARM at all. What the read
+    /// feeds is not: the DECISION is `arms_upgrade`, and
+    /// `only_the_ok_dome_arms_the_upgrade_listener` drives it over every event the
+    /// driver can report. **This doc said "the acceptance is pinned by the
+    /// source-shape test above plus `the_hold_key_is_one_the_pad_can_actually_report`"
+    /// until 2026-09-18, and that was not true** — neither of those asserts that
+    /// `UPGRADE_HOLD_KEY` is the thing matched, so widening the arm survived green.
+    ///
+    /// The second leg pins the one property `shuffle_rows` needs of `BootRng`: that
+    /// it is not a constant. A constant would make the row order fixed, which costs
+    /// nothing here (nothing secret is typed at a hold check) but would be a silent
+    /// surprise if this type were ever reused where it does matter.
+    #[test]
+    fn a_pad_that_will_not_open_cannot_arm_the_upgrade_listener() {
+        assert!(!upgrade_requested(None));
+
+        use rand_core::RngCore as _;
+        let mut rng = BootRng(1);
+        let a = rng.next_u32();
+        let b = rng.next_u32();
+        assert_ne!(a, b, "a constant source would fix the scan order");
+        // And the byte filler reaches every byte, which is what `fill_bytes` claims.
+        let mut buf = [0u8; 8];
+        rng.fill_bytes(&mut buf);
+        assert!(buf.iter().any(|b| *b != 0), "fill_bytes wrote nothing");
+    }
+
+    /// **Only the OK dome arms the listener**, and the twelve-key table is what says
+    /// so rather than one needle.
+    ///
+    /// THE MUTATION: widen the accept arm to `| Ok(keypad::Event::MultiKey)`. That
+    /// survived the ENTIRE firmware suite GREEN before this test existed, and it is
+    /// not a theoretical mutation: `MultiKey` is what the driver reports for a wet or
+    /// shorted pad, so every unit with a damp column would have booted into the
+    /// pre-`Session` listener — which answers the magic handshake and admits
+    /// `PrepareUpgrade2` from any coordinator over an unauthenticated wire — and
+    /// never reached `Session::open`, so it would also never sign. The weaker
+    /// `Ok(keypad::Event::Down(_))` (any of the twelve keys arms the only reflash
+    /// path) reddens here too.
+    ///
+    /// Driven off `DECODER` rather than off a literal list, so a decoder edit cannot
+    /// leave a key untested; and the count is asserted, so a decoder that shrank
+    /// could not make the loop vacuous.
+    #[test]
+    fn only_the_ok_dome_arms_the_upgrade_listener() {
+        assert_eq!(
+            keypad::DECODER.len(),
+            12,
+            "the loop below is only exhaustive over the pad the decoder describes"
+        );
+        let mut armed = 0;
+        for k in keypad::DECODER {
+            let arms = arms_upgrade(Ok(keypad::Event::Down(k)));
+            assert_eq!(
+                arms,
+                k == UPGRADE_HOLD_KEY,
+                "{:?} must {} the listener",
+                k as char,
+                if k == UPGRADE_HOLD_KEY { "arm" } else { "not arm" }
+            );
+            armed += usize::from(arms);
+        }
+        assert_eq!(armed, 1, "exactly one of the twelve keys is the hold key");
+
+        // Everything the driver can report that is NOT a single confirmed key. The
+        // first is the one that matters: `MultiKey` is the ghost rejection and also
+        // what a wet or shorted pad produces at power-on.
+        for e in [
+            keypad::Event::MultiKey,
+            keypad::Event::Unsettled,
+            keypad::Event::AllUp,
+        ] {
+            assert!(!arms_upgrade(Ok(e)), "{e:?} is not a decision to reflash");
+        }
+        // And a pad that cannot be read at all. `ColumnsStuckLow` is the interesting
+        // one: it is the diagnostic for a pad whose columns read low with every row
+        // Hi-Z, i.e. the hardware fault closest to "a key looks held".
+        for e in [
+            keypad::KeypadError::NotOnThisTarget,
+            keypad::KeypadError::ColumnsStuckLow { idr: 0 },
+        ] {
+            assert!(!arms_upgrade(Err(e)), "{e:?} must not arm the listener");
+        }
+    }
+
+    /// The hold key is one the pad can actually report.
+    ///
+    /// THE MUTATION: `b'y'` -> `b'q'`. `q` is in no position of the decoder, so
+    /// `read_key` can never return it and the listener becomes unreachable — a
+    /// silent loss of the only reflash path, with every other gate green.
+    ///
+    /// `DECODER` is a runtime array, so this has a runtime-variable operand and
+    /// clippy's `assertions_on_constants` has nothing to fold. The vacuous-assertion
+    /// tally in this tree is 24.
+    #[test]
+    fn the_hold_key_is_one_the_pad_can_actually_report() {
+        assert!(
+            keypad::DECODER.contains(&UPGRADE_HOLD_KEY),
+            "the pad's decoder cannot produce {:?}, so nothing can arm the listener",
+            UPGRADE_HOLD_KEY as char
+        );
+        // And it is the OK dome specifically, not merely *a* key: `KEY_OK` is what
+        // every consent screen advertises, so a hold on any other key would be a
+        // second, undocumented meaning for that key.
+        assert_eq!(UPGRADE_HOLD_KEY, KEY_OK);
     }
 
     /// The `Answer`s are distinct, so `Wait` cannot be `No` by accident — and
