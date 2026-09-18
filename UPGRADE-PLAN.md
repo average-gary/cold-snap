@@ -210,8 +210,12 @@ acceptable.
   `PA_SUCCESSFUL` free. The `Counted` classification stays correct; the stated reason does not.
   Consequence worth documenting for migration: on a blank-PIN Coldcard, **any key-0-signed firmware
   reads the BIP-39 secret for free.** So an old Coldcard seed must be treated as retired.
-* `DECISIONS.md` decision 2 still claims `| PIN | none | mandatory, SE1-enforced |`. False for the
-  shipped product.
+* **CLOSED 2026-09-18** — decision 2 now carries an `AMENDED` note recording that cold-snap
+  ships with no PIN, that the surviving dual-secure-element value is the root of trust rather
+  than PIN authorisation, and that the table row describes stock Coldcard firmware and not this
+  product. The row itself is left standing because it is true of the platform it names.
+  ~~`DECISIONS.md` decision 2 still claims `| PIN | none | mandatory, SE1-enforced |`. False for the
+  shipped product.~~
 
 ### 3.10 The destructive-selector guard does not currently work
 `no_counted_or_destructive_selector_is_reachable_from_this_module` is a REFUSAL, and

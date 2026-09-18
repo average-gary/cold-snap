@@ -2,6 +2,11 @@
 
 A Frostsnap signing device on COLDCARD Mk4 hardware.
 
+**To operate the device, jump to [Using the device](#using-the-device)** — the
+flows, the consent model, what it refuses, and how to stage a firmware upgrade.
+Everything before that section is the honest state of the project, and everything
+after it is for building and packaging.
+
 **Status: phases 0 and 1 complete; phases 2, 3, 4 and the mono UI written and
 host-verified, all still unproven on silicon. Architecture decided 2026-08-12.**
 Frostsnap's hardware-independent crates are vendored and verified to cross-compile
@@ -209,6 +214,106 @@ reclassified as fixed personalisation. PLAN.md §5.1.
 
 See **[PLAN.md](PLAN.md)** for the architecture, the three walls (display, root
 of trust, brick risk), and phasing.
+
+## Using the device
+
+**Read this first: nothing below has run on silicon.** Every flow in this section
+is proven only host-side, by `hostcheck/` driving an unmodified sibling
+`frostsnap_coordinator` against `firmware/examples/stub.rs` over a pty. Treat this
+as a guide to what the code *does*, not as an operating manual for a device you
+should put money on. The on-silicon assumptions are PLAN.md §9.
+
+### What it is
+
+One FROST share holder. A **coordinator** — Frostsnap's app, over USB — runs every
+ceremony; the device holds one share of one key and is useless below the threshold
+`t`. That is the whole protection model, and it is upstream's by design: *"Frostsnap
+devices do not handle authentication of the user directly unlike other devices with
+on-device pin codes"*. There is no PIN, no passphrase and no unlock step on a
+cold-snap device.
+
+The keypad is the Mk4's 4×3 membrane pad: `1`–`9`, `0`, **OK** and **X**
+(`hal/src/keypad.rs`'s `DECODER`). The screen is 1-bit mono.
+
+### The consent model — understand this before any flow
+
+**Every consent screen draws a randomised digit, and you type the digit that is on
+the glass.** The digit is fresh on the frame that asks, and the accepted key is not
+predictable from outside — which is what makes consent structural rather than
+bolted on. Consequences worth knowing:
+
+* A keypress cannot *start* a flow that no digit consented to. `Session::entry_key`
+  and `Session::quiz_key` refuse outright when nothing is in progress.
+* **Pressing `X` declines, and a declined prompt yields nothing at all** — not a
+  partial share, not an ack. `hostcheck` fails its own run if a declined signing
+  prompt ever produces a signature share.
+* A `Cancel` from the coordinator clears six pieces of state: temporary data, a
+  previewed name, and the reveal, recorded-question, entry and quiz grants. A
+  cancelled ceremony acks nothing.
+
+### The flows
+
+| flow | you do | notes |
+|---|---|---|
+| **Keygen** | confirm the digit on each device | the device also shows a 4-byte session code; it equals the coordinator's session hash, so compare them across devices |
+| **Sign** | confirm the digit, or press `X` | declining yields no share |
+| **Set name** | confirm the digit | the coordinator *previews* a name; a preview is not consent, so nothing reaches flash until you approve |
+| **Show backup** | confirm, then page through 25 words | then a final hold-to-confirm "backup recorded?" — one reveal buys at most one ack |
+| **Check backup** | answer the quiz | 8 answers, drawn only from words that reveal actually showed |
+| **Enter a backup** | type the words on the letter picker | for restoring onto a device that holds nothing |
+| **Consolidate** | confirm the digit | writes an entered backup onto this device's flash |
+| **Verify address** | read the address off the glass | refused for a `key_id` this device does not hold — the point is that it came from a key this device has a share of |
+| **Stage a firmware upgrade** | hold **OK** at power-on | see below |
+
+### Staging a firmware upgrade
+
+New as of 2026-09-18, and **it stages only — nothing is burned.**
+
+1. Power the device on with the **OK** key held. One ~50 ms pad read decides it; a
+   wet or shorted pad reports `MultiKey` and is **not** armed, nor is any other key,
+   nor a pad that cannot be read at all.
+2. The device comes up as an upgrade listener *before* entropy, flash and identity.
+   That is deliberate: staging is reachable on a unit whose SE1, SE2, flash and
+   identity are all broken, which is the failure it exists to survive.
+3. The coordinator streams the image in 4,096-byte chunks over a raw, unframed
+   stream; the device acks each with a single byte and verifies the digest by
+   reading the staged bytes back out of PSRAM.
+4. **Nothing is burned.** No callgate sub-call is bound. A successful stage means
+   bytes in PSRAM and nothing more. The burn is phase 6.
+
+**There is no progress bar and no screen during staging** — watch the coordinator,
+not the device. And what the OK hold authorises is *"reflash this device this boot"*,
+not *"this specific image"*: the device cannot show you a digest before boot. Binding
+consent to a digest belongs to the phase that binds the burn.
+
+### What the device refuses, and will keep refusing
+
+* **Wiping or decommissioning.** `DataErase` is refused on the wire; upstream's own
+  `EraseDevice` driver never completes against this device. There is no
+  factory-reset path. This is carried as known debt, not as a feature.
+* **A genuine-check challenge.** It needs an ESP32 RSA peripheral and a factory
+  certificate this hardware does not have.
+* **Creating or changing a PIN.** cold-snap never offers to set one; see the note
+  under Decision 2 in DECISIONS.md for why a PIN buys nothing here. A unit that
+  *already* has a PIN from stock Coldcard firmware needs the SE1 login, which is
+  **not built yet** (UPGRADE-PLAN §1.1, phase 5).
+* **Burning a staged image.** Phase 6.
+
+### When something goes wrong
+
+* **A damaged identity record holds the device DARK on purpose.** It will not
+  announce, so a coordinator cannot talk to it — a device that cannot prove which
+  device it is must not act like one. Since 2026-09-18 the **OK**-held upgrade
+  listener is reachable *above* that hold, so such a unit can still be reflashed.
+* **A device with a damaged identity record AND a keypad that cannot be read is
+  unrecoverable.** The gate fails closed, by choice: an ungated upgrade listener on
+  a share-holding device is the evil-maid hole UPGRADE-PLAN §1.3 exists to close.
+* **Every panic is a reset, not a halt**, and the reset budget is counted. A fault
+  that is identical on every boot is held rather than panicked, so it does not spend
+  that budget and end in `LOCKUP_FOREVER`.
+* **First flash** is performed by the factory MicroPython, not by cold-snap — see
+  *Packaging* below, and run `firmware/examples/checkfw.rs` against the artifact
+  first: it answers whether the Mk4 bootloader's `verify_firmware()` would accept it.
 
 ## Build
 

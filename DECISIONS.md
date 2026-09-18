@@ -75,6 +75,20 @@ Coinkite's code, reached from Rust through the callgate.
 coercion resistance, which forfeits the entire dual-secure-element rationale for
 choosing this hardware.
 
+**AMENDED 2026-09-18, and the amendment is larger than the decision.** cold-snap
+as shipped **has no PIN**: UPGRADE-PLAN §1.1 decided it never offers to create
+one, because the share-encryption key takes no PIN and no MCU-key input, so at
+rest the share is protected by RDP=2 and the coordinator's contribution — and a
+blank PIN yields none of the security property anyway, since its digest is a value
+anyone can compute (`hal/src/callgate.rs:717-718`). So the "alternative" this
+rationale rejects is what the product is, and the dual-secure-element value that
+survives is the root of trust, the signed-flash requirement and RDP=2 — not PIN
+authorisation. The table below still describes the two **platforms**, and
+"mandatory, SE1-enforced" remains true of *stock Coldcard firmware*; it is not a
+claim about cold-snap. A unit with a PIN already set is supported via the SE1
+login, which is phase 5 and not built. This closes the second item of
+UPGRADE-PLAN §3.9.
+
 | | Frostsnap | Coldcard Mk4 |
 |---|---|---|
 | Identity | read-protected eFuse key | SE1 + SE2 + MCU key slots |
