@@ -211,9 +211,33 @@ Checklist, roughly in descending risk:
 - [ ] `README.md` — "all 9/9 device(s) pressed `x` at the signing screen": **REMEASURE.**
       The run now reports 12/12. Quote the new line, keep the old as trajectory.
 - [ ] `README.md` — `COLDSNAP_GLASS_KEYS=1yy` "exits 1 with 8 of 9 devices declining (the
-      ninth happened to draw `1`)": **REMEASURE, and it cannot be derived.** That is a
-      1-in-5 draw per device; at 12 devices the expected count changes and the specific
-      outcome must come from a run. NOT YET RUN — see A.7.
+      ninth happened to draw `1`)": **MEASURED 2026-09-21 at 12 devices — READY TO APPLY,
+      text below.** It could not be derived (1-in-5 draw per device); it came from a run,
+      with no source change, on `6e29bb6`. Keep the 9-device figure as a trajectory row,
+      do not overwrite it.
+
+      Replacement prose, as measured:
+
+      > `COLDSNAP_GLASS_KEYS=1yy` exits **1** with **11 of 12** devices declining at the
+      > twelve-device roster of `6e29bb6` — only `035f4007…` drew `1`, the 1-in-5 made
+      > visible — and pass `STUB_CHUNK=64` dies on
+      > `11 prompt(s) DECLINED but STUB_EXPECT_DECLINES=0`. At the earlier nine-device
+      > roster the same variable gave **8 of 9** (the ninth drew `1`); `=9yy` gives 9/9.
+
+      Supporting detail, VERIFIED (status off the command, not a pipe): `cargo run` /
+      `hostcheck` exit **1**, child stub exit **2** (`stub exited exit status: 2`),
+      failure surfaced in the first pass as `Error: pass STUB_CHUNK=64`. The device-side
+      line, verbatim:
+
+      > `stub: FAIL in KeygenInProgress after 7700 bytes read, 0 signature share(s) sent:`
+      > `11 prompt(s) DECLINED but STUB_EXPECT_DECLINES=0 -- a declined prompt is a`
+      > `FAILURE unless the run declares it`
+
+      The one approval was `DeviceId 035f4007b30d19f3c4a27a8462036643a154d31c3c304bdf6964ae97baff18797a`
+      (`CheckKeyGen -> approved on the randomised digit read off the glass`); the other
+      eleven each printed `DECLINED CheckKeyGen -- the protocol has no message for a no`
+      (prefixes `0212a8d6 0252993f 028f758d 029871dd 02a37833 02bcf5e9 03120f18 031c445e
+      032d9c67 033bbd71 0345882f`; full ids in the run log). Tree clean after the run.
 - [ ] `README.md` — the 9-of-9 `CertifyPlease` 2,179 B figure and the 12-of-12 = 2,863 B
       "1,233 spare" figure: the second is now **MEASURED on the wire** (A.6), not merely
       computed. Upgrade its status; keep 2,179 as trajectory.
@@ -269,34 +293,170 @@ tests reference only small rosters (2 devices in `frostsnap_core/tests/share_loc
 so **this harness is now the largest roster either tree has exercised.** Worth knowing
 before blaming our side for any future failure at this size.
 
-### A.6b Mutation register — 1 run, 1 caught, 0 survivors
+### A.6b Mutation register — 4 run, 2 caught, 2 survivors
 
-| Mutation | Outcome | Evidence |
-|---|---|---|
-| Roster mismatch: `hostcheck` at 12, `stub` at 9 | **CAUGHT** | exit **1** at **5.002944541 s**: `DEADLINE (5s) in state WaitingForAnnounces -- magic_writes=5, writes_queued=27, writes_done=27, read_timeouts=0, announced=10, shares=0, acks=0, session_hash=false, ...` |
+Register grew 2026-09-21: three mutations were added to the original roster-mismatch one,
+each predicted BEFORE it ran. Tree verified clean between mutations and at the end
+(`git checkout --` exit 0, stub rebuilt exit 0, `git diff --quiet` exit 0, HEAD still
+`6e29bb6`).
 
-Failed **by name and bounded**, not by hanging, and the counters localise it exactly —
-`announced=10` against the expected 13, before any keygen state was entered. Reverted; the
-stub was rebuilt and the tree ends holding the 9→12 change and nothing else, green.
+| # | Mutation | Outcome | Evidence, short form |
+|---|---|---|---|
+| M-0 | Roster mismatch: `hostcheck` at 12, `stub` at 9 | **CAUGHT** | exit **1** at **5.002944541 s**: `DEADLINE (5s) in state WaitingForAnnounces -- magic_writes=5, writes_queued=27, writes_done=27, read_timeouts=0, announced=10, shares=0, acks=0, session_hash=false, ...` |
+| M-1 | `hostcheck/src/main.rs:4285` `if device_hashes.len() != N_DEVICES {` → `> N_DEVICES` | **SURVIVED GREEN** | exit **0**, 18.476 s, all four passes ok. See A.6b-1 |
+| M-2 | `hostcheck/src/main.rs:886` `const THRESHOLD: u16 = 12;` → `= 8;` | **CAUGHT**, but late and mis-named | passes 1-2 green and printed `8-of-12`; pass 3 died on `DEADLINE (65s) in state SigningAwaitingShares -- ... sig_shares=0/8`. See below |
+| M-3 | `firmware/examples/stub.rs:1998` `if saved.len() == N_DEVICES && !announced_save {` → `saved.len() >= 1` | **SURVIVED GREEN**, and is INERT | exit **0**, all four passes ok, and `saved` is never observed between 0 and 12. See A.6b-2 |
 
-**One mutation is a floor, not a register.** `PLAN.md` §8.2b's lesson is that survivors
-cluster in the harness rather than the device, and the two silent-pass mutations the
-census was meant to predict were never produced — see A.7.
+M-0 failed **by name and bounded**, not by hanging, and the counters localise it exactly —
+`announced=10` against the expected 13, before any keygen state was entered.
+
+**M-2, the one that was caught — by accident, and in the wrong place.** The prediction was
+right about every assertion it analysed: the finalize check (`:3872`) tests device COUNT and
+`has_blank` only, never the threshold; the single threshold assertion (`:4261`,
+`found.threshold() != THRESHOLD`) compares the coordinator's value against the very const
+handed to `BeginKeygen` (`:3349`), so both sides move together; and the signer subset
+(`:3985`, `take(THRESHOLD)`) is compared at `:4559` against that same set, so 8 signers
+still produce a verified signature. **Passes 1 and 2 went green on an 8-of-12 keygen** and
+printed their own confession — `8-of-12 (keygen_id f400927857aaf64114f561baacb37970) after
+512.736125ms`, then `pass ok: keygen … FINISHED in 3.061673667s` and `… 6.595876625s`.
+What caught it was pass 3, verbatim:
+
+```
+Error: pass DECLINE
+
+Caused by:
+    DEADLINE (65s) in state SigningAwaitingShares -- magic_writes=1, writes_queued=78,
+    writes_done=78, read_timeouts=0, announced=13, shares=12, acks=12, session_hash=true,
+    held=12, replenished=12, sign_session=true, sig_shares=0/8, anything_to_read=false,
+    elapsed=65.002499708s
+```
+
+Mechanism, VERIFIED by counting the log: the coordinator sent exactly 8 `RequestSign`
+frames and the stub logged exactly 8 `DECLINED SignatureRequest at the glass` lines, but the
+DECLINE pass breaks out on `declined.len() == N_DEVICES` (`:4168`, 12), so it sat out the
+full 65 s signing budget. `sig_shares=0/8` shows the mutated threshold on the wire. That
+condition is an **accidental** threshold tripwire — the number of devices prompted to sign
+IS the threshold — so the suite reports a lowered threshold as a 65 s timeout in pass 3 and
+never as a named threshold failure. INFERRED, not verified: had the DECLINE pass compared
+against `THRESHOLD` instead of `N_DEVICES`, M-2 would have survived fully.
+
+#### A.6b-1 SURVIVOR: the by-name keygen-agreement check is CORRECT, and no run exercises it
+
+**Edit:** `hostcheck/src/main.rs:4285`, `if device_hashes.len() != N_DEVICES {` →
+`if device_hashes.len() > N_DEVICES {`. **Outcome: exit 0, all four passes green.**
+
+**Why it survives (predicted, and confirmed):** on a healthy run `device_hashes.len()` is
+exactly `N_DEVICES`, so `> N_DEVICES` is false exactly where `!= N_DEVICES` was false.
+Same types, no control flow change, no deadline moved.
+
+**VERIFIED evidence** (`/tmp/m1_run.log`, exit 0, 18.476 s wall):
+
+- `--- pass: STUB_CHUNK=64 ---` → `pass ok: keygen f400927857aaf64114f561baacb37970 FINISHED in 3.298706708s`
+- `--- pass: STUB_CHUNK=1 ---` → `pass ok: keygen f400927857aaf64114f561baacb37970 FINISHED in 7.336146208s`
+- `--- pass: DECLINE … ---` → ``pass ok: DECLINE -- keygen … FINISHED in 2.16716675s and the glass matched on 12/12 devices, then all 12/12 device(s) pressed `x` at the signing screen and NOT ONE signature share reached the coordinator``
+- `--- pass: UPGRADE STAGING (M13) ---` → ``pass ok: M13 -- 262656 B announced as 65 chunks (64 whole plus a 512-byte SHORT tail, so `% 4096 != 0` is under test and not rounded off)``
+- Final line: `M1+M2+M3+M5+M7+M8+M9+M12+M13 PASS: real 12-of-12 keygen over a roster cut out of 13 announced devices…`
+- Log line 1 is `Compiling hostcheck v0.1.0`, so the mutated coordinator is the binary that
+  ran; keygen timings 3.30 s / 7.34 s sit inside the A.6 baselines, so nothing moved.
+
+**THE DEFECT IS THE COVERAGE, NOT THE SHIPPED CONDITION.** `!= N_DEVICES` at HEAD is the
+correct strict check, and its own `bail!` text — `only {}/{N_DEVICES} device(s) reported a
+session hash` — says which half is the point: the under-count half, with the over-count half
+dead weight. Nothing on that line needs fixing. What is missing is any run that would notice
+if it were weakened, because **no pass ever presents fewer than 12 hashes**, so the
+assertion is **UNEXERCISED**. The following `for (id, got) in &device_hashes` loop iterates
+only the hashes that ARRIVED, so under the mutation a run in which **one device — or zero —
+reported a session hash** satisfies the harness's own by-name keygen-agreement check
+silently. What would then be left covering cross-process transcript agreement is upstream's
+in-black-box `ack_session_hash` refusal inside `recv_device_message` — **exactly the
+re-vendor hole the comment at `:4276-4279` says this assertion exists to close.**
+
+**Therefore UNPROVEN, if this assertion is ever weakened:** that every device on the roster
+reported a session hash to the harness by name. Partial mitigation, VERIFIED: the DECLINE
+pass independently prints `the glass matched on 12/12 devices`, so the 12-of-12 count is
+still asserted on that separate screen-to-coordinator path. The survivor is a fact about the
+harness's **roster bookkeeping**, not about the device — which is precisely the cluster
+`PLAN.md` §8.2b predicts survives.
+
+**Closing it needs a negative case, not an edit.** A pass in which one device withholds its
+session hash — a stub that skips `ack_session_hash` for exactly one id — so that the strict
+check is the thing that ends the run, by name. No pass constructs that today. Decision not
+taken, sized nowhere yet.
+
+#### A.6b-2 SURVIVOR: the device side's own arity report is asserted by nobody, and is untestable as written
+
+**Edit:** `firmware/examples/stub.rs:1998`, `if saved.len() == N_DEVICES && !announced_save {`
+→ `if saved.len() >= 1 && !announced_save {`. **Outcome: exit 0, all four passes green.**
+
+**VERIFIED evidence:** final line of the mutated run, exit 0 —
+`M1+M2+M3+M5+M7+M8+M9+M12+M13 PASS: real 12-of-12 keygen over a roster cut out of 13
+announced devices, nonce replenishment and a signature that VERIFIES against the group
+key, … and a 262656 B firmware image STAGES into the device's PSRAM over a raw, unframed
+65-chunk stream … and NOTHING IS BURNED because no callgate sub-call is bound`. All four
+gates ok (`… FINISHED in 3.351037416s`, `… 6.948247667s`, DECLINE with
+`the glass matched on 12/12 devices`, `pass ok: M13 -- 262656 B announced as 65 chunks`).
+No DEADLINE, no assertion failure, no counter mismatch anywhere in the log.
+
+**Why it survives — VERIFIED, two independent reasons.**
+
+1. *Nobody is reading.* `hostcheck` spawns the stub with `.stderr(Stdio::inherit())` at
+   both call sites (`main.rs:2589`, `:2923`) and never parses a stub log line; the stub is
+   ended by `kill()` + `wait()` (`Reaped`, `:4933`) with only a premature-exit `try_wait()`
+   probe (`:4195`), and this latch body deliberately does not exit. So the device side's own
+   report cannot influence the pass/fail decision at all.
+2. *The arity is never exercised.* The latch is evaluated once per fd-0 read, AFTER the
+   `for id in targets` loop (`:1841-1853`) that calls `drive()`, which is what inserts into
+   `saved` (`:1621`). `FinalizeKeyGen` is addressed to all 12 devices in ONE frame, so
+   `saved` goes **0 → 12 inside a single read iteration**. Mutated log lines 165-170 show
+   the twelve `HOLDS a share … -- N device(s) do now` lines running up to
+   `12 device(s) do now`, and only then, at line 180,
+   `stub: 12/12 devices saved a share for AccessStructureRef { key_id: KeyId(9f9cb5f2…),
+   access_structure_id: AccessStructureId(5dbb0e80…) }` — exactly 3 such lines, one per
+   keygen pass, same as an unmutated run.
+
+So `>= 1` and `== N_DEVICES` first become true on the **same** iteration, `refs.len()` is 12
+at that moment (not 1), and the printed `12/12` is still true here. **The mutation is not
+merely undetected; under this harness it is behaviourally INERT.**
+
+**THE DEFECT IN THE HARNESS, and it is the worse of the two.** The constant `N_DEVICES` on
+that line is untested **by construction**, not merely unwatched: no run ever observes
+`saved.len()` at any value strictly between 0 and 12. Two device-side checks are therefore
+carried as decoration — the `refs.len() != 1` "all shares belong to ONE access structure"
+check, which goes vacuous at one share, and the `{N_DEVICES}/{N_DEVICES} devices saved a
+share` line, which would become a const-literal lie printed after device #1.
+
+**Therefore UNPROVEN:** that the device side ever agrees with the coordinator about roster
+arity. A stub that announced the roster complete after a single share would exit 0 and the
+suite would print its full PASS line. Closing it needs both halves — a device-side counter
+echoed onto the wire (or a stub exit status the coordinator actually reads) **and** a case
+where shares land across separate reads, which today's single all-destinations
+`FinalizeKeyGen` frame prevents. Decision not taken; sized nowhere yet.
+
+**What the register now says.** Two survivors on the first real census, both in the
+**harness** and neither in the device — `PLAN.md` §8.2b's prediction, confirmed rather than
+assumed. Both survivors are roster/arity bookkeeping. Note what this does NOT mean: no
+mutation to the device's own behaviour has yet been tried at 12 devices.
 
 ### A.7 WHAT PHASE A DID NOT ESTABLISH
 
 Honest gaps, so nobody reads A.6 as more than it is:
 
-1. **The `COLDSNAP_GLASS_KEYS=1yy` distribution at 12 devices is NOT re-measured.** The
-   README figure ("8 of 9 declining, the ninth drew `1`") is still a 9-device
-   measurement. One run supplies it; it was not done here.
+1. ~~**The `COLDSNAP_GLASS_KEYS=1yy` distribution at 12 devices is NOT re-measured.**~~
+   **CLOSED 2026-09-21.** Measured: **11 of 12** declining, `035f4007…` drew `1`, exit 1 in
+   pass `STUB_CHUNK=64`. Prose is queued ready-to-apply in A.5; the 9-device figure stays as
+   a trajectory row.
 2. **The "seven counted conditions" claim is still un-adjudicated.** `hostcheck:894-900`
    asserts a mechanical rename would have flipped *seven* conditions; a grep pass found
    ~15 count-bearing sites and could not reproduce the number seven. The change did not
    need the answer (every count is symbolic), but the doc's number remains unverified.
-3. **Only one mutation was run.** Two predicted silent-pass mutations were supposed to come
-   out of an adversarial census that did not complete (see §6). Until they exist, "the
-   suite would catch a harness that stopped proving 12-of-12" rests on one data point.
+3. ~~**Only one mutation was run.**~~ **CLOSED 2026-09-21, and the answer is worse than the
+   gap.** Three more mutations ran (A.6b): the two predicted silent-pass mutations now
+   exist, both **SURVIVED GREEN** (A.6b-1, A.6b-2), and a third was caught only as a 65 s
+   timeout in an unrelated pass. So "the suite would catch a harness that stopped proving
+   12-of-12" is now **disproven as stated**: it would not catch either survivor. What
+   replaces this gap: no mutation to the DEVICE's behaviour has been tried at 12 devices,
+   and neither survivor's coverage gap is closed — in both cases the line at HEAD is the
+   correct one and what is missing is a case that exercises it (A.6b-1, A.6b-2).
 4. **No `WRITE_STALL` coverage.** The path is still unexercised; see A.2 item 3.
 5. **Nothing here touches silicon, `usb.rs`, `UsbSerialManager`, or the multi-port
    topology.** The pty tier exercises `comms.rs` fully and `usb.rs` not at all, and this
@@ -305,18 +465,139 @@ Honest gaps, so nobody reads A.6 as more than it is:
 
 ---
 
-## Phase B — drive n=13 through a real coordinator
+## Phase B — drive n=13 through a real coordinator — RUN 2026-09-21
 
-Small, and it closes the one gap the unit tests cannot: the device's refusal is
-tested (`firmware/src/lib.rs:3713`), but **nothing proves the coordinator survives
-being refused.**
+The original work order (kept, because two of its three bullets were answered and the third
+turned out to be a wrong question):
 
-- Roster of 13, expect `Refusal::GroupTooLarge`, assert the coordinator reports a
-  clean failure rather than hanging or wedging its own state.
-- Assert the refusal happens **on policy, not on size** — 13-of-13 is 3,091 B and
-  fits `FRAME_LIMIT` 4,096, so a run that "passes" because a frame was too long is
-  a false pass. Log the size and the refusal reason separately.
-- Keep it in `hostcheck` as its own pass, alongside the existing decline pass.
+> - Roster of 13, expect `Refusal::GroupTooLarge`, assert the coordinator reports a clean
+>   failure rather than hanging or wedging its own state.
+> - Assert the refusal happens **on policy, not on size** — 13-of-13 is 3,091 B and fits
+>   `FRAME_LIMIT` 4,096, so a run that "passes" because a frame was too long is a false
+>   pass. Log the size and the refusal reason separately.
+> - Keep it in `hostcheck` as its own pass, alongside the existing decline pass.
+
+**Run 2026-09-21, temporary 13-roster edit plus one-line `MAX_DOWN_B` instrumentation on the
+deadline path, both reverted; tree verified CLEAN afterwards. Exit 1, both invocations
+identical, 36 s wall.**
+
+### B.1 Is n=13 refused? YES — and by policy, before anything else happens
+
+VERIFIED. `firmware/src/lib.rs:1093`:
+
+```rust
+if begin.devices.len() > MAX_PARTIES { return Err(Fault::Refused(Refusal::GroupTooLarge)) }
+```
+
+`MAX_PARTIES = 12` (`lib.rs:291`). It fires inside `Session::recv_core` on the
+`CoordinatorToDeviceMessage::KeyGen(Keygen::Begin(begin))` arm — i.e. on the **FIRST keygen
+message**, before the signer and before any `CertifyPlease` existed. All 13 roster devices
+hit it: `stub: <id> REFUSED GroupTooLarge (policy, not an error)` ×13.
+
+The second `GroupTooLarge` site (`lib.rs:1099-1101`, the threshold bound) was **unreachable**:
+n=13 > 12 returns first, and t=13 ≤ n=13 would not have tripped it anyway.
+
+### B.2 Policy, not size — and the 3,091 B figure was the wrong thing to watch
+
+**On policy: YES, conclusively**, because the size that would have made a false pass was
+never put on the wire.
+
+| Figure | Measured | Note |
+|---|---|---|
+| Largest coordinator→device frame, 13-roster run | **934 B** (`max_down_b=934`) | the 13-id `Keygen::Begin` frame; high-water of the whole run |
+| Same, as fraction of `FRAME_LIMIT` 4,096 | 22.8 % | far below any size-rejection threshold |
+| 12-of-12 green-run high-water (A.6) | 2,863 B | the 13-roster run is **smaller**, not larger |
+| 13-of-13 `CertifyPlease` | 3,091 B, **never written** | no device answered `Begin`, so the coordinator never advanced to step 2 |
+
+A size rejection would have required `max_down_b ≥ 3,091`. It was 934. Note the trajectory:
+the work order assumed the risk lived in the 3,091 B `CertifyPlease`; the refusal lands one
+step earlier than that, so `CertifyPlease` at 13 remains **unmeasured on the wire** and
+3,091 B is still a computed figure.
+
+Reporting caveat, VERIFIED: the harness's own `largest coordinator->device frame actually
+written` line (`hostcheck/src/main.rs:4649`) lives **only in the pass-ok block**, so on a
+failing run it never prints — grep of the log returns nothing for it. So 934 B is the ACTUAL
+figure and "never reported" is the harness's behaviour.
+
+### B.3 How the coordinator behaved: bounded, correctly named by STATE, WRONG by CAUSE
+
+No hang, no wedge. It terminated on its **own** named bound and **learned nothing from the
+refusal**. Verbatim:
+
+```
+Error: pass STUB_CHUNK=64
+
+Caused by:
+    DEADLINE (35s) in state KeygenAwaitingShares -- magic_writes=1, writes_queued=32,
+    writes_done=32, read_timeouts=0, announced=14, shares=0, acks=0, session_hash=false,
+    held=0, replenished=0, sign_session=false, sig_shares=0/0, anything_to_read=false,
+    elapsed=35.001371334s, max_down_b=934
+```
+
+Exit 1. The bound is `HANDSHAKE_DEADLINE` 5 s + `KEYGEN_DEADLINE` 30 s = 35 s and it fired at
+35.0014 s. Pass 1 of 4 died; DECLINE and UPGRADE STAGING never ran. The handshake was fully
+healthy first: `announced=14/14` in 517 ms, every device acked and previewed its name,
+`-> KeyGen to 13 device(s)` went out, `stub: rx Core -> 13 device(s)` came back.
+
+**The defect this exposes.** `hostcheck` DID see the refusal on the wire — it printed
+`hostcheck: <id> REFUSED GroupTooLarge (a frame our own coordinator never asked for)` 13
+times — and **that parenthetical is FALSE here**: this coordinator had asked for exactly that
+frame. The fail-fast branch for a refused frame already exists
+(`hostcheck/src/main.rs:3565-3600`) but is scoped to the restore device and the two
+backup-save phases (for `Restore::erase_refusals`' reason), so a keygen refusal falls through
+to the log-only path and the run sits out the **full 30 s keygen budget with the refusal on
+the wire the entire time**. This is the same defect the module note at `main.rs:552-558`
+records as found-and-fixed for `SavePhysicalBackup` — **still unfixed for keygen.**
+
+### B.4 Proposed assertion — DECISION NOT TAKEN
+
+Written down so the cost is visible. **Nothing below is implemented.** The assertion is
+small; the pass that reaches it is not.
+
+**(a) The latch, ~8 lines, reusing machinery that already exists.** The stub already puts the
+refusal on the wire as `DeviceSendBody::Debug { message: "refused=GroupTooLarge" }`
+(`stub.rs:1405-1415`) and `hostcheck` already parses it at `main.rs:3565`
+(`Some(("refused", what))`):
+
+```rust
+// in the `Some(("refused", what))` arm, beside the DataErase set:
+if what == "GroupTooLarge" { refused_group.insert(from); }
+
+// once per lap, in the refusal pass only:
+if refused_group.len() == ALL_DEVICES {
+    // THE POINT: prove it was POLICY, not FRAME_LIMIT. 13-of-13
+    // CertifyPlease is 3,091 B and FITS 4,096; a size rejection
+    // would have put max_down_b at >= 3,091.
+    assert!(MAX_DOWN_B.load(Ordering::Relaxed) < 3_091,
+        "refusal came from frame size, not MAX_PARTIES: max_down_b={}",
+        MAX_DOWN_B.load(Ordering::Relaxed));
+    break Ok(());
+}
+```
+
+**(b) The half that covers the stated deliverable (untested COORDINATOR behaviour), same arm,
+~4 lines** — the keygen twin of the restore-scoped check already at `:3588`:
+
+```rust
+else if state == State::KeygenAwaitingShares {
+    break Err(anyhow!("{from} REFUSED {what} while this coordinator was \
+        in KeygenAwaitingShares WAITING for its share"));
+}
+```
+
+**(c) COST VERDICT: (b) yes on its own merits; (a)+(c) is its own commit.** `N_DEVICES` and
+`THRESHOLD` are `const` with 40+ uses and seven counted latches keyed off them, so a
+13-roster pass cannot reuse the shared keygen driver without threading both as parameters.
+The lazy route is a 5th pass that reuses only the handshake and then drives
+`coordinator.do_keygen(all 13 announced, 13)` itself — but that still needs a new `State`
+variant, its `NAMES` entry (with the `EraseRefusal as usize + 1` arithmetic documented at
+`:1288` re-derived), a `budget()` arm, a `Pass` variant plus main's dispatch, and its own
+pass-ok line: realistically **45-60 lines across five sites** in a 4,900-line harness.
+
+So, judged honestly: **(b) alone is a genuine ~4-line win** that converts today's mis-named
+35 s DEADLINE into an immediate named failure, and it is worth doing whether or not a
+standing 13-roster pass ever exists. **(a)+(c) is not a small change** and should not ride
+along with anything else. Neither is done.
 
 ---
 
