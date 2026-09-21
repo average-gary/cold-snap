@@ -547,12 +547,13 @@ frame. The fail-fast branch for a refused frame already exists
 backup-save phases (for `Restore::erase_refusals`' reason), so a keygen refusal falls through
 to the log-only path and the run sits out the **full 30 s keygen budget with the refusal on
 the wire the entire time**. This is the same defect the module note at `main.rs:552-558`
-records as found-and-fixed for `SavePhysicalBackup` — **still unfixed for keygen.**
+records as found-and-fixed for `SavePhysicalBackup` — **it was still unfixed for keygen when
+this was written; (b) below is now APPLIED, see B.5.**
 
-### B.4 Proposed assertion — DECISION NOT TAKEN
+### B.4 Proposed assertion — (b) APPLIED 2026-09-21, (a)+(c) DECISION NOT TAKEN
 
-Written down so the cost is visible. **Nothing below is implemented.** The assertion is
-small; the pass that reaches it is not.
+Written down so the cost is visible. **(a) and (c) below are still not implemented; (b) is —
+B.5 has the measurements.** The assertion is small; the pass that reaches it is not.
 
 **(a) The latch, ~8 lines, reusing machinery that already exists.** The stub already puts the
 refusal on the wire as `DeviceSendBody::Debug { message: "refused=GroupTooLarge" }`
@@ -597,7 +598,61 @@ pass-ok line: realistically **45-60 lines across five sites** in a 4,900-line ha
 So, judged honestly: **(b) alone is a genuine ~4-line win** that converts today's mis-named
 35 s DEADLINE into an immediate named failure, and it is worth doing whether or not a
 standing 13-roster pass ever exists. **(a)+(c) is not a small change** and should not ride
-along with anything else. Neither is done.
+along with anything else. (b) is now done (B.5); **(a)+(c) remains a decision not taken**, at
+the same 45-60-lines-across-five-sites estimate and still owed its own commit.
+
+### B.5 Fix (b) APPLIED — MEASURED on the failure path 2026-09-21
+
+`hostcheck/src/main.rs`, the `Some(("refused", what))` arm, **33 insertions / 2 deletions,
+one file, no constant touched**. Two changes and one comment:
+
+1. The parenthetical `(a frame our own coordinator never asked for)` is gone — it asserted
+   something false of every refusal of a frame we DID ask for. It now says the refusal is
+   policy on the device's side and that the branches below decide whether this coordinator
+   was waiting on that frame.
+2. A branch that ends the run by NAME when a refusal arrives in any of the five
+   `Keygen*` waiting states. Broader than (b) as drafted (`state == KeygenAwaitingShares`)
+   by four `match` arms, deliberately: `FinalizeKeyGen` refused in `KeygenAwaitingAcks`
+   wedges exactly the same way, and the four extra variants cost four lines. `DataErase`
+   stays excluded ahead of it — it is refused by design by every device, so an unscoped
+   check could never pass; same reason `Restore::erase_refusals` documents, and the existing
+   restore-device branch is untouched.
+
+**VERIFIED ON THE FAILURE PATH, not by a passing run.** Temporary 13-roster edit (hostcheck
+`N_DEVICES`/`THRESHOLD` 13, stub `N_DEVICES` 13), reverted by hand afterwards; the three
+constants read 12 and `git diff` carries the fix alone.
+
+| | BEFORE (B.3) | AFTER |
+|---|---|---|
+| Exit | 1 | 1 |
+| Wall clock | **35.0014 s** | **1.67 s** (0.92 s of it `cargo` compiling `hostcheck`) |
+| How it ended | `DEADLINE (35s) in state KeygenAwaitingShares` — the STATE, not the cause | the refusal itself, by name |
+| Refusals read | 13, all log-only | **1** — it dies on the first one and never reads the other 12 |
+
+Verbatim, `cargo run` exit 1:
+
+```
+Error: pass STUB_CHUNK=64
+
+Caused by:
+    0212a8d61750e48638f6f0412f8253c7b2faa5031aa78f25e1b09266dccef44871 REFUSED
+    GroupTooLarge while this coordinator was in KeygenAwaitingShares WAITING for it --
+    the keygen can never complete, so failing here rather than at the deadline, which
+    would have named the state and not the cause
+```
+
+The handshake was healthy first and identically so: `ANNOUNCE 14/14 ... after 513.735417ms`,
+then `13-of-13 (keygen_id f400927857aaf64114f561baacb37970) after 513.903709ms`,
+`-> KeyGen to 13 device(s)`, `stub: rx Core -> 13 device(s)`, and the failure on the next
+lap. **Faster than the 5-7 s predicted** — the refusal is read the lap after `Begin` is
+written, so the fix costs one lap, not one budget.
+
+Green regression, both sides of the 13-roster edit, at the committed 12-device roster:
+`cargo run` **exit 0** at **18.90 s** before and **18.23 s** after, all four passes ok
+(`keygen ... FINISHED in 3.261337375s` / `6.894467208s`, DECLINE with `the glass matched on
+12/12 devices`, `M13 -- 262656 B announced as 65 chunks`). **76 `REFUSED DataErase` lines**
+in that green run (stub side plus coordinator side) and not one of them in a `Keygen*` state,
+which is the check that the new branch cannot fire on a healthy run.
 
 ---
 

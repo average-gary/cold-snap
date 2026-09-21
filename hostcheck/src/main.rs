@@ -3565,8 +3565,9 @@ fn one_pass(
                                 }
                                 Some(("refused", what)) => {
                                     eprintln!(
-                                        "hostcheck: {from} REFUSED {what} (a frame our own \
-                                         coordinator never asked for)"
+                                        "hostcheck: {from} REFUSED {what} (policy on the \
+                                         device's side; whether THIS coordinator was waiting \
+                                         on that frame is what the branches below decide)"
                                     );
                                     if what == "DataErase" {
                                         refused_erase.insert(from);
@@ -3581,6 +3582,36 @@ fn one_pass(
                                                 r.erase_refusals += 1;
                                             }
                                         }
+                                    }
+                                    // THE KEYGEN TWIN of the `SavePhysicalBackup` fix the
+                                    // module note at `:552-558` records, same defect and same
+                                    // shape. MEASURED at a 13-device roster, which
+                                    // `MAX_PARTIES` refuses at `lib.rs:1093`: BEFORE, the 13
+                                    // `refused=GroupTooLarge` frames were log lines only and
+                                    // the run sat out the whole 30 s keygen budget to die at
+                                    // 35.001371334 s on `DEADLINE (35s) in state
+                                    // KeygenAwaitingShares`, naming the state and not the
+                                    // cause. AFTER: it fails on the FIRST refusal it reads,
+                                    // one lap after the 513.9 ms handshake -- 1.67 s wall,
+                                    // exit 1, `0212a8d6.. REFUSED GroupTooLarge while this
+                                    // coordinator was in KeygenAwaitingShares WAITING for
+                                    // it`, and the other 12 refusals never get read.
+                                    else if matches!(
+                                        state,
+                                        State::KeygenAwaitingShares
+                                            | State::KeygenAwaitingSessionHash
+                                            | State::KeygenAwaitingAcks
+                                            | State::KeygenAwaitingDeviceSave
+                                            | State::KeygenAwaitingHeldShares
+                                    ) {
+                                        break Err(anyhow::anyhow!(
+                                            "{from} REFUSED {what} while this coordinator was \
+                                             in {} WAITING for it -- the keygen can never \
+                                             complete, so failing here rather than at the \
+                                             deadline, which would have named the state and \
+                                             not the cause",
+                                            state.name()
+                                        ));
                                     }
                                     // A REFUSAL OF A FRAME THIS COORDINATOR DID ASK FOR
                                     // IS A FAILURE, and until now it was only a log line.
