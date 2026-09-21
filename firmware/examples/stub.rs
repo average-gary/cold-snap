@@ -147,9 +147,9 @@ use frostsnap_core::{AccessStructureRef, DeviceId};
 /// coordinator owns `BeginKeygen` and therefore owns that choice. What this file uses
 /// the number for is the count of sessions that must have STAGED a share, which is a
 /// fact it observes rather than one it arranges.
-const N_DEVICES: usize = 9;
+const N_DEVICES: usize = 12;
 
-/// Sessions this process hosts, matching `hostcheck`'s ALL_DEVICES. The tenth is left
+/// Sessions this process hosts, matching `hostcheck`'s ALL_DEVICES. The LAST one is left
 /// out of the keygen BY THE COORDINATOR (M12), so it reaches the signature holding
 /// nothing; we discover which one that is structurally — it is the session with no
 /// [`Sheet`] and no staged `SaveShare` — exactly as `advertised_key` discovers the

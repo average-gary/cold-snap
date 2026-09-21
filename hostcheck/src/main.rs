@@ -556,7 +556,7 @@
 //!  coordinator is waiting on now fails immediately, scoped to the restore device and to
 //!  the two phases that wait on a save for [`Restore::erase_refusals`]' reason.
 //!
-//!  M12 (THE TENTH, BLANK DEVICE -- a restore ONTO A UNIT THAT HOLDS NOTHING).
+//!  M12 (THE LAST, BLANK DEVICE -- a restore ONTO A UNIT THAT HOLDS NOTHING).
 //!  [`ALL_DEVICES`] devices announce and [`N_DEVICES`] of them do the keygen. The tenth is
 //!  cut out of the same expression as the roster (`announced[..N_DEVICES]` /
 //!  `announced[N_DEVICES]`) at the `BeginKeygen` site, so it is ASSIGNED and never
@@ -861,25 +861,40 @@ const DEFAULT_STUB: &str = "../target/aarch64-apple-darwin/debug/examples/stub";
 /// [`ALL_DEVICES`]. Everything counted per keygen participant keys off THIS: shares,
 /// acks, session hashes, glass codes, `SetName`s, declines, the forged `DataErase`.
 ///
-/// n is not arbitrary: it is what fits the frame bound. MEASURED sizes at n=3 are
+/// n is not arbitrary: it is what fits the frame bound. MEASURED sizes at n=3, t=2 are
 /// `CertifyPlease` 778 B, `Check` 646 B, `KeyGenResponse` ~318 B, so nothing crosses
 /// the ~1 KB point at which an undrained pty blocks a write. That is now a bound, not
-/// a hang (`WRITE_STALL_LIMIT`), but staying under it is still why keygen is fast.
-/// At 9-of-9 `CertifyPlease` is
-/// 2,179 B and does not even fit the device's frame limit. Do not raise these
-/// without re-deriving both bounds. The tenth device does NOT move either figure,
+/// a hang (`WRITE_STALL_LIMIT`).
+///
+/// **RAISED 9 -> 12 on 2026-09-21**, to the device's declared envelope: `MAX_PARTIES`
+/// = 12 (`firmware/src/lib.rs`), enforced by two `Refusal::GroupTooLarge` sites and
+/// unit-tested on both edges (n=13 refused, n=12 admitted). `CertifyPlease` is
+/// `195·n + 33·t + 127` — which the n=3, t=2 figure above confirms independently
+/// (585 + 66 + 127 = 778) — so 12-of-12 is **2,863 B**, with 1,233 B spare under
+/// `FRAME_LIMIT` 4,096. It CROSSES the ~1 KB write point, so the writer thread and
+/// `WRITE_STALL_LIMIT` are now exercised on every keygen rather than never. Keygen is
+/// no longer fast for that reason, and a new stall here is a finding, not a flake.
+///
+/// **This block read "but staying under it is still why keygen is fast. At 9-of-9
+/// `CertifyPlease` is 2,179 B and does not even fit the device's frame limit" until
+/// 2026-09-21, and the second half was STALE rather than merely dated:** 2,179 fits
+/// 4,096 with 1,917 to spare. It was true under the 2,060 bound that decision 7
+/// replaced, and it was the sentence that made 9 read as a ceiling. Do not raise these
+/// without re-deriving both bounds. The BLANK device does NOT move either figure,
 /// because it is not in the roster the certpedpop transcript is built over.
-const N_DEVICES: usize = 9;
-const THRESHOLD: u16 = 9;
+const N_DEVICES: usize = 12;
+const THRESHOLD: u16 = 12;
 
-/// Devices on the wire. The tenth is THE BLANK ONE (M12): it announces, gets an
+/// Devices on the wire. The LAST one is THE BLANK ONE (M12) — the thirteenth since
+/// 2026-09-21, the tenth before that: it announces, gets an
 /// `AnnounceAck` and a name preview like the rest, and is then left OUT of
 /// `BeginKeygen`, so it reaches the signature holding nothing at all.
 ///
 /// `N_DEVICES` was NOT renamed to `KEYGEN_DEVICES`, deliberately. 40-plus
 /// occurrences, most of them inside format strings, and a mechanical rename would
-/// have flipped the seven counted conditions that must STAY at 9 into this constant
-/// and weakened all seven at once. Leaving `N_DEVICES = 9` means an unconverted site
+/// have flipped the seven counted conditions that must STAY at the ROSTER count into
+/// this constant and weakened all seven at once. Leaving the roster spelled
+/// `N_DEVICES` means an unconverted site
 /// keeps the STRICTER count, which is the fail-closed direction; the cost is that
 /// `N_DEVICES` names something narrower than it reads, which is why its doc says so
 /// in its first line.
@@ -1691,8 +1706,8 @@ impl Restore {
     /// refusals exist but are UNREACHABLE from here.
     ///
     /// `Phase::Erase` is additionally ruled out by an exact count: `refused_erase.len()
-    /// != N_DEVICES` at PASS, and driving `EraseDevice` at a tenth device adds a tenth
-    /// `refused=DataErase`.
+    /// != N_DEVICES` at PASS, and driving `EraseDevice` at the BLANK device (the one past
+    /// the roster) adds one more `refused=DataErase`.
     fn new(device: DeviceId, share_index: ShareIndex, digest: Sha256Digest, start: Phase) -> Self {
         Restore {
             device,
@@ -2495,7 +2510,7 @@ fn main() -> Result<()> {
          the device can still describe; a coordinator-previewed 14-char/56-byte name reaches FLASH \
          on all {N_DEVICES} devices and comes back byte-exact as `SetName`; upstream's own \
          `EraseDevice` driver NEVER completes against this device, which refuses its `DataErase` on \
-         the wire; and the TENTH device, which this coordinator left out of the keygen and which \
+         the wire; and the LAST ({ALL_DEVICES}th) device, which this coordinator left out of the keygen and which \
          reported holding nothing at all, ingested another device's 25 words off its sheet and \
          CONSOLIDATED them onto a flash that held no share; and a {STAGE_SIZE} B firmware image \
          STAGES into the device's PSRAM over a raw, unframed 65-chunk stream that bypasses the \
@@ -3454,7 +3469,7 @@ fn one_pass(
                                         }
                                     }
                                     // ============================ M12 ============================
-                                    // THE ONE PLACE A TENTH DEVICE MAKES AN EXISTING
+                                    // THE ONE PLACE THE BLANK DEVICE MAKES AN EXISTING
                                     // ASSERTION WEAKER, loosened as narrowly as it can
                                     // be. Three scopes, all by IDENTITY or by STATE and
                                     // not one of them by count:
@@ -4623,7 +4638,7 @@ fn one_pass(
                  \n      appkey = {}\n      signers = {:?} ({} of {N_DEVICES})\
                  \n    device half verified over the wire: {}/{ALL_DEVICES} HeldShares2 \
                  reports matched our own access structure -- {N_DEVICES} from the keygen, and \
-                 the tenth is M12's blank device AFTER it consolidated (it reported NOTHING \
+                 the LAST one is M12's blank device AFTER it consolidated (it reported NOTHING \
                  the first time it was asked)\
                  \n    session_hash AGREED device<->coordinator on {}/{N_DEVICES} devices \
                  (two processes, two copies of frostsnap_core)\
@@ -4648,7 +4663,7 @@ fn one_pass(
                  \n      M9  ERASE     -- upstream's own EraseDevice driver stayed at \
                  is_complete()==None for the whole grace window and the device REFUSED its \
                  DataErase on the wire, so its completion path is unreachable here\
-                 \n    M12 THE TENTH, BLANK DEVICE: {} announced with the other {N_DEVICES} and \
+                 \n    M12 THE LAST ({ALL_DEVICES}th), BLANK DEVICE: {} announced with the other {N_DEVICES} and \
                  was LEFT OUT of BeginKeygen -- a roster this coordinator cut itself and then \
                  checked at finalize against its own contains_device -- and it reported holding \
                  NOTHING AT ALL when asked. It was then handed {}'s SHEET, the same 25 words that \
