@@ -286,7 +286,10 @@
 //!  - TRAP 2, upstream's, made a decision instead of an accident: `CHECK_BACKUP_SINCE`
 //!    lowered to 0.2.0 -> **`declared firmware v0.2.0 does not have the check_backup
 //!    feature, so CheckBackupProtocol would silently drive the LEGACY physical-backup
-//!    path and the quiz would never run`**, exit 1.
+//!    path and the quiz would never run`**, exit 1. Also caught without a device, by
+//!    `check_backup_threshold::the_recorded_threshold_is_the_one_upstream_uses`
+//!    (MEASURED with that mutation: `cargo test` exit 101, `upstream no longer grants
+//!    check_backup at v0.2.0 ...`), so the guard does not go untested between runs.
 //!
 //!  WHAT SURVIVED, stated rather than hidden:
 //!  - the share-IMAGE comparison in `check_glass_words` is REACHABLE but not
@@ -842,7 +845,7 @@ use frostsnap_coordinator::frostsnap_core::bincode;
 use frostsnap_coordinator::frostsnap_core::Gist;
 use frostsnap_coordinator::serialport::{SerialPort, TTYPort};
 use frostsnap_coordinator::{
-    Completion, DeviceMode, FirmwareVersion, FramedSerialPort, Sink, UiProtocol, VersionNumber,
+    Completion, DeviceMode, DeviceProfile, FramedSerialPort, Sink, UiProtocol, VersionNumber,
 };
 use rand_chacha::rand_core::SeedableRng;
 use rand_chacha::ChaCha20Rng;
@@ -1025,21 +1028,36 @@ const SIGN_DEADLINE: Duration = Duration::from_secs(30);
 /// charge of killing a slow run and throw the diagnosis away. See the note there.
 const RESTORE_DEADLINE: Duration = Duration::from_secs(30);
 
-/// The firmware version this harness DECLARES to `CheckBackupProtocol`, and the one
-/// decision trap 2 of the M7 brief demands be made explicitly.
+/// The ESP32 release at which upstream's `check_backup` feature turned on, kept as
+/// the recorded threshold this harness is reasoning against — NOT as an identity for
+/// this device.
 ///
-/// `CheckBackupProtocol::new` branches on `firmware.features().check_backup`, which is
-/// `version >= 0.3.0` (`frostsnap_comms/src/firmware_version.rs:57-61`). This device
-/// announces a firmware DIGEST and never a `FirmwareVersion`, so upstream's
-/// `FirmwareVersion::new(digest)` leaves `version: None`, and `features()` then FAILS
-/// OPEN to `FirmwareFeatures::all()` — which happens to select the modern path, by
-/// accident of the digest being unknown rather than by anybody's decision.
+/// HISTORY, because the shape of this changed under the harness. `CheckBackupProtocol`
+/// used to branch on `FirmwareVersion::features()`, which FAILED OPEN to
+/// `FirmwareFeatures::all()` for any digest it did not recognize — so a cold-snap Mk4
+/// took the modern path by accident of being unknown rather than by anybody's
+/// decision, and this harness worked around it by DECLARING an ESP32 version beside
+/// the announced digest. Upstream now takes a [`DeviceProfile`] instead and there is
+/// no fail-open left: an unrecognized profile claims no feature at all.
 ///
-/// Stating the version instead makes it a decision, and [`Restore`]'s `Phase::Quiz`
-/// arm ASSERTS `features().check_backup` before it builds the driver. Without that
-/// assert an upstream that moved the threshold would silently drive the LEGACY path —
-/// `tell_device_to_load_physical_backup` plus a share-image comparison — which is
-/// M7d's flow wearing M7c's name, and the quiz would never run at all.
+/// So the declaration is now of the PROFILE, in [`Restore`]'s `Phase::Quiz` arm.
+/// Without an assert there a flipped declaration would silently drive the LEGACY path
+/// — `tell_device_to_load_physical_backup` plus a share-image comparison — which is
+/// M7d's flow wearing M7c's name, and the quiz would never run at all. Declaring an
+/// ESP32 identity for this device to pass a version comparison is exactly what the
+/// profile model exists to stop, so the arm declares the Mk4 profile it is.
+///
+/// **THE GUARD IS IN TWO HALVES AND NEITHER IS A TAUTOLOGY**, because one of them was:
+/// asserting `DeviceProfile::ColdsnapMk4 { .. }.features().check_backup` on a profile
+/// built as a literal two lines above resolves to the literal `true` in upstream's
+/// `device_profile.rs`, and it left this constant with no use at all.
+///
+///  1. `CHECK_BACKUP_SINCE.features().check_backup` — this constant, run through
+///     upstream's own `VersionNumber::features()`. It fires if upstream raises its
+///     threshold past 0.3.0, and it fires if this constant is lowered below it, which
+///     is the deliberate-failure case the module header documents.
+///  2. `!profile.needs_legacy_check_backup()` — the EXACT predicate
+///     `CheckBackupProtocol::new` branches on, so the two cannot drift.
 const CHECK_BACKUP_SINCE: VersionNumber = VersionNumber::new(0, 3, 0);
 
 /// The name of the throwaway restoration M7d opens purely to obtain a
@@ -1621,7 +1639,7 @@ struct Restore {
     /// coordinator's own `device_to_share_indicies`. `CheckBackupProtocol` matches its
     /// ack against it, and M7b's `ShareBackup::from_words` needs it.
     share_index: ShareIndex,
-    /// The digest that device ANNOUNCED, for the `FirmwareVersion` handed to
+    /// The digest that device ANNOUNCED, for the profile label M7c reports beside
     /// `CheckBackupProtocol`. See [`CHECK_BACKUP_SINCE`].
     digest: Sha256Digest,
     phase: Phase,
@@ -2030,16 +2048,29 @@ fn restore_step(
             if !r.started {
                 r.started = true;
                 // TRAP 2, made a decision instead of an accident. See CHECK_BACKUP_SINCE.
-                let firmware = FirmwareVersion {
-                    digest: r.digest,
-                    version: Some(CHECK_BACKUP_SINCE),
+                // The Mk4 profile, DECLARED: this harness drives a device whose digest
+                // it does not require to be in the app's compatibility registry, and an
+                // ESP32 release identity here would be a lie told to a version
+                // comparison.
+                let profile = DeviceProfile::ColdsnapMk4 {
+                    revision: "hostcheck-declared".to_string(),
                 };
-                if !firmware.features().check_backup {
+                // Half 1: upstream's own version->feature table, against the
+                // threshold this harness records. Lowering CHECK_BACKUP_SINCE, or
+                // upstream raising V0_3_0, fires here.
+                if !CHECK_BACKUP_SINCE.features().check_backup {
                     bail!(
-                        "declared firmware {} does not have the check_backup feature, so \
-                         CheckBackupProtocol would silently drive the LEGACY physical-backup path \
-                         and the quiz would never run",
-                        firmware.version_name()
+                        "declared firmware v{CHECK_BACKUP_SINCE} does not have the check_backup \
+                         feature, so CheckBackupProtocol would silently drive the LEGACY \
+                         physical-backup path and the quiz would never run"
+                    );
+                }
+                // Half 2: the predicate the driver itself branches on.
+                if profile.needs_legacy_check_backup() {
+                    bail!(
+                        "declared profile {} takes the LEGACY physical-backup path in \
+                         CheckBackupProtocol, so the quiz would never run",
+                        profile.name(&r.digest)
                     );
                 }
                 let proto = CheckBackupProtocol::new(
@@ -2048,7 +2079,7 @@ fn restore_step(
                     as_ref,
                     r.share_index,
                     ENCRYPTION_KEY,
-                    firmware,
+                    profile.clone(),
                     // `()`: this driver's completion IS `is_complete() == Success`
                     // (`check_backup.rs:108-118`), so there is nothing to read off a
                     // sink and no adapter to write.
@@ -2057,9 +2088,9 @@ fn restore_step(
                 .context("CheckBackupProtocol::new")?;
                 eprintln!(
                     "hostcheck: M7c -- asking {} to sit the CHECK QUIZ on the same share, \
-                     declared firmware {}",
+                     declared profile {}",
                     r.device,
-                    firmware.version_name()
+                    profile.name(&r.digest)
                 );
                 *ui = Some(Box::new(proto));
                 if let Some(p) = ui.as_mut() {
@@ -2633,6 +2664,44 @@ mod golden_vector {
     }
 }
 
+/// TRAP 2's guard, checkable without a device.
+///
+/// The module header documents the reproduction as "`CHECK_BACKUP_SINCE` lowered to
+/// 0.2.0 -> bail, exit 1", and that bail lives in `Phase::Quiz`, which needs a whole
+/// stub run to reach. These two asserts are the same two facts the guard asserts, so
+/// `cargo test` alone says whether the documented failure case still reproduces —
+/// rather than the guard being taken on trust between full runs.
+#[cfg(test)]
+mod check_backup_threshold {
+    use super::{DeviceProfile, VersionNumber, CHECK_BACKUP_SINCE};
+
+    #[test]
+    fn the_recorded_threshold_is_the_one_upstream_uses() {
+        // Half 1, and the reproduction: true at 0.3.0, false below it. Lowering the
+        // constant, or upstream raising its own threshold, flips the first assert.
+        assert!(
+            CHECK_BACKUP_SINCE.features().check_backup,
+            "upstream no longer grants check_backup at v{CHECK_BACKUP_SINCE}, so M7c's \
+             guard would bail and the quiz would not run"
+        );
+        assert!(
+            !VersionNumber::new(0, 2, 0).features().check_backup,
+            "the threshold has to be a real boundary for the guard to mean anything"
+        );
+
+        // Half 2: the predicate `CheckBackupProtocol::new` branches on, against the
+        // profile M7c declares. Fires if upstream's Mk4 arm ever takes the legacy
+        // physical-backup path.
+        assert!(
+            !DeviceProfile::ColdsnapMk4 {
+                revision: "hostcheck-declared".to_string()
+            }
+            .needs_legacy_check_backup(),
+            "upstream now routes an Mk4 down the LEGACY 25-word re-entry path"
+        );
+    }
+}
+
 /// A fresh `STUB_UPGRADE=1` child, its pty and a completed magic handshake.
 ///
 /// One per LEG, because `upgrade::run` returns on `Outcome::Staged` and the stub then
@@ -3132,8 +3201,8 @@ fn one_pass(
     let mut keygen: Option<Keygen> = None;
     let mut sign = Sign::default();
     let mut queue: VecDeque<CoordinatorSend> = VecDeque::new();
-    // The firmware digest each device ANNOUNCED, for the `FirmwareVersion` M7c hands
-    // `CheckBackupProtocol`. See [`CHECK_BACKUP_SINCE`].
+    // The firmware digest each device ANNOUNCED, which M7c labels the profile it
+    // hands `CheckBackupProtocol` with. See [`CHECK_BACKUP_SINCE`].
     let mut digests: BTreeMap<DeviceId, Sha256Digest> = BTreeMap::new();
     // ============================= M7a: THE SEAM =============================
     // ONE boxed `UiProtocol` at a time and deliberately no `UiStack`. The five-call
@@ -3279,9 +3348,9 @@ fn one_pass(
                     match body {
                         DeviceSendBody::Announce { firmware_digest } => {
                             // Kept for M7c, which has to hand `CheckBackupProtocol` a
-                            // `FirmwareVersion`. The DIGEST is the real thing this
-                            // device says about its firmware; the version beside it is
-                            // the harness's declaration. See [`CHECK_BACKUP_SINCE`].
+                            // profile. The DIGEST is the real thing this device says
+                            // about its firmware; the profile beside it is the
+                            // harness's declaration. See [`CHECK_BACKUP_SINCE`].
                             digests.insert(from, firmware_digest);
                             if !announced.contains(&from) {
                                 announced.push(from);
