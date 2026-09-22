@@ -5,7 +5,7 @@
     "status": "DEGRADED",
     "reason": "All 6 acceptance criteria met and all checks pass for the right reason, but one CONFIRMED finding is open: tools/test-pack-signed.py:174-176 asserts only 'REFUSE' on the corrupted-signature negative, not the R12 signature rule it quotes; the run does fail on R12 today, so the guard is weak, not the result. Close-out may not edit source.",
     "evidence": "01-repair-firmware-packaging.md",
-    "commit": null,
+    "commit": "985f2f121f30ba56331e681dbb72f1ea36204ed7",
     "open_confirmed": [
       "tools/test-pack-signed.py:174-176 - corrupted-signature end-to-end case asserts the generic 'REFUSE' verdict line instead of the specific 'R12' signature rule; would still pass if checkfw stopped verifying signatures but failed another rule on the same fixture. One-word fix. Breaks no acceptance criterion."
     ],
@@ -16,6 +16,35 @@
       "U2 OTP min-version floor (verify.c:143,181) - install path only, and it ratchets with every install already done on that unit",
       "U3 RDP level (verify.c:340) - decides Factory boot vs red light, and whether a failed verify can still reach enter_dfu",
       "U4 that an install path exists at all - only pins.c:1276-1340 from a logged-in MicroPython installs new firmware; sdcard_recovery cannot (sdcard.c:248 needs SE1 to already hold this image's world hash)"
+    ]
+  },
+  {
+    "task": "03",
+    "slug": "check-coldcard-reference-contracts",
+    "status": "DEGRADED",
+    "reason": "All 6 acceptance criteria met and all 12 commands pass for the right reason (one documented command, tools/check-reference-contracts.py, runs 114 checks in covered/failed/unavailable buckets with exit 0/1/2 against the real reference sources: the C side compiled from the reference's own headers for thumbv7em-none-eabihf and read out of the object's .probe section, never executed; the Rust side parsed from hal/ and firmware/ source; the linker side parsed from link.x and layout.ld; 114 COVERED / 0 FAILED / 0 UNAVAILABLE; tools/test-reference-contracts.py proves 6/6 negative cases exit nonzero for the named reason, including that pixel-check.py's exit-0 SKIP becomes a nonzero UNAVAILABLE). DEGRADED because one CONFIRMED finding is open and close-out may not edit source: tools/check-reference-contracts.py:726 and :817 read the cold-snap side with a silent 0 default (rs.get('BURN_LEN_MAX', 0), rs.get('PSRAM_STAGE_OFFSET', 0) + rs.get('PSRAM_STAGE_LEN', 0)), so a missing or renamed constant reports COVERED instead of the drift signal the checker's own docstring at :186-188 promises. Weak guard, not a wrong result - all three constants exist and every value agrees today. One-character fix per site. Breaks no acceptance criterion.",
+    "evidence": "03-check-coldcard-reference-contracts.md",
+    "commit": null,
+    "open_confirmed": [
+      "tools/check-reference-contracts.py:726 and :817 - two of the 114 checks read the cold-snap side with a silent 0 default, so an absent constant satisfies the bound unconditionally and reports COVERED rather than FAILED; reproduced by replaying both call sites with rs={} against this run's real probe values. PSRAM_STAGE_OFFSET (hal/src/psram.rs:194) is consumed only at :817, so its rename is caught nowhere; BURN_LEN_MAX is still caught at :834 and PSRAM_STAGE_LEN at :827. Contradicts the checker's documented contract at :186-188 and the prompt Objective 'Make source drift fail visibly'. Drop the ', 0' at both sites. Breaks no acceptance criterion."
+    ],
+    "criteria_met": 6,
+    "criteria_total": 6,
+    "notes": [
+      "D1 reference-internal, recorded not fixed: sigheader.h:34 future[5] (20 B by ARM sizeof) vs :58 FWH_NUM_FUTURE 7. FWH_PY_FORMAT's 20s and struct.calcsize agree with the struct, so FWH_NUM_FUTURE is stale. Nothing in cold-snap reads it; coldcard-firmware is read-only.",
+      "D2 stale doc anchors in cold-snap, found and NOT fixed (out of this round's scope): hal/src/callgate.rs cites pins.h:96-116 for pinAttempt_t (actual :47-68), pins.h:37 for PA_MAGIC_V2 (actual :38), pins.h:71 for PIN_ATTEMPT_SIZE_V2 (actual :72), pins.h:85 for EPIN_PIN_REQUIRED (actual :84); root Cargo.toml cites dispatch.c:417-418 for enter_dfu EPERM (actual :161-165). Every numeric value at those sites is proved correct by the 114 checks; only the line citations rotted. Worth a separate comment sweep.",
+      "Group 3 coverage is bounded and the non-claim is explicit: 40 constants cross-checked; every other register offset, mask and bit in hal/src/{flash,display,keypad,rng,panic,usb}.rs is not claimed validated.",
+      "Startup ordering is a RECORDED DISASSEMBLY REVIEW (target/software-only/refcheck/reset-entry.asm), not an automated assertion. tools/qemu-boot.sh is never invoked: diagnostic, not a gate.",
+      "PLAUSIBLE, not confirmed, disclosed rather than reverted: run.json:8 carries a backfill of task 01's 'commit' field from null to 985f2f121f30ba56331e681dbb72f1ea36204ed7, left by task 01's close-out (985f2f1 could not contain its own SHA). Value verified correct; committed with this task's staging, named in the evidence file's Files changed table."
+    ],
+    "bench_only": [
+      "B1 peripheral timing and wait states: flash program/erase timing, FLASH_SPIN_LIMIT, SPI FIFO drain, RNG seed-error recovery",
+      "B2 silicon behaviour: the real DBANK option-byte value (4 K vs 8 K erase granularity), FPU/clock behaviour after the CPACR write, whether SRAM3 reads back as the bootloader left it",
+      "B3 real secure-element calls: no callgate transit performed; whether sub-call 0 is counter-free, whether attempts_left behaves as read, whether this bootrom expects PIN_ATTEMPT_SIZE_V2 at run time",
+      "B4 board-specific bootloader state: RDP level, option bytes, PCROP, pairing secret, OTP min-version floor, and whether an install path exists at all on the unit in hand",
+      "B5 startup instruction order on target: the reset-entry.asm review sits one frame above the VTOR/CPACR stores; nothing proves the VTOR store precedes the first faulting instruction",
+      "B6 the bootloader's PSRAM recovery path: RECHDR_POS and the psram.c:261-266 gate are compared as bounds only; psram_recover_firmware() is never exercised and no arg2=7 burn is bound",
+      "B7 the 40-constant register set is bounded by design; every other HAL register transcription is unchecked"
     ]
   }
 ]
