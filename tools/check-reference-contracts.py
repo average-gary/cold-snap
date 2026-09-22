@@ -81,6 +81,7 @@ INC_PATHS = ['external/micropython/lib/stm32lib/CMSIS/STM32L4xx/Include',
 RUST_FILES = ['hal/src/lib.rs', 'hal/src/callgate.rs', 'hal/src/psram.rs',
               'hal/src/flash.rs', 'hal/src/display.rs', 'hal/src/keypad.rs',
               'hal/src/rng.rs', 'hal/src/panic.rs', 'hal/src/usb.rs',
+              'hal/src/image.rs',
               'firmware/src/entry.rs', 'firmware/link.x']
 
 
@@ -296,6 +297,7 @@ ABI_KEYS = (['sizeof_pinAttempt', 'alignof_pinAttempt']
                'FW_HEADER_MAGIC', 'FW_MIN_LENGTH', 'FW_MAX_LENGTH_MK4',
                'FWH_PK_NUM_OFFSET', 'FWH_NUM_FUTURE', 'FLASH_HEADER_BASE_MK4',
                'off_firmware_length', 'off_pubkey_num', 'sizeof_future',
+               'off_hw_compat',
                'sizeof_dfu_flag', 'dfu_flag_addr', 'FIRMWARE_START',
                'PSRAM_BASE', 'PSRAM_SIZE', 'MK_4_OK',
                'sizeof_ptr', 'sizeof_int', 'sizeof_long'])
@@ -322,6 +324,7 @@ __attribute__((used, section(".probe"))) const unsigned int probe[] = {
     offsetof(coldcardFirmwareHeader_t, firmware_length),
     offsetof(coldcardFirmwareHeader_t, pubkey_num),
     sizeof(((coldcardFirmwareHeader_t *)0)->future),
+    offsetof(coldcardFirmwareHeader_t, hw_compat),
     sizeof(dfu_flag_t), (unsigned int)(uintptr_t)dfu_flag, FIRMWARE_START,
     PSRAM_BASE, PSRAM_SIZE, MK_4_OK,
     sizeof(void *), sizeof(int), sizeof(long),
@@ -666,7 +669,8 @@ def main(argv=None):
                 os.path.join(mk4, 'console.h'),
                 os.path.join(ref, 'stm32', 'COLDCARD_MK4', 'pins.csv'),
                 os.path.join(ref, 'shared', 'mempad.py'),
-                os.path.join(ref, 'unix', 'simulator.py')]
+                os.path.join(ref, 'unix', 'simulator.py'),
+                os.path.join(ref, 'cli', 'signit.py')]
     consumed += [os.path.join(ref, p, h) for p, h in (
         (INC_PATHS[0], 'stm32l4s5xx.h'),
         (INC_PATHS[1], 'stm32l4xx_hal_flash.h'),
@@ -720,6 +724,14 @@ def main(argv=None):
            'psram::FW_LENGTH_FIELD_OFFSET vs offsetof(.., firmware_length)')
     log.eq(a, 'fw-min-body-len', rs.get('FW_MIN_BODY_LEN'), abi['FW_MIN_LENGTH'],
            'memmap::FW_MIN_BODY_LEN vs FW_MIN_LENGTH')
+    log.eq(a, 'fw-header-magic', rs.get('FW_HEADER_MAGIC'), abi['FW_HEADER_MAGIC'],
+           'image::FW_HEADER_MAGIC vs sigheader.h FW_HEADER_MAGIC (verify.c:212)')
+    log.eq(a, 'hw-compat-field-offset', rs.get('HW_COMPAT_FIELD_OFFSET'),
+           abi['off_hw_compat'],
+           'image::HW_COMPAT_FIELD_OFFSET vs offsetof(.., hw_compat)')
+    log.eq(a, 'mk-4-ok', rs.get('MK_4_OK'), abi['MK_4_OK'],
+           'image::MK_4_OK vs sigheader.h:71 MK_4_OK (enforced in the reference by '
+           'shared/utils.py:401-417 only, never by verify.c)')
     log.eq(a, 'burn-len-min', rs.get('BURN_LEN_MIN'), abi['FW_MIN_LENGTH'],
            'psram::BURN_LEN_MIN vs the bootloader\'s own floor (psram.c:264)')
     log.eq(a, 'burn-len-max-within-fw-max',
@@ -833,6 +845,34 @@ def main(argv=None):
     log.eq(m, 'burn-len-max-reaches-flash-fs',
            rs.get('BURN_BASE', 0) + rs.get('BURN_LEN_MAX', 0), rs.get('FLASH_FS_BASE'),
            'BURN_BASE + BURN_LEN_MAX vs FLASH_FS_BASE (a burn cannot reach the share)')
+
+    # The two packer alignments, read out of `cli/signit.py` rather than retyped.
+    # `align_to(len(body), 512)` is every product's rule and is `FW_BODY_ALIGN`;
+    # `align_to(body_len, 4096)` is the PSRAM-product branch (Mk4/Q1/Mk5) and is
+    # `FW_INSTALL_ALIGN`. The bootloader enforces NEITHER (`verify.c:212-217` has no
+    # alignment test), so signit is the only source these can be checked against --
+    # which is exactly why they need checking rather than asserting.
+    sig_py = os.path.join(ref, 'cli', 'signit.py')
+    sig_src = open(sig_py).read() if os.path.exists(sig_py) else ''
+    for key, const, pat in (
+            ('signit-body-align', 'FW_BODY_ALIGN',
+             r'align_to\(len\(body\),\s*(\d+)\)'),
+            ('signit-install-align', 'FW_INSTALL_ALIGN',
+             r'align_to\(body_len,\s*(\d+)\)')):
+        hit = re.search(pat, sig_src)
+        if not hit:
+            log.unavail(m, key, 'cli/signit.py no longer spells `%s`' % pat)
+        else:
+            log.eq(m, key, rs.get(const), int(hit.group(1)),
+                   'memmap::%s vs cli/signit.py `%s`' % (const, hit.group(0)))
+    # And the reason the whole-image length may be judged by the body's rule:
+    # `signit.py:315` puts exactly FW_HEADER_OFFSET + FW_HEADER_SIZE bytes ahead of
+    # the body, and that prefix is itself a whole number of 4,096-byte units.
+    log.eq(m, 'install-align-divides-header-prefix',
+           (rs.get('FW_HEADER_OFFSET', 0) + rs.get('FW_HEADER_SIZE', 0))
+           % max(rs.get('FW_INSTALL_ALIGN', 1), 1), 0,
+           'FW_HEADER_OFFSET + FW_HEADER_SIZE is a multiple of FW_INSTALL_ALIGN '
+           '(so firmware_length is 4 K-aligned exactly when the body is)')
 
     say('\n[4] registers: compiler-resolved CMSIS/HAL vs the HAL\'s literals')
     reg = dict(zip(REG_KEYS, probe('reg-probe', REG_C, ref, defs)))

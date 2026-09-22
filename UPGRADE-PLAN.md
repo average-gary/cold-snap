@@ -39,12 +39,47 @@ fixes that.
 * **`pin_change` (18/3) stays unbound and stays classified `Destructive`** (`hal/src/callgate.rs:799`).
   Setting or changing PINs is not this device's job.
 
-### 1.2 The always-required gate is the coordinator's contribution, not the PIN
+### 1.2 SUPERSEDED 2026-09-21 — there is NO coordinator-contribution gate, and upgrades are deliberately unauthenticated at the application level
 
-Every upgrade must carry a `root_shared_key` + `coord_share_decryption_contrib` that **actually
-decrypts a share this device holds** — the same check `device/restoration.rs` already applies three
-times before a backup reveal. Rationale: **the upgrade door must not be weaker than the share it
-protects.** A device holding no share holds no money and upgrades freely.
+**The gate this section used to require is WITHDRAWN by user decision**
+(`prompts/software-only/05-validate-mk4-upgrade-images.md`, "Policy to implement"). What replaces it:
+
+* **The user accepts locally built firmware signed with Coldcard's published dev key 0.** The
+  bootloader still requires that signature, but *anyone* can produce it — the private half is
+  published (`coldcard-firmware/stm32/keys/README.md`) — so it is a FORMAT check, never
+  trusted-release authentication. §1.3's reading of that fact is unchanged and is why the
+  signature was never the gate either.
+* **No authenticated manifest, private release authority, owner/threshold proof,
+  coordinator-contribution gate, or factory certificate is required for an upgrade.** A
+  recognized-release digest list is compatibility metadata, not an installation allowlist. A valid
+  local development build must be installable without first registering a release or configuring a
+  new trust anchor. Nothing in the tree may grow a release allowlist, a rollback ratchet or an OTP
+  write to re-introduce one.
+* **Digests are integrity, never trust.** The announced SHA-256 over the two signed ranges
+  (`firmware_digest`) checks the TRANSFER and the PSRAM READ-BACK. It says nothing about who sent
+  the image. §3.5 and decision 8's correction trail already say this; it is now the whole claim.
+* **What remains, and it is all that remains:** physical confirmation (the step-6d key hold, §3.7,
+  plus a consent screen), the format/bounds checks — implemented 2026-09-21 as
+  `coldsnap_hal::image::check_installable`, called by `upgrade::Stager::installable` on the device
+  and by `firmware/examples/checkfw.rs` R14 on the host — and the bootloader's own existing PIN and
+  downgrade rules, which we do not touch.
+* **Consequence, stated rather than buried: the evil-maid exposure §1.3 describes is ACCEPTED, not
+  closed.** Physical possession of an unlocked unit plus the published key plus a consent digit read
+  off the glass is persistent code execution, and after this decision nothing in the design
+  contradicts that. It is a user decision about a bench-and-development device, not a claim that the
+  door is strong. No sentence anywhere may describe the current design as closing it.
+
+**What this section required until 2026-09-21** (kept verbatim, because the reasoning is what makes
+the residual risk above legible and because re-proposing it would be a decision, not a fix):
+
+> **The always-required gate is the coordinator's contribution, not the PIN.** Every upgrade must
+> carry a `root_shared_key` + `coord_share_decryption_contrib` that **actually decrypts a share this
+> device holds** — the same check `device/restoration.rs` already applies three times before a
+> backup reveal. Rationale: **the upgrade door must not be weaker than the share it protects.** A
+> device holding no share holds no money and upgrades freely.
+
+Because that message no longer exists, **the wire-size measurement it was blocked on is withdrawn
+too** — see §5 item 3 and phase 4 in §4.
 
 ### 1.3 Why the PIN cannot be the gate on a blank unit — our own source says so
 
@@ -58,18 +93,27 @@ and this file exists partly to stop it being re-proposed.** The co-factor: key 0
 published (`coldcard-firmware/stm32/keys/README.md`: *"shared on the Internet so anyone can build
 experimental code"*), so `verify_signature` is a FORMAT check, not an authorisation check. Blank PIN
 + published key + a consent digit an attacker reads off the glass = 30 seconds of physical
-possession becomes persistent code execution. That is the evil-maid hole, and §1.2 is what closes it.
+possession becomes persistent code execution. That is the evil-maid hole. **§1.2 used to close it
+with the coordinator-contribution gate; that gate was withdrawn 2026-09-21 and the hole is now
+ACCEPTED, with physical possession of the unit plus a consent screen as the only barrier.** The
+analysis above is unchanged and still correct — it is the reason the PIN and the key-0 signature are
+both non-gates — only the conclusion about what closes it is withdrawn.
 
 ### 1.4 The resulting matrix
 
+**Rewritten 2026-09-21 with §1.2's gate withdrawn.** The "upgrade requires" column below was
+"coord-contrib gate + consent" (and, for a migrated unit, "18/2 login **+** coord-contrib gate +
+consent") until that date.
+
 | device | PIN | upgrade requires | notes |
 |---|---|---|---|
-| bench / bring-up | blank | coord-contrib gate + consent | 18/0 grants `PA_SUCCESSFUL` free. Simplest path; debug everything here. |
-| fresh, in service | blank | coord-contrib gate + consent | We never offer to add a PIN. |
-| migrated Coldcard | already set | 18/2 login **+** coord-contrib gate + consent | Two factors: owner present, group authorises. |
+| bench / bring-up | blank | physical consent (key hold + on-glass confirm) + format/bounds checks | 18/0 grants `PA_SUCCESSFUL` free. Simplest path; debug everything here. |
+| fresh, in service | blank | physical consent + format/bounds checks | We never offer to add a PIN. |
+| migrated Coldcard | already set | 18/2 login **+** physical consent + format/bounds checks | One factor beyond presence: the bootloader demands the login, we do not add a gate. |
 
-One code path: the coord-contrib gate is unconditional; the PIN login is conditional on
-`PA_IS_BLANK` being clear.
+One code path: the consent and the checks are unconditional; the PIN login is conditional on
+`PA_IS_BLANK` being clear. The format/bounds column is
+`coldsnap_hal::image::check_installable` — a shape check, never an authorisation check.
 
 ### 1.5 The boundary that must hold structurally
 
@@ -260,11 +304,16 @@ constant. The size arrives on the wire and `hostcheck`'s M13 deliberately drives
 = 64 × 4,096 + 512, because a 97 × 4,096 exact fit cannot fail the ack arithmetic or the short
 tail and would be the vacuous test.*
 
-**Phase 4 — the coord-contrib gate. BLOCKED on one measurement.** The `SharedKey` check of §1.2.
-**Needs a wire-size measurement first** — see §5 item 3. The heap half of that item is no longer
-outstanding: §7d MEASURED the arena at 60,512 B of 65,536 with 5,024 B spare against the
-staging tree, so what is left is how many bytes a `SharedKey`-carrying upgrade message costs on the
-wire and in the decode arena.
+**Phase 4 — WITHDRAWN 2026-09-21, not deferred.** It was "the coord-contrib gate, BLOCKED on one
+measurement": the `SharedKey` check of §1.2, needing a wire-size measurement first (§5 item 3). §1.2's
+gate is withdrawn by user decision, so there is no `SharedKey`-carrying upgrade message to size and
+**the measurement that blocked this phase is withdrawn with it**. Nothing takes phase 4's place: what
+the withdrawn gate would have added is not replaced by another gate. The format/bounds boundary that
+does exist is `coldsnap_hal::image::check_installable` (§7e), and it is not a phase — it is a pure
+function with no device state.
+
+*Phase numbering is left alone rather than closed up: phases 5 and 6 are cited by number elsewhere in
+this file and in DECISIONS.md decision 8.*
 
 **Phase 5 — the PIN login (18/2), conditional on `PA_IS_BLANK` being clear.** Only after phase 4.
 Debugged on the phase-0 bench unit.
@@ -282,14 +331,21 @@ by then run on the same silicon.
    after two 18/0 calls, on the phase-0 bench unit. **Gates phase 6.**
 2. **Does RDP=2 disable SWD on STM32L4S5?** Not citable from either repo; needs RM0432 §3.5. The
    "RDP=2 is the only thing protecting the plaintext identity secret" claim rests on it.
-3. **Does a `SharedKey`-carrying upgrade message fit `FRAME_LIMIT` 4,096 and the heap?**
-   **Half settled 2026-09-18 (§7d).** The arena baseline is no longer inherited: with the whole
-   staging path in the tree it MEASURES 60,512 B of 65,536, **5,024 B spare**, peak requested 54,496 B,
+3. **~~Does a `SharedKey`-carrying upgrade message fit `FRAME_LIMIT` 4,096 and the heap?~~
+   WITHDRAWN 2026-09-21 — it gates nothing, because the message does not exist.** §1.2's
+   coordinator-contribution gate is withdrawn by user decision, so there is no
+   `SharedKey`-carrying upgrade message to size on the wire or in the decode arena, and phase 4 is
+   withdrawn with it. **This item is closed by withdrawal, NOT by measurement: no wire size for such
+   a message has been measured, and nothing may later cite this item as evidence that one fits.**
+   The half that WAS measured stands and is still the current baseline: with the whole staging path
+   in the tree the arena MEASURES 60,512 B of 65,536, **5,024 B spare**, peak requested 54,496 B,
    0 allocator refusals — run, not argued (`cargo run --release --target aarch64-apple-darwin -p
    coldsnap_firmware --example heap_session --features="coldsnap_hal/test-seam,frostsnap_core/coordinator"`).
-   What is STILL OPEN, and it is what actually gates phase 4: the WIRE-SIZE measurement for a
-   `SharedKey`-carrying upgrade message, plus the decode-arena cost of admitting one, measured by
-   extending `firmware/examples/heap_session.rs` in the §7 style. **Gates phase 4.**
+   Note what that figure is NOT (§7e): `heap_session.rs` has no `Stager` in its workload, so it is a
+   baseline for the tree, not a measurement of staging. The 2026-09-21 image-validation work adds no
+   allocation and no retained state to measure against it — `image::check_installable` is a pure
+   function over a borrowed slice and `Stager::installable` takes `&self` — but that is an argument
+   FROM CONSTRUCTION and is labelled as one.
 4. **Consent UX for the burn.** Read upstream's own device UX for precedent before inventing one.
    Fallback is the physical key-hold of §3.7.
 5. **The `.dfu` must be on a contiguous FAT SD card in the slot before the burn is confirmed.**
@@ -712,6 +768,10 @@ simply redundant with four others. Net coverage is up: the test went from one le
 
 #### What phase 4 still needs, unchanged by this pass
 
+*Superseded 2026-09-21: phase 4 itself is WITHDRAWN (§4, §5 item 3), so the wire-size measurement
+this paragraph is still waiting for is withdrawn too and no later pass owes it. The paragraph is kept
+as written because it is the record of what was outstanding on 2026-09-18.*
+
 Nothing in §5 was settled here, with one exception of scope rather than substance: §5 item 3's
 `MEASURED_ARENA_FOOTPRINT_BYTES` half is now a MEASURED 60,512 of 65,536 with 5,024 B spare against
 this tree rather than an inherited figure, so the heap side of the phase-4 gate has a current
@@ -745,6 +805,78 @@ pad read and `readback_selftest` against real OCTOSPI have never executed.
   security property for a channel." That comment is rewritten with what is now true, including the
   exact scope of the regression (one attach event; enumeration still never COMPLETES, because
   `hold` never polls `cdc`) and what re-closes it (step 6d).
+
+### §7e — THE CHECKED-IMAGE BOUNDARY, 2026-09-21: the policy correction of §1.2 and one install validator
+
+Landed by task 05 (`prompts/software-only/05-validate-mk4-upgrade-images.md`). Software only: no
+device, no callgate, no burn, and `pin_firmware_upgrade` (18/7) is still unbound.
+
+**1. The policy.** §1.2's coordinator-contribution gate is WITHDRAWN and the withdrawal is recorded
+there, in §1.4, in §4 phase 4, in §5 item 3, and in DECISIONS.md decision 8's 2026-09-21 amendment.
+Nothing in the tree gained a release allowlist, an authenticated manifest, a rollback ratchet, an OTP
+write or a signing key, and dev key 0 is still the only key `checkfw` embeds.
+
+**2. Two boundaries where there was one.** Transfer-stage validity is not installability:
+
+* *Staging* (`upgrade::Stager::admit`/`feed`/`verify`, unchanged) judges a transfer:
+  `memmap::FW_BODY_ALIGN` 512 (`signit.py:295`, every product's rule), the
+  `[BURN_LEN_MIN, BURN_LEN_MAX]` window, exact `received == size == header.firmware_length`, and the
+  announced digest recomputed from PSRAM read-back.
+* *Installability* (NEW: `coldsnap_hal::image::check_installable`, called by
+  `upgrade::Stager::installable` and by `checkfw` R14) adds header magic, `hw_compat` admitting Mk4,
+  and **`memmap::FW_INSTALL_ALIGN` 4,096** — `signit.py:305`'s re-alignment for PSRAM products,
+  which `verify.c:106` ties to `psram_do_upgrade`'s page-erase stride. It is `&self`/pure and burns
+  nothing; task 07 models installation against it.
+
+The 262,656-byte short-tail fixture therefore stages and verifies and **cannot** install
+(`upgrade::tests::a_short_tail_image_stages_and_verifies_but_cannot_be_installed`), which is what
+"existing synthetic short-tail staging tests do not establish a bootable image" means in code. It is
+also the first non-test caller of `psram::check_burn_len`, the decoupling guard that had none.
+
+**3. The 4,096-vs-512 disagreement is closed by giving each rule one home.** Until this pass
+`checkfw` carried a local `MK4_ALIGN = 4096` while the device had no 4 K rule at all, and both sites
+recorded the divergence as an open gap. `FW_BODY_ALIGN` was NOT tightened — that would make one
+constant answer two questions and would delete the short-tail coverage — so the tripwires on it
+(`firmware_digest_alignment_bound_is_looser_than_mk4_requires`,
+`prepare_refuses_a_size_the_burn_cannot_align`) stay green and their docs now say why.
+
+**4. `hw_compat` has a boundary for the first time.** `grep hw_compat` in `mk4-bootloader/` is 0 hits
+in `verify.c`; the only enforcer in the reference tree is MicroPython's installer
+(`shared/utils.py:401-417`), including its `hw_compat == 0` means "no constraint" reading. On a unit
+with no MicroPython the host pre-flight and `Stager::installable` are the only applicable boundaries,
+and both now check it.
+
+**5. Golden vectors, because code sharing is impossible here.** `hostcheck` cannot depend on
+`coldsnap_hal` (cargo refuses the combined graph), so its `signed_digest` and the device's
+`firmware_digest` are independent implementations of one range with nothing comparing them — a
+matching pair of WRONG literals was green on both sides. `golden/mk4-staging-vectors.txt` now pins
+M13's image with all three digests it can be confused with: ours (single, two ranges), the
+bootloader's double (`verify.c:226`), and the ESP32 coordinator's contiguous prefix. Read by
+`upgrade::tests::the_golden_vector_pins_the_announced_digest_and_the_two_it_must_not_be` and by
+`hostcheck`'s `golden_vector_agrees_with_m13s_own_digest`.
+
+**6. Read-back corruption is covered where the prompt's own Checks block can see it.** The
+`PsramError::Mismatch` path lived only in `coldsnap_hal`'s suite, which
+`cargo test -p coldsnap_firmware` does not run.
+`upgrade::tests::psram_reading_back_a_byte_it_was_never_given_is_a_digest_refusal` drives it through
+`Stager` with `FakePsram::corrupt_writes_at` armed after admission — a different failure from the
+corrupt-wire case, which is the one that was already covered.
+
+**7. New constants are pinned against the reference, not asserted.**
+`tools/check-reference-contracts.py` now also parses `hal/src/image.rs` and checks
+`FW_HEADER_MAGIC`, `HW_COMPAT_FIELD_OFFSET` (vs `offsetof`), `MK_4_OK`, and both packer alignments
+read out of `cli/signit.py` (`align_to(len(body), 512)` -> `FW_BODY_ALIGN`,
+`align_to(body_len, 4096)` -> `FW_INSTALL_ALIGN`), plus that the 16,384-byte header prefix is itself
+4 K-aligned — which is what makes checking the whole-image length against a BODY rule legitimate.
+
+**8. Cost: nothing to measure, and that is stated as construction rather than measurement.** No
+allocation, no retained state, no new buffer, no frame or decode change: chunks still bypass `Link`
+and `Stager` gained a `&self` method and no field. The heap baseline is unchanged at 60,512 B of
+65,536 and is re-run, not re-cited — and it still does not exercise `Stager` (§5 item 3).
+
+**Still requires hardware, unchanged:** every ARM leg (`MappedPsram::from_raw_parts`, `Cdc`'s `Wire`
+impl, `readback_selftest` against real OCTOSPI, the key-hold read), U1-U4 of `checkfw` (SE1 world
+checksum, OTP minimum timestamp, RDP level, whether an install path exists at all), and the burn.
 
 ## 8. PROVENANCE
 

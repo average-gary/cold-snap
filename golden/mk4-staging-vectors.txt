@@ -1,0 +1,49 @@
+# Fixed golden vectors for the Mk4 staging/upgrade digest. Authored 2026-09-21.
+#
+# WHY A FILE AND NOT SHARED CODE. `coldsnap_firmware::firmware_digest` is the one
+# implementation of the Mk4 bootloader's signed range in this tree, and the
+# coordinator-side consumer that has to agree with it -- `hostcheck`, which drives
+# the real staging interop in M13 -- CANNOT CALL IT. One cargo graph will not hold
+# `coldsnap_hal` and upstream `frostsnap_coordinator` at once (`hostcheck/Cargo.toml`
+# records cargo's own refusal: "package collision in the lockfile ... frost_backup
+# ... are different"). So the two consumers are independent readers of the range by
+# construction, and until this file existed nothing bound them together: each
+# derived the digest from its own literals, and a matching pair of wrong literals
+# would have been green on both sides.
+#
+# Both consumers `include_str!` THIS FILE and compare against it:
+#   - cold-snap: `firmware/src/upgrade.rs`, test `the_golden_vector_pins_...`
+#   - hostcheck: `hostcheck/src/main.rs`, test `golden_vector_agrees_with_m13s_own_digest`
+# Neither computes a value the other supplies, so a drift in either reddens here.
+#
+# HOW TO REPRODUCE, from nothing but this comment:
+#
+#   size  = 262656                      # 64 * 4096 + 512, M13's announced size
+#   img   = bytes((i*7 + i//251) % 256 for i in range(size))
+#   img[16280:16284] = size.to_bytes(4, 'little')   # header firmware_length, LE u32
+#                                                   # 16280 = FW_HEADER_OFFSET + 24
+#   announced = sha256(img[0:16320] + img[16384:size])
+#   fw_check  = sha256(announced)
+#   prefix    = sha256(img[0:size])
+#
+# THE THREE DIGESTS ARE THREE DIFFERENT NUMBERS OVER THE SAME BYTES, and that is
+# the point of carrying all three:
+#
+#   announced  what cold-snap announces and verifies (`firmware_digest`): a SINGLE
+#              sha256 over TWO ranges, [0, 16320) then [16384, firmware_length),
+#              i.e. with the 64-byte key-0 signature that sits INSIDE the header at
+#              byte 16,320 punched out (`mk4-bootloader/verify.c:265-273`).
+#   fw_check   what the Mk4 BOOTLOADER signs: sha256 of `announced`, a DOUBLE hash
+#              over the same two ranges (`verify.c:226`). `checkfw` adds this outer
+#              hash and nothing else.
+#   prefix     what a stock ESP32 coordinator computes: a single sha256 over one
+#              CONTIGUOUS prefix (`frostsnap_coordinator/src/firmware.rs:206-212`).
+#              Recorded so the incompatibility is a pinned number rather than a
+#              paragraph: a stock coordinator's announced digest will NOT match
+#              ours, which is the fail-closed direction.
+#
+# Integrity, not trust: none of the three says anything about who sent an image.
+#
+# Format: one vector per line -- `<name> <size> <announced> <fw_check> <prefix>`.
+
+m13-synth-262656 262656 33b54101f5ab06c1db9f6a968b4687114926ccac1a5054821e8bbf6e1ab19489 cd00f217e4685da072f3da725701334b439177b5ae56b0065e60800e452ee629 f0660a40b87bed9fadf6f79c3cb19d518df60844f930927de79adb49e726cff9

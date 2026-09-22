@@ -129,6 +129,7 @@ pub mod display;
 pub mod flash;
 pub mod heap;
 pub mod identity;
+pub mod image;
 pub mod keypad;
 pub mod panic;
 pub mod psram;
@@ -321,6 +322,27 @@ pub mod memmap {
     pub const FW_MIN_BODY_LEN: u32 = 256 * 1024;
     /// Required body alignment (`cli/signit.py:295`).
     pub const FW_BODY_ALIGN: u32 = 512;
+
+    /// **The Mk4 INSTALLATION alignment, 4,096 bytes**, and the single home of
+    /// that number.
+    ///
+    /// Distinct from [`FW_BODY_ALIGN`] and both are real. 512 is what
+    /// `cli/signit.py:295` pads every product's body to and is the looser rule a
+    /// TRANSFER is judged against. 4,096 is what `signit.py:305` then re-aligns
+    /// the body to for PSRAM-based products (Mk4, Q1, Mk5) because
+    /// `psram_do_upgrade` page-erases as it writes at the 4 K flash erase unit
+    /// (`verify.c:106`), so a 512-but-not-4,096 length erases past the end of the
+    /// image it just wrote. It is the rule an INSTALL is judged against, applied
+    /// by [`crate::image::check_installable`].
+    ///
+    /// The bootloader enforces neither: `verify_header` (`verify.c:212-217`) has
+    /// no alignment test at all. So this is our rule about the reference packer's
+    /// output, not a mirror of a reference check — which is exactly why it needs
+    /// one home. It had two before 2026-09-21: `firmware/examples/checkfw.rs`
+    /// carried a local `MK4_ALIGN = 4096` while nothing on the device side had the
+    /// number at all, and the host and device consumers therefore disagreed 4,096
+    /// vs 512 about the same header field.
+    pub const FW_INSTALL_ALIGN: u32 = 4096;
 
     /// The bootloader's 12-byte `dfu_flag` (`mk4-bootloader/main.h:14`).
     ///

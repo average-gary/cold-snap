@@ -779,12 +779,52 @@ step-6d hold's ACCEPT condition, which was pinned by no test, is now the host-te
 wet or shorted pad — had survived the whole suite green). The image measures **379,940 B** after
 both, and the heap arena was MEASURED at 60,512 B of 65,536 rather than argued from construction.
 
-**Not decided here, and deliberately:** the coordinator-contribution gate (UPGRADE-PLAN
-§1.2, blocked on a WIRE-SIZE measurement — the heap half of that item was measured 2026-09-18, §7d), the PIN login (§1.1), on-device signature
+**Not decided here, and deliberately:** ~~the coordinator-contribution gate (UPGRADE-PLAN
+§1.2, blocked on a WIRE-SIZE measurement — the heap half of that item was measured 2026-09-18, §7d),~~
+the PIN login (§1.1), on-device signature
 verification (the bootloader does it inside the firewall and only its verdict counts), and
 the burn itself. Also **assumed**, not measured: every ARM leg of this — `MappedPsram`'s
 `from_raw_parts`, `Cdc`'s `Wire` impl, `readback_selftest` against real OCTOSPI, and the
 key-hold read — has never run on silicon.
+
+*The struck clause is superseded by the amendment below: the coordinator-contribution gate is no
+longer undecided-and-blocked, it is decided AGAINST.*
+
+**AMENDED 2026-09-21 (UPGRADE-PLAN §7e) — (e) UPGRADES ARE DELIBERATELY UNAUTHENTICATED AT THE
+APPLICATION LEVEL, AND THE STAGED/INSTALLABLE BOUNDARY IS SPLIT IN TWO.** A user decision, recorded
+because it REMOVES a requirement this decision deferred rather than adding one:
+
+* **The coordinator-contribution gate of UPGRADE-PLAN §1.2 is WITHDRAWN**, along with the wire-size
+  measurement that blocked it (UPGRADE-PLAN §4 phase 4, §5 item 3). No authenticated manifest,
+  private release authority, owner/threshold proof or factory certificate is required either. The
+  user accepts locally built firmware signed with Coldcard's published **dev key 0**; the bootloader
+  still demands that signature, but the private half is published, so it is a FORMAT check and never
+  trusted-release authentication. A recognized-release digest list would be compatibility metadata,
+  not an installation allowlist, and a valid local build must install with no registration and no new
+  trust anchor. **What this forecloses:** nothing may reintroduce a release allowlist, a rollback
+  ratchet, an OTP write or a new signing authority as an upgrade precondition without a new decision.
+  **What it COSTS, stated plainly and not buried:** the evil-maid exposure of UPGRADE-PLAN §1.3 is
+  ACCEPTED, with physical possession plus a consent screen as the only remaining barrier. §1.3's
+  analysis is unchanged; only its conclusion that §1.2 closes the hole is withdrawn.
+* **Digests are integrity, never trust.** The announced single SHA-256 over the two signed ranges
+  checks the transfer and the PSRAM read-back. It is not, and is nowhere described as, evidence about
+  the sender. `golden/mk4-staging-vectors.txt` pins it against the two digests it is confusable with
+  — the bootloader's double (`verify.c:226`) and a stock ESP32 coordinator's contiguous prefix — so
+  the three-way distinction is checked numbers rather than prose, in both cold-snap and `hostcheck`.
+* **(a)'s staging rules are unchanged, and a SECOND, tighter boundary now exists beside them:**
+  `coldsnap_hal::image::check_installable` (header magic, `hw_compat` admitting Mk4, header/announced
+  length agreement via `psram::check_burn_len`, the burn window, and `memmap::FW_INSTALL_ALIGN`
+  4,096), called by `upgrade::Stager::installable` on the device and `checkfw` R14 on the host.
+  **Rationale:** transfer-stage validity is not installability — the 262,656-byte short-tail fixture
+  that (a)'s digest check accepts is 512-but-not-4,096 aligned and could never boot, because
+  `psram_do_upgrade` page-erases at the 4 K stride (`verify.c:106`, `signit.py:305`).
+  **What it forecloses:** nothing burns anything still — 18/7 stays unbound, the validator is `&self`
+  and pure — and `memmap::FW_BODY_ALIGN` must stay 512, because one constant answering both questions
+  is exactly how the host came to demand 4,096 while the device demanded 512 with neither closing the
+  gap. **Named gap:** `hw_compat` and the 4 K rule have NO counterpart in `verify.c` at all; the only
+  enforcer in the reference tree is MicroPython's installer (`shared/utils.py:401-417`), which this
+  unit does not have, so these are our rules about the reference packer's output and are checked
+  against `cli/signit.py` by `tools/check-reference-contracts.py` rather than assumed.
 
 ---
 

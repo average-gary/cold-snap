@@ -57,6 +57,7 @@
 //! a heap buffer was never available to be considered.
 
 use coldsnap_hal::comms::{self, CoordinatorSendBody};
+use coldsnap_hal::image::{self, NotInstallable};
 use coldsnap_hal::memmap;
 use coldsnap_hal::psram::{self, Psram, PsramError};
 use coldsnap_hal::usb;
@@ -569,6 +570,43 @@ impl<P: Psram> Stager<P> {
         }
     }
 
+    /// **The INSTALL boundary, which is not the staging boundary.** Would the
+    /// staged image be installable on an Mk4? Returns the header's
+    /// `firmware_length` — the only length a burn may ever use.
+    ///
+    /// Nothing calls this in this phase and nothing burns anything: it is the
+    /// checked-image predicate task 07 models installation against, and it is
+    /// `&self` because a validator that could mutate the thing it judges is not a
+    /// validator. The rules are `coldsnap_hal::image::check_installable`'s —
+    /// header magic, `hw_compat` admitting Mk4, the header's length agreeing with
+    /// the announced one, the burn window, and 4 KiB installation alignment — and
+    /// they are the SAME code the host pre-flight (`examples/checkfw.rs` R8/R13)
+    /// applies, not a second implementation.
+    ///
+    /// Why it is separate from [`Stager::verify`] rather than folded into it:
+    /// `State::Staged` means *the bytes we hold are the bytes that were announced*,
+    /// which the 262,656-byte short-tail fixture satisfies exactly — and that
+    /// fixture is 512-but-not-4,096 aligned, so it could never boot. Making
+    /// staging refuse it would delete the coverage it exists for (65 chunks, a
+    /// genuinely short final chunk, `hostcheck`'s M13); making installability a
+    /// second, tighter predicate keeps both.
+    ///
+    /// # Errors
+    ///
+    /// [`NotInstallable::Unstaged`] unless the digest already matched a PSRAM
+    /// read-back, [`NotInstallable::Unreadable`] if the window will not view, and
+    /// otherwise whatever `image::check_installable` refuses.
+    pub fn installable(&self) -> Result<u32, NotInstallable> {
+        let State::Staged { size } = self.state else {
+            return Err(NotInstallable::Unstaged);
+        };
+        let view = self
+            .psram
+            .view(size)
+            .map_err(|_| NotInstallable::Unreadable)?;
+        image::check_installable(view, size)
+    }
+
     /// Record the refusal and report it. One place, so no refusal can leave a state
     /// that still reads as prepared or staged.
     fn refuse(&mut self, why: Refuse) -> Result<(), Refuse> {
@@ -942,9 +980,14 @@ mod tests {
     /// the fake's capacity.
     ///
     /// This is a SECOND tripwire on `memmap::FW_BODY_ALIGN`, alongside
-    /// `firmware_digest_alignment_bound_is_looser_than_mk4_requires`. Correcting
-    /// that constant to the 4,096 the Mk4 actually requires reddens both,
-    /// deliberately: this fixture would then have to move to a 4,096-aligned size.
+    /// `firmware_digest_alignment_bound_is_looser_than_mk4_requires`. Tightening
+    /// that constant to 4,096 reddens both, deliberately: this fixture would then
+    /// have to move to a 4,096-aligned size. **And it must not be tightened** —
+    /// since 2026-09-21 the Mk4 install's 4,096 is `memmap::FW_INSTALL_ALIGN`,
+    /// checked by [`Stager::installable`] at the boundary where it applies. 512 is
+    /// `signit.py:295`'s rule for every product and is the transfer rule; one
+    /// constant answering both questions is what put the host at 4,096 and the
+    /// device at 512 with neither closing the gap.
     #[test]
     fn prepare_refuses_a_size_the_burn_cannot_align() {
         for (size, want) in [
@@ -1359,5 +1402,195 @@ mod tests {
             "exactly one path out of the crate root, and it is `use crate::firmware_digest;`"
         );
         assert!(code.contains("use crate::firmware_digest;"));
+    }
+
+    /// 65 x 4,096 = 266,240: the shape a REAL artifact has. Above the 262,144
+    /// floor, 4,096-aligned, and not equal to [`SIZE`] — the pair is what the
+    /// install boundary is tested with, because a fixture that could only ever be
+    /// refused would not show that anything is ever accepted.
+    ///
+    /// The measured release artifact is 397,312 = 97 x 4,096
+    /// (`target/software-only/package/firmware-signed.bin`); 266,240 is the same
+    /// shape at the smallest size that clears the floor, so the fake stays small.
+    const INSTALL_SIZE: u32 = 266_240;
+
+    /// [`image`] plus the two header fields the INSTALL boundary reads: `magic` and
+    /// `hw_compat`. `0x28` is `MK_4_OK | MK_5_OK`, the value measured in the real
+    /// artifact's header by `checkfw` (`hw_compat 0x28`).
+    ///
+    /// The staging fixtures deliberately do NOT set these: staging does not read
+    /// them, and a shared fixture would hide which boundary is doing the work.
+    fn installable_image(size: usize, hw_compat: u32, magic: u32) -> Vec<u8> {
+        let mut v = image(size);
+        let off = memmap::FW_HEADER_OFFSET as usize;
+        v[off..off + 4].copy_from_slice(&magic.to_le_bytes());
+        let hw = off + image::HW_COMPAT_FIELD_OFFSET as usize;
+        v[hw..hw + 4].copy_from_slice(&hw_compat.to_le_bytes());
+        v
+    }
+
+    /// Stream `img` in 4,096-byte chunks and assert it staged.
+    fn staged(img: &[u8]) -> Stager<FakePsram> {
+        let mut s = armed(img);
+        stream(&mut s, img, 4096).expect("this fixture stages");
+        assert_eq!(
+            s.state(),
+            State::Staged {
+                size: img.len() as u32
+            }
+        );
+        s
+    }
+
+    /// **Transfer-stage validity is not installability.** The 262,656-byte
+    /// short-tail fixture stages, verifies its digest from PSRAM read-back, and is
+    /// then refused at the install boundary for the 4 KiB alignment every real Mk4
+    /// artifact has (`cli/signit.py:305`).
+    ///
+    /// Both halves are load-bearing. Without the 266,240 leg an `installable` that
+    /// refused everything would pass; without the 262,656 leg the separation is
+    /// unobserved. Neither size is derived from `FW_INSTALL_ALIGN`, so the fixture
+    /// cannot move with the constant it pins.
+    ///
+    /// THE MUTATION: delete the alignment arm of `image::check_installable`, or
+    /// point it at `memmap::FW_BODY_ALIGN` (512) — either turns the second leg
+    /// `Ok(262_656)`.
+    #[test]
+    fn a_short_tail_image_stages_and_verifies_but_cannot_be_installed() {
+        let real = installable_image(INSTALL_SIZE as usize, 0x28, image::FW_HEADER_MAGIC);
+        assert_eq!(staged(&real).installable(), Ok(INSTALL_SIZE));
+
+        let short_tail = installable_image(SIZE as usize, 0x28, image::FW_HEADER_MAGIC);
+        let s = staged(&short_tail);
+        assert_eq!(s.state(), State::Staged { size: SIZE });
+        assert_eq!(
+            s.installable(),
+            Err(NotInstallable::Alignment(SIZE)),
+            "512-but-not-4096 aligned: psram_do_upgrade would erase past the image \
+             it just wrote (verify.c:106)"
+        );
+    }
+
+    /// A wrong image family and a wrong magic reject at the INSTALL boundary and
+    /// nowhere earlier — because nowhere earlier is where the reference tree puts
+    /// them either.
+    ///
+    /// `hw_compat` is tested by no line of `mk4-bootloader/` (0 hits in
+    /// `verify.c`); MicroPython's installer `shared/utils.py:401-417` is the only
+    /// enforcer in the reference, so the installer boundary is the applicable one.
+    /// Each leg therefore asserts BOTH that staging accepted it and that install
+    /// refused it.
+    #[test]
+    fn a_wrong_family_or_magic_stages_and_is_refused_only_at_the_install_boundary() {
+        for (hw, magic, want) in [
+            // Mk5-only and Mk1-3-only: legal Coldcard images, not for this unit.
+            (0x20u32, image::FW_HEADER_MAGIC, Err(NotInstallable::WrongFamily(0x20))),
+            (0x07, image::FW_HEADER_MAGIC, Err(NotInstallable::WrongFamily(0x07))),
+            // `0` is "no constraint" (`shared/utils.py:401` only consults the bits
+            // `if hw_compat != 0`), not "no product".
+            (0, image::FW_HEADER_MAGIC, Ok(INSTALL_SIZE)),
+            (0x28, 0xdead_beef, Err(NotInstallable::Magic(0xdead_beef))),
+        ] {
+            let img = installable_image(INSTALL_SIZE as usize, hw, magic);
+            let s = staged(&img);
+            assert_eq!(s.installable(), want, "hw_compat {hw:#x} magic {magic:#x}");
+        }
+    }
+
+    /// PSRAM reading back a byte it was never given is a digest refusal, and the
+    /// staged image is then not installable either.
+    ///
+    /// A DIFFERENT failure from the corrupt-wire case in
+    /// `every_chunk_is_acked_once_and_the_last_ack_is_the_digest_verdict`: there
+    /// the bytes on the wire were wrong, here every byte on the wire was right and
+    /// the STORAGE lied. That is the failure `Stager::verify` digests a read-back
+    /// rather than the stream to catch, and until this test it was covered only in
+    /// `coldsnap_hal`'s own suite (`hal/src/psram.rs`'s `readback_selftest` tests),
+    /// which this prompt's Checks block does not run.
+    ///
+    /// The corruption is armed AFTER admission on purpose: at admission
+    /// `readback_selftest` would catch it as `Refuse::Selftest(Mismatch { .. })`
+    /// instead, which is a different (earlier, cheaper) boundary.
+    #[test]
+    fn psram_reading_back_a_byte_it_was_never_given_is_a_digest_refusal() {
+        const OFF: usize = 40 * 4096 + 7;
+        let img = image(SIZE as usize);
+        let mut s = armed(&img);
+        s.psram.corrupt_writes_at(OFF as u32);
+
+        assert_eq!(stream(&mut s, &img, 4096), Err(Refuse::Digest));
+        assert_eq!(s.state(), State::Refused(Refuse::Digest));
+        assert_ne!(
+            s.psram.cells()[OFF], img[OFF],
+            "the fake must actually have stored a byte nobody sent"
+        );
+        assert_eq!(
+            s.installable(),
+            Err(NotInstallable::Unstaged),
+            "a refused transfer has nothing to install"
+        );
+    }
+
+    /// The fixed golden vector, and the two digests the announced one must NOT be.
+    ///
+    /// Why a file: the coordinator-side consumer that has to agree with
+    /// `firmware_digest` is `hostcheck`, and it CANNOT call it — one cargo graph
+    /// will not hold `coldsnap_hal` and upstream `frostsnap_coordinator`
+    /// (`hostcheck/Cargo.toml`). `golden/mk4-staging-vectors.txt` is what binds the
+    /// two independent readers, and `hostcheck`'s
+    /// `golden_vector_agrees_with_m13s_own_digest` reads the same line. Before it
+    /// existed, a matching pair of WRONG literals would have been green on both
+    /// sides.
+    ///
+    /// The three-way distinction the prompt requires is pinned as numbers rather
+    /// than prose: ours is a single hash over two ranges, the bootloader's is the
+    /// double (`verify.c:226`), the ESP32 coordinator's is a contiguous prefix
+    /// (`frostsnap_coordinator/src/firmware.rs:206-212`).
+    #[test]
+    fn the_golden_vector_pins_the_announced_digest_and_the_two_it_must_not_be() {
+        let (size, announced, fw_check, prefix) = golden("m13-synth-262656");
+        assert_eq!(size, SIZE, "the vector is M13's own announced size");
+        let img = image(size as usize);
+
+        // The production function first: this is the number the device computes.
+        assert_eq!(
+            firmware_digest(&img).expect("a well-formed synthetic image").0,
+            announced
+        );
+        // ... and this file's own literal-derived copy, so neither can drift alone.
+        assert_eq!(announce(&img).0, announced);
+
+        let double: [u8; 32] = Sha256::digest(announced).into();
+        assert_eq!(double, fw_check, "the bootloader's double SHA-256");
+        let contiguous: [u8; 32] = Sha256::digest(&img).into();
+        assert_eq!(contiguous, prefix, "the ESP32 coordinator's prefix digest");
+        assert_ne!(announced, fw_check);
+        assert_ne!(announced, prefix);
+    }
+
+    /// One vector out of `golden/mk4-staging-vectors.txt`, by name.
+    ///
+    /// `include_str!` and not a runtime read: the file is then a build input, so a
+    /// deleted or renamed vector is a compile error rather than a skipped test —
+    /// the "exit 0 with SKIP is not a pass" rule applied to a fixture.
+    fn golden(name: &str) -> (u32, [u8; 32], [u8; 32], [u8; 32]) {
+        let line = include_str!("../../golden/mk4-staging-vectors.txt")
+            .lines()
+            .find(|l| l.split_whitespace().next() == Some(name))
+            .expect("golden/mk4-staging-vectors.txt carries this vector");
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let hex = |s: &str| {
+            let mut o = [0u8; 32];
+            for (i, b) in o.iter_mut().enumerate() {
+                *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).expect("32 hex bytes");
+            }
+            o
+        };
+        (
+            f[1].parse().expect("a decimal size"),
+            hex(f[2]),
+            hex(f[3]),
+            hex(f[4]),
+        )
     }
 }

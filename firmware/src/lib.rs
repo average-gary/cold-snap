@@ -3015,17 +3015,29 @@ pub fn firmware_digest(image: &[u8]) -> Option<Sha256Digest> {
     //   its name, never tighter. The real body floor is signit's alone
     //   (`signit.py:293`), and signit binds 16 K sooner than the device.
     // * Alignment. The bootloader enforces NONE (`verify.c:212-217` has no
-    //   alignment test). This is ours, and it is 8x too loose for this part:
-    //   `signit.py:302-306` re-aligns the Mk4 body to 4096 and `verify.c:106` says
-    //   the length must match the 4 K flash erase unit, so every real artifact is
-    //   4096-aligned. `memmap::FW_BODY_ALIGN` records the mk1-3 512 and is `hal`'s
-    //   to correct, not this crate's — duplicating 4096 here would give a memmap
-    //   number a second home, which is the drift `link.x`'s ASSERTs exist to catch.
-    //   `firmware_digest_alignment_bound_is_looser_than_mk4_requires` is the live
-    //   tripwire on that gap and fails the moment the constant is fixed.
+    //   alignment test). This is ours, it is the TRANSFER rule, and it is
+    //   deliberately the looser of the two real numbers: 512 is what
+    //   `signit.py:295` pads every product's body to, and `512 % 4 == 0` is what
+    //   makes `psram::WRITE_ALIGN` follow from it rather than being a second test.
+    //   The 4 KiB rule — `signit.py:305` re-aligns the Mk4/Mk5 body to the 4 K
+    //   flash erase unit `verify.c:106` ties to `psram_do_upgrade`'s page-erase
+    //   stride, so every real artifact is 4096-aligned — is the INSTALL rule, and
+    //   since 2026-09-21 it has one home, `memmap::FW_INSTALL_ALIGN`, applied by
+    //   `coldsnap_hal::image::check_installable` at the install boundary
+    //   (`upgrade::Stager::installable`) and by `examples/checkfw.rs` R8/R14 on the
+    //   host. It is NOT applied here on purpose: a digest that refused the
+    //   262,656-byte short-tail fixture would delete the ack-arithmetic and
+    //   short-final-chunk coverage that fixture exists for, and transfer-stage
+    //   validity is not installability.
+    //   `firmware_digest_alignment_bound_is_looser_than_mk4_requires` pins that
+    //   this bound is the looser one, on purpose, rather than by oversight.
     // * Upper bound. The bootloader's is the constant `FW_MAX_LENGTH_MK4`
-    //   (2,031,616); ours is the slice we were handed, which is what keeps the two
-    //   `image.get(..)` calls below from ever needing to fail.
+    //   (1,966,080 = `0x200000 - 0x20000`, `sigheader.h:53` — **this read
+    //   2,031,616 until 2026-09-21, which is not that expression's value and
+    //   disagreed with the two other sites that carry it correctly,
+    //   `hal/src/psram.rs:126` and `checkfw.rs:43`**); ours is the slice we were
+    //   handed, which is what keeps the two `image.get(..)` calls below from ever
+    //   needing to fail.
     if length < memmap::FW_MIN_BODY_LEN
         || length % memmap::FW_BODY_ALIGN != 0
         || length as usize > image.len()
@@ -3641,14 +3653,25 @@ mod tests {
         );
     }
 
-    /// Tripwire, not an endorsement: our alignment refusal is 8x looser than the
-    /// Mk4 artifact actually is.
+    /// Our alignment refusal is 8x looser than the Mk4 artifact actually is, and
+    /// **since 2026-09-21 that is a decision rather than a gap**.
     ///
-    /// `signit.py:302-306` re-aligns the Mk4/Mk5 body to 4096 and `verify.c:106`
-    /// ties the length to the 4 K flash erase unit, so no real artifact is
-    /// 512-but-not-4096 aligned. `memmap::FW_BODY_ALIGN` records the mk1-3 512 and
-    /// belongs to `hal`. When it is corrected to 4096 this test FAILS — flip the
-    /// assertion to `is_none()` then, and delete this paragraph.
+    /// `signit.py:305` re-aligns the Mk4/Mk5 body to 4096 and `verify.c:106` ties
+    /// the length to the 4 K flash erase unit, so no real artifact is
+    /// 512-but-not-4096 aligned. `memmap::FW_BODY_ALIGN` records the 512 that
+    /// `signit.py:295` pads EVERY product to, which is the right rule for a
+    /// transfer; the 4,096 the Mk4 install requires is `memmap::FW_INSTALL_ALIGN`,
+    /// enforced by `coldsnap_hal::image::check_installable` at the install boundary
+    /// and by `checkfw` R8/R14 on the host. Two rules, two boundaries, one home
+    /// each.
+    ///
+    /// So this stays `is_some()`: it pins that the DIGEST admits the 262,656-byte
+    /// short-tail fixture — deleting that would delete the ack-arithmetic and
+    /// short-final-chunk coverage it exists for — while
+    /// `upgrade::tests::a_short_tail_image_stages_and_verifies_but_cannot_be_installed`
+    /// pins that the same image cannot be installed. Do NOT "fix" this by
+    /// tightening `FW_BODY_ALIGN`; that would make one constant answer two
+    /// questions.
     #[test]
     fn firmware_digest_alignment_bound_is_looser_than_mk4_requires() {
         let header_off = memmap::FW_HEADER_OFFSET as usize;
@@ -3660,7 +3683,9 @@ mod tests {
             .copy_from_slice(&signit_header(misaligned));
         assert!(
             firmware_digest(&image).is_some(),
-            "FW_BODY_ALIGN was fixed to 4096 — flip this to is_none()"
+            "the digest's bound is signit.py:295's 512 (the transfer rule); the Mk4 \
+             install's 4,096 is memmap::FW_INSTALL_ALIGN and belongs to \
+             image::check_installable, not here"
         );
     }
 

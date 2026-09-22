@@ -2568,6 +2568,71 @@ fn signed_digest(img: &[u8]) -> Sha256Digest {
     Sha256Digest(h.finalize().into())
 }
 
+/// The fixed golden vector that binds this file's independent reader to the device's.
+///
+/// [`signed_digest`] and `coldsnap_firmware::firmware_digest` are two implementations
+/// of one range, and they are two BY FORCE: this crate cannot depend on
+/// `coldsnap_hal` at all (see this file's own note at [`synth_image`] and the
+/// manifest's), so "independent reader" is a property cargo enforces. What was
+/// missing until 2026-09-21 is the other half of that argument — nothing compared
+/// the two. A matching pair of WRONG literals (say both skipping `[16_320, 16_384)`
+/// at the wrong offset) was green on both sides, and M13 would have certified a
+/// digest the Mk4 bootloader does not sign.
+///
+/// `golden/mk4-staging-vectors.txt` is that comparison. The same line is read by
+/// `coldsnap_firmware`'s `the_golden_vector_pins_the_announced_digest_and_the_two_it_must_not_be`,
+/// which checks it against the PRODUCTION `firmware_digest`. `include_str!`, so a
+/// deleted vector is a compile error and not a skipped test.
+#[cfg(test)]
+mod golden_vector {
+    // `sha2` reaches this file as a re-export through `frostsnap_core` (see the root
+    // `use` list), not as a direct dependency, so the path is `super::` and not a
+    // crate name.
+    use super::sha2::{self, Digest as _};
+    use super::{signed_digest, synth_image, STAGE_SIZE};
+
+    fn vector(name: &str) -> (u32, [u8; 32], [u8; 32], [u8; 32]) {
+        let line = include_str!("../../golden/mk4-staging-vectors.txt")
+            .lines()
+            .find(|l| l.split_whitespace().next() == Some(name))
+            .expect("golden/mk4-staging-vectors.txt carries this vector");
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let hex = |s: &str| {
+            let mut o = [0u8; 32];
+            for (i, b) in o.iter_mut().enumerate() {
+                *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).expect("32 hex bytes");
+            }
+            o
+        };
+        (
+            f[1].parse().expect("a decimal size"),
+            hex(f[2]),
+            hex(f[3]),
+            hex(f[4]),
+        )
+    }
+
+    #[test]
+    fn golden_vector_agrees_with_m13s_own_digest() {
+        let (size, announced, fw_check, prefix) = vector("m13-synth-262656");
+        assert_eq!(size, STAGE_SIZE, "the vector is this leg's announced size");
+        let img = synth_image(size);
+        assert_eq!(signed_digest(&img).0, announced);
+
+        // The two digests ours must NOT be, pinned as numbers: the bootloader's
+        // double hash over the same two ranges, and the contiguous-prefix digest a
+        // stock ESP32 coordinator computes (`frostsnap_coordinator/src/firmware.rs`
+        // `ValidatedFirmwareBin::new`). The third is why a stock coordinator's
+        // announced digest cannot match ours — fail-closed, and now a checked fact
+        // rather than a paragraph.
+        let double: [u8; 32] = sha2::Sha256::digest(announced).into();
+        assert_eq!(double, fw_check, "the bootloader's double SHA-256");
+        let contiguous: [u8; 32] = sha2::Sha256::digest(&img).into();
+        assert_eq!(contiguous, prefix, "the ESP32 coordinator's prefix digest");
+        assert_ne!(announced, prefix);
+    }
+}
+
 /// A fresh `STUB_UPGRADE=1` child, its pty and a completed magic handshake.
 ///
 /// One per LEG, because `upgrade::run` returns on `Outcome::Staged` and the stub then

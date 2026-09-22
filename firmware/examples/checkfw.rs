@@ -44,8 +44,15 @@ const MAX_LEN: u32 = 0x0020_0000 - 0x0002_0000; // FW_MAX_LENGTH_MK4, sigheader.
 const NUM_KNOWN_PUBKEYS: u32 = 6; // firmware-keys.h:5
 /// `signit.py:302-306` re-aligns the Mk4/Mk5 body to the 4 K flash erase unit,
 /// which `verify.c:106` ties to `psram_do_upgrade`'s page-erase stride. NOT
-/// `memmap::FW_BODY_ALIGN` (512, the mk1-3 rule) — see finding in the report.
-const MK4_ALIGN: u32 = 4096;
+/// `memmap::FW_BODY_ALIGN` (512, the mk1-3 rule and the rule a TRANSFER is judged
+/// against).
+///
+/// **This was a local `const MK4_ALIGN: u32 = 4096` here until 2026-09-21**, which
+/// is how the host and device consumers came to disagree 4,096 vs 512 about the
+/// same header field with the divergence recorded as an open gap in two places and
+/// closed in neither. The number now has one home and the device-side install
+/// boundary (`coldsnap_hal::image::check_installable`) applies the same constant.
+const MK4_ALIGN: u32 = memmap::FW_INSTALL_ALIGN;
 
 /// `approved_pubkeys[0]` verbatim (`mk4-bootloader/firmware-keys.h:10-11`), the
 /// published dev key whose private half is `stm32/keys/00.pem`. Raw X||Y, so
@@ -120,8 +127,8 @@ fn main() {
 
     let rules = check(&secp, image);
     let failed = rules.iter().filter(|(ok, _)| !ok).count();
-    // R1-R7 and R12 are verify_firmware()'s own, in its order. R8-R11 are the
-    // installer's and the packer's; each cites where it really lives, because
+    // R1-R7 and R12 are verify_firmware()'s own, in its order. R8-R11 and R13-R14
+    // are the installer's and the packer's; each cites where it really lives, because
     // claiming the bootloader enforces something it does not is the same class of
     // lie as claiming a signature is valid when it is not.
     println!("\nrules checkable from this file alone:");
@@ -141,8 +148,10 @@ fn verdict(total: usize, failed: usize) -> ! {
     println!("\nRESULT: REFUSE — {failed} of {total} rules failed. Read each citation:");
     println!("        R1-R7/R12 → the BOOT refuses (verify.c:320/332) → screen_corrupt");
     println!("        → psram_recover_firmware → while(1) sdcard_recovery().");
-    println!("        R8-R11 → verify_header would pass, but the INSTALL is wrong");
-    println!("        (4 K erase stride, burn length, or verify.c:256's downgrade gate).");
+    println!("        R8-R11/R13-R14 → verify_header would pass, but the INSTALL is wrong");
+    println!("        (4 K erase stride, burn length, hardware family, or verify.c:256's");
+    println!("        downgrade gate). R14 is the device's own boundary, so a REFUSE there");
+    println!("        is what `Stager::installable` would answer on the same bytes.");
     std::process::exit(1);
 }
 
@@ -379,6 +388,51 @@ fn check(secp: &Secp256k1<secp256k1::VerifyOnly>, image: &[u8]) -> Vec<(bool, St
         "len < 8, tail all zero".into(),
         hex(ver),
         "signit.py:263",
+    );
+
+    // NUMBERED AFTER R12 AND PRINTED BEFORE IT, deliberately: R12 is the expensive
+    // rule and stays last in the file, while these two were added later
+    // (2026-09-21) and renumbering the others would break every citation of them.
+    //
+    // R13 has NO counterpart in the bootloader: `grep hw_compat verify.c` = 0 hits,
+    // and `sigheader.h:32,67-73` only declares the field. The one enforcer in the
+    // reference tree is MicroPython's installer, `shared/utils.py:401-417`, which
+    // also supplies the `hw_compat == 0` means "no constraint" reading that
+    // `image::family_ok` implements. So this is an INSTALLER rule, and on a unit
+    // with no MicroPython the host pre-flight and `Stager::installable` are the
+    // only places it can live.
+    let hw_compat = u32at(32);
+    rule(
+        "R13",
+        coldsnap_hal::image::family_ok(hw_compat),
+        "hw_compat admits Mk4",
+        format!(
+            "MK_4_OK ({:#x}) set, or 0",
+            coldsnap_hal::image::MK_4_OK
+        ),
+        format!("{hw_compat:#x}"),
+        "sigheader.h:71, shared/utils.py:401-417",
+    );
+    // R14 is the AGREEMENT rule, and it is not the sum of R5/R6/R8/R9/R13 restated:
+    // it runs the DEVICE's install boundary — the same function
+    // `upgrade::Stager::installable` calls — over this file's bytes. Without it,
+    // "host and device agree" would rest on two sets of constants that happen to
+    // match; with it, one refusal is one implementation. The device is TIGHTER than
+    // R6 on purpose (its ceiling is `psram::BURN_LEN_MAX` 1,441,792, not
+    // `FW_MAX_LENGTH_MK4` 1,966,080, because a longer burn would reach `FLASH_FS`),
+    // so an image between the two fails here and passes R6, which is the correct
+    // direction for a pre-flight of THIS device.
+    let install = coldsnap_hal::image::check_installable(image, image.len() as u32);
+    rule(
+        "R14",
+        install.is_ok(),
+        "device install boundary (coldsnap_hal::image::check_installable)",
+        format!("Ok({})", image.len()),
+        match &install {
+            Ok(n) => format!("Ok({n})"),
+            Err(e) => format!("{e:?}"),
+        },
+        "hal/src/image.rs, firmware/src/upgrade.rs Stager::installable",
     );
 
     // The signature. `firmware_digest` owns the range; we add only the outer hash.
