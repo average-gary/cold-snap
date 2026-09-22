@@ -1,0 +1,21 @@
+[
+  {
+    "task": "01",
+    "slug": "repair-firmware-packaging",
+    "status": "DEGRADED",
+    "reason": "All 6 acceptance criteria met and all checks pass for the right reason, but one CONFIRMED finding is open: tools/test-pack-signed.py:174-176 asserts only 'REFUSE' on the corrupted-signature negative, not the R12 signature rule it quotes; the run does fail on R12 today, so the guard is weak, not the result. Close-out may not edit source.",
+    "evidence": "01-repair-firmware-packaging.md",
+    "commit": null,
+    "open_confirmed": [
+      "tools/test-pack-signed.py:174-176 - corrupted-signature end-to-end case asserts the generic 'REFUSE' verdict line instead of the specific 'R12' signature rule; would still pass if checkfw stopped verifying signatures but failed another rule on the same fixture. One-word fix. Breaks no acceptance criterion."
+    ],
+    "criteria_met": 6,
+    "criteria_total": 6,
+    "bench_only": [
+      "U1 world checksum / SE1 CHECKMAC of KEYNUM_firmware (verify.c:305,326,336) - covers flash outside the image, so no file can satisfy it; a never-blessed image takes the red-light branch (verify.c:344-347), ~25 s delay then boots",
+      "U2 OTP min-version floor (verify.c:143,181) - install path only, and it ratchets with every install already done on that unit",
+      "U3 RDP level (verify.c:340) - decides Factory boot vs red light, and whether a failed verify can still reach enter_dfu",
+      "U4 that an install path exists at all - only pins.c:1276-1340 from a logged-in MicroPython installs new firmware; sdcard_recovery cannot (sdcard.c:248 needs SE1 to already hold this image's world hash)"
+    ]
+  }
+]

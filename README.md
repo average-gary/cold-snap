@@ -807,7 +807,12 @@ linked image is now measured and it is large.** `firmware/` links, and
 `target/thumbv7em-none-eabihf/release/coldsnap_firmware` is **379,940 B = 26.6548%**
 flash-resident (`.vector_table` 64 + `.text` 321,700 + `.rodata` 58,140 + `.data`
 36, from `objdump -h` — `0x40 + 0x4e8a4 + 0xe31c + 0x24`), re-measured **2026-09-18** in
-the MAIN checkout with a real `FrostSigner`, 25-word entry, the `CheckBackup` quiz, the
+the MAIN checkout. **That is a section SUM, and the artifact is 4 B larger: 379,944 B
+are emitted** (64 vectors + a 379,880 B body), because `.rodata`'s alignment 8 leaves
+four bytes of padding after `.text`. Both figures are right for what they measure; see
+"Packaging" for the packaging check that used to conflate them and abort.
+It was measured
+with a real `FrostSigner`, 25-word entry, the `CheckBackup` quiz, the
 keygen check's randomised digit, address verification and now firmware-upgrade STAGING
 all linked. Margin on `FLASH_TEXT` is **1,045,468 B**.
 **This row read 380,040 B = 26.6618% / margin 1,045,368 B on 2026-09-17, and
@@ -1088,13 +1093,15 @@ parent. See `vendor/README.md` and DECISIONS.md decision 3.
 ```sh
 python3 -m venv target/pack-venv && target/pack-venv/bin/pip install ecdsa click  # once
 python3 tools/pack-signed.py                     # re-execs into that venv itself
+python3 tools/test-pack-signed.py                # the geometry checks + 2 refusals
 ```
 
 One command, every byte printed. Writes `target/pack/firmware-signed.bin`
 (397,312 B, raw image at `0x08020000`) and `target/pack/coldsnap-6.0.0cs.dfu`
 (397,621 B). **It flashes nothing** and writes only under `--out`.
-Numbers below are from a real run against the release ELF (650,532 B), re-run
-2026-09-12, exit 0, `rerun: byte-identical to the previous firmware-signed.bin`.
+Numbers below are from a real run against the release ELF (652,992 B), re-run
+2026-09-21, exit 0, `rerun: byte-identical to the previous firmware-signed.bin`.
+**The ELF size read 650,532 B and the re-run date 2026-09-12 until 2026-09-21.**
 Every one of them is a line the tool PRINTS (steps [2], [3] and [6]); this section
 is a transcript of it, not arithmetic done here.
 
@@ -1110,27 +1117,61 @@ the 2026-09-10 text asserted the 4 K alignment step "costs nothing", hedged with
 then ended. See the padding paragraph.
 
 **Two `llvm-objcopy` runs, never one.** `-j .vector_table` → 64 B;
-`-j .text -j .rodata -j .data` → 379,584 B (the **body**, i.e. the image minus the
-64-byte `.vector_table`; **this read 377,192 B until 2026-09-12** — and note that
+`-j .text -j .rodata -j .data` → 379,880 B (the **body**, i.e. the image minus the
+64-byte `.vector_table`; **this read 379,584 B until 2026-09-21 and 377,192 B until
+2026-09-12** — and note that
 377,192 was simultaneously the correct BODY figure and a stale IMAGE figure elsewhere in
 this document set, which is exactly the trap a blanket search-and-replace walks into). A single whole-ELF dump zero-fills the
 16 KiB hole between `.vector_table` and `.text`, where signit's own padding is
-`0xff`. The tool proves no fill happened by comparing each flat file against the
-sum of its section sizes — widening the `-j` list to span the gap aborts with
-`objcopy gap-filled +16320 B`. It also aborts if the ELF ever grows a
+`0xff`. It also aborts if the ELF ever grows a
 flash-resident section it does not know about, since objcopy would drop it
 silently.
 
+**A flat file is not the sum of its section sizes, and asserting that it is broke
+packaging outright — fixed 2026-09-21.** The tool used to prove "no gap fill
+happened" by comparing each flat file against `sum(section sizes)`. Against this
+image that assertion is simply false: `.rodata`'s *section* alignment is 8 and
+`.text` ends at `0x080728a4`, so the linker leaves four bytes there, `llvm-objcopy`
+emits them, and the body comes out **379,880 B against a 379,876 B sum**. The run
+died with `firmware1.bin is 379880 B but its sections sum to 379876 B: objcopy
+gap-filled +4 B. Split the -j list so no gap is spanned.` — advice that cannot be
+taken, because splitting the `-j` list cannot remove a gap *inside* the body, and
+the only way to close it is to move `.rodata`, i.e. to change the linked image to
+suit the checker. **The four bytes were never the bug; the assertion was.**
+`tools/pack-signed.py::geometry()` now validates flash-load geometry instead:
+the expected flat size is `max(lma + size) − min(lma)` over the group, and each
+gap is accepted only when it equals exactly the padding the *next* section's
+alignment demands (`align_up(prev_end, next.align) − prev_end`), reported by
+address and fill value. Anything else — a hole alignment does not explain, an
+overlap, a 32-bit wrap, a group whose base moved off `0x08020000`/`0x08024000`, an
+image reaching `FLASH_FS` at `0x08180000` — still aborts nonzero. So the emitted
+bytes are still all accounted for; they are now accounted for *correctly*, and
+the count is `379,876 B of sections + 4 B in 1 alignment gap`.
+
+**Placement is by LMA, never VMA.** `.data` has a RAM VMA (`0x20008010`) and a
+flash LMA (`0x08080bc4`); only the LMA says where its 36 bytes land in the
+artifact. An ELF section header carries no LMA, so the tool reads
+`llvm-readelf --elf-output-style=JSON --sections --program-headers` and takes it
+from the `PT_LOAD` containing each section: `p_paddr + (sh_offset − p_offset)`.
+That also fixes a latent hole in the header-slot check, which compared VMAs and so
+could not have seen a section whose *flash* bytes landed in
+`0x08023F80..0x08024000` while its VMA sat in RAM. Note `.data`'s **file** offset
+(`0x078010`) is *not* contiguous with `.rodata`'s (`0x070bc4`) even though their
+LMAs are, so each section is re-read at its own ELF offset — a single contiguous
+read of the ELF would be wrong.
+
 **The 256 KiB floor is already cleared, so padding is alignment-only.** Body
-379,584 B ≥ `FW_MIN_LENGTH` 262,144 B by 117,440 B. `align_to(379584, 512)` =
-379,904 (+320), then `align_to(379904, 4096)` = **380,928 (+1,024)** — Mk4/Mk5 take
+379,880 B ≥ `FW_MIN_LENGTH` 262,144 B by 117,736 B. `align_to(379880, 512)` =
+379,904 (+24), then `align_to(379904, 4096)` = **380,928 (+1,024)** — Mk4/Mk5 take
 the 4 K branch (`cli/signit.py:302-306`, `verify.c:106`), *not* the 512 that
 `memmap::FW_BODY_ALIGN` records. **The 4 K step costs 1,024 B here; it cost 3,584 B
 earlier on 2026-09-12 and 0 before that.** The 2026-09-10 body landed on 92 × 4096
 exactly and the two branches agreed; nothing since has, so the branch that is actually
 taken stays visible in the total. Read that as the point rather than as a regression:
 the 4 K erase unit costs whatever it takes to reach the next multiple whenever the body
-is not already one, which is 4,095 times out of 4,096. 1,344 B of `0xff` in total, plus
+is not already one, which is 4,095 times out of 4,096. 1,048 B of `0xff` in total
+(**this read 1,344 B until 2026-09-21**, when the body grew 296 B and the 512-step
+share of the padding shrank by the same amount), plus
 16,192 B of `0xff` after the vectors. **The padded body is 380,928 either side, so
 `firmware_length` did NOT move**: `firmware_length = 16,256 + 128 + 380,928 = 397,312
 (0x61000)` = 97 × 4096 — a **total** measured from `0x08020000`, header and vector
@@ -1279,6 +1320,12 @@ tools/measure-flash.py   the rlib sums in "Flash budget"; needs LTO off
 tools/pack-signed.py  ELF -> signed, bootloader-acceptable artifact, one command.
                       Prints every step and byte count, verifies what it produced,
                       flashes nothing. See "Packaging" above.
+tools/test-pack-signed.py  the packer's regression checks. Pure geometry cases
+                      (the real 4 B alignment gap, overlap, unexplained hole,
+                      32-bit wrap, header slot by LMA, FLASH_FS) plus two
+                      end-to-end refusals: a bad-layout ELF and a corrupted
+                      signature, both nonzero. Fixtures under target/, never
+                      the real firmware or the reference tree.
 tools/pixel-check.py  an independent decoder for the framebuffer, so ui.rs's own
                       cell()/cell_2x() readback cannot agree with itself and be wrong
 tools/qemu-boot.sh    a DIAGNOSTIC, never a gate. See its section above
