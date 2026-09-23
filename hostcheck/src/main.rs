@@ -4590,27 +4590,39 @@ fn one_pass(
             // The exact count and not `>=`: a second unexplained absence must fail even
             // though `cancelled`'s absence is expected.
             //
-            // M12 does NOT move this count and does not weaken it. It counts a
-            // `commit_name`, which fires only from `Session::run`'s `FinalizeKeyGen` arm —
-            // so the blank device cannot appear here at all, and the exact `N_DEVICES - 1`
-            // still catches any THIRD absence. What changed is only the message: with ten
-            // devices on the wire TWO are expected to be silent, and both are named rather
-            // than subtracted. The blank device is still sent `Naming(Preview)` like every
-            // other, deliberately: a preview commits nothing without a `FinalizeKeyGen`, so
-            // the announce arm stays free of a per-device exception a future edit could
-            // widen, at a cost of one 97 B frame per run.
-            if device_names.len() != N_DEVICES - 1 {
+            // M12 MOVES this count by exactly one, and only on a pass that ran it. A
+            // `commit_name` fires from `Session::run`'s `FinalizeKeyGen` arm AND from
+            // `confirm_at`'s `ConsolidateBackup` arm (upstream's
+            // `save_pending_device_name` after `finish_consolidation`), and the blank device
+            // is sent `Naming(Preview)` at announce like every other -- so once M12's leg 2
+            // consolidates (`sighted.is_some()`), the blank device MUST report the name
+            // too, and it is named, not merely counted. The DECLINE pass breaks before any
+            // restoration, so there it stays silent. Still an exact count, so a THIRD
+            // absence (or an extra name) fails.
+            let blank_named = sighted.is_some();
+            let want_names = N_DEVICES - 1 + usize::from(blank_named);
+            if blank_named && !blank.is_some_and(|b| device_names.contains_key(&b)) {
+                bail!(
+                    "M12: the blank device {blank:?} consolidated a backup under a previewed \
+                     name and reported NO name (SetName: {device_names:?}) -- `confirm_at`'s \
+                     `ConsolidateBackup` arm did not commit it, so the app would keep this \
+                     device `DeviceMode::Blank` and never ask it to sign"
+                );
+            }
+            if device_names.len() != want_names {
                 bail!(
                     "{}/{} device(s) reported a NAME (SetName: {device_names:?}) -- \
                      `commit_name` pushes SetName only after NameStore::save returned Ok, so a \
                      device missing here either never took the preview or could not persist it. \
-                     TWO of the {ALL_DEVICES} on the wire are expected to be missing: \
-                     {cancelled}, whose preview was followed by a `Cancel` (M10), and \
-                     {blank:?}, which M12 left OUT of the keygen so it never reached \
-                     `FinalizeKeyGen` at all. Anything else absent is a device that failed to \
-                     commit",
+                     Expected missing: {cancelled}, whose preview was followed by a `Cancel` \
+                     (M10){}. Anything else absent is a device that failed to commit",
                     device_names.len(),
-                    N_DEVICES - 1,
+                    want_names,
+                    if blank_named {
+                        String::new()
+                    } else {
+                        format!(", and {blank:?}, which this pass never restored")
+                    },
                 );
             }
             for (id, got) in &device_names {
@@ -4872,7 +4884,7 @@ fn one_pass(
                 blank_leg.typed.map_or("?".to_string(), |n| n.to_string()),
                 blank_leg.share_index,
                 device_names.len(),
-                N_DEVICES - 1,
+                want_names,
                 DEVICE_NAME,
                 DEVICE_NAME.chars().count(),
                 DEVICE_NAME.len(),

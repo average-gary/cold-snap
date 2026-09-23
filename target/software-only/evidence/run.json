@@ -112,5 +112,26 @@
       "erase_all_devices with mixed hardware: whether a daisy-chained Mk4 downstream of an addressed ESP32 forwards the DataErase cleanly and drops it is device behaviour, unexercised here. The dialog also says nothing about the skipped Mk4.",
       "NOT bench-only and must not be cited later as measured: the evil-maid hole is untouched and open. Key 0's private key is published, so a key-0 signature is a FORMAT check and not an authorisation check; the registry changes that in neither direction and is compatibility, not permission to install."
     ]
+  },
+  {
+    "task": "04",
+    "slug": "test-real-app-with-virtual-devices",
+    "status": "DEGRADED",
+    "reason": "4 of 5 criteria met; criterion 3 (replug/restart preserve identities and wallet state) only partly met: device replug, an in-process stub power cycle after keygen and restored-device signing are covered and verified, but the app is never restarted (sqlite/bdk never reloaded) and a stub process restart is impossible with in-memory FakeFlash. All 12 CONFIRMED verifier findings repaired and re-verified; close-out re-run: stub build 0, hostcheck 0, tools/app-rig-test.sh 0 (+8 All tests passed, Core ACCEPTED/REJECTED Invalid Schnorr/ACCEPTED, teardown clean), bare flutter test 1 (named Bad state), pgrep empty. Residual: SIGKILL of app-rig.py itself is uncatchable and would leave the command group and regtest node. Flutter 3.38.5/Dart 3.10.4 pinned; regtest ran against /Users/garykrause/repos/implementations/bitcoin-v31.1/build/bin/bitcoin-node.",
+    "evidence": "04-test-real-app-with-virtual-devices.md",
+    "commit": "4b9edfa6168ec03c4b8e6993eb8936cec095b3b3",
+    "commits": {
+      "frostsnap": "4b9edfa6168ec03c4b8e6993eb8936cec095b3b3",
+      "cold-snap": "the commit that adds this entry (git -C cold-snap log -1 -- target/software-only/evidence/run.json)"
+    },
+    "open_confirmed": [],
+    "criteria_met": 4,
+    "criteria_total": 5,
+    "bench_only": [
+      "USB enumeration: usb.rs and OTG_FS register sequences, host-driven enumeration (rig carries comms.rs over ptys only)",
+      "Keypad timing: scan/debounce and randomised timing",
+      "Other untested physical behaviour: SSD1306 init/timing/legibility, TRNG sources and health checks, callgate, panic->reset, real STM32 program/erase and power-loss durability, FROST latency on a 120 MHz M4F, OCTOSPI/PSRAM, RDP/PCROP",
+      "Replug/restart physically: a real unplug power-cycles; the ARM image announces only on a link edge and does not re-announce on a coordinator re-open, so test 8 is not evidence the shipped firmware survives an app restart"
+    ]
   }
 ]

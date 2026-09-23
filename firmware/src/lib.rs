@@ -1470,11 +1470,23 @@ impl<'a, F: NorFlash + fmt::Debug> Session<'a, F> {
                 // `device.rs:629-635`). It is consumed here and never returned, and
                 // the screen that asked prints the key name, the share index and the
                 // threshold — no word and no scalar.
+                //
+                // THE NAME IS COMMITTED HERE TOO, after the share, as upstream does
+                // (`esp32_run.rs:703-712`: `finish_consolidation` then
+                // `save_pending_device_name`). The app's restore flow previews a name
+                // (`DeviceNameField` -> `update_name_preview`) before the entry, and
+                // without this commit the device never sends `SetName`, so the app's
+                // device list keeps it `name == None` -> `DeviceMode::Blank`, and the
+                // signing dispatcher never offers it a request: a restored device that
+                // holds the right share and can never sign. Same consent as the share —
+                // this arm is only reached after the digit on "Store share?".
                 ToUserRestoration::ConsolidateBackup(phase) => {
                     let sends = self
                         .signer
                         .finish_consolidation(&mut self.secrets, phase, rng);
-                    self.run(sends, out)
+                    let prompts = self.run(sends, out)?;
+                    self.commit_name(out)?;
+                    Ok(prompts)
                 }
                 // THE QUIZ GRANT. The human read `prompt_screen_at`'s "check backup?"
                 // screen — which named the key and the share index and showed no word

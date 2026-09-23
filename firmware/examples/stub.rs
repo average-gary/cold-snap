@@ -23,10 +23,12 @@
 //! desynchronises the coordinator, whose magic-byte scan has no backtracking
 //! (any mismatch resets progress to 0). Every diagnostic goes to **stderr**.
 //!
-//! `ALL_DEVICES` (currently **10**) sessions in this one process, each with its OWN
+//! `ALL_DEVICES` (currently **13**) sessions in this one process, each with its OWN
 //! `FakeFlash`, all multiplexed over the one wire and told apart by
 //! `Destination` — which is what the real daisy chain does too, so nothing is
-//! faked by co-hosting them. `N_DEVICES` (currently **9**) of them complete a
+//! faked by co-hosting them. `STUB_SESSIONS=1` (with a per-process `STUB_SALT`) is
+//! the OTHER shape, the one `tools/app-rig.py` runs: one device per pty, which is
+//! the shipping topology. See [`session_count`] and [`salt`]. `N_DEVICES` (currently **12**) of them complete a
 //! THRESHOLD-of-N_DEVICES keygen, a nonce replenishment and a signature with the
 //! coordinator, and then keep serving so the coordinator can ask each device what it
 //! holds.
@@ -122,13 +124,13 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 
 use coldsnap_firmware::{
-    firmware_digest, prompt_screen, quiz, wordentry, Checked, DebugFlash, Fault, Outbox, Session,
-    Typed,
+    firmware_digest, prompt_screen_at, quiz, wordentry, Checked, DebugFlash, Fault, Outbox,
+    Session, Shown, Typed,
 };
 use coldsnap_hal::comms::{decode_body, CoordinatorSendBody, Link, MAGIC_REPLY};
 use coldsnap_hal::flash::fake::FakeFlash;
@@ -189,6 +191,21 @@ static SIG_ACKS: AtomicUsize = AtomicUsize::new(0);
 /// `SIG_ACKS` is, and read by the main loop's fail-closed check.
 static DECLINES: AtomicUsize = AtomicUsize::new(0);
 
+/// FAULT INJECTION, OFF by default (`STUB_LOSE_FIRST_SHARE`): the FIRST signature reply
+/// this process produces is signed by the real core -- consent taken, nonce consumed,
+/// signing state written to flash -- and then dropped instead of written to the wire, as
+/// a cable pulled between the device signing and the coordinator reading would. What it
+/// exists to drive is the core's at-most-once rule (`device_nonces.rs`: a re-sent request
+/// for the same session is answered from the flash cache with no new nonce; a lower
+/// index is `IndexUsed`). The app rig then replugs the device and re-sends the request;
+/// a device that signed again from a fresh nonce would produce a share the coordinator
+/// cannot combine, or die on `IndexUsed`. Only the loss is simulated; the re-send, the
+/// cache and the verification are all real.
+fn lose_first_share() -> bool {
+    std::env::var_os("STUB_LOSE_FIRST_SHARE").is_some()
+}
+static SHARE_LOST: AtomicBool = AtomicBool::new(false);
+
 /// LONGER than the harness's own budget on purpose, and that is load-bearing.
 /// `hostcheck` owns the budget and kills us itself; this watchdog only exists so
 /// a stub run BY HAND cannot hang forever. If it fires during a `hostcheck` run,
@@ -228,6 +245,43 @@ const TEST_FINGERPRINT: Fingerprint = Fingerprint {
     max_bits_total: 6,
     tag: "test",
 };
+
+/// Whether to re-announce when the coordinator asks for magic bytes on an already-linked
+/// wire (`STUB_REANNOUNCE`, OFF by default). See the call site for what it is for and why
+/// `hostcheck` must not have it.
+fn reannounce() -> bool {
+    std::env::var_os("STUB_REANNOUNCE").is_some()
+}
+
+/// Which fingerprint this process's devices CHECK (`STUB_FINGERPRINT`, `test` by default
+/// — `hostcheck`'s value and every existing measurement's — or `frost-v0`).
+///
+/// LOAD-BEARING FOR THE APP RIG, and it was a silent 1-in-16 lottery until 2026-09-22.
+/// The check is not symmetric with the grind: the COORDINATOR grinds coefficients to
+/// satisfy its own `keygen_fingerprint`, and the device then requires its own. `hostcheck`
+/// sets [`TEST_FINGERPRINT`] on both sides, so they agree. The real Flutter app's
+/// coordinator uses the shipped `Fingerprint::FROST_V0` — different tag, so a completely
+/// different hash — and against `TEST_FINGERPRINT`'s 2 bits per coefficient (capped at 6)
+/// a 2-of-3 keygen then passed the device's check only by accident, about one run in
+/// sixteen. MEASURED: two app-rig keygens passed and the third died with
+/// `InvalidMessage { kind: "KeyGen", reason: "key generation did not match the
+/// fingerprint" }` with no source change between them.
+///
+/// The grind is the coordinator's cost, not the device's — `check_fingerprint` is one
+/// hash per coefficient — so a device checking `FROST_V0` costs this process nothing.
+fn keygen_fingerprint() -> Fingerprint {
+    let want = std::env::var("STUB_FINGERPRINT").unwrap_or_else(|_| "test".into());
+    match want.as_str() {
+        "test" => TEST_FINGERPRINT,
+        "frost-v0" => Fingerprint::FROST_V0,
+        // NOT a silent default: the wrong answer here is a keygen that fails 15 times
+        // out of 16 with a message about coefficients.
+        other => die(
+            2,
+            &format!("STUB_FINGERPRINT={other:?} is not `test` or `frost-v0`"),
+        ),
+    }
+}
 
 /// USB packet reality: `frostsnap_comms` moves bytes over OTG_FS in 64-byte
 /// packets, so a real device NEVER hands the coordinator a whole frame at once.
@@ -438,6 +492,52 @@ fn expect_declines() -> usize {
         .unwrap_or(0)
 }
 
+/// How many flash-backed sessions this process hosts (`STUB_SESSIONS`, default
+/// [`ALL_DEVICES`] — `hostcheck`'s shape, unchanged).
+///
+/// The APP RIG (`tools/app-rig.py`) needs the other shape: the shipping topology is
+/// one port per device (the conch is off on this board, so every cold-snap device is
+/// a leaf), so the rig runs N processes of `STUB_SESSIONS=1` on N ptys and the real
+/// coordinator sees N port state machines. `hostcheck`'s one-pty/13-session shape is
+/// a convenience, not the shipping topology (HARNESS-PLAN §2), and both have to be
+/// runnable from one binary or the app rig would be testing a second stub.
+///
+/// Only the COUNT is read here. Which sessions end up in a keygen is still the
+/// coordinator's choice, observed rather than arranged — see [`N_DEVICES`].
+fn session_count() -> usize {
+    std::env::var("STUB_SESSIONS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(ALL_DEVICES)
+}
+
+/// The entropy salt for THIS PROCESS (`STUB_SALT`, decimal or `0x`-prefixed,
+/// default `0x5a` — the value every existing measurement was taken at).
+///
+/// LOAD-BEARING FOR THE APP RIG, not cosmetic. [`entropy`] is deterministic, so two
+/// processes run at the same salt derive the same keypair from
+/// `identity::load_or_create` and announce the SAME `DeviceId`. [`open_sessions`]
+/// only catches that WITHIN one process; across processes the coordinator would see
+/// one device where the rig launched several. `tools/app-rig.py` gives each child a
+/// distinct salt and then checks the announced ids are distinct, because a collision
+/// here looks like a topology bug three layers up.
+fn salt() -> u8 {
+    let Ok(raw) = std::env::var("STUB_SALT") else {
+        return 0x5a;
+    };
+    let parsed = match raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+        Some(hex) => u8::from_str_radix(hex, 16),
+        None => raw.parse::<u8>(),
+    };
+    match parsed {
+        Ok(salt) => salt,
+        // NOT a silent default: a typo'd salt would mean duplicate identities, which
+        // is the one failure this variable exists to prevent.
+        Err(e) => die(2, &format!("STUB_SALT={raw:?} is not a u8: {e}")),
+    }
+}
+
 /// The consent seam, and the only one: ONE closure threaded through [`drive`],
 /// answering with **the key byte** a human would press after looking at `frame`.
 ///
@@ -517,6 +617,49 @@ fn advertised_key(frame: &ui::Frame) -> Option<u8> {
         return row.first().copied();
     }
     None
+}
+
+/// The most pages [`approved`] will advance through before calling the page set
+/// broken. `hal::ui::SignPages` is `recipients * 2 + high_fee + 2`, so `MAX_RECIPIENTS`
+/// (32) tops out at 67; this is past every set the declared envelope admits, so
+/// reaching it means the set does not terminate rather than that a transaction was
+/// large. Bounded because an unbounded page walk is a hang, and a hang is
+/// indistinguishable from a device that stopped answering.
+const PAGE_CAP: usize = 256;
+
+/// Every row of `frame`, read back through the shipped reverse glyph lookup, on
+/// stderr — WHAT WAS ACTUALLY ON THE GLASS when this process consented.
+///
+/// THE ASSERTION CHANNEL FOR "check the displayed recipients/address/amounts against
+/// the transaction being signed". The app rig cannot see a screen; it can read this
+/// process's stderr, which the rig captures per device (`device-N.log`), so the
+/// comparison the app-side test makes is against the RENDERED PIXELS and not against
+/// anything the coordinator told the device. `ui::Frame::cell` is the shipped inverse
+/// of the font (byte-for-byte match), the same lookup [`glass_code`] and [`row_text`]
+/// use — nothing here re-implements the font.
+///
+/// A cell whose pixels are not a glyph is `?` rather than dropped: `mark_sensitive`
+/// noise and a half-drawn cell must both be visible as unreadable instead of closing
+/// up into a shorter string that might still match.
+///
+/// OFF unless `STUB_GLASS_LOG` is set, because `hostcheck` runs 13 sessions x 4 passes
+/// through here on an inherited stderr and its output is read by a human.
+fn log_glass(frame: &ui::Frame, page: usize, last: bool) {
+    if std::env::var_os("STUB_GLASS_LOG").is_none() {
+        return;
+    }
+    for row in 0..ui::ROWS {
+        let text: String = (0..ui::COLS)
+            .map(|col| char::from(frame.cell(col, row).map_or(b'?', |(ch, _)| ch)))
+            .collect();
+        let text = text.trim_end();
+        if !text.is_empty() {
+            eprintln!(
+                "stub: glass page {page}{} row {row}: {text}",
+                if last { " (last)" } else { "" }
+            );
+        }
+    }
 }
 
 /// The four bytes the KEYGEN CHECK screen actually **drew**, read back off the
@@ -616,6 +759,120 @@ fn sheet_read(paper: &BTreeMap<DeviceId, Sheet>, id: DeviceId) -> &Sheet {
                 paper.keys().collect::<Vec<_>>()
             ),
         ),
+    }
+}
+
+/// Where a [`Sheet`] is carried BETWEEN PROCESSES (`STUB_SHEET_DIR`), which is the
+/// one thing the app rig needs and `hostcheck` does not.
+///
+/// `hostcheck` hosts every session in ONE process, so the sheet M7b's reveal fills is
+/// in the same `paper` map M7d's letter picker reads. The app rig runs one session per
+/// process (the shipping topology — N ports, N devices), so the revealing device and
+/// the blank device are different OS processes and `paper` cannot possibly be shared.
+/// A FILE IS THE HONEST MODEL OF THAT: it is a human carrying a sheet of paper from
+/// one unit to the other, which is exactly what the flow asks of them. Unset — every
+/// existing `hostcheck` run — and nothing is written or read, so that path is byte for
+/// byte unchanged.
+///
+/// It is a plaintext share on disk under an ignored `target/` path. Deliberately, and
+/// for the same reason [`Sheet`] is a plaintext share in a harness variable: a human
+/// holds one too. It reaches no flash, no signer and no wire body.
+fn sheet_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("STUB_SHEET_DIR").map(std::path::PathBuf::from)
+}
+
+/// Put `sheet` where another process can pick it up. No-op without [`sheet_dir`].
+///
+/// REFUSES TO OVERWRITE, because two sheets in the room is the case [`sheet_read`]
+/// dies on rather than guessing between: silently replacing the first reveal would
+/// turn that refusal into a harness asserting about the wrong share.
+fn sheet_write(id: DeviceId, sheet: &Sheet) {
+    let Some(dir) = sheet_dir() else { return };
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        die(2, &format!("STUB_SHEET_DIR {}: {e}", dir.display()));
+    }
+    let path = dir.join(format!("sheet-{id}.tsv"));
+    if path.exists() {
+        die(
+            2,
+            &format!(
+                "{} already holds a sheet for {id}: a second reveal by the same device would \
+                 replace the one another process may already be typing",
+                path.display()
+            ),
+        );
+    }
+    let mut text = String::new();
+    if let Some(index) = sheet.index {
+        text.push_str(&format!("index\t{index}\n"));
+    }
+    for (pos, word) in &sheet.words {
+        text.push_str(&format!("{pos}\t{word}\n"));
+    }
+    if let Err(e) = std::fs::write(&path, text) {
+        die(2, &format!("writing {}: {e}", path.display()));
+    }
+    eprintln!(
+        "stub: {id} wrote its reveal to {} ({} words) -- the sheet a human carries",
+        path.display(),
+        sheet.words.len()
+    );
+}
+
+/// Pick up every sheet another process left in [`sheet_dir`], for a device that has
+/// none of its own.
+///
+/// ONLY WHEN `paper` IS EMPTY. A device that revealed reads its OWN sheet out of
+/// memory, and importing on top of that would put two sheets in the room —
+/// [`sheet_read`]'s "there is no rule for which it retypes" refusal, which is the
+/// check, not an obstacle.
+fn sheets_import(paper: &mut BTreeMap<DeviceId, Sheet>) {
+    if !paper.is_empty() {
+        return;
+    }
+    let Some(dir) = sheet_dir() else { return };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(id_hex) = name
+            .strip_prefix("sheet-")
+            .and_then(|rest| rest.strip_suffix(".tsv"))
+        else {
+            continue;
+        };
+        let Ok(id) = id_hex.parse::<DeviceId>() else {
+            die(2, &format!("{name}: {id_hex:?} is not a DeviceId"));
+        };
+        let text = match std::fs::read_to_string(entry.path()) {
+            Ok(text) => text,
+            Err(e) => die(2, &format!("reading {}: {e}", entry.path().display())),
+        };
+        let mut sheet = Sheet::default();
+        for line in text.lines() {
+            let Some((key, value)) = line.split_once('\t') else {
+                die(2, &format!("{name}: {line:?} is not <key>TAB<value>"));
+            };
+            if key == "index" {
+                sheet.index = Some(match value.parse() {
+                    Ok(index) => index,
+                    Err(e) => die(2, &format!("{name}: index {value:?}: {e}")),
+                });
+            } else {
+                match key.parse::<usize>() {
+                    Ok(pos) => sheet.words.insert(pos, value.to_owned()),
+                    Err(e) => die(2, &format!("{name}: position {key:?}: {e}")),
+                };
+            }
+        }
+        eprintln!(
+            "stub: picked up {id}'s sheet from {} ({} words, share #{:?})",
+            entry.path().display(),
+            sheet.words.len(),
+            sheet.index
+        );
+        paper.insert(id, sheet);
     }
 }
 
@@ -1161,8 +1418,9 @@ fn type_backup(
     }
 }
 
-/// Render `prompt`, ask `consent` for a keypress, and decide. `true` means
-/// confirm it.
+/// Walk `prompt`'s pages, ask `consent` for a keypress on the last one, and decide.
+/// `Some(page)` means confirm it AT THAT PAGE — hand the same number to
+/// [`Session::confirm_at`], which accepts no other.
 ///
 /// THE ONE PLACE A KEY BECOMES CONSENT. `Session::confirm` renders the screen
 /// again for its own renderability gate, with its own throwaway digit (documented
@@ -1181,17 +1439,55 @@ fn approved(
     rng: &mut Entropy,
     consent: Consent,
     out: &mut Outbox,
-) -> bool {
-    let digit = ui::ConfirmDigit::draw(rng);
-    let mut frame = ui::Frame::new();
-    // `Ok(false)` (informational, no screen) and `Err` (this device cannot draw
-    // the request in full) are both prompts NO key may authorise. They are
-    // deliberately not called declines: `Session::confirm` fails closed on exactly
-    // these two — `NotConfirmable` and `Refused` — and names the failure itself,
-    // so it stays the authority and its diagnostics keep their existing wording.
-    if !matches!(prompt_screen(&mut frame, prompt, digit), Ok(true)) {
-        return true;
-    }
+) -> Option<usize> {
+    // THE PAGE WALK, which is `main.rs`'s `Answer::Next` arm with the keypad taken
+    // out: advance one page at a time, and only the page that reports `last` prints a
+    // digit and may be answered. It is not an extra: `prompt_screen` (page 0) is
+    // `Ok(false)` for a multi-page bitcoin transaction, so a caller without a cursor
+    // used to reach `return true` below — approving a request it had not rendered —
+    // and then die in `Session::confirm` with `Fault::NotConfirmable`. Every recipient
+    // and the fee are on pages after the first (`hal::ui::SignPages`), so this loop is
+    // what makes "the human read the transaction" true of this harness at all.
+    //
+    // SINGLE ADVANCES, deliberately: `Session::confirm_at`'s contract is "the drawn
+    // digit, checked against the key, on a page reached by single advances", and
+    // jumping straight to `len() - 1` would be a caller inventing a screen nobody saw.
+    let mut page = 0usize;
+    let (digit, frame) = loop {
+        let digit = ui::ConfirmDigit::draw(rng);
+        let mut frame = ui::Frame::new();
+        // `Shown::Nothing` (informational, no screen), `Shown::Info` (drawn but
+        // authorises nothing — address verification) and `Err` (this device cannot
+        // draw the request in full) are all prompts NO key may authorise. They are
+        // deliberately not called declines: `Session::confirm_at` fails closed on
+        // exactly these — `NotConfirmable` and `Refused` — and names the failure
+        // itself, so it stays the authority and its diagnostics keep their wording.
+        match prompt_screen_at(&mut frame, prompt, digit, page) {
+            Ok(Shown::Page { last: true }) => break (digit, frame),
+            Ok(Shown::Page { last: false }) => {
+                // What a human sees before pressing `ui::NEXT_KEY`, read back off the
+                // pixels: this is the only record of WHICH transaction was on the
+                // glass, and the app rig's assertion that the displayed recipients,
+                // amounts and fee are the ones being signed is made against it.
+                log_glass(&frame, page, false);
+                page += 1;
+                if page > PAGE_CAP {
+                    die(
+                        2,
+                        &format!(
+                            "no page below {PAGE_CAP} reported itself last -- the page set does \
+                             not terminate, so nothing can be consented to"
+                        ),
+                    );
+                }
+            }
+            // Same value the one-page funnel returned here, and the same reason: it is
+            // not a decline, it is a prompt with nothing to answer. Page 0, because
+            // that is the only page a caller may then name.
+            _ => return Some(0),
+        }
+    };
+    log_glass(&frame, page, true);
     // ASSERTION 1, on the wire. `UNREADABLE` rather than skipping the report: a
     // screen whose code cannot be read back is a screen whose code is not the
     // coordinator's, and `hostcheck` must fail on it rather than on a missing map
@@ -1205,7 +1501,9 @@ fn approved(
         }
     }
     let key = consent(prompt, &frame);
-    match prompt {
+    // `Some(page)` — the page the key was pressed on, which is the page
+    // `Session::confirm_at` must be told about and the only one it accepts.
+    let granted = match prompt {
         // THE ANTI-MITM SCREEN, and as of 2026-09-11 it is gated exactly like the
         // signing one. This arm read `key == b'1'` because `ui::keygen_check` printed a
         // fixed `1=match x=no`; that made this the ONE consent screen in the tree a
@@ -1237,7 +1535,8 @@ fn approved(
         // Not a consent prompt. Unreachable from the call sites in `drive`, and a
         // decline — which fails the run — if that ever stops being true.
         _ => false,
-    }
+    };
+    granted.then_some(page)
 }
 
 /// The consent closure said no: `Session::confirm` is never called, and the only
@@ -1299,7 +1598,7 @@ fn entropy(salt: u8) -> Entropy {
     Entropy::from_proven_seed(seed)
 }
 
-/// `ALL_DEVICES` blank flashes at the shipped geometry, sized so a write past the
+/// [`session_count`] blank flashes at the shipped geometry, sized so a write past the
 /// nonce region is out of bounds rather than silently landing in `FS_FREE`.
 ///
 /// Separate from `open_sessions` because these must OUTLIVE every session: a
@@ -1308,7 +1607,7 @@ fn entropy(salt: u8) -> Entropy {
 /// power cycle does.
 fn blank_flashes() -> Vec<RefCell<Flash>> {
     let sectors = memmap::FS_FREE_OFFSET as usize / ERASE_SIZE;
-    (0..ALL_DEVICES)
+    (0..session_count())
         .map(|_| RefCell::new(DebugFlash(FakeFlash::new(sectors))))
         .collect()
 }
@@ -1340,7 +1639,7 @@ fn open_sessions<'a>(
             Ok(session) => session,
             Err(e) => die(2, &format!("Session::open: {e:?}")),
         };
-        session.signer.keygen_fingerprint = TEST_FINGERPRINT;
+        session.signer.keygen_fingerprint = keygen_fingerprint();
         if sessions.insert(session.device_id(), session).is_some() {
             die(2, "two devices derived the SAME DeviceId from different flashes");
         }
@@ -1363,6 +1662,45 @@ fn synthetic_digest() -> frostsnap_comms::Sha256Digest {
     let off = memmap::FW_HEADER_OFFSET as usize + 24;
     image[off..off + 4].copy_from_slice(&length.to_le_bytes());
     firmware_digest(&image).expect("a well-formed synthetic image must hash")
+}
+
+/// The digest this process ANNOUNCES, and which image it came from.
+///
+/// `STUB_IMAGE=<path>` hashes a REAL image file with the same shipped
+/// `firmware_digest`; unset falls back to [`synthetic_digest`]. Both are the same
+/// function over different bytes, and the difference matters to exactly one
+/// consumer: the app identifies a device by announced digest against
+/// `frostsnap_coordinator/src/coldsnap-mk4-registry.txt`, so the synthetic image's
+/// digest is `DeviceProfile::Unrecognized` — `is_compatible() == false`, every
+/// capability false, and the app's keygen gate refuses the device
+/// (`device_list::check_keygen_group`). Pointing this at the packaged, key-0-signed
+/// artifact makes the announced digest the CHECKED ARTIFACT'S, which is what task
+/// 04's work item 4 asks for.
+///
+/// IT IS STILL NOT ATTESTATION and pointing at a file does not make it any more so.
+/// The device reports this about itself over the same wire as everything else; a
+/// registry hit says WHICH FIRMWARE and nothing about who sent it. This process is
+/// not running the image it names — it is a host stub — so the honest statement is
+/// "announced digest = the packaged artifact's", and the second element returned
+/// here is what puts that provenance on stderr instead of leaving a reader to
+/// guess. A missing or unhashable file DIES rather than falling back: silently
+/// announcing the synthetic digest instead would look like a compatibility bug in
+/// the app.
+fn announced_digest() -> (frostsnap_comms::Sha256Digest, String) {
+    let Ok(path) = std::env::var("STUB_IMAGE") else {
+        return (synthetic_digest(), "synthetic (STUB_IMAGE unset)".into());
+    };
+    let image = match std::fs::read(&path) {
+        Ok(image) => image,
+        Err(e) => die(2, &format!("STUB_IMAGE={path:?} unreadable: {e}")),
+    };
+    match firmware_digest(&image) {
+        Some(digest) => (digest, format!("{path} ({} B)", image.len())),
+        None => die(
+            2,
+            &format!("STUB_IMAGE={path:?} is not a hashable image (header/length check failed)"),
+        ),
+    }
 }
 
 /// Feed one decoded coordinator body to one session, answer the prompts a human
@@ -1436,9 +1774,7 @@ fn drive(
                     die(2, &format!("Debug(session_hash) refused by framing: {e:?}"));
                 }
                 let p = DeviceToUserMessage::CheckKeyGen { phase };
-                if !approved(&p, rng, &mut *consent, &mut out) {
-                    decline(id, "CheckKeyGen", &mut out);
-                } else {
+                if let Some(page) = approved(&p, rng, &mut *consent, &mut out) {
                     // NOT an auto-ack, and as of 2026-09-11 not weaker than the signing
                     // arm either: `approved` above required `digit.accepts(key)` against
                     // a RANDOMISED `ui::ConfirmDigit`, read back out of the rendered
@@ -1451,7 +1787,7 @@ fn drive(
                     eprintln!(
                         "stub: {id} CheckKeyGen -> approved on the randomised digit read off the glass"
                     );
-                    match session.confirm(p, rng, &mut out) {
+                    match session.confirm_at(p, page, rng, &mut out) {
                         Ok(more) => prompts.extend(more),
                         Err(e) => die(2, &format!("confirm(CheckKeyGen, {id}): {e:?}")),
                     }
@@ -1459,12 +1795,12 @@ fn drive(
                         eprintln!("stub: {id} clear_tmp_data() at CheckKeyGen -- WRONG ON PURPOSE");
                         session.signer.clear_tmp_data();
                     }
+                } else {
+                    decline(id, "CheckKeyGen", &mut out);
                 }
             }
             p @ DeviceToUserMessage::SignatureRequest { .. } => {
-                if !approved(&p, rng, &mut *consent, &mut out) {
-                    decline(id, "SignatureRequest", &mut out);
-                } else {
+                if let Some(page) = approved(&p, rng, &mut *consent, &mut out) {
                     // NOT an auto-ack either, and this one is structural: `approved`
                     // required `digit.accepts(key)` against a RANDOMISED
                     // `ui::ConfirmDigit` drawn on the frame the consent answered, so
@@ -1472,16 +1808,29 @@ fn drive(
                     // and `=y2` are refusals by construction). What a host cannot
                     // supply is a human who actually read the screen.
                     eprintln!(
-                        "stub: {id} SignatureRequest -> approved on the randomised digit read off the glass"
+                        "stub: {id} SignatureRequest -> approved on the randomised digit read off \
+                         the glass, on page {page} (the last page of the set)"
                     );
-                    match session.confirm(p, rng, &mut out) {
+                    match session.confirm_at(p, page, rng, &mut out) {
                         Ok(more) => {
+                            if lose_first_share() && !SHARE_LOST.swap(true, Ordering::Relaxed) {
+                                let lost = out.take();
+                                eprintln!(
+                                    "stub: {id} SIGNATURE REPLY LOST ON THE WIRE \
+                                     (STUB_LOSE_FIRST_SHARE): {} B signed and dropped",
+                                    lost.len()
+                                );
+                                prompts.extend(more);
+                                continue;
+                            }
                             SIG_ACKS.fetch_add(1, Ordering::Relaxed);
                             STATE.fetch_max(6, Ordering::Relaxed);
                             prompts.extend(more);
                         }
                         Err(e) => die(2, &format!("confirm(SignatureRequest, {id}): {e:?}")),
                     }
+                } else {
+                    decline(id, "SignatureRequest", &mut out);
                 }
             }
             DeviceToUserMessage::FinalizeKeyGen { key_name } => {
@@ -1526,14 +1875,14 @@ fn drive(
                     continue;
                 }
                 let p = DeviceToUserMessage::Restoration(Box::new(inner));
-                if !approved(&p, rng, &mut *consent, &mut out) {
+                let Some(page) = approved(&p, rng, &mut *consent, &mut out) else {
                     decline(id, &format!("{grant:?}"), &mut out);
                     continue;
-                }
+                };
                 eprintln!(
                     "stub: {id} {grant:?} -> approved on the randomised digit read off the glass"
                 );
-                match session.confirm(p, rng, &mut out) {
+                match session.confirm_at(p, page, rng, &mut out) {
                     Ok(more) => prompts.extend(more),
                     Err(e) => die(2, &format!("confirm({grant:?}, {id}): {e:?}")),
                 }
@@ -1548,9 +1897,17 @@ fn drive(
                     // never revealed, and [`sheet_read`] would then hand that empty
                     // sheet straight to `type_backup` — which is exactly the blank
                     // device's situation.
-                    Grant::Reveal => reveal(session, rng, &mut out, paper.entry(id).or_default()),
+                    Grant::Reveal => {
+                        let sheet = paper.entry(id).or_default();
+                        reveal(session, rng, &mut out, sheet);
+                        // The handoff, and only when the rig asked for one: with one
+                        // session per process the device that types this share back is
+                        // a different process, so the sheet has to leave this one.
+                        sheet_write(id, sheet);
+                    }
                     // M7c. Answered ONLY from what M7b's reveal showed.
                     Grant::Check => {
+                        sheets_import(paper);
                         let answers = check_quiz(session, rng, &mut out, sheet_read(paper, id));
                         if let Err(e) = out.push(DeviceSendBody::Debug {
                             message: format!("quiz={answers}"),
@@ -1561,6 +1918,11 @@ fn drive(
                     // M7d. `entry_key` sends `PhysicalEntered` itself, and only when
                     // 25 words pass their checksum.
                     Grant::Enter => {
+                        // A BLANK DEVICE HAS NO SHEET OF ITS OWN -- it holds no share,
+                        // so the coordinator refuses `DisplayBackup` for it -- and in
+                        // the rig it is its own process, so the sheet it retypes has to
+                        // come off the disk another process wrote it to.
+                        sheets_import(paper);
                         let (presses, more) =
                             type_backup(session, rng, &mut out, sheet_read(paper, id));
                         eprintln!(
@@ -1582,6 +1944,38 @@ fn drive(
                         "stub: {id} CONSOLIDATED -- the typed share REPLACED the stored record"
                     ),
                     Grant::Nothing => {}
+                }
+            }
+            // ADDRESS VERIFICATION. `Shown::Info`: a screen that is DRAWN and
+            // authorises nothing, so there is no consent and no `confirm_at` call —
+            // `confirm_at` refuses `Info` fail-closed, and `approved` is never asked.
+            // The only thing a human does with this screen is READ it, so the only
+            // thing this process does is read it back off the pixels.
+            //
+            // THAT READ IS THE CHECK. The app's "Sender has correct address" button
+            // sets a Dart bool and discards `verify_address`'s stream, so tapping it
+            // proves nothing about what the device drew; this line is what the app rig
+            // compares against the address the app's own wallet handed out. Until now
+            // this prompt fell through to `_other` and the address was never rendered
+            // at all, which is why nothing could compare it.
+            p @ DeviceToUserMessage::VerifyAddress { .. } => {
+                let mut frame = ui::Frame::new();
+                match prompt_screen_at(&mut frame, &p, ui::ConfirmDigit::draw(rng), 0) {
+                    Ok(Shown::Info) => {
+                        eprintln!("stub: {id} VerifyAddress drawn (authorises nothing)");
+                        log_glass(&frame, 0, false);
+                    }
+                    // A `Page` here would mean the address screen had started printing
+                    // a confirm digit, i.e. had become answerable — `firmware/src/lib.rs`
+                    // has a named test pinning that it must not. Refused rather than
+                    // logged, because a harness that shrugs at it is how it would ship.
+                    other => die(
+                        2,
+                        &format!(
+                            "VerifyAddress drew {other:?}, not Shown::Info -- an address \
+                             screen that authorises something is a hole, not a feature"
+                        ),
+                    ),
                 }
             }
             // Debug is not derived on every inner phase type, so no {other:?}.
@@ -1693,13 +2087,24 @@ fn main() {
         die(3, "watchdog fired: no progress within the deadline");
     });
 
-    let mut rng = entropy(0x5a);
+    let mut rng = entropy(salt());
     let flashes = blank_flashes();
     let mut sessions = open_sessions(&flashes, &mut rng);
     let ids: Vec<DeviceId> = sessions.keys().copied().collect();
-    eprintln!("stub: {ALL_DEVICES} flash-backed sessions: {ids:?}");
+    // PARSED BY `tools/app-rig.py` — it reads the ids back off this line and refuses a
+    // run in which two child processes announce the same one. Keep the
+    // `flash-backed sessions: [..]` shape if you edit it.
+    let hosted = sessions.len();
+    eprintln!(
+        "stub: {hosted} flash-backed sessions (salt {:#04x}): {ids:?}",
+        salt()
+    );
 
-    let digest = synthetic_digest();
+    let (digest, digest_from) = announced_digest();
+    eprintln!(
+        "stub: announcing firmware digest {} from {digest_from}",
+        hex(&digest.0)
+    );
     let mut saved: BTreeMap<DeviceId, AccessStructureRef> = BTreeMap::new();
     let mut announced_save = false;
     // THE PAPER. Outside the restart on purpose: it is filled by M7b's reveal, which
@@ -1816,6 +2221,42 @@ fn main() {
         // `Link` exposes `is_linked()` but no edge, and this file is specified to
         // need zero `hal/src/` changes.
         let was_linked = link.is_linked();
+        // THE COORDINATOR HAS LOST US. It writes its magic pattern every
+        // `MAGIC_BYTES_PERIOD` **only until it reads our reply**
+        // (`usb_serial_manager::poll_ports`'s `awaiting_magic` loop), so magic bytes
+        // arriving on an already-linked wire mean it is back in the handshake state for
+        // this port -- it closed and re-opened it, or it restarted. That is the app rig's
+        // REPLUG: the manifest line went away and came back, the app dropped the port and
+        // opened it again, and its device registry no longer holds us.
+        //
+        // TWO THINGS DIVERGE FROM `firmware/src/main.rs` HERE AND BOTH ARE RECORDED
+        // RATHER THAN QUIETLY PAPERED OVER:
+        //  - `main.rs` replies `MAGIC_REPLY` to every `MagicBytes` frame
+        //    (`send_magic_reply = true` in its callback, with no `was_linked` guard) and
+        //    this file did not reply at all once linked. That was a straight fidelity
+        //    bug in this stub: the app sat in `awaiting_magic` writing magic bytes
+        //    forever -- 1,758 of them in one measured run -- and no device came back.
+        //  - `main.rs` announces ONLY on the link edge (`!was_linked && link.is_linked()`),
+        //    so on the ARM image a coordinator that re-opens a port without the device
+        //    power-cycling gets a `MAGIC_REPLY` and no `Announce`, and never re-registers
+        //    the device. Its own comment expects a desync to unlink and produce a fresh
+        //    edge, but repeat magic bytes decode as an ordinary frame
+        //    (`comms::test::magic_bytes_after_the_handshake_are_an_ordinary_frame`), so
+        //    there is no desync and no edge. On real hardware an unplug cuts power and
+        //    the device reboots, which is how the gap stays hidden. THIS FILE
+        //    RE-ANNOUNCES; the ARM image does not, and that difference is a finding to
+        //    fix in `main.rs`, not something this run may claim as covered.
+        //
+        // OPT-IN (`STUB_REANNOUNCE=1`, which only `tools/app-rig.py` sets) because
+        // `hostcheck` writes coordinator magic bytes CONTINUOUSLY on a linked wire, not
+        // only while it is waiting for a reply. Re-announcing there re-registers every
+        // device in the middle of a keygen and throws its keygen state away — MEASURED:
+        // `Session::recv(...): InvalidMessage { kind: "KeyGen", reason: "no keygen state
+        // for provided keygen_id" }`, exit 2, on the first hostcheck run after this was
+        // unconditional. So the two coordinators genuinely need different answers here,
+        // and that is itself the evidence that "magic bytes on a linked wire" does not
+        // mean one thing on this protocol.
+        let mut rehello = false;
         let mut wire: Vec<u8> = Vec::new();
         let poll = link.poll::<ReceiveSerial<Upstream>, _>(&bytes, |frame| match frame {
             ReceiveSerial::Message(msg) => {
@@ -1860,7 +2301,10 @@ fn main() {
             }
             // The coordinator keeps re-sending magic every 100 ms until it reads
             // our reply; those arrive as ordinary frames once linked.
-            ReceiveSerial::MagicBytes(_) => eprintln!("stub: rx MagicBytes"),
+            ReceiveSerial::MagicBytes(_) => {
+                eprintln!("stub: rx MagicBytes");
+                rehello = true;
+            }
             ReceiveSerial::Conch => eprintln!("stub: rx Conch"),
             ReceiveSerial::Reset => eprintln!("stub: rx Reset"),
             _ => eprintln!("stub: rx unused variant"),
@@ -1869,6 +2313,50 @@ fn main() {
             die(
                 2,
                 &format!("Link::poll: {e:?} (pending {} bytes)", link.pending()),
+            );
+        }
+
+        // The re-hello, which is a POWER CYCLE first. A cold-snap unit is USB-powered, so
+        // an unplug/replug drops every byte of RAM: the sessions are rebuilt from the same
+        // `FakeFlash` bytes BEFORE the re-announce, exactly as a boot would, and the
+        // DeviceIds are asserted unchanged. Unlike the link-edge restart below, this one
+        // happens AFTER keygen, so the rebuilt session has to read its share and its nonce
+        // streams back off flash -- the app rig signs with this device after the replug
+        // to prove it did. Only with `STUB_REANNOUNCE` (the app rig); hostcheck never
+        // replugs. It must NOT fall through to the link-edge restart. See the `rehello`
+        // comment above for the `main.rs` divergence.
+        if rehello && link.is_linked() && was_linked && reannounce() {
+            sessions = open_sessions(&flashes, &mut rng);
+            let after: Vec<DeviceId> = sessions.keys().copied().collect();
+            if after != ids {
+                die(
+                    2,
+                    &format!(
+                        "IDENTITY DID NOT SURVIVE THE REPLUG RESTART: announced {ids:?} but \
+                         flash rebuilt as {after:?}"
+                    ),
+                );
+            }
+            eprintln!(
+                "stub: REPLUG RESTART -- dropped all {hosted} signers and rebuilt them from \
+                 flash after keygen; every DeviceId unchanged"
+            );
+            let mut hello = Vec::from(MAGIC_REPLY);
+            for session in sessions.values() {
+                let mut out = Outbox::new(session.device_id());
+                if let Err(e) = session.announce(digest, &mut out) {
+                    die(2, &format!("re-announce({}): {e:?}", session.device_id()));
+                }
+                hello.extend_from_slice(&out.take());
+            }
+            if let Err(e) = write_chunked(&mut wire_out, &hello, chunk) {
+                die(2, &format!("write(fd 1): {e}"));
+            }
+            eprintln!(
+                "stub: the coordinator asked for magic on a LINKED wire -- it re-opened this \
+                 port, so MAGIC_REPLY + {hosted} Announce again ({} bytes), after the \
+                 replug restart above.",
+                hello.len()
             );
         }
 
@@ -1896,7 +2384,7 @@ fn main() {
             }
             STATE.fetch_max(1, Ordering::Relaxed);
             eprintln!(
-                "stub: sent MAGIC_REPLY + {ALL_DEVICES} Announce+NeedName = {} bytes in {} chunk(s) \
+                "stub: sent MAGIC_REPLY + {hosted} Announce+NeedName = {} bytes in {} chunk(s) \
                  of {chunk}",
                 hello.len(),
                 hello.len().div_ceil(chunk),
@@ -1939,12 +2427,13 @@ fn main() {
             }
             STATE.fetch_max(2, Ordering::Relaxed);
             eprintln!(
-                "stub: RESTARTED -- dropped all {ALL_DEVICES} signers and rebuilt them from flash; \
+                "stub: RESTARTED -- dropped all {hosted} signers and rebuilt them from flash; \
                  every DeviceId unchanged, so the coordinator is still talking to the same devices"
             );
         }
 
-        // `ALL_DEVICES` and not `N_DEVICES`, because every session on the wire gets an
+        // `hosted` (= [`session_count`], `ALL_DEVICES` by default) and not `N_DEVICES`,
+        // because every session on the wire gets an
         // `AnnounceAck` including the blank one, and this is an EQUALITY recomputed each
         // lap rather than a latch: at 9 it would claim "all acked" while one device has
         // not. Left at 9 and reached, `STATE` never advances to 3 and the progress word
@@ -1963,10 +2452,10 @@ fn main() {
         // the acks ever do coalesce (heavier load, larger reads, a chunk-size change), 9
         // is skipped and nothing says so.
         let acked = sessions.values().filter(|s| s.coordinator_acked).count();
-        if acked == ALL_DEVICES && STATE.load(Ordering::Relaxed) == 2 {
+        if acked == hosted && STATE.load(Ordering::Relaxed) == 2 {
             STATE.fetch_max(3, Ordering::Relaxed);
             eprintln!(
-                "stub: all {ALL_DEVICES} devices acked (post-restart sessions), waiting for keygen"
+                "stub: all {hosted} devices acked (post-restart sessions), waiting for keygen"
             );
         }
 
