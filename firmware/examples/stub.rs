@@ -381,11 +381,18 @@ fn glass_keys() -> String {
 ///    stashed `tmp_keygen_pending_finalize` but BEFORE the coordinator's
 ///    `Finalize` asks for it back. Expect the stub to die 2 with "device doesn't
 ///    have keygen for <keygen_id>" (`device/keygen.rs` `keygen_finalize`).
+///
 /// Task 08: what each device answers its Nth ERASE question with, one byte per
 /// question, PER DEVICE (so `xy` declines every device's first `DataErase` and
-/// approves its second). `y` presses what the glass advertises; anything else is that
-/// literal key, and a missing byte is `x`. DEFAULT `x`: a run that does not ask for an
-/// erase never gets one, whatever a coordinator sends.
+/// approves its second). `y` presses what the glass advertises. Fix 2a: `p`, `c`, `a`
+/// and `f` press it too and then CUT POWER mid-erase, at one point each: `p` before
+/// the marker commits (every program refused: the device keeps its id and share);
+/// `c` after the commit and one share sector (no ack); `a` after deletion with
+/// `EraseConfirmed` still in RAM, lost unwritten; `f` in `finish`, after the ack was
+/// written. The device then stays off until a replug reboots it into
+/// `erase::recover`. Anything else is that literal key, and a missing byte is `x`.
+/// DEFAULT `x`: a run that does not ask for an erase never gets one, whatever a
+/// coordinator sends.
 fn erase_keys() -> String {
     std::env::var("STUB_ERASE_KEYS").unwrap_or_else(|_| "x".into())
 }
@@ -398,6 +405,12 @@ enum EraseOutcome {
     /// `Session::erase` returned `Ok`: data verified blank, `EraseConfirmed` pushed
     /// under the old id. The session is poisoned; `main` must rebuild it from flash.
     Erased,
+    /// `p`/`c`/`a`/`f`: approved, then a power cut (see [`erase_keys`]). `main`
+    /// powers it OFF (drops the session; it answers nothing) until the next replug.
+    /// `committed`: the marker is `Pending`, so that boot's `erase::recover` finishes
+    /// the erase and the ack it owes goes out under the old id before the fresh
+    /// announce; otherwise the same device boots back, share intact.
+    Interrupted { committed: bool },
 }
 
 /// `(programs, erases)` on every flash, for the "a no writes nothing" check.
@@ -1639,6 +1652,13 @@ fn blank_flashes() -> Vec<RefCell<Flash>> {
         .collect()
 }
 
+/// Sessions by id, each id's flash index, and `(fresh, original)` per recovered erase.
+type Booted<'a> = (
+    BTreeMap<DeviceId, Session<'a, Flash>>,
+    BTreeMap<DeviceId, usize>,
+    Vec<(DeviceId, DeviceId)>,
+);
+
 /// Build one `Session` per flash, entirely out of what is ON that flash.
 ///
 /// THE POINT OF THIS FILE: `identity::load_or_create` for the keypair (durable,
@@ -1649,24 +1669,36 @@ fn blank_flashes() -> Vec<RefCell<Flash>> {
 /// Called TWICE: once at start-up, which creates each identity, and once for the
 /// restart, which must READ BACK the same 32 bytes. The second call getting a
 /// different secret shows up as a changed `DeviceId`.
+///
+/// The third element is every device whose boot FINISHED an interrupted erase: its
+/// fresh id and the ORIGINAL id whose `EraseConfirmed` the caller owes the wire.
 fn open_sessions<'a>(
     flashes: &'a [RefCell<Flash>],
     rng: &mut Entropy,
-) -> (BTreeMap<DeviceId, Session<'a, Flash>>, BTreeMap<DeviceId, usize>) {
+) -> Booted<'a> {
     let mut sessions = BTreeMap::new();
     let mut index = BTreeMap::new();
+    let mut recovered_erases = Vec::new();
     for (i, flash) in flashes.iter().enumerate() {
-        let session = open_one(flash, rng);
+        let (session, recovered) = open_one(flash, rng);
+        if let Some(orig) = recovered {
+            recovered_erases.push((session.device_id(), DeviceId(orig)));
+        }
         index.insert(session.device_id(), i);
         if sessions.insert(session.device_id(), session).is_some() {
             die(2, "two devices derived the SAME DeviceId from different flashes");
         }
     }
-    (sessions, index)
+    (sessions, index, recovered_erases)
 }
 
-/// One device's boot, out of what is on its flash. See [`open_sessions`].
-fn open_one<'a>(flash: &'a RefCell<Flash>, rng: &mut Entropy) -> Session<'a, Flash> {
+/// One device's boot, out of what is on its flash. See [`open_sessions`]. The second
+/// element is `erase::recover`'s: the ORIGINAL id of an interrupted erase it just
+/// finished, whose `EraseConfirmed` the caller owes the wire.
+fn open_one<'a>(
+    flash: &'a RefCell<Flash>,
+    rng: &mut Entropy,
+) -> (Session<'a, Flash>, Option<[u8; erase::ID_LEN]>) {
     {
         // `load_or_create` wants `&mut Flash` and the session takes a shared
         // borrow of the same `RefCell` for its whole life, so the identity has to
@@ -1675,9 +1707,10 @@ fn open_one<'a>(flash: &'a RefCell<Flash>, rng: &mut Entropy) -> Session<'a, Fla
         // And before THAT, `main.rs`'s step 8a: an interrupted erase is resumed
         // before identity or nonces are read, and a damaged marker is fatal. The
         // stub has no `main.rs` boot path, so it repeats the step here.
-        if let Err(e) = erase::recover(&mut *flash.borrow_mut()) {
-            die(2, &format!("erase::recover: {e:?}"));
-        }
+        let recovered = match erase::recover(&mut *flash.borrow_mut()) {
+            Ok(recovered) => recovered,
+            Err(e) => die(2, &format!("erase::recover: {e:?}")),
+        };
         let secret = match identity::load_or_create(&mut *flash.borrow_mut(), rng) {
             Ok(secret) => secret,
             Err(e) => die(2, &format!("identity::load_or_create: {e:?}")),
@@ -1687,7 +1720,7 @@ fn open_one<'a>(flash: &'a RefCell<Flash>, rng: &mut Entropy) -> Session<'a, Fla
             Err(e) => die(2, &format!("Session::open: {e:?}")),
         };
         session.signer.keygen_fingerprint = keygen_fingerprint();
-        session
+        (session, recovered)
     }
 }
 
@@ -1766,6 +1799,7 @@ fn announced_digest() -> (frostsnap_comms::Sha256Digest, String) {
 /// `hostcheck`'s DECLINE pass proves that `x` refuses.
 fn drive(
     session: &mut Session<'_, Flash>,
+    flash: &RefCell<Flash>,
     body: CoordinatorSendBody,
     rng: &mut Entropy,
     consent: Consent,
@@ -1816,10 +1850,69 @@ fn drive(
         }
         log_glass(&frame, 0, true);
         let key = match scripted {
-            b'y' => advertised_key(&frame).unwrap_or(b'x'),
+            b'y' | b'p' | b'c' | b'a' | b'f' => advertised_key(&frame).unwrap_or(b'x'),
             key => key,
         };
-        let outcome = if digit.accepts(key) {
+        let outcome = if digit.accepts(key) && b"pcaf".contains(&scripted) {
+            {
+                let mut f = flash.borrow_mut();
+                if scripted == b'p' {
+                    // The marker body is the first program: nothing commits.
+                    let at = f.0.programs;
+                    f.0.refuse_programs_after(at);
+                } else if scripted == b'c' {
+                    // Marker region = 2 pages, then the first share sector; every
+                    // erase after that is refused, as a power cut would stop them.
+                    let at = f.0.erases + 3;
+                    f.0.refuse_erases_after(at);
+                }
+            }
+            let r = session.erase(&mut out);
+            let frames = out.frames();
+            let mut fin = None;
+            if scripted == b'a' {
+                // Power gone with the ack still in the outbox: it never leaves RAM.
+                drop(out.take());
+            } else if scripted == b'f' {
+                // main.rs's order: the ack is written, then `finish`, which the cut stops.
+                wire.extend_from_slice(&out.take());
+                let mut f = flash.borrow_mut();
+                let at = f.0.erases;
+                f.0.refuse_erases_after(at);
+                drop(f);
+                fin = Some(session.finish_erase());
+            }
+            flash.borrow_mut().0.heal();
+            let marker = erase::read(&mut *flash.borrow_mut());
+            let deleted = matches!(scripted, b'a' | b'f');
+            let want = if scripted == b'p' { erase::Marker::Clear } else { erase::Marker::Pending };
+            if r.is_ok() != deleted
+                || frames != usize::from(deleted)
+                || marker != Ok(want)
+                || fin.as_ref().is_some_and(Result::is_ok)
+            {
+                die(
+                    2,
+                    &format!(
+                        "{id}: cut {} erase gave {r:?}, {frames} frame(s), finish {fin:?}, \
+                         marker {marker:?}",
+                        scripted as char
+                    ),
+                );
+            }
+            let what = match scripted {
+                b'p' => "before the commit: nothing committed, no EraseConfirmed sent",
+                b'c' => "marker committed, no EraseConfirmed sent",
+                b'a' => "after deletion: EraseConfirmed lost in RAM unwritten, marker kept",
+                _ => "in finish: EraseConfirmed written, marker kept",
+            };
+            eprintln!(
+                "stub: {id} POWER CUT mid-erase [{}] (erase question #{n}): {what}; off \
+                 until the next boot runs erase::recover",
+                scripted as char
+            );
+            EraseOutcome::Interrupted { committed: scripted != b'p' }
+        } else if digit.accepts(key) {
             match session.erase(&mut out) {
                 Ok(()) => {
                     eprintln!(
@@ -2177,7 +2270,13 @@ fn main() {
 
     let mut rng = entropy(salt());
     let flashes = blank_flashes();
-    let (mut sessions, mut flash_of) = open_sessions(&flashes, &mut rng);
+    let (mut sessions, mut flash_of, recovered) = open_sessions(&flashes, &mut rng);
+    if !recovered.is_empty() {
+        die(2, "a fresh stub's flash held a committed erase marker");
+    }
+    // Fix 2a: devices whose erase a power cut interrupted, OFF until the next replug.
+    // `(id, committed)`: whether its marker committed before the cut.
+    let mut powered_off: Vec<(DeviceId, bool)> = Vec::new();
     let mut ids: Vec<DeviceId> = sessions.keys().copied().collect();
     let mut erase_asks: BTreeMap<DeviceId, usize> = BTreeMap::new();
     // PARSED BY `tools/app-rig.py` — it reads the ids back off this line and refuses a
@@ -2347,7 +2446,8 @@ fn main() {
         // mean one thing on this protocol.
         let mut rehello = false;
         let mut wire: Vec<u8> = Vec::new();
-        let mut erased: Vec<DeviceId> = Vec::new();
+        // `(id, cut)`: `Some(committed)` = a power cut interrupted the erase.
+        let mut erased: Vec<(DeviceId, Option<bool>)> = Vec::new();
         let poll = link.poll::<ReceiveSerial<Upstream>, _>(&bytes, |frame| match frame {
             ReceiveSerial::Message(msg) => {
                 let mut dest = msg.target_destinations;
@@ -2373,8 +2473,10 @@ fn main() {
                             let session =
                                 sessions.get_mut(&id).expect("id came from `sessions`");
                             let before = flash_counters(&flashes);
+                            let flash = &flashes[flash_of[&id]];
                             match drive(
                                 session,
+                                flash,
                                 body.clone(),
                                 &mut rng,
                                 &mut consent,
@@ -2387,7 +2489,10 @@ fn main() {
                                 EraseOutcome::Declined if flash_counters(&flashes) != before => {
                                     die(2, &format!("{id} declined an erase and flash changed"))
                                 }
-                                EraseOutcome::Erased => erased.push(id),
+                                EraseOutcome::Erased => erased.push((id, None)),
+                                EraseOutcome::Interrupted { committed } => {
+                                    erased.push((id, Some(committed)))
+                                }
                                 _ => {}
                             }
                         }
@@ -2422,10 +2527,34 @@ fn main() {
         // NeedName follow the `EraseConfirmed` already in `wire`, which is the order a
         // real unit's reset puts them in. (A real reset also drops USB and re-runs the
         // magic handshake; one pty cannot model that for one of N sessions.)
-        for old in erased {
-            sessions.remove(&old);
+        for (old, cut) in erased {
+            let Some(mut session) = sessions.remove(&old) else {
+                die(2, &format!("{old} erased with no session"));
+            };
             let i = flash_of.remove(&old).expect("every session has a flash");
-            let fresh = open_one(&flashes[i], &mut rng);
+            ids = sessions.keys().copied().collect();
+            if let Some(committed) = cut {
+                // FIX 2a: power is off. Nothing answers for `old` until the replug
+                // below reboots this flash through `erase::recover`.
+                powered_off.push((old, committed));
+                eprintln!("stub: {old} OFF after the power cut; its flash waits for boot");
+                continue;
+            }
+            // main.rs's order: the EraseConfirmed is WRITTEN, then the marker cleared.
+            if let Err(e) = write_chunked(&mut wire_out, &wire, chunk) {
+                die(2, &format!("write(fd 1): {e}"));
+            }
+            wire.clear();
+            if let Err(e) = session.finish_erase() {
+                die(2, &format!("{old}: finish_erase after the ack was written: {e:?}"));
+            }
+            drop(session);
+            let (fresh, recovered) = open_one(&flashes[i], &mut rng);
+            // An uncut erase acked in session and `finish` cleared its marker, so
+            // boot owes nothing; a second ack here would be a duplicate.
+            if let Some(orig) = recovered {
+                die(2, &format!("{old}: acked erase left a marker for {orig:02x?}"));
+            }
             let new = fresh.device_id();
             if new == old || sessions.contains_key(&new) {
                 die(2, &format!("{old} erased but came back as {new}"));
@@ -2462,7 +2591,55 @@ fn main() {
         // replugs. It must NOT fall through to the link-edge restart. See the `rehello`
         // comment above for the `main.rs` divergence.
         if rehello && link.is_linked() && was_linked && reannounce() {
-            (sessions, flash_of) = open_sessions(&flashes, &mut rng);
+            let recovered;
+            (sessions, flash_of, recovered) = open_sessions(&flashes, &mut rng);
+            // FIX 2a: a device whose erase a power cut interrupted boots HERE. Its
+            // boot finished the erase; it must be one we powered off, come back as a
+            // new id with nothing on it, and its ack (old id) leads the hello.
+            let mut acks = Vec::new();
+            let mut expect = ids.clone();
+            for (new, orig) in &recovered {
+                let Some(at) = powered_off.iter().position(|&(o, c)| o == *orig && c) else {
+                    die(2, &format!("boot recovered an erase for {orig}, which was never cut"));
+                };
+                powered_off.remove(at);
+                let fresh = &sessions[new];
+                if new == orig
+                    || fresh.signer.held_shares().count() != 0
+                    || fresh.stored_name().is_some()
+                {
+                    die(2, &format!("{orig} recovered as {new} but is not blank"));
+                }
+                match coldsnap_firmware::recovered_erase_ack(orig.0) {
+                    Ok(ack) => acks.extend_from_slice(ack.bytes()),
+                    Err(e) => die(2, &format!("recovered_erase_ack({orig}): {e:?}")),
+                }
+                eprintln!(
+                    "stub: {orig} erase::recover FINISHED the cut erase at boot; \
+                     EraseConfirmed queued under the old id after recovery verified the \
+                     flash blank; rebuilt from flash as {new}: 0 shares, no name"
+                );
+                expect.push(*new);
+            }
+            // A cut before the commit: boot finds no marker and the SAME device,
+            // share intact, and owes no ack.
+            for (off, committed) in powered_off.drain(..) {
+                let kept = sessions.get(&off).map(|s| s.signer.held_shares().count());
+                if committed || kept.is_none_or(|n| n == 0) {
+                    die(
+                        2,
+                        &format!("{off} was cut (committed={committed}) but booted as {kept:?}"),
+                    );
+                }
+                eprintln!(
+                    "stub: {off} rebooted after a pre-commit power cut: same id, {} share(s) \
+                     kept, no EraseConfirmed",
+                    kept.unwrap_or(0)
+                );
+                expect.push(off);
+            }
+            expect.sort();
+            ids = expect;
             let after: Vec<DeviceId> = sessions.keys().copied().collect();
             if after != ids {
                 die(
@@ -2475,9 +2652,11 @@ fn main() {
             }
             eprintln!(
                 "stub: REPLUG RESTART -- dropped all {hosted} signers and rebuilt them from \
-                 flash after keygen; every DeviceId unchanged"
+                 flash after keygen; every DeviceId unchanged except {} recovered erase(s)",
+                recovered.len()
             );
             let mut hello = Vec::from(MAGIC_REPLY);
+            hello.extend_from_slice(&acks);
             for session in sessions.values() {
                 let mut out = Outbox::new(session.device_id());
                 if let Err(e) = session.announce(digest, &mut out) {
@@ -2550,7 +2729,11 @@ fn main() {
             //
             // The assert below is belt: it fails fast and by name, whereas the
             // coordinator's failure would be a keygen timeout.
-            (sessions, flash_of) = open_sessions(&flashes, &mut rng);
+            let recovered;
+            (sessions, flash_of, recovered) = open_sessions(&flashes, &mut rng);
+            if !recovered.is_empty() {
+                die(2, "an erase marker survived to the link-edge restart");
+            }
             let after: Vec<DeviceId> = sessions.keys().copied().collect();
             if after != ids {
                 die(

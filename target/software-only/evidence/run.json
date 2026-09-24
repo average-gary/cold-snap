@@ -218,6 +218,27 @@
         "still_open": [
           "criterion 2 partial: recover-at-boot sends no completion signal (PLAUSIBLE)"
         ]
+      },
+      {
+        "fix": "2a",
+        "commit": [
+          "frostsnap 6d58541a4b46c87323b67e306b9f048e62a4c12b",
+          "cold-snap: the fix 2a close-out commit (see git log; it cannot name its own SHA)"
+        ],
+        "closed": [
+          "criterion 2 partial: an interrupted committed erase finished at boot now sends EraseConfirmed from the original id after verified deletion; the coordinator claims it via the normal EraseDevice path and the app drops the share via dropErasedDeviceShares (host rig, cuts p/c/a/f)",
+          "normal erase silent window: marker cleared before the ack was written (finish_erase now after cdc.write Ok)",
+          "Session cut matrix counted a RAM-only ack as sent",
+          "duplicate EraseConfirmed reached the sink twice (!confirmed guard)"
+        ],
+        "still_open": [
+          "CONFIRMED: main.rs:2614-2616 link-edge send of the recovered ack has no test (M7/M7b survive every gate)",
+          "PLAUSIBLE: EraseConfirmed from is not bound to a port (pre-existing)",
+          "PLAUSIBLE: main.rs takes the recovered id then discards the cdc.write result",
+          "PLAUSIBLE: cancelProtocol/app restart while the device is off leaves the recovered ack unclaimed (fails safe)",
+          "PLAUSIBLE: no timeout on the erase wait; Dart test does not pump the dialog; the f-cut duplicate count is racy",
+          "hostcheck DECLINE deadline intermittent 1 in 3 in repair 1"
+        ]
       }
     ]
   },

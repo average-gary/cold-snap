@@ -436,3 +436,11 @@ script). Task-04 app rig: regtest backend ran (height 101, transactions accepted
 The user's untracked `frostsnap_coordinator/tests/coldcard_msg_len.rs:97` E0308 (caused by frostsnap `b565de9`, `BitcoinBip32Path::external` now takes a `NormalIndex`) was fixed in place at :18 and :97. The file is still untracked and no assertion was changed. **Closed:** check 9 / "Blocked command". `cargo test -p frostsnap_coordinator` (cwd $HOME/repos/frostsnap) now exits 0, with 0 failures. **Still open:** criterion 2 partial (recover-at-boot sends no completion signal; PLAUSIBLE) and this task's other recorded items are unchanged.
 
 Detail: `10-followup.md` § Fix 1.
+
+## Follow-up 2026-09-24 — fix 2a
+
+**Closed:** the PLAUSIBLE "interrupted committed erase sends no completion", which drove criterion 2 PARTIAL. On the host, boot recovery now sends `EraseConfirmed` from the original id (recorded in the marker before the commit) after it verifies the flash is blank. The coordinator claims the ack through the normal `EraseDevice` path, and the app drops the share through the dialog's `dropErasedDeviceShares`. The app rig drives this end to end for cuts before the commit, after the commit, with the ack lost in RAM, and in finish. Also closed: the normal erase's silent window (the marker was cleared before the ack was written; `finish_erase` now runs after the write) and the Session cut matrix's before-effect-only / RAM-ack weakness.
+**Still open:** the real ARM boot's link-edge send of the recovered ack (`firmware/src/main.rs:2614-2616`) is covered by no test (CONFIRMED; deleting it passes every gate). PLAUSIBLE: `from` is not tied to a port; the write result is discarded; there is no timeout on the erase wait, and the dialog is not pumped; the reset may beat the USB IN transfer. Real reset / re-enumeration remains bench-only. Criterion 2 is now met on host for the stub and the coordinator. It is not shown for main.rs.
+
+Detail: `10-followup.md` § Fix 2a (status PARTLY FIXED).
+

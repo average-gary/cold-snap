@@ -29,12 +29,19 @@
 //!
 //! # The marker
 //!
-//! 16 bytes at the start of the marker region, written in two programs:
+//! 16 bytes at the start of the marker region, plus the original id after
+//! it, written in three programs:
 //!
 //! | offset | bytes | field |
 //! |--------|-------|-------|
 //! | `0x00` | 8 | `sha256(DOMAIN)[..8]`, the body |
 //! | `0x08` | 8 | [`MAGIC`], programmed **last**: the commit |
+//! | `0x10` | 40 | the erasing device's original `DeviceId` ([`ID_LEN`] bytes, `0xff`-padded), programmed before the commit |
+//!
+//! The id is not part of [`classify`]: it only says whom boot's recovery acks
+//! as. A committed marker always has it (it is programmed before the commit);
+//! a corrupted one makes the ack name a device no coordinator is erasing, so
+//! it is claimed by nobody and deletes nothing.
 //!
 //! [`classify`] reads it as exactly one of:
 //!
@@ -58,16 +65,20 @@
 //!    region one 4 K sector per call, SHARE FIRST, then nonces, then name, and
 //!    IDENTITY LAST; then reads every byte back as `0xff`.
 //! 3. The caller acknowledges (`CommsMisc::EraseConfirmed`) — after `destroy`
-//!    returned `Ok`, never before.
-//! 4. [`finish`]: re-verifies the data region is blank, then erases the marker
+//!    returned `Ok`, never before — under the original id, and WRITES it.
+//! 4. Only once that write returned `Ok`, [`finish`]: re-verifies the data region is blank, then erases the marker
 //!    region and reads it back blank. The marker therefore outlives the data.
 //! 5. The caller resets; boot finds `Clear` and a vacant identity.
 //!
 //! At boot, [`recover`] runs BEFORE identity generation, session opening, or
 //! nonce use. `Pending` resumes steps 2 and 4 (idempotent — erasing blank
-//! sectors again is harmless) and does NOT acknowledge: the original identity
-//! may already be gone, so there is nothing true to sign the ack with. A
-//! coordinator waiting on that ack keeps waiting; it is never told a falsehood.
+//! sectors again is harmless) and, only once both returned `Ok`, hands back the
+//! original id the marker recorded, so the caller can send the
+//! `EraseConfirmed` the interrupted session never got to: the wire's `from` is
+//! an id, not a signature, so the identity secret is not needed for it. If the
+//! device dies again after [`finish`] and before that ack leaves, the ack is
+//! lost (the marker is gone) and a waiting coordinator keeps waiting — it
+//! keeps a share it could have dropped, it is never told a falsehood.
 //!
 //! The share-first order is a second line behind the marker, not a substitute
 //! for it: at every intermediate state, if any nonce or name or identity sector
@@ -99,6 +110,12 @@ const DOMAIN: &[u8] = b"coldsnap-erase-marker-v1";
 
 /// Marker record length: body + commit.
 pub const RECORD_LEN: usize = 16;
+
+/// A `DeviceId`'s length (a compressed point), recorded after the marker.
+pub const ID_LEN: usize = 33;
+const ID_AT: u32 = memmap::FS_ERASE_OFFSET + RECORD_LEN as u32;
+/// [`ID_LEN`] rounded up to whole doublewords, so it is one aligned program.
+const ID_SLOT: usize = ID_LEN.div_ceil(crate::flash::WRITE_SIZE) * crate::flash::WRITE_SIZE;
 
 /// The data region the eraser destroys, in the order it destroys it.
 ///
@@ -199,17 +216,19 @@ pub fn read<S: ReadNorFlash>(flash: &mut S) -> Result<Marker, EraseFault> {
     Ok(classify(&buf))
 }
 
-/// Commit an erase: write and verify the marker. Destroys nothing.
+/// Commit an erase: write and verify the marker, recording `original_id` (the
+/// erasing device's `DeviceId` bytes) for boot's [`recover`] to ack under.
+/// Destroys nothing.
 ///
 /// Call only after fresh on-device consent. Idempotent on an already-`Pending`
-/// marker (which it leaves untouched).
+/// marker (which it leaves untouched, id included).
 ///
 /// # Errors
 ///
 /// [`EraseFault::Damaged`] leaves the marker untouched. Any other fault may
 /// leave it `Clear` (nothing committed) or `Pending` (committed, read-back
 /// failed); the next boot's [`recover`] interprets whichever it is.
-pub fn begin<S: NorFlash>(flash: &mut S) -> Result<(), EraseFault> {
+pub fn begin<S: NorFlash>(flash: &mut S, original_id: &[u8; ID_LEN]) -> Result<(), EraseFault> {
     match read(flash)? {
         Marker::Pending => return Ok(()),
         Marker::Damaged => return Err(EraseFault::Damaged),
@@ -221,6 +240,10 @@ pub fn begin<S: NorFlash>(flash: &mut S) -> Result<(), EraseFault> {
         .erase(AT, AT + memmap::FS_ERASE_LEN)
         .map_err(flash_err)?;
     flash.write(AT, &body()).map_err(flash_err)?;
+    let mut id = [0xffu8; ID_SLOT];
+    id[..ID_LEN].copy_from_slice(original_id);
+    // Before the commit: a committed marker always names its device.
+    flash.write(ID_AT, &id).map_err(flash_err)?;
     flash
         .write(AT + 8, &MAGIC.to_le_bytes())
         .map_err(flash_err)?;
@@ -298,21 +321,26 @@ pub fn finish<S: NorFlash>(flash: &mut S) -> Result<(), EraseFault> {
 
 /// Boot step: interpret the marker BEFORE identity, session or nonces.
 ///
-/// `Ok(false)`: no erase in progress, boot normally. `Ok(true)`: an interrupted
-/// erase was resumed and completed; the data region is blank and identity will
-/// regenerate. No acknowledgement is owed or possible here (module docs).
+/// `Ok(None)`: no erase in progress, boot normally. `Ok(Some(id))`: an
+/// interrupted erase was resumed and completed — the data region and marker
+/// verified blank — and `id` is the original `DeviceId` the marker recorded.
+/// The caller owes the coordinator `CommsMisc::EraseConfirmed` from `id`
+/// (module docs); identity will regenerate.
 ///
 /// # Errors
 ///
 /// Every `Err` is a hold. [`EraseFault::Damaged`] touches nothing.
-pub fn recover<S: NorFlash>(flash: &mut S) -> Result<bool, EraseFault> {
+pub fn recover<S: NorFlash>(flash: &mut S) -> Result<Option<[u8; ID_LEN]>, EraseFault> {
     match read(flash)? {
-        Marker::Clear => Ok(false),
+        Marker::Clear => Ok(None),
         Marker::Damaged => Err(EraseFault::Damaged),
         Marker::Pending => {
+            // Read while the marker still holds it; returned only after `finish`.
+            let mut id = [0u8; ID_LEN];
+            flash.read(ID_AT, &mut id).map_err(flash_err)?;
             destroy(flash)?;
             finish(flash)?;
-            Ok(true)
+            Ok(Some(id))
         }
     }
 }
@@ -473,8 +501,10 @@ mod tests {
     }
 
     /// The full in-session sequence minus the ack, which is the caller's.
+    const ID: [u8; ID_LEN] = [0x02; ID_LEN];
+
     fn session_erase(f: &mut Rig) -> Result<(), EraseFault> {
-        begin(f)?;
+        begin(f, &ID)?;
         destroy(f)?;
         finish(f)
     }
@@ -513,13 +543,13 @@ mod tests {
             "a sentinel above FS_FREE moved"
         );
         assert_in_bounds(&rig.log);
-        // Body before commit, both after the marker erase, and nothing else
-        // written anywhere.
+        // Body, then id, then commit LAST, all after the marker erase, and
+        // nothing else written anywhere.
         let writes: Vec<_> = rig.log.iter().filter(|e| e.0 == Op::Write).collect();
-        assert_eq!(writes.len(), 2);
+        assert_eq!(writes.len(), 3);
         assert_eq!(
-            (writes[0].1, writes[1].1),
-            (MARKER as u32, MARKER as u32 + 8)
+            (writes[0].1, writes[1].1, writes[2].1),
+            (MARKER as u32, ID_AT, MARKER as u32 + 8)
         );
         // Identity is the last data sector erased, share the first.
         let erases: Vec<_> = rig.log.iter().filter(|e| e.0 == Op::Erase).collect();
@@ -528,7 +558,7 @@ mod tests {
             erases[erases.len() - 2].1,
             memmap::FS_IDENTITY_OFFSET + SECTOR
         );
-        assert!(!recover(&mut rig).unwrap(), "a finished erase left work");
+        assert_eq!(recover(&mut rig).unwrap(), None, "a finished erase left work");
     }
 
     #[test]
@@ -541,7 +571,7 @@ mod tests {
             let before = bytes(&mut rig.inner);
             assert_eq!(destroy(&mut rig), Err(EraseFault::NotBegun));
             assert_eq!(finish(&mut rig), Err(EraseFault::NotBegun));
-            assert_eq!(recover(&mut rig), Ok(false));
+            assert_eq!(recover(&mut rig), Ok(None));
             assert_eq!(bytes(&mut rig.inner), before, "torn={torn}: bytes changed");
             assert!(rig.log.iter().all(|e| e.0 == Op::Read));
         }
@@ -558,7 +588,7 @@ mod tests {
                 .unwrap();
             let before = bytes(&mut rig.inner);
             assert_eq!(recover(&mut rig), Err(EraseFault::Damaged));
-            assert_eq!(begin(&mut rig), Err(EraseFault::Damaged));
+            assert_eq!(begin(&mut rig, &ID), Err(EraseFault::Damaged));
             assert_eq!(destroy(&mut rig), Err(EraseFault::Damaged));
             assert_eq!(finish(&mut rig), Err(EraseFault::Damaged));
             assert_eq!(bytes(&mut rig.inner), before);
@@ -614,7 +644,13 @@ mod tests {
                 let mut plain = Rig::over(restore(&img));
                 let marker_pending = classify(img[MARKER..MARKER + RECORD_LEN].try_into().unwrap())
                     == Marker::Pending;
-                recover(&mut plain).unwrap();
+                // The ack boot owes: the ORIGINAL id exactly when a committed
+                // erase was resumed, and nothing when none was committed.
+                assert_eq!(
+                    recover(&mut plain).unwrap(),
+                    marker_pending.then_some(ID),
+                    "fail={fail} after={after}: recovery's ack id"
+                );
                 // A refused read mutates nothing, so the interior of a run of
                 // verification reads yields the same bytes as its edges: nest
                 // only from distinct states, at distinct points.
@@ -637,7 +673,9 @@ mod tests {
                         let mid = bytes(&mut again.inner);
                         check_interrupted(&original, &mid, m, after2);
                         let mut last = Rig::over(restore(&mid));
-                        recover(&mut last).unwrap();
+                        let pending = classify(mid[MARKER..MARKER + RECORD_LEN].try_into().unwrap())
+                            == Marker::Pending;
+                        assert_eq!(recover(&mut last).unwrap(), pending.then_some(ID));
                         check_resolved(&original, &bytes(&mut last.inner), marker_pending);
                         states += 1;
                     }

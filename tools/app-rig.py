@@ -159,7 +159,8 @@ class Rig:
 
     def spawn(self, stub: str, salt_base: int, duplicate_salts: bool,
               image: str | None, decline: set[int], watchdog_scale: int,
-              lose: set[int] = frozenset(), erase: set[int] = frozenset()) -> None:
+              lose: set[int] = frozenset(), erase: set[int] = frozenset(),
+              erase_cut: dict[int, str] | None = None) -> None:
         # A previous, larger run's `device-N.log` would otherwise sit there looking
         # like a device this run has.
         for stale in os.listdir(self.outdir):
@@ -234,6 +235,12 @@ class Rig:
                 # second (`stub.rs::erase_keys`). Every other device keeps the default
                 # `x`, so a DataErase it is sent is refused at its glass.
                 env["STUB_ERASE_KEYS"] = "xy"
+            if erase_cut and i in erase_cut:
+                # Fix 2a: APPROVE this device's erase questions in turn, each cut by a
+                # power loss at the point its key names (`stub.rs::erase_keys`: p c a f).
+                # A committed cut reboots into `erase::recover`, which finishes the
+                # erase and sends the EraseConfirmed under the old id.
+                env["STUB_ERASE_KEYS"] = erase_cut[i]
             child = subprocess.Popen(
                 [stub],
                 stdin=master,
@@ -432,6 +439,11 @@ def main() -> int:
     ap.add_argument("--erase", type=int, action="append", default=[], metavar="N",
                     help="device N declines its first erase question and approves its "
                          "second (repeatable); every other device declines every one.")
+    ap.add_argument("--erase-cut", action="append", default=[], metavar="N[:KEYS]",
+                    help="device N approves its erase questions in turn, each cut by a "
+                         "power loss at the point its KEYS letter names (p before the "
+                         "commit, c after it, a with the ack in RAM, f in finish; "
+                         "default c); boot recovery finishes a committed one (repeatable).")
     ap.add_argument("--force-duplicate-identities", action="store_true",
                     help="MUTATION PROBE: give every device the same salt. The rig must "
                          "then fail with exit 3; if it exits 0 the identity check is dead.")
@@ -456,6 +468,18 @@ def main() -> int:
     erase = set(args.erase)
     if any(not 0 <= i < args.devices for i in erase):
         log(f"FAIL --erase {sorted(erase)} names no device (0..{args.devices - 1})")
+        return 2
+    erase_cut: dict[int, str] = {}
+    for spec in args.erase_cut:
+        n, _, keys = spec.partition(":")
+        keys = keys or "c"
+        if not n.isdigit() or int(n) in erase_cut or keys.strip("pcaf"):
+            log(f"FAIL --erase-cut {spec!r}: want N[:KEYS], KEYS from p c a f, N once")
+            return 2
+        erase_cut[int(n)] = keys
+    if any(not 0 <= i < args.devices for i in erase_cut) or erase_cut.keys() & erase:
+        log(f"FAIL --erase-cut {sorted(erase_cut)} names no device (0..{args.devices - 1}) "
+            f"or one --erase already scripts")
         return 2
     if args.image and not os.path.isfile(args.image):
         # NOT a silent fallback to the synthetic digest: that would make every device
@@ -500,7 +524,7 @@ def main() -> int:
         # watchdog stays the backstop for a rig that was SIGKILLed and cannot reap.
         watchdog_scale = max(1, int((args.timeout + args.id_timeout) // 240) + 1)
         rig.spawn(args.stub, args.salt_base, args.force_duplicate_identities,
-                  args.image, decline, watchdog_scale, lose, erase)
+                  args.image, decline, watchdog_scale, lose, erase, erase_cut)
         rig.await_identities(args.id_timeout)
         if not cmd:
             log(f"rig up; holding for {args.timeout:g}s (^C to stop). "
@@ -523,6 +547,7 @@ def main() -> int:
         env["COLDSNAP_RIG_DECLINE_SIGNING"] = ",".join(str(i) for i in sorted(decline))
         env["COLDSNAP_RIG_LOSE_FIRST_SHARE"] = ",".join(str(i) for i in sorted(lose))
         env["COLDSNAP_RIG_ERASE"] = ",".join(str(i) for i in sorted(erase))
+        env["COLDSNAP_RIG_ERASE_CUT"] = ",".join(f"{i}:{k}" for i, k in sorted(erase_cut.items()))
         log(f"running: {' '.join(cmd)}")
         # Popen, not `run`, so a dead stub is caught WHILE the command runs. It used to be
         # checked only after: a device that died mid-suite then showed up as a workflow

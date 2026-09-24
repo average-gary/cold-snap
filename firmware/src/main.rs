@@ -1579,8 +1579,8 @@ pub unsafe extern "C" fn entry_point() -> ! {
 #[cfg(target_arch = "arm")]
 fn boot() -> ! {
     use coldsnap_firmware::{
-        firmware_digest, prompt_screen_at, quiz, Checked, DebugFlash, Fault, Outbox, Session,
-        Shown, Typed,
+        firmware_digest, prompt_screen_at, quiz, recovered_erase_ack, Checked, DebugFlash, Fault,
+        Outbox, Session, Shown, Typed,
     };
     use coldsnap_hal::panic::{bump_counter, clear_counter, BootHealth, Counter};
     use coldsnap_hal::{comms, display, erase, flash, identity, psram, rng, usb};
@@ -2160,23 +2160,27 @@ fn boot() -> ! {
     // BEFORE identity generation, the session and every nonce read (task 08).
     // A committed, unfinished erase marker means the data region may hold any
     // mixture of old share and blanked nonce copies: resume it to completion, so
-    // step 8b finds a vacant identity and generates a fresh one. No
-    // `EraseConfirmed` from here — the original identity may already be gone, so
-    // no truthful ack can be signed; a waiting coordinator keeps waiting.
+    // step 8b finds a vacant identity and generates a fresh one. `recover`
+    // hands back the ORIGINAL id the marker recorded, only after the data region
+    // and marker verified blank; the link edge below sends `EraseConfirmed` from
+    // it (`recovered_erase_ack`), so a coordinator still waiting on the erase
+    // drops the share it had for that id. (Lost if power dies again before the
+    // link comes up: the coordinator keeps waiting, never told a falsehood.)
     //
     // Every `Err` is a HOLD, for step 8b's reason: bytes on flash, identical on
     // the next boot. `Damaged` (a committed marker that does not verify, or a
     // newer firmware's format) is deliberately neither resumed nor ignored —
     // ignoring it could reopen a half-erased signer, and it is never read as a
     // blank device. `Session::open` refuses a non-clear marker as well.
-    if let Err(fault) = erase::recover(&mut *flash.borrow_mut()) {
-        hold(match fault {
+    let mut recovered_erase = match erase::recover(&mut *flash.borrow_mut()) {
+        Ok(original_id) => original_id,
+        Err(fault) => hold(match fault {
             erase::EraseFault::Damaged => "erase damaged",
             erase::EraseFault::NotBegun => "erase not begun",
             erase::EraseFault::Flash(_) => "erase flash err",
             erase::EraseFault::VerifyFailed => "erase unverified",
-        })
-    }
+        }),
+    };
 
     // --- Step 8b: identity. ------------------------------------------------
     // Generated once, on the first boot that finds no committed record, and read
@@ -2605,6 +2609,11 @@ fn boot() -> ! {
         // re-registers itself on every link edge without a human touching it. Both
         // legs are the library's; nothing about naming is decided in this file.
         if !was_linked && link.is_linked() {
+            // The erase boot's step 8a finished for the device this unit USED to
+            // be: its ack first, under that old id, once (it leaves RAM with it).
+            if let Some(Ok(ack)) = recovered_erase.take().map(recovered_erase_ack) {
+                let _ = cdc.write(ack.bytes());
+            }
             let _ = session.announce(digest, &mut outbox);
         }
 
@@ -2818,12 +2827,17 @@ fn boot() -> ! {
                     Answer::Wait => glass = Some(flow),
                     Answer::Yes => {
                         let erased = session.erase(&mut outbox);
-                        if outbox.frames() > 0 {
-                            let bytes = outbox.take();
-                            let _ = cdc.write(&bytes);
-                        }
+                        let sent = outbox.frames() > 0 && cdc.write(&outbox.take()).is_ok();
                         match erased {
                             Err(Fault::Refused(_)) => refuse(panel.as_mut(), &mut glass),
+                            // The marker outlives the ack's RAM copy: cleared only once
+                            // the write returned Ok (the last packet queued in the IN
+                            // FIFO, not a host receipt). A failed write, or a power loss
+                            // before this, leaves it Pending and step 8a acks again.
+                            Ok(()) if sent => {
+                                let _ = session.finish_erase();
+                                coldsnap_hal::panic::system_reset()
+                            }
                             _ => coldsnap_hal::panic::system_reset(),
                         }
                     }
@@ -4491,6 +4505,11 @@ mod tests {
         assert!(src.contains(
             "Flow::Erase(_) => match verdict {\n                    Answer::Wait => glass = Some(flow),\n                    Answer::Yes => {\n                        let erased = session.erase(&mut outbox);"
         ));
+        // The marker is cleared at one place, after the ack's write returned Ok.
+        assert_eq!(src.matches("session.finish_erase()").count(), 1);
+        let write = src.find("let sent = outbox.frames() > 0 && cdc.write(&outbox.take()).is_ok();");
+        let finish = src.find("Ok(()) if sent => {\n                                let _ = session.finish_erase();");
+        assert!(matches!((write, finish), (Some(w), Some(f)) if w < f), "finish before the write");
         assert_eq!(src.matches("session.decline_erase()").count(), 1);
         assert_eq!(src.matches("show_erase(panel, &mut entropy, &mut glass)").count(), 1);
     }

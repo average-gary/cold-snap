@@ -161,6 +161,27 @@ pub enum Fault {
     Erase(coldsnap_hal::erase::EraseFault),
 }
 
+/// Boot's half of an erase an interruption cut short: `coldsnap_hal::erase::recover`
+/// returned `Some(original_id)` — it resumed a committed erase and verified the
+/// data region and marker blank — and this is the `CommsMisc::EraseConfirmed`
+/// the interrupted [`Session::erase`] never sent, stamped with that ORIGINAL id
+/// (the one the coordinator's `EraseDevice` waits on), not this boot's fresh one.
+/// Write its bytes after the magic reply, before the fresh identity's announce.
+///
+/// Only a live `EraseDevice` targeting `original_id` claims it; a coordinator
+/// that is not erasing this device drops it unclaimed.
+///
+/// # Errors
+///
+/// Only if framing refused a fixed one-variant body, which it cannot.
+pub fn recovered_erase_ack(
+    original_id: [u8; coldsnap_hal::erase::ID_LEN],
+) -> Result<Outbox, CommsError> {
+    let mut out = Outbox::new(DeviceId(original_id));
+    out.push(DeviceSendBody::Misc(CommsMisc::EraseConfirmed))?;
+    Ok(out)
+}
+
 impl From<CommsError> for Fault {
     fn from(e: CommsError) -> Self {
         Fault::Comms(e)
@@ -960,8 +981,14 @@ impl<'a, F: NorFlash + fmt::Debug> Session<'a, F> {
     /// 3. `begin` + `destroy` — durable, verified deletion.
     /// 4. ONLY THEN `EraseConfirmed`, stamped with the ORIGINAL id (the outbox's),
     ///    which is the id the coordinator's `EraseDevice` is waiting on.
-    /// 5. `finish` clears the marker. A fault here is harmless: the data is already
-    ///    gone and boot's `erase::recover` completes it.
+    /// 5. The marker is LEFT COMMITTED. The ack is only in RAM, so the caller
+    ///    writes `out` to the wire and calls [`Session::finish_erase`] only once that
+    ///    write returned `Ok`. A power loss or a write fault before then leaves the
+    ///    marker `Pending`, and boot's `erase::recover` completes the erase and acks
+    ///    again through [`recovered_erase_ack`] (a second ack is claimed by no one).
+    ///
+    /// `begin` records the original id in the marker, so an erase cut short
+    /// anywhere after the commit is still acked, by boot, under that id.
     ///
     /// The caller must then reset; the next boot mints a fresh identity with no
     /// share and no name.
@@ -984,11 +1011,23 @@ impl<'a, F: NorFlash + fmt::Debug> Session<'a, F> {
         self.check = None;
         {
             let mut flash = self.flash.borrow_mut();
-            erase::begin(&mut *flash).map_err(Fault::Erase)?;
+            erase::begin(&mut *flash, &self.device_id().0).map_err(Fault::Erase)?;
             erase::destroy(&mut *flash).map_err(Fault::Erase)?;
         }
         out.push(DeviceSendBody::Misc(CommsMisc::EraseConfirmed))?;
-        erase::finish(&mut *self.flash.borrow_mut()).map_err(Fault::Erase)
+        Ok(())
+    }
+
+    /// Step 5 of [`Session::erase`]: clear the marker, ONLY after the caller's write
+    /// of the `EraseConfirmed` outbox returned `Ok`. Until then the marker is the
+    /// only durable record that an ack is owed. `erase::finish` re-verifies the
+    /// data region blank first and refuses (`NotBegun`) with no marker committed.
+    ///
+    /// # Errors
+    ///
+    /// `erase::finish`'s. Harmless: the marker stays and boot's recovery acks.
+    pub fn finish_erase(&mut self) -> Result<(), Fault> {
+        coldsnap_hal::erase::finish(&mut *self.flash.borrow_mut()).map_err(Fault::Erase)
     }
 
     /// The name a coordinator has previewed but no human has approved, for a
@@ -3684,7 +3723,7 @@ mod tests {
         }
         assert_eq!(counters(&flash), c0, "a refused erase wrote");
         assert_eq!(bytes_of(&flash), before, "a refused erase changed bytes");
-        assert!(!coldsnap_hal::erase::recover(&mut *flash.borrow_mut()).unwrap());
+        assert_eq!(coldsnap_hal::erase::recover(&mut *flash.borrow_mut()).unwrap(), None);
         let session = Session::open(&flash, &secret).unwrap();
         assert_eq!(session.device_id(), id);
         assert_eq!(session.signer.held_shares().count(), 1);
@@ -3707,6 +3746,8 @@ mod tests {
                 .recv(CoordinatorSendBody::DataErase, &mut rng, &mut out)
                 .unwrap();
             session.erase(&mut out).expect("approved erase");
+            // The ack is only in RAM: the marker must still owe it to boot.
+            assert_eq!(erase::read(&mut *flash.borrow_mut()).unwrap(), erase::Marker::Pending);
             assert!(!session.erase_requested());
             // Poisoned: nothing answers for the device that no longer exists.
             assert!(matches!(
@@ -3718,12 +3759,14 @@ mod tests {
                 Err(Fault::ErasePending)
             ));
             assert!(matches!(session.erase(&mut out), Err(Fault::Refused(_))));
+            assert_eq!(out.frames(), 1, "exactly the EraseConfirmed");
+            let mut want = Outbox::new(id);
+            want.push(DeviceSendBody::Misc(CommsMisc::EraseConfirmed))
+                .unwrap();
+            assert_eq!(out.bytes(), want.bytes(), "not EraseConfirmed under the old id");
+            // The caller's write returned Ok: now, and only now, the marker goes.
+            session.finish_erase().unwrap();
         }
-        assert_eq!(out.frames(), 1, "exactly the EraseConfirmed");
-        let mut want = Outbox::new(id);
-        want.push(DeviceSendBody::Misc(CommsMisc::EraseConfirmed))
-            .unwrap();
-        assert_eq!(out.bytes(), want.bytes(), "not EraseConfirmed under the old id");
         assert!(
             bytes_of(&flash).iter().all(|&b| b == 0xff),
             "an acked erase left bytes behind"
@@ -3749,7 +3792,7 @@ mod tests {
         let approve = |flash: &RefCell<DebugFlash<FakeFlash>>,
                        secret: &IdentitySecret,
                        id: DeviceId|
-         -> (Result<(), Fault>, Outbox) {
+         -> (Result<(), Fault>, StdVec<u8>) {
             let mut rng = entropy(76);
             let mut out = Outbox::new(id);
             let mut session = Session::open(flash, secret).unwrap();
@@ -3761,7 +3804,20 @@ mod tests {
                 session.recv(CoordinatorSendBody::AnnounceAck, &mut rng, &mut out),
                 Err(Fault::ErasePending)
             ));
-            (r, out)
+            if r.is_err() {
+                return (r, StdVec::new());
+            }
+            // An ack in RAM is NOT an ack sent: a power loss here destroys the
+            // outbox, so the marker must still be there for boot to ack again.
+            assert_eq!(
+                erase::read(&mut *flash.borrow_mut()).unwrap(),
+                erase::Marker::Pending,
+                "EraseConfirmed only in RAM but the marker is gone"
+            );
+            // main.rs's order: the write returned Ok, THEN finish.
+            let wire = out.take();
+            let _ = session.finish_erase();
+            (r, wire)
         };
         let (flash, secret, id) = erase_rig(75);
         let c0 = counters(&flash);
@@ -3784,14 +3840,14 @@ mod tests {
                     f.0.refuse_erases_after(e);
                 }
             }
-            let (r, out) = approve(&flash, &secret, old);
+            let (r, wire) = approve(&flash, &secret, old);
             flash.borrow_mut().0.heal();
             let data_blank = {
                 let b = bytes_of(&flash);
                 let m = memmap::FS_ERASE_OFFSET as usize;
                 b[..m].iter().all(|&x| x == 0xff)
             };
-            if out.frames() > 0 {
+            if !wire.is_empty() {
                 acked += 1;
                 assert!(data_blank, "cut {prog:?}/{er:?}: acked before deletion");
             } else {
@@ -3803,16 +3859,25 @@ mod tests {
                 assert!(matches!(Session::open(&flash, &secret), Err(Fault::ErasePending)));
             }
             let resumed = erase::recover(&mut *flash.borrow_mut()).unwrap();
+            // Recovery acks under the ORIGINAL id and exactly when it resumed.
+            assert_eq!(resumed, (marker == erase::Marker::Pending).then_some(old.0));
             let mut rng = entropy(77);
             let now = identity::load_or_create(&mut *flash.borrow_mut(), &mut rng).unwrap();
             let session = Session::open(&flash, &now).unwrap();
             if session.device_id() == old {
-                assert!(!resumed && out.frames() == 0, "cut {prog:?}/{er:?}");
+                assert!(resumed.is_none() && wire.is_empty(), "cut {prog:?}/{er:?}");
                 assert_eq!(session.signer.held_shares().count(), 1, "cut {prog:?}/{er:?}: partial");
                 assert_eq!(session.stored_name().as_deref(), Some("doomed"));
             } else {
                 assert_eq!(session.signer.held_shares().count(), 0, "cut {prog:?}/{er:?}");
                 assert_eq!(session.stored_name(), None, "cut {prog:?}/{er:?}");
+                // FIX 2a: a device that came back fresh had its ack WRITTEN to
+                // the wire before its marker went, or boot owes it — never only
+                // an outbox in RAM. (The host write is a model; see main.rs.)
+                assert!(
+                    !wire.is_empty() || resumed == Some(old.0),
+                    "cut {prog:?}/{er:?}: erased with no EraseConfirmed from either path"
+                );
             }
         }
         // Cuts in `finish` (after the ack) and cuts before it both occurred.
@@ -4949,15 +5014,15 @@ mod tests {
             };
             (flash, secret, id)
         };
-        let run = |f: &mut DebugFlash<FakeFlash>| -> Result<(), erase::EraseFault> {
-            erase::begin(f)?;
+        let run = |f: &mut DebugFlash<FakeFlash>, id: DeviceId| -> Result<(), erase::EraseFault> {
+            erase::begin(f, &id.0)?;
             erase::destroy(f)?;
             erase::finish(f)
         };
         // Measure the schedule once rather than hardcoding it.
-        let (flash, _, _) = build();
+        let (flash, _, id) = build();
         let (p0, e0) = (flash.borrow().0.programs, flash.borrow().0.erases);
-        run(&mut flash.borrow_mut()).unwrap();
+        run(&mut flash.borrow_mut(), id).unwrap();
         let (programs, erases) = (flash.borrow().0.programs - p0, flash.borrow().0.erases - e0);
         assert!(
             programs >= 2 && erases > 2,
@@ -4986,7 +5051,7 @@ mod tests {
                 // `erases` counts PAGES and a marker erase is one 2-page call, so
                 // a cut on its second page lands on the NEXT call instead — and on
                 // the final call, nowhere.
-                let interrupted = run(&mut f).is_err();
+                let interrupted = run(&mut f, old_id).is_err();
                 f.0.heal();
                 if !interrupted {
                     continue;
@@ -4999,7 +5064,15 @@ mod tests {
                     matches!(Session::open(&flash, &secret), Err(Fault::ErasePending)),
                     "cut {prog:?}/{er:?}: a signer opened over a committed erase"
                 );
-                assert!(erase::recover(&mut *flash.borrow_mut()).unwrap());
+                let original = erase::recover(&mut *flash.borrow_mut()).unwrap();
+                assert_eq!(original, Some(old_id.0), "cut {prog:?}/{er:?}: ack id");
+                let mut want = Outbox::new(old_id);
+                want.push(DeviceSendBody::Misc(CommsMisc::EraseConfirmed)).unwrap();
+                assert_eq!(
+                    recovered_erase_ack(original.unwrap()).unwrap().bytes(),
+                    want.bytes(),
+                    "recovery's ack is not EraseConfirmed under the old id"
+                );
                 let mut rng = entropy(62);
                 let fresh = identity::load_or_create(&mut *flash.borrow_mut(), &mut rng).unwrap();
                 assert!(fresh != secret, "cut {prog:?}/{er:?}: identity survived");
@@ -5009,7 +5082,7 @@ mod tests {
             } else {
                 // Never committed: nothing may have been destroyed.
                 assert_eq!(marker, erase::Marker::Clear);
-                assert!(!erase::recover(&mut *flash.borrow_mut()).unwrap());
+                assert_eq!(erase::recover(&mut *flash.borrow_mut()).unwrap(), None);
                 let session = Session::open(&flash, &secret).unwrap();
                 assert_eq!(session.device_id(), old_id);
                 assert_eq!(
