@@ -133,5 +133,30 @@
       "Other untested physical behaviour: SSD1306 init/timing/legibility, TRNG sources and health checks, callgate, panic->reset, real STM32 program/erase and power-loss durability, FROST latency on a 120 MHz M4F, OCTOSPI/PSRAM, RDP/PCROP",
       "Replug/restart physically: a real unplug power-cycles; the ARM image announces only on a link edge and does not re-announce on a coordinator re-open, so test 8 is not evidence the shipped firmware survives an app restart"
     ]
+  },
+  {
+    "task": "06",
+    "slug": "add-mk4-host-updater",
+    "status": "DEGRADED",
+    "reason": "5/5 criteria met at pty/stub-peer scope; two CONFIRMED findings open (repair-round logs only in /tmp, not target/; nonexistent --port reported after 30 s as a peer that never answered). Verbatim `cargo test -p frostsnap_coordinator` exits 101 BLOCKED solely by the user's untracked tests/coldcard_msg_len.rs:97 (E0308); every other target exits 0. R1 (weak CLI refusal needles) and R2 (surplus 0x11 could shift the final ack) fixed and re-verified. Flutter 3.38.5/Dart 3.10.4 pinned; no regtest (not applicable).",
+    "evidence": "06-add-mk4-host-updater.md",
+    "commit": "87733279119fa29ed9208c051d2f2acab746111a",
+    "commits": {
+      "frostsnap": "87733279119fa29ed9208c051d2f2acab746111a",
+      "cold-snap": "the commit that adds this entry (git -C cold-snap log -1 -- target/software-only/evidence/run.json)"
+    },
+    "open_confirmed": [
+      "O1: repair-round logs written to /tmp/r06_*.log, not under ignored target/",
+      "O2: coldsnap-mk4-update with a nonexistent --port path waits 30 s and reports 'never answered the handshake' instead of the open failure"
+    ],
+    "criteria_met": 5,
+    "criteria_total": 5,
+    "bench_only": [
+      "Staging and installation of key-0 Mk4 artifacts on a real Mk4 over real USB CDC; bootloader acceptance on silicon",
+      "Framed-to-raw boundary on real USB: late MAGIC_REPLY or link residue after the 100 ms readiness gap",
+      "Real PSRAM self-test/read-back time versus the 5 s port timeout",
+      "Install request and verified reconnect (task-07 installation-controller peer, then a device)",
+      "Effect on a real ESP32 of Mk4 PrepareUpgrade2/EnterUpgradeMode sent while it is handshaken but unannounced"
+    ]
   }
 ]

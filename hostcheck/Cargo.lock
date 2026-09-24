@@ -455,6 +455,7 @@ dependencies = [
  "rusqlite",
  "rustls",
  "rustls-pki-types",
+ "secp256k1 0.29.1",
  "serde",
  "serialport",
  "sha2",
