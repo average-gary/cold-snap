@@ -148,6 +148,17 @@ pub enum Fault {
     /// from the top of `Session::run`, before the outbox is touched, so a
     /// coordinator never hears about a share this device did not keep.
     Store(StoreFault),
+    /// [`Session::open`] found the erase marker anything but clear (or could
+    /// not read it): an erase is committed and unfinished, or its marker is
+    /// damaged. No signer is built over a data region that may be half-erased;
+    /// boot runs `coldsnap_hal::erase::recover` first, so reaching this is a
+    /// caller that skipped it.
+    ErasePending,
+    /// [`Session::erase`] could not finish. The session is poisoned either way
+    /// (every later call is [`Fault::ErasePending`]) and nothing was acked unless
+    /// deletion was verified; a committed marker is resumed by
+    /// `coldsnap_hal::erase::recover` on the next boot.
+    Erase(coldsnap_hal::erase::EraseFault),
 }
 
 impl From<CommsError> for Fault {
@@ -179,8 +190,11 @@ pub enum Refusal {
     ///   stays unbound and classified `Destructive`, and DFU stays
     ///   hardware-impossible (`mk4-bootloader/dispatch.c:150-165` returns `EPERM`).
     FirmwareUpgrade,
-    /// `DataErase`: destroys shares. Only ever behind physical consent, and no
-    /// such screen or button path exists yet.
+    /// `DataErase` with no live consent question behind it. [`Session::recv`]
+    /// ADMITS `DataErase` — it only raises a question ([`Session::erase_requested`])
+    /// and writes nothing — and this is what [`Session::erase`] returns when that
+    /// question was never asked, was withdrawn by any later coordinator message
+    /// (a `Cancel` included), or was already answered.
     DataErase,
     /// `Challenge`: needs the ESP32 hardware-RSA DS peripheral and a factory
     /// certificate this device does not have. Upstream never sends it
@@ -797,6 +811,17 @@ pub struct Session<'a, F: NorFlash + fmt::Debug> {
     /// retires the previous quiz. RAM-only, like both other grants: an unplug
     /// mid-quiz costs a round trip and never a share.
     check: Option<Checking>,
+    /// The flash every store above lives on, for [`Session::erase`] — the one
+    /// operation that spans all of them.
+    flash: &'a RefCell<F>,
+    /// A coordinator sent `DataErase` and nothing since. RAM-only, never written:
+    /// the question costs no flash, and only [`Session::erase`] — reached from a
+    /// physical yes to the screen [`erase_screen`] draws — acts on it.
+    erase_asked: bool,
+    /// [`Session::erase`] has started. From here the in-RAM signer describes a
+    /// device that no longer exists, so every entry point refuses with
+    /// [`Fault::ErasePending`] and the caller must reset.
+    erased: bool,
 }
 
 /// One consented quiz: the machine, plus the two PUBLIC values
@@ -841,6 +866,15 @@ impl<'a, F: NorFlash + fmt::Debug> Session<'a, F> {
     /// `Session::run` would sit on flash while `RequestHeldShares` answered
     /// empty — the gap being closed here, seen from the other end.
     pub fn open(flash: &'a RefCell<F>, secret: &IdentitySecret) -> Result<Self, Fault> {
+        // BEFORE the nonce slots are read and the share replayed: a committed,
+        // unfinished erase means these regions may hold any mixture of old share
+        // and blanked nonce copies, and a signer over that mixture could reissue
+        // a nonce under a live share. Belt to `main.rs`'s step 8a, for every
+        // caller that is not `main.rs`.
+        match coldsnap_hal::erase::read(&mut *flash.borrow_mut()) {
+            Ok(coldsnap_hal::erase::Marker::Clear) => {}
+            _ => return Err(Fault::ErasePending),
+        }
         let scalar = Scalar::<Secret, NonZero>::from_bytes(*secret.expose_secret())
             .ok_or(Fault::IdentityScalar)?;
         let slots = NonceAbSlot::load_slots(FlashPartition::new(
@@ -888,7 +922,73 @@ impl<'a, F: NorFlash + fmt::Debug> Session<'a, F> {
             // And the same rule again, for the grant that holds PLAINTEXT: a quiz
             // does not survive a reset, so the words are gone with the RAM.
             check: None,
+            flash,
+            // RAM-only, like every grant: an erase question does not survive a reset.
+            erase_asked: false,
+            erased: false,
         })
+    }
+
+    /// A coordinator asked this device to erase itself and has sent nothing since.
+    /// The caller draws [`erase_screen`] and, on a physical yes, calls
+    /// [`Session::erase`]; on anything else, [`Session::decline_erase`].
+    #[must_use]
+    pub fn erase_requested(&self) -> bool {
+        self.erase_asked && !self.erased
+    }
+
+    /// The human said no (or pressed a key the screen did not offer). Nothing was
+    /// written and nothing is sent: upstream's `EraseDevice` has no refusal message,
+    /// so the coordinator's dialog stays open until the user cancels it there.
+    pub fn decline_erase(&mut self) {
+        self.erase_asked = false;
+    }
+
+    /// ERASE THIS DEVICE: identity, share, nonce slots and name, through
+    /// `coldsnap_hal::erase` (marker first, share first, identity last, each page
+    /// verified blank). Only with a live [`Session::erase_requested`] question —
+    /// the caller's job is to have put [`erase_screen`] on the glass and seen its
+    /// digit pressed.
+    ///
+    /// Order, and it is the point of the function:
+    ///
+    /// 1. The session is poisoned BEFORE the first write, so a flash fault part way
+    ///    through cannot leave a signer answering over half-erased regions.
+    /// 2. RAM secrets are dropped: the identity seed is zeroed, the signer's tmp
+    ///    state, every grant and the previewed name are cleared. (The signer's own
+    ///    key map stays until the reset — it is unreachable behind the poison.)
+    /// 3. `begin` + `destroy` — durable, verified deletion.
+    /// 4. ONLY THEN `EraseConfirmed`, stamped with the ORIGINAL id (the outbox's),
+    ///    which is the id the coordinator's `EraseDevice` is waiting on.
+    /// 5. `finish` clears the marker. A fault here is harmless: the data is already
+    ///    gone and boot's `erase::recover` completes it.
+    ///
+    /// The caller must then reset; the next boot mints a fresh identity with no
+    /// share and no name.
+    pub fn erase(&mut self, out: &mut Outbox) -> Result<(), Fault> {
+        use coldsnap_hal::erase;
+        if self.erased || !core::mem::take(&mut self.erase_asked) {
+            return Err(Fault::Refused(Refusal::DataErase));
+        }
+        self.erased = true;
+        for b in self.secrets.seed.iter_mut() {
+            // SAFETY: `b` is a valid `&mut u8`. Volatile so the zeroing of a seed
+            // that is never read again is not optimised out.
+            unsafe { core::ptr::write_volatile(b, 0) };
+        }
+        self.signer.clear_tmp_data();
+        self.pending_name = None;
+        self.reveal = None;
+        self.record_pending = false;
+        self.entry = None;
+        self.check = None;
+        {
+            let mut flash = self.flash.borrow_mut();
+            erase::begin(&mut *flash).map_err(Fault::Erase)?;
+            erase::destroy(&mut *flash).map_err(Fault::Erase)?;
+        }
+        out.push(DeviceSendBody::Misc(CommsMisc::EraseConfirmed))?;
+        erase::finish(&mut *self.flash.borrow_mut()).map_err(Fault::Erase)
     }
 
     /// The name a coordinator has previewed but no human has approved, for a
@@ -941,6 +1041,9 @@ impl<'a, F: NorFlash + fmt::Debug> Session<'a, F> {
     /// Send this on the magic-bytes **edge**, not once per boot: a coordinator
     /// that restarts re-sends magic and expects a fresh announce.
     pub fn announce(&self, firmware_digest: Sha256Digest, out: &mut Outbox) -> Result<(), Fault> {
+        if self.erased {
+            return Err(Fault::ErasePending);
+        }
         out.push(DeviceSendBody::Announce { firmware_digest })?;
         match self.names.load() {
             // `truncate` cannot shorten anything that got here: the name was
@@ -966,6 +1069,14 @@ impl<'a, F: NorFlash + fmt::Debug> Session<'a, F> {
         rng: &mut R,
         out: &mut Outbox,
     ) -> Result<Vec<DeviceToUserMessage>, Fault> {
+        if self.erased {
+            return Err(Fault::ErasePending);
+        }
+        // An erase question is answered against the message that raised it and
+        // nothing later: ANY other coordinator body — `Cancel` among them —
+        // withdraws it, so a digit pressed afterwards cannot erase for a request the
+        // coordinator has moved on from.
+        self.erase_asked = matches!(body, CoordinatorSendBody::DataErase);
         match body {
             CoordinatorSendBody::Core(core) => self.recv_core(core, rng, out),
 
@@ -1069,7 +1180,9 @@ impl<'a, F: NorFlash + fmt::Debug> Session<'a, F> {
             // `firmware_upgrade_is_refused` guards a live path rather than a
             // tautology.
             CoordinatorSendBody::Upgrade(_) => Err(Fault::Refused(Refusal::FirmwareUpgrade)),
-            CoordinatorSendBody::DataErase => Err(Fault::Refused(Refusal::DataErase)),
+            // ADMITTED, and it does nothing but raise the question (set above): no
+            // marker, no write, no reply. See [`Session::erase`].
+            CoordinatorSendBody::DataErase => Ok(Vec::new()),
             CoordinatorSendBody::Challenge(_) => Err(Fault::Refused(Refusal::GenuineChallenge)),
         }
     }
@@ -1328,6 +1441,9 @@ impl<'a, F: NorFlash + fmt::Debug> Session<'a, F> {
         rng: &mut R,
         out: &mut Outbox,
     ) -> Result<Vec<DeviceToUserMessage>, Fault> {
+        if self.erased {
+            return Err(Fault::ErasePending);
+        }
         // FAIL CLOSED, before any share or signature share exists. A `confirm`
         // can only mean "the human read the screen and pressed yes", so a prompt
         // this device could not have DRAWN IN FULL is one no human can have
@@ -2515,6 +2631,20 @@ fn consent_screen(frame: &mut ui::Frame, lines: [&str; 4], confirm: ui::ConfirmD
     fits
 }
 
+/// The ERASE consent screen: what a yes destroys, and the one digit that says yes.
+///
+/// Drawn by the caller when [`Session::erase_requested`] is set; the digit is the
+/// caller's (`ui::ConfirmDigit::draw`), the same split every other consent screen
+/// keeps. Returns [`consent_screen`]'s "every line fit" — a screen that lost
+/// characters must not be answered.
+pub fn erase_screen(frame: &mut ui::Frame, confirm: ui::ConfirmDigit) -> bool {
+    consent_screen(
+        frame,
+        ["ERASE DEVICE?", "id+share+nonces", "+name DELETED", "funds need bkup"],
+        confirm,
+    )
+}
+
 /// One page of a bitcoin transaction's consent screen, drawn.
 ///
 /// Split out of [`prompt_screen_at`]'s arm so that the paging is REACHABLE FROM A
@@ -3454,11 +3584,239 @@ mod tests {
         );
     }
 
-    /// `DataErase` destroys shares. Never without physical consent, and no such
-    /// path exists.
+    /// A device holding a persisted share, an open nonce stream and a stored
+    /// name — the state an erase must destroy — plus its secret and id.
+    fn erase_rig(
+        salt: u8,
+    ) -> (RefCell<DebugFlash<FakeFlash>>, IdentitySecret, DeviceId) {
+        let flash = fs_flash();
+        let mut rng = entropy(salt);
+        let secret = identity::load_or_create(&mut *flash.borrow_mut(), &mut rng).unwrap();
+        let id = {
+            let mut session = Session::open(&flash, &secret).unwrap();
+            let id = session.device_id();
+            let mut out = Outbox::new(id);
+            let (_, streams) = open_streams(1, &mut rng);
+            session.recv(streams, &mut rng, &mut out).expect("streams");
+            stage_a_finished_keygen(&mut session, 9);
+            session
+                .recv(one_frame_body(id), &mut rng, &mut out)
+                .expect("persist");
+            NameStore::open(&flash).save("doomed").expect("name");
+            id
+        };
+        (flash, secret, id)
+    }
+
+    fn counters(flash: &RefCell<DebugFlash<FakeFlash>>) -> (u32, u32) {
+        let f = flash.borrow();
+        (f.0.programs, f.0.erases)
+    }
+
+    fn bytes_of(flash: &RefCell<DebugFlash<FakeFlash>>) -> StdVec<u8> {
+        let mut buf = vec![0u8; memmap::FS_FREE_OFFSET as usize];
+        flash.borrow_mut().read(0, &mut buf).unwrap();
+        buf
+    }
+
+    /// Task 08 NEGATIVES. `DataErase` is admitted as a QUESTION and nothing else:
+    /// no program, no erase, no reply. And [`Session::erase`] refuses — still
+    /// writing nothing — for every way consent can be missing: never asked, asked
+    /// then declined, asked then `Cancel`led, asked then overtaken by any other
+    /// message (stale), and asked-and-answered twice. After all of it the device
+    /// reopens with the same id, its share and its name.
     #[test]
-    fn data_erase_is_refused() {
-        assert_eq!(refuse(CoordinatorSendBody::DataErase), Refusal::DataErase);
+    fn no_erase_without_a_live_consented_request() {
+        let (flash, secret, id) = erase_rig(71);
+        let before = bytes_of(&flash);
+        let c0 = counters(&flash);
+        let mut rng = entropy(72);
+        {
+            let mut session = Session::open(&flash, &secret).unwrap();
+            let mut out = Outbox::new(id);
+            let refused = |s: &mut Session<'_, _>, out: &mut Outbox| {
+                assert!(matches!(
+                    s.erase(out),
+                    Err(Fault::Refused(Refusal::DataErase))
+                ));
+            };
+            // Never asked.
+            assert!(!session.erase_requested());
+            refused(&mut session, &mut out);
+            // Asked: a question, and nothing written or sent.
+            let prompts = session
+                .recv(CoordinatorSendBody::DataErase, &mut rng, &mut out)
+                .expect("DataErase is admitted");
+            assert!(prompts.is_empty());
+            assert!(session.erase_requested());
+            assert_eq!(counters(&flash), c0, "the question itself touched flash");
+            // Declined.
+            session.decline_erase();
+            refused(&mut session, &mut out);
+            // Cancelled.
+            session
+                .recv(CoordinatorSendBody::DataErase, &mut rng, &mut out)
+                .unwrap();
+            session
+                .recv(CoordinatorSendBody::Cancel, &mut rng, &mut out)
+                .unwrap();
+            assert!(!session.erase_requested(), "Cancel left the question up");
+            refused(&mut session, &mut out);
+            // Stale: overtaken by an unrelated message.
+            session
+                .recv(CoordinatorSendBody::DataErase, &mut rng, &mut out)
+                .unwrap();
+            session
+                .recv(CoordinatorSendBody::AnnounceAck, &mut rng, &mut out)
+                .unwrap();
+            refused(&mut session, &mut out);
+            // Malformed: a body that is not `DataErase` never raises it.
+            let _ = session.recv(
+                CoordinatorSendBody::Upgrade(
+                    frostsnap_comms::CoordinatorUpgradeMessage::EnterUpgradeMode,
+                ),
+                &mut rng,
+                &mut out,
+            );
+            assert!(!session.erase_requested());
+            refused(&mut session, &mut out);
+            assert_eq!(out.frames(), 0, "a refused erase answered");
+        }
+        assert_eq!(counters(&flash), c0, "a refused erase wrote");
+        assert_eq!(bytes_of(&flash), before, "a refused erase changed bytes");
+        assert!(!coldsnap_hal::erase::recover(&mut *flash.borrow_mut()).unwrap());
+        let session = Session::open(&flash, &secret).unwrap();
+        assert_eq!(session.device_id(), id);
+        assert_eq!(session.signer.held_shares().count(), 1);
+        assert_eq!(session.stored_name().as_deref(), Some("doomed"));
+    }
+
+    /// Task 08 APPROVED FLOW, at the session. A yes erases, and `EraseConfirmed`
+    /// leaves under the ORIGINAL id only once the data region reads blank. The
+    /// session is poisoned; the reopened flash is a fresh device: new id, no share,
+    /// no name, and only the outbox's one frame was ever sent.
+    #[test]
+    fn an_approved_erase_acks_after_deletion_and_reopens_fresh() {
+        use coldsnap_hal::erase;
+        let (flash, secret, id) = erase_rig(73);
+        let mut rng = entropy(74);
+        let mut out = Outbox::new(id);
+        {
+            let mut session = Session::open(&flash, &secret).unwrap();
+            session
+                .recv(CoordinatorSendBody::DataErase, &mut rng, &mut out)
+                .unwrap();
+            session.erase(&mut out).expect("approved erase");
+            assert!(!session.erase_requested());
+            // Poisoned: nothing answers for the device that no longer exists.
+            assert!(matches!(
+                session.recv(CoordinatorSendBody::AnnounceAck, &mut rng, &mut out),
+                Err(Fault::ErasePending)
+            ));
+            assert!(matches!(
+                session.announce(Sha256Digest([0; 32]), &mut out),
+                Err(Fault::ErasePending)
+            ));
+            assert!(matches!(session.erase(&mut out), Err(Fault::Refused(_))));
+        }
+        assert_eq!(out.frames(), 1, "exactly the EraseConfirmed");
+        let mut want = Outbox::new(id);
+        want.push(DeviceSendBody::Misc(CommsMisc::EraseConfirmed))
+            .unwrap();
+        assert_eq!(out.bytes(), want.bytes(), "not EraseConfirmed under the old id");
+        assert!(
+            bytes_of(&flash).iter().all(|&b| b == 0xff),
+            "an acked erase left bytes behind"
+        );
+        assert_eq!(erase::read(&mut *flash.borrow_mut()).unwrap(), erase::Marker::Clear);
+        let fresh = identity::load_or_create(&mut *flash.borrow_mut(), &mut rng).unwrap();
+        let session = Session::open(&flash, &fresh).unwrap();
+        assert_ne!(session.device_id(), id);
+        assert_eq!(session.signer.held_shares().count(), 0);
+        assert_eq!(session.stored_name(), None);
+    }
+
+    /// Task 08 INTERRUPTION MATRIX, through `Session::erase`: a cut at every
+    /// program and every page erase of an approved erase. Whatever the cut:
+    /// `EraseConfirmed` is in the outbox ONLY if the data already reads blank; the
+    /// session is poisoned; and after boot's `recover` the flash is either the old
+    /// device whole (marker never committed) or a fresh one (it did) — never a
+    /// signer over a mixture. Host fault injection: says nothing about STM32 erase
+    /// physics.
+    #[test]
+    fn an_erase_cut_at_any_flash_call_acks_only_after_deletion() {
+        use coldsnap_hal::erase;
+        let approve = |flash: &RefCell<DebugFlash<FakeFlash>>,
+                       secret: &IdentitySecret,
+                       id: DeviceId|
+         -> (Result<(), Fault>, Outbox) {
+            let mut rng = entropy(76);
+            let mut out = Outbox::new(id);
+            let mut session = Session::open(flash, secret).unwrap();
+            session
+                .recv(CoordinatorSendBody::DataErase, &mut rng, &mut out)
+                .unwrap();
+            let r = session.erase(&mut out);
+            assert!(matches!(
+                session.recv(CoordinatorSendBody::AnnounceAck, &mut rng, &mut out),
+                Err(Fault::ErasePending)
+            ));
+            (r, out)
+        };
+        let (flash, secret, id) = erase_rig(75);
+        let c0 = counters(&flash);
+        approve(&flash, &secret, id).0.unwrap();
+        let (programs, erases) = (counters(&flash).0 - c0.0, counters(&flash).1 - c0.1);
+        assert!(programs >= 2 && erases > 2, "{programs} programs, {erases} erases");
+
+        let mut cuts = StdVec::new();
+        cuts.extend((0..programs).map(|p| (Some(c0.0 + p), None)));
+        cuts.extend((0..erases).map(|e| (None, Some(c0.1 + e))));
+        let (mut acked, mut unacked) = (0, 0);
+        for (prog, er) in cuts {
+            let (flash, secret, old) = erase_rig(75);
+            {
+                let mut f = flash.borrow_mut();
+                if let Some(p) = prog {
+                    f.0.refuse_programs_after(p);
+                }
+                if let Some(e) = er {
+                    f.0.refuse_erases_after(e);
+                }
+            }
+            let (r, out) = approve(&flash, &secret, old);
+            flash.borrow_mut().0.heal();
+            let data_blank = {
+                let b = bytes_of(&flash);
+                let m = memmap::FS_ERASE_OFFSET as usize;
+                b[..m].iter().all(|&x| x == 0xff)
+            };
+            if out.frames() > 0 {
+                acked += 1;
+                assert!(data_blank, "cut {prog:?}/{er:?}: acked before deletion");
+            } else {
+                unacked += 1;
+                assert!(r.is_err(), "cut {prog:?}/{er:?}: Ok without an ack");
+            }
+            let marker = erase::read(&mut *flash.borrow_mut()).unwrap();
+            if marker == erase::Marker::Pending {
+                assert!(matches!(Session::open(&flash, &secret), Err(Fault::ErasePending)));
+            }
+            let resumed = erase::recover(&mut *flash.borrow_mut()).unwrap();
+            let mut rng = entropy(77);
+            let now = identity::load_or_create(&mut *flash.borrow_mut(), &mut rng).unwrap();
+            let session = Session::open(&flash, &now).unwrap();
+            if session.device_id() == old {
+                assert!(!resumed && out.frames() == 0, "cut {prog:?}/{er:?}");
+                assert_eq!(session.signer.held_shares().count(), 1, "cut {prog:?}/{er:?}: partial");
+                assert_eq!(session.stored_name().as_deref(), Some("doomed"));
+            } else {
+                assert_eq!(session.signer.held_shares().count(), 0, "cut {prog:?}/{er:?}");
+                assert_eq!(session.stored_name(), None, "cut {prog:?}/{er:?}");
+            }
+        }
+        // Cuts in `finish` (after the ack) and cuts before it both occurred.
+        assert!(acked > 0 && unacked > 0, "acked {acked}, unacked {unacked}");
     }
 
     /// `DisplayBackup` for a share this device does not hold is refused **before any
@@ -4558,6 +4916,111 @@ mod tests {
              no share ({} B): the share is not in it",
             empty_out.bytes().len()
         );
+    }
+
+    /// Task 08: an erase interrupted at every flash call boundary, reconstructed
+    /// from the resulting BYTES with a real persisted share and an open nonce
+    /// stream on them. While the marker is committed, no signer opens — not even
+    /// with the OLD identity secret still in hand. After `erase::recover` the
+    /// same flash is a fresh device: new `DeviceId`, no share. Where the marker
+    /// never committed, the old device comes back whole.
+    ///
+    /// Interruptions are FakeFlash refusals scheduled by count (all-or-nothing per
+    /// call), so this is host fault injection only: it says nothing about a torn
+    /// STM32 page erase.
+    #[test]
+    fn an_interrupted_erase_never_reopens_a_signer_and_resumes_to_a_fresh_device() {
+        use coldsnap_hal::erase;
+        let build = || {
+            let flash = fs_flash();
+            let mut rng = entropy(61);
+            let secret = identity::load_or_create(&mut *flash.borrow_mut(), &mut rng).unwrap();
+            let id = {
+                let mut session = Session::open(&flash, &secret).unwrap();
+                let id = session.device_id();
+                let mut out = Outbox::new(id);
+                let (_, streams) = open_streams(1, &mut rng);
+                session.recv(streams, &mut rng, &mut out).expect("streams");
+                stage_a_finished_keygen(&mut session, 9);
+                session
+                    .recv(one_frame_body(id), &mut rng, &mut out)
+                    .expect("persist");
+                id
+            };
+            (flash, secret, id)
+        };
+        let run = |f: &mut DebugFlash<FakeFlash>| -> Result<(), erase::EraseFault> {
+            erase::begin(f)?;
+            erase::destroy(f)?;
+            erase::finish(f)
+        };
+        // Measure the schedule once rather than hardcoding it.
+        let (flash, _, _) = build();
+        let (p0, e0) = (flash.borrow().0.programs, flash.borrow().0.erases);
+        run(&mut flash.borrow_mut()).unwrap();
+        let (programs, erases) = (flash.borrow().0.programs - p0, flash.borrow().0.erases - e0);
+        assert!(
+            programs >= 2 && erases > 2,
+            "{programs} programs, {erases} erases"
+        );
+
+        let mut cuts = StdVec::new();
+        for p in 0..programs {
+            cuts.push((Some(p0 + p), None));
+        }
+        for e in 0..erases {
+            cuts.push((None, Some(e0 + e)));
+        }
+        let n_cuts = cuts.len();
+        let mut observed = 0;
+        for (prog, er) in cuts {
+            let (flash, secret, old_id) = build();
+            {
+                let mut f = flash.borrow_mut();
+                if let Some(p) = prog {
+                    f.0.refuse_programs_after(p);
+                }
+                if let Some(e) = er {
+                    f.0.refuse_erases_after(e);
+                }
+                // `erases` counts PAGES and a marker erase is one 2-page call, so
+                // a cut on its second page lands on the NEXT call instead — and on
+                // the final call, nowhere.
+                let interrupted = run(&mut f).is_err();
+                f.0.heal();
+                if !interrupted {
+                    continue;
+                }
+                observed += 1;
+            }
+            let marker = erase::read(&mut *flash.borrow_mut()).unwrap();
+            if marker == erase::Marker::Pending {
+                assert!(
+                    matches!(Session::open(&flash, &secret), Err(Fault::ErasePending)),
+                    "cut {prog:?}/{er:?}: a signer opened over a committed erase"
+                );
+                assert!(erase::recover(&mut *flash.borrow_mut()).unwrap());
+                let mut rng = entropy(62);
+                let fresh = identity::load_or_create(&mut *flash.borrow_mut(), &mut rng).unwrap();
+                assert!(fresh != secret, "cut {prog:?}/{er:?}: identity survived");
+                let session = Session::open(&flash, &fresh).unwrap();
+                assert_ne!(session.device_id(), old_id);
+                assert_eq!(session.signer.held_shares().count(), 0, "a share survived");
+            } else {
+                // Never committed: nothing may have been destroyed.
+                assert_eq!(marker, erase::Marker::Clear);
+                assert!(!erase::recover(&mut *flash.borrow_mut()).unwrap());
+                let session = Session::open(&flash, &secret).unwrap();
+                assert_eq!(session.device_id(), old_id);
+                assert_eq!(
+                    session.signer.held_shares().count(),
+                    1,
+                    "cut {prog:?}/{er:?}: an uncommitted erase destroyed the share"
+                );
+            }
+        }
+        // Every cut but the second page of the final (completion) erase.
+        assert_eq!(observed, n_cuts - 1, "the cut schedule collapsed");
     }
 
     /// THE ORDERING PROPERTY. A share that could not be written is a share the

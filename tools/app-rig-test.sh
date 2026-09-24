@@ -46,6 +46,7 @@ exec python3 "$REPO/tools/app-rig.py" \
     --devices 4 \
     --decline-signing 2 \
     --lose-first-share 3 \
+    --erase 1 \
     --timeout 1200 \
     "$@" \
     -- /bin/sh -c "cd '$APP/frostsnapp' && BUNDLE_FIRMWARE=0 exec flutter test $TEST -d macos"

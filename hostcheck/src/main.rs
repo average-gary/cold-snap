@@ -390,6 +390,17 @@
 //!    construction uses `new` and bails: bounding the INPUT is the only thing that catches
 //!    it, and the 15-char mutation above is the proof that it does.
 //!
+//!  M9 -- SUPERSEDED IN PART BY TASK 08. The device now ADMITS `DataErase` as a glass
+//!  question instead of refusing it, so M9 moved to the END of leg 2 (the blank device,
+//!  after its consolidation, so no share the rest of the pass reads is at stake) and
+//!  became two phases: M9a drives `EraseDevice`, the glass DECLINES, and the same two
+//!  halves below are asserted with `declined=DataErase` in place of `refused=DataErase`;
+//!  M9b drives a second `EraseDevice`, the glass APPROVES, and it must reach
+//!  `Completion::Success`, after which an id this coordinator has never seen must
+//!  announce, send `NeedName` and report holding nothing. `refused=DataErase` is now a
+//!  failure. The history below (task 03) is kept as written; its measurements are of the
+//!  refusing device and were not re-measured.
+//!
 //!  M9 (`erase_device` MUST NEVER COMPLETE). The one flow whose CORRECT behaviour is to
 //!  hang, which is exactly why it needs an explicit assertion: an unasserted hang is
 //!  indistinguishable from a harness that forgot to drive anything. Runs as a new
@@ -1573,8 +1584,16 @@ struct Sign {
 /// DEADLINE keeps its documented ~2.53x ratio.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Phase {
-    /// M9: upstream's `EraseDevice`, which must NEVER reach `Completion::Success`.
+    /// M9a (task 08): upstream's `EraseDevice` at the LEG-2 device, which this pass
+    /// DECLINES at the glass (`STUB_ERASE_KEYS`' first byte). It must not reach
+    /// `Completion::Success` for [`ERASE_GRACE`], and the device must report
+    /// `declined=DataErase` for the frame this driver sent.
     Erase,
+    /// M9b (task 08): a SECOND `EraseDevice` at the same device, APPROVED at the glass.
+    /// Must reach `Completion::Success` (only `CommsMisc::EraseConfirmed` does that),
+    /// and then a device this coordinator has never seen must announce with
+    /// `NeedName` and report holding nothing. DESTRUCTIVE, hence after everything.
+    Erased,
     /// M7b: `DisplayBackupProtocol`.
     Reveal,
     /// M7c: `CheckBackupProtocol`.
@@ -1613,7 +1632,7 @@ enum Phase {
 impl Phase {
     fn state(self) -> State {
         match self {
-            Phase::Erase => State::EraseRefusal,
+            Phase::Erase | Phase::Erased => State::EraseRefusal,
             Phase::Reveal => State::BackupReveal,
             Phase::Quiz => State::BackupQuiz,
             // `SavedV1` shares `BackupIngest`'s state deliberately: it is the tail of
@@ -1708,6 +1727,20 @@ struct Restore {
     /// kept because it is what makes the scoping true by construction rather than by the
     /// current position of one other block.
     erase_refusals: usize,
+    /// Task 08: does this leg end in M9a/M9b? Only leg 2 (the blank device) does —
+    /// erasing leg 1's device would take a threshold member out of a wallet the rest
+    /// of the pass still reads.
+    erase_last: bool,
+    /// M9b: `EraseDevice` reached `Completion::Success`.
+    erase_confirmed: bool,
+    /// M9b: the id that announced for the first time AFTER the confirmation.
+    fresh: Option<DeviceId>,
+    /// M9b: that id sent `NeedName`, i.e. no name survived.
+    fresh_need_name: bool,
+    /// M9b: `request_held_shares(fresh)` was sent.
+    fresh_asked: bool,
+    /// M9b: that id reported holding nothing at all.
+    fresh_empty: bool,
 }
 
 impl Restore {
@@ -1746,6 +1779,12 @@ impl Restore {
             saved_v1_threshold: None,
             erase_at: None,
             erase_refusals: 0,
+            erase_last: false,
+            erase_confirmed: false,
+            fresh: None,
+            fresh_need_name: false,
+            fresh_asked: false,
+            fresh_empty: false,
         }
     }
 
@@ -1943,33 +1982,22 @@ fn restore_step(
         Phase::Erase => {
             if !r.started {
                 r.started = true;
-                // `()` for the sink: `EraseDeviceState` only ever says what this process
-                // already knows by having polled — `WaitingForConfirmation` is pushed by
-                // `poll` itself — and the two facts this phase asserts are
-                // `is_complete()` and what came back on the wire.
                 *ui = Some(Box::new(EraseDevice::new(r.device, ())));
-                // A documented no-op for THIS driver (`UiProtocol::connected`'s default
-                // body is empty and `EraseDevice` does not override it), unlike M7d
-                // where trap 4 bites. Kept so all five arms drive the identical
-                // lifecycle, which is the seam being tested.
                 if let Some(p) = ui.as_mut() {
                     p.connected(r.device, DeviceMode::Ready);
                 }
                 r.erase_at = Some(Instant::now());
                 eprintln!(
-                    "hostcheck: M9 -- driving UPSTREAM's EraseDevice at {}; it must NEVER \
-                     complete",
+                    "hostcheck: M9a -- driving UPSTREAM's EraseDevice at {}; the glass DECLINES \
+                     it, so it must NOT complete",
                     r.device
                 );
             }
-            // HALF ONE. Nothing but `CommsMisc::EraseConfirmed` can produce this, and the
-            // `Completion::Abort` arm at the top of this function covers the other half
-            // of `is_complete()`.
             if done(ui) {
                 bail!(
-                    "ERASE COMPLETED: upstream's EraseDevice reached Completion::Success at \
-                     {}, which it only does on CommsMisc::EraseConfirmed -- this device \
-                     answered a DataErase it is supposed to refuse outright",
+                    "ERASE COMPLETED ON A NO: upstream's EraseDevice reached Completion::Success \
+                     at {}, which it only does on CommsMisc::EraseConfirmed -- the device erased \
+                     after its erase question was declined",
                     r.device
                 );
             }
@@ -1978,28 +2006,59 @@ fn restore_step(
                 .expect("set on the same lap the driver is built")
                 .elapsed();
             if waited > ERASE_GRACE * timeout_scale() {
-                // HALF TWO, and BOTH halves are load-bearing: "never completed" is also
-                // what a DEAD device looks like, and a refusal line on its own does not
-                // prove the driver stayed open.
                 if r.erase_refusals == 0 {
                     bail!(
                         "{} left upstream's EraseDevice open for {waited:?} without ever \
-                         reporting `refused=DataErase` -- silence is not a refusal, it is \
+                         reporting `declined=DataErase` -- silence is not a decline, it is \
                          what a dead device looks like, so this proves nothing about the \
                          erase path",
                         r.device
                     );
                 }
                 eprintln!(
-                    "hostcheck: M9 PASS -- {} REFUSED the driver's DataErase ({} time(s)) and \
+                    "hostcheck: M9a PASS -- {} DECLINED the driver's DataErase ({} time(s)) and \
                      EraseDevice stayed at is_complete()==None for {waited:?}",
                     r.device, r.erase_refusals
                 );
-                r.advance(ui, Phase::Reveal);
+                r.advance(ui, Phase::Erased);
             }
         }
 
-        // ============================== M7b ==============================
+        Phase::Erased => {
+            if !r.started {
+                r.started = true;
+                *ui = Some(Box::new(EraseDevice::new(r.device, ())));
+                if let Some(p) = ui.as_mut() {
+                    p.connected(r.device, DeviceMode::Ready);
+                }
+                eprintln!(
+                    "hostcheck: M9b -- driving a SECOND EraseDevice at {}; the glass APPROVES it",
+                    r.device
+                );
+            }
+            if !r.erase_confirmed && done(ui) {
+                r.erase_confirmed = true;
+                eprintln!(
+                    "hostcheck: M9b -- EraseDevice reached Completion::Success at {} \
+                     (CommsMisc::EraseConfirmed under the ORIGINAL id)",
+                    r.device
+                );
+            }
+            if let (Some(fresh), false) = (r.fresh, r.fresh_asked) {
+                r.fresh_asked = true;
+                queue.extend(coordinator.request_held_shares(fresh));
+            }
+            if r.erase_confirmed && r.fresh_need_name && r.fresh_empty {
+                eprintln!(
+                    "hostcheck: M9b PASS -- {} erased; it came back as {} with NeedName and 0 \
+                     shares",
+                    r.device,
+                    r.fresh.expect("fresh_empty implies fresh")
+                );
+                r.advance(ui, Phase::Done);
+            }
+        }
+
         Phase::Reveal => {
             if !r.started {
                 r.started = true;
@@ -2309,7 +2368,11 @@ fn restore_step(
 
         Phase::Reheld => {
             if r.reheld {
-                r.phase = Phase::Done;
+                if r.erase_last {
+                    r.advance(ui, Phase::Erase);
+                } else {
+                    r.phase = Phase::Done;
+                }
             }
         }
         Phase::Done => {}
@@ -2540,8 +2603,9 @@ fn main() -> Result<()> {
          `check_physical_backup` accepts them, and the destructive consolidation leaves a record \
          the device can still describe; a coordinator-previewed 14-char/56-byte name reaches FLASH \
          on all {N_DEVICES} devices and comes back byte-exact as `SetName`; upstream's own \
-         `EraseDevice` driver NEVER completes against this device, which refuses its `DataErase` on \
-         the wire; and the LAST ({ALL_DEVICES}th) device, which this coordinator left out of the keygen and which \
+         `EraseDevice` driver does NOT complete when the device's glass declines its `DataErase`, \
+         and a second one DOES complete on `EraseConfirmed` when the glass approves, after which \
+         the device comes back under a new id with no name and no shares; and the LAST ({ALL_DEVICES}th) device, which this coordinator left out of the keygen and which \
          reported holding nothing at all, ingested another device's 25 words off its sheet and \
          CONSOLIDATED them onto a flash that held no share; and a {STAGE_SIZE} B firmware image \
          STAGES into the device's PSRAM over a raw, unframed 65-chunk stream that bypasses the \
@@ -3042,6 +3106,11 @@ fn one_pass(
         // stub's default so an exported `STUB_EXPECT_DECLINES` in somebody's shell
         // cannot loosen the signature passes.
         .env("STUB_EXPECT_DECLINES", "0")
+        // Task 08: one glass key per erase QUESTION per device. Every roster device
+        // is asked once (the forged frame) and declines; the blank device is asked
+        // twice (M9a declines, M9b approves). A missing byte is a decline in the
+        // stub, so a device asked a third time fails closed.
+        .env("STUB_ERASE_KEYS", "xy")
         .stdin(Stdio::from(wire_in))
         .stdout(Stdio::from(wire_out))
         // Still INHERIT, and that is now a decision rather than a default: the
@@ -3353,6 +3422,16 @@ fn one_pass(
                             // harness's declaration. See [`CHECK_BACKUP_SINCE`].
                             digests.insert(from, firmware_digest);
                             if !announced.contains(&from) {
+                                // M9b: the first NEW id after the confirmation is the
+                                // erased device, reset.
+                                if let Some(r) = restore.as_mut() {
+                                    if r.phase == Phase::Erased
+                                        && r.erase_confirmed
+                                        && r.fresh.is_none()
+                                    {
+                                        r.fresh = Some(from);
+                                    }
+                                }
                                 announced.push(from);
                                 eprintln!(
                                     "hostcheck: ANNOUNCE {}/{ALL_DEVICES} from {from} digest \
@@ -3633,6 +3712,19 @@ fn one_pass(
                                     //    as a standalone `bail!` it could not fail and
                                     //    would read like coverage. As a PATTERN it makes
                                     //    every other shape fail closed.
+                                    None if shares.is_empty()
+                                        && restore.as_ref().is_some_and(|r| {
+                                            r.phase == Phase::Erased && r.fresh == Some(from)
+                                        }) =>
+                                    {
+                                        if let Some(r) = restore.as_mut() {
+                                            r.fresh_empty = true;
+                                        }
+                                        eprintln!(
+                                            "hostcheck: M9b -- {from} (the erased device, reset) \
+                                             reports holding NOTHING AT ALL"
+                                        );
+                                    }
                                     None if Some(from) == blank
                                         && restore.is_none()
                                         && shares.is_empty() =>
@@ -3696,6 +3788,28 @@ fn one_pass(
                                     if what == "SignatureRequest" {
                                         declined.insert(from);
                                     }
+                                    // Task 08: `DataErase` is a QUESTION now and the
+                                    // pass declines it. M9a's decline is counted per
+                                    // phase (see [`Restore::erase_refusals`]); every
+                                    // other one is the forged frame's.
+                                    if what == "DataErase" {
+                                        let m9 = restore.as_mut().filter(|r| {
+                                            r.phase == Phase::Erase && from == r.device
+                                        });
+                                        match m9 {
+                                            Some(r) => r.erase_refusals += 1,
+                                            None => {
+                                                refused_erase.insert(from);
+                                            }
+                                        }
+                                    }
+                                }
+                                Some(("refused", "DataErase")) => {
+                                    break Err(anyhow::anyhow!(
+                                        "{from} REFUSED DataErase outright -- since task 08 a \
+                                         device ASKS (and this pass declines), so a refusal is \
+                                         a device that never raised the question"
+                                    ));
                                 }
                                 Some(("refused", what)) => {
                                     eprintln!(
@@ -3703,20 +3817,6 @@ fn one_pass(
                                          device's side; whether THIS coordinator was waiting \
                                          on that frame is what the branches below decide)"
                                     );
-                                    if what == "DataErase" {
-                                        refused_erase.insert(from);
-                                        // M9's second half. Scoped to the phase and the
-                                        // device on purpose — see
-                                        // [`Restore::erase_refusals`]: the set above is
-                                        // already full from the forged frame, so only a
-                                        // refusal that arrives WHILE the driver is open
-                                        // says anything about the driver.
-                                        if let Some(r) = restore.as_mut() {
-                                            if r.phase == Phase::Erase && from == r.device {
-                                                r.erase_refusals += 1;
-                                            }
-                                        }
-                                    }
                                     // THE KEYGEN TWIN of the `SavePhysicalBackup` fix the
                                     // module note at `:552-558` records, same defect and same
                                     // shape. MEASURED at a 13-device roster, which
@@ -3730,7 +3830,7 @@ fn one_pass(
                                     // exit 1, `0212a8d6.. REFUSED GroupTooLarge while this
                                     // coordinator was in KeygenAwaitingShares WAITING for
                                     // it`, and the other 12 refusals never get read.
-                                    else if matches!(
+                                    if matches!(
                                         state,
                                         State::KeygenAwaitingShares
                                             | State::KeygenAwaitingSessionHash
@@ -3865,6 +3965,15 @@ fn one_pass(
                             let claimed = ui
                                 .as_mut()
                                 .is_some_and(|p| p.process_comms_message(from, misc.clone()));
+                            // Task 08: an EraseConfirmed nobody asked for is a device that
+                            // erased without this pass's own EraseDevice being live -- the
+                            // forged frame was approved, or a device erased on its own.
+                            if !claimed && matches!(misc, CommsMisc::EraseConfirmed) {
+                                break Err(anyhow::anyhow!(
+                                    "UNSOLICITED ERASE: {from} sent EraseConfirmed with no live \
+                                     EraseDevice to claim it"
+                                ));
+                            }
                             if !claimed {
                                 eprintln!(
                                     "hostcheck: WARNING no live UiProtocol claimed {} from {from}",
@@ -3895,6 +4004,11 @@ fn one_pass(
                         // the same burst as the `Announce` itself.
                         DeviceSendBody::NeedName => {
                             need_name.insert(from);
+                            if let Some(r) = restore.as_mut() {
+                                if r.fresh == Some(from) {
+                                    r.fresh_need_name = true;
+                                }
+                            }
                         }
                         DeviceSendBody::SetName { name } => {
                             // The device announced `SetName` instead of `NeedName`, i.e.
@@ -4215,7 +4329,7 @@ fn one_pass(
                                     break Err(anyhow::anyhow!("{device} announced no digest"))
                                 }
                             };
-                            restore = Some(Restore::new(device, share_index, digest, Phase::Erase));
+                            restore = Some(Restore::new(device, share_index, digest, Phase::Reveal));
                         }
                         let r = restore.as_mut().expect(
                             "restore is Some here: it is built above when both legs are unstarted, \
@@ -4304,8 +4418,9 @@ fn one_pass(
                                 leg1.device
                             );
                             sighted = Some(leg1);
-                            restore =
-                                Some(Restore::new(blank, share_index, digest, Phase::Ingest));
+                            let mut leg2 = Restore::new(blank, share_index, digest, Phase::Ingest);
+                            leg2.erase_last = true;
+                            restore = Some(leg2);
                             // `ui` is already None: `Phase::Consolidate` retired the last
                             // driver through `advance`, and the new `Restore` has
                             // `started: false`, so leg 2 builds its own.
@@ -4502,12 +4617,12 @@ fn one_pass(
                 }
             }
 
-            // ================= THE FORGED DataErase WAS REFUSED =================
+            // ============ THE FORGED DataErase WAS DECLINED AT THE GLASS ============
             if refused_erase.len() != N_DEVICES {
                 bail!(
-                    "only {}/{N_DEVICES} device(s) refused the forged DataErase (refused: \
-                     {refused_erase:?}) -- a device that neither refused nor died either \
-                     obeyed it or dropped it silently",
+                    "only {}/{N_DEVICES} device(s) DECLINED the forged DataErase at the glass \
+                     (declined: {refused_erase:?}) -- a device that neither declined nor died \
+                     either obeyed it or dropped it silently",
                     refused_erase.len()
                 );
             }
@@ -4822,7 +4937,8 @@ fn one_pass(
                  \n    THE GLASS shows {want_glass} on {}/{N_DEVICES} devices -- the 4 bytes \
                  `ui::keygen_check` RENDERED, read back with `Frame::cell_2x`, equal this \
                  coordinator's session-hash prefix\
-                 \n    forged DataErase REFUSED by {}/{N_DEVICES} devices, and they still signed\
+                 \n    forged DataErase raised an erase question and was DECLINED at the glass by \
+                 {}/{N_DEVICES} devices, with no flash write, and they still signed\
                  \n    largest coordinator->device frame actually written: {} B \
                  (old FRAME_LIMIT was 2060, so this keygen was previously REFUSED)\
                  \n    M7 at {}, share index {:?}, all four flows from a REAL coordinator driver:\
@@ -4837,9 +4953,10 @@ fn one_pass(
                  `PhysicalBackupSaved` completed `EnterPhysicalBackup`\
                  \n      M7e CONSOLIDATE -- the DESTRUCTIVE write landed, and the device described \
                  the record it wrote when asked again\
-                 \n      M9  ERASE     -- upstream's own EraseDevice driver stayed at \
-                 is_complete()==None for the whole grace window and the device REFUSED its \
-                 DataErase on the wire, so its completion path is unreachable here\
+                 \n    M9 ERASE at the blank device after its consolidation (task 08): upstream's \
+                 own EraseDevice, DECLINED at the glass, stayed at is_complete()==None for the \
+                 grace window; a second one, APPROVED, reached Completion::Success on \
+                 EraseConfirmed, and the device came back as {} with NeedName and 0 shares\
                  \n    M12 THE LAST ({ALL_DEVICES}th), BLANK DEVICE: {} announced with the other {N_DEVICES} and \
                  was LEFT OUT of BeginKeygen -- a roster this coordinator cut itself and then \
                  checked at finalize against its own contains_device -- and it reported holding \
@@ -4877,6 +4994,8 @@ fn one_pass(
                 r.glass_words.len(),
                 QUIZ_POSITIONS,
                 r.typed.map_or("?".to_string(), |n| n.to_string()),
+                // M9b's fresh id.
+                blank_leg.fresh.map_or("?".to_string(), |id| id.to_string()),
                 // M12's four: the blank device, the sheet's source, its own keypress
                 // count and the index it was handed.
                 blank_leg.device,

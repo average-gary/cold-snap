@@ -159,7 +159,7 @@ class Rig:
 
     def spawn(self, stub: str, salt_base: int, duplicate_salts: bool,
               image: str | None, decline: set[int], watchdog_scale: int,
-              lose: set[int] = frozenset()) -> None:
+              lose: set[int] = frozenset(), erase: set[int] = frozenset()) -> None:
         # A previous, larger run's `device-N.log` would otherwise sit there looking
         # like a device this run has.
         for stale in os.listdir(self.outdir):
@@ -229,6 +229,11 @@ class Rig:
                 # can replug it and re-send the request -- the only way this rig drives
                 # the core's at-most-once signing rule.
                 env["STUB_LOSE_FIRST_SHARE"] = "1"
+            if i in erase:
+                # Task 08: DECLINE this device's first erase question and APPROVE its
+                # second (`stub.rs::erase_keys`). Every other device keeps the default
+                # `x`, so a DataErase it is sent is refused at its glass.
+                env["STUB_ERASE_KEYS"] = "xy"
             child = subprocess.Popen(
                 [stub],
                 stdin=master,
@@ -424,6 +429,9 @@ def main() -> int:
     ap.add_argument("--lose-first-share", type=int, action="append", default=[], metavar="N",
                     help="device N signs its first signature request and drops the reply "
                          "before the wire (repeatable), so a replug + re-send is driven.")
+    ap.add_argument("--erase", type=int, action="append", default=[], metavar="N",
+                    help="device N declines its first erase question and approves its "
+                         "second (repeatable); every other device declines every one.")
     ap.add_argument("--force-duplicate-identities", action="store_true",
                     help="MUTATION PROBE: give every device the same salt. The rig must "
                          "then fail with exit 3; if it exits 0 the identity check is dead.")
@@ -444,6 +452,10 @@ def main() -> int:
     lose = set(args.lose_first_share)
     if any(not 0 <= i < args.devices for i in lose):
         log(f"FAIL --lose-first-share {sorted(lose)} names no device (0..{args.devices - 1})")
+        return 2
+    erase = set(args.erase)
+    if any(not 0 <= i < args.devices for i in erase):
+        log(f"FAIL --erase {sorted(erase)} names no device (0..{args.devices - 1})")
         return 2
     if args.image and not os.path.isfile(args.image):
         # NOT a silent fallback to the synthetic digest: that would make every device
@@ -488,7 +500,7 @@ def main() -> int:
         # watchdog stays the backstop for a rig that was SIGKILLed and cannot reap.
         watchdog_scale = max(1, int((args.timeout + args.id_timeout) // 240) + 1)
         rig.spawn(args.stub, args.salt_base, args.force_duplicate_identities,
-                  args.image, decline, watchdog_scale, lose)
+                  args.image, decline, watchdog_scale, lose, erase)
         rig.await_identities(args.id_timeout)
         if not cmd:
             log(f"rig up; holding for {args.timeout:g}s (^C to stop). "
@@ -510,6 +522,7 @@ def main() -> int:
         # than hardcoding an index is what lets `--decline-signing` move.
         env["COLDSNAP_RIG_DECLINE_SIGNING"] = ",".join(str(i) for i in sorted(decline))
         env["COLDSNAP_RIG_LOSE_FIRST_SHARE"] = ",".join(str(i) for i in sorted(lose))
+        env["COLDSNAP_RIG_ERASE"] = ",".join(str(i) for i in sorted(erase))
         log(f"running: {' '.join(cmd)}")
         # Popen, not `run`, so a dead stub is caught WHILE the command runs. It used to be
         # checked only after: a device that died mid-suite then showed up as a workflow

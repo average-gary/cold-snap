@@ -1175,21 +1175,14 @@ fn session_scenes(
             )),
         ),
         (
-            // WAS `EnterPhysicalBackup`, then `CheckBackup`. Both are now ADMITTED and
-            // answer with a consent screen, so neither can hold this fixture's
-            // assertion any longer — **every** `CoordinatorRestoration` variant is
-            // admitted today, each behind a digit, so there is no restoration message
-            // left to pin here. `DataErase` is the nearest thing with the same
-            // consequence: it destroys shares, it is refused outright by the dispatch,
-            // and no other scene covers it.
-            //
-            // `CheckBackup` moved because the quiz landed: `Session::confirm_at` builds
-            // a `quiz::Quiz` and `Session::quiz_key` scores it, with the true word among
-            // three on `ui::QUIZ_KEYS` and never a plain page of 25. Its refusals are
-            // covered by `firmware/src/lib.rs`'s tests, not by a fixture here.
-            "9b session: DataErase -> REFUSAL",
-            "it destroys shares, so it may only ever run behind physical consent — and \
-             no such screen or button path exists on this device",
+            // WAS "DataErase -> REFUSAL" until task 08. `DataErase` is now ADMITTED
+            // as a question: `Session::recv` writes nothing and sets
+            // `erase_requested`, and main.rs draws `erase_screen` over it. The scene
+            // shows that screen and then DECLINES (`decline_erase`), so this session
+            // keeps its identity for the scene after it.
+            "9b session: DataErase -> ERASE QUESTION",
+            "admitted as a question only: no marker, no write, no reply. A physical \
+             yes on this digit is the only path to `Session::erase`; the scene declines",
             CoordinatorSendBody::DataErase,
         ),
         (
@@ -1210,6 +1203,17 @@ fn session_scenes(
         .into_iter()
         .map(
             |(name, note, body)| match session.recv(body, rng, &mut out) {
+                Ok(prompts) if prompts.is_empty() && session.erase_requested() => {
+                    let digit = ui::ConfirmDigit::draw(rng);
+                    session.decline_erase();
+                    Scene::shown(
+                        name,
+                        note,
+                        vec![frame(|f| {
+                            coldsnap_firmware::erase_screen(f, digit);
+                        })],
+                    )
+                }
                 Ok(prompts) if prompts.is_empty() => Scene::shown(
                     name,
                     &format!("{note} [announce: {announced}]"),
@@ -1421,12 +1425,34 @@ fn main() {
         .filter(|s| s.refusal.is_some())
         .map(|s| s.name.as_str())
         .collect();
-    for expected in ["3f", "3g", "3h", "5b", "9b", "9c"] {
+    for expected in ["3f", "3g", "3h", "5b", "9c"] {
         assert!(
             refused.iter().any(|n| n.starts_with(expected)),
             "fixture {expected} was NOT refused -- fail-open. refused: {refused:#?}"
         );
     }
+    // 9b (`DataErase`) is admitted since task 08, but ONLY as a question: the scene
+    // must be the erase screen, and the real Session must have written nothing --
+    // same identity, no question left open after the decline. Re-ask it here so the
+    // check exercises `Session::recv` directly rather than trusting the scene label.
+    let id_before = session.device_id();
+    assert!(
+        scenes.iter().any(|s| s.name.starts_with("9b") && s.refusal.is_none()),
+        "fixture 9b (DataErase) was not shown as the erase question"
+    );
+    let mut out = Outbox::new(id_before);
+    let prompts = session
+        .recv(CoordinatorSendBody::DataErase, &mut rng, &mut out)
+        .expect("DataErase must be admitted as a question");
+    assert!(
+        prompts.is_empty() && session.erase_requested(),
+        "DataErase did not raise the erase question"
+    );
+    session.decline_erase();
+    assert!(
+        !session.erase_requested() && session.device_id() == id_before,
+        "declined DataErase changed the device -- fail-open"
+    );
 
     // SELF-CHECK 2: the display stream. Runs in both front-ends -- the terminal one
     // prints the same bytes it would push, so a transport bug found here is real

@@ -50,6 +50,7 @@
 //! | 6d | the OK-key hold → `upgrade::run`, or fall through | [`boot`] |
 //! | 7 | `Entropy::boot(Sources)` — fail-closed | [`boot`] |
 //! | 8 | `StmFlashToken::take().open()` — DBANK geometry | [`boot`] |
+//! | 8a | `erase::recover` — resume an interrupted erase, or a hold | [`boot`] |
 //! | 8b | `identity::load_or_create` — the durable secret, or a hold | [`boot`] |
 //! | 8c | `Session::open` — the flash-backed `FrostSigner`, share reloaded | [`boot`] |
 //! | 10 | bounded event loop, then the panic-counter clear | [`boot`] |
@@ -1025,6 +1026,11 @@ enum Flow {
     /// start a quiz, cannot pick a distractor and cannot put a share word on the glass
     /// without a digit having been pressed first.
     Check(Check),
+    /// The ERASE question (`coldsnap_firmware::erase_screen`) is on the glass with
+    /// this digit. Produced only by `show_erase`, only while
+    /// `Session::erase_requested` is set; its yes is the one path to
+    /// `Session::erase` in this image, and every other answer declines.
+    Erase(ui::ConfirmDigit),
 }
 
 /// What the flow currently on the glass will accept, and whether it is the last page
@@ -1051,6 +1057,9 @@ fn flow_consent(flow: Flow) -> (Consent<'static>, bool) {
         // which keys reach it: the passed screen's own legend is `(x)done`, so it wants
         // a byte delivered too.
         Flow::Check(_) => (Consent::Quiz, true),
+        // A device question like the recorded one: one digit, no prompt, so there is
+        // nothing for `confirm_at` to be handed even by mistake.
+        Flow::Erase(confirm) => (Consent::Question(confirm), true),
     }
 }
 
@@ -1574,7 +1583,7 @@ fn boot() -> ! {
         Shown, Typed,
     };
     use coldsnap_hal::panic::{bump_counter, clear_counter, BootHealth, Counter};
-    use coldsnap_hal::{comms, display, flash, identity, psram, rng, usb};
+    use coldsnap_hal::{comms, display, erase, flash, identity, psram, rng, usb};
     use core::cell::RefCell;
     // `Session` is generic over its flash (`Session<'a, F: NorFlash + Debug>`), so
     // the two nested helpers that take one have to name the bound. Nothing else here
@@ -1774,6 +1783,20 @@ fn boot() -> ! {
     /// (Prose, and not that call spelled out: `production_source()` includes doc comments,
     /// so a counted pin sees them. MEASURED — spelling it out failed
     /// `a_parked_prompt_is_serviced_once_per_iteration_and_never_in_a_loop` with 2 != 1.)
+    /// Put the ERASE question on the glass and, only if every line of it fit, the
+    /// cursor that answers it. Through `take_glass`, so whatever flow was up ends in
+    /// the same statement; the caller drops any parked prompt, so the digit a human
+    /// sees is the only one live.
+    fn show_erase(panel: &mut display::Panel, rng: &mut rng::Entropy, glass: &mut Option<Flow>) {
+        let mut frame = ui::Frame::new();
+        let confirm = ui::ConfirmDigit::draw(rng);
+        let fits = coldsnap_firmware::erase_screen(&mut frame, confirm);
+        take_glass(panel, &frame, glass);
+        if fits {
+            *glass = Some(Flow::Erase(confirm));
+        }
+    }
+
     fn refuse(panel: Option<&mut display::Panel>, glass: &mut Option<Flow>) {
         let Some(panel) = panel else { return };
         let mut frame = ui::Frame::new();
@@ -2133,6 +2156,28 @@ fn boot() -> ! {
     // panics and every reachable panic on this unit is a brick.
     let flash = RefCell::new(DebugFlash(flash));
 
+    // --- Step 8a: an interrupted erase. -------------------------------------
+    // BEFORE identity generation, the session and every nonce read (task 08).
+    // A committed, unfinished erase marker means the data region may hold any
+    // mixture of old share and blanked nonce copies: resume it to completion, so
+    // step 8b finds a vacant identity and generates a fresh one. No
+    // `EraseConfirmed` from here — the original identity may already be gone, so
+    // no truthful ack can be signed; a waiting coordinator keeps waiting.
+    //
+    // Every `Err` is a HOLD, for step 8b's reason: bytes on flash, identical on
+    // the next boot. `Damaged` (a committed marker that does not verify, or a
+    // newer firmware's format) is deliberately neither resumed nor ignored —
+    // ignoring it could reopen a half-erased signer, and it is never read as a
+    // blank device. `Session::open` refuses a non-clear marker as well.
+    if let Err(fault) = erase::recover(&mut *flash.borrow_mut()) {
+        hold(match fault {
+            erase::EraseFault::Damaged => "erase damaged",
+            erase::EraseFault::NotBegun => "erase not begun",
+            erase::EraseFault::Flash(_) => "erase flash err",
+            erase::EraseFault::VerifyFailed => "erase unverified",
+        })
+    }
+
     // --- Step 8b: identity. ------------------------------------------------
     // Generated once, on the first boot that finds no committed record, and read
     // back off flash on every boot after that. `DeviceId` derives from this
@@ -2221,7 +2266,9 @@ fn boot() -> ! {
     // reset, and FROST nonce reuse leaks the share.
     //
     // FAILURE POLICY, and it is the third of three in this function on purpose.
-    // `Session::open`'s only failure is `Fault::IdentityScalar`: the stored secret
+    // `Session::open` fails with `Fault::ErasePending` on a non-clear erase marker
+    // (unreachable after step 8a's `recover`, and held with its own reason), and
+    // otherwise only with `Fault::IdentityScalar`: the stored secret
     // is not a usable scalar. That is a property of bytes in flash, identical on
     // the next boot, so it belongs with the identity hold and NOT with the
     // `panic!()`s of steps 7-9 — a counted reset cannot clear it and would end in
@@ -2249,6 +2296,7 @@ fn boot() -> ! {
     // it was never acked, so no coordinator believes it exists.
     let mut session = match Session::open(&flash, &secret) {
         Ok(session) => session,
+        Err(Fault::ErasePending) => hold("erase pending"),
         Err(_fault) => hold("no valid scalar"),
     };
 
@@ -2443,6 +2491,13 @@ fn boot() -> ! {
                                             draw_batch(panel, &mut entropy, prompts, &mut glass)
                                         {
                                             parked = Some(next);
+                                        }
+                                        // `DataErase` admitted: its question replaces
+                                        // whatever was up, a parked prompt included, so
+                                        // no other digit stays live behind it.
+                                        if session.erase_requested() {
+                                            parked = None;
+                                            show_erase(panel, &mut entropy, &mut glass);
                                         }
                                     }
                                 }
@@ -2750,6 +2805,34 @@ fn boot() -> ! {
             // source pin matches.
             let verdict = ask(keypad.as_mut(), &mut entropy, consent, last);
             match flow {
+                // THE ERASE, and the only call to `Session::erase` in this image: the
+                // printed digit, on the erase question, with the request still live
+                // (`erase` re-checks that — any coordinator message since withdraws
+                // it). The ack is flushed to the wire BEFORE the reset, and it was
+                // pushed only after `begin` + `destroy` verified the data blank. Then
+                // an UNCOUNTED reset — an erase is not a fault — and the next boot
+                // mints a fresh identity with no share and no name. A flash fault
+                // mid-erase also resets: the session is poisoned, and boot's step 8a
+                // resumes a committed marker or holds.
+                Flow::Erase(_) => match verdict {
+                    Answer::Wait => glass = Some(flow),
+                    Answer::Yes => {
+                        let erased = session.erase(&mut outbox);
+                        if outbox.frames() > 0 {
+                            let bytes = outbox.take();
+                            let _ = cdc.write(&bytes);
+                        }
+                        match erased {
+                            Err(Fault::Refused(_)) => refuse(panel.as_mut(), &mut glass),
+                            _ => coldsnap_hal::panic::system_reset(),
+                        }
+                    }
+                    // Any key the screen did not offer is a no, and a no writes nothing.
+                    _ => {
+                        session.decline_erase();
+                        refuse(panel.as_mut(), &mut glass);
+                    }
+                },
                 Flow::Reveal(state) => match reveal_step(state, verdict, BACKUP_END) {
                     // Nobody has answered yet. Put the same screen back, undrawn: a
                     // redraw re-randomises `ui::Frame::mark_sensitive`'s noise (averaging
@@ -4118,10 +4201,14 @@ mod tests {
         // results (the grant, a redraw, the passed screen), five re-parks (a reveal page,
         // an entry that saw nothing pressed, an entry whose key did nothing, a quiz that
         // saw nothing pressed, a quiz whose key did nothing) and the `take_glass` drop.
+        // FIFTEEN since task 08, and both new ones are existing shapes: `show_erase`
+        // sets the erase cursor on the line after the `take_glass` that drew its
+        // question (a redraw result), and the erase flow re-parks when nothing was
+        // pressed (a re-park of a frame still up).
         assert_eq!(
             src.matches("glass =").count(),
-            13,
-            "seven redraw results, five re-parks, one `take_glass` drop"
+            15,
+            "eight redraw results, six re-parks, one `take_glass` drop"
         );
         // THE FAIL-OPEN THIS CLOSED. The cursor is dropped in exactly one place, and
         // that place is `take_glass`, one line above the `panel.show` that replaces
@@ -4173,13 +4260,13 @@ mod tests {
              `show_backup_page`'s three legs, `show_entry_page`'s two and `show_quiz`'s \
              two. An eleventh must say what it does to the flow cursor"
         );
-        // Both callers of `take_glass` are the ones that used to draw for themselves:
-        // a prompt's own screen (or `ui::refusal` for one it cannot draw) and the
-        // refusal a policy `Fault` earns.
+        // The callers of `take_glass`: a prompt's own screen (or `ui::refusal` for one
+        // it cannot draw), the refusal a policy `Fault` earns, and (task 08) the erase
+        // question, which must end whatever flow was up before its own digit is live.
         assert_eq!(
             src.matches("take_glass(panel, &frame, glass)").count(),
-            2,
-            "`draw_prompt` and `refuse` are the two things that take the glass"
+            3,
+            "`draw_prompt`, `refuse` and `show_erase` are the three things that take the glass"
         );
         // AND THE ONE LEG THAT MUST NOT REACH IT. Deleting this guard reads as a pure
         // simplification, because the `_ => None` arm four lines below already answers
@@ -4375,6 +4462,39 @@ mod tests {
     /// carries the library-side gate (`record_pending`, host-tested in
     /// `firmware/src/lib.rs`); this carries the half that lives in `boot`, where no
     /// gate in this tree compiles a line.
+    /// Task 08: the erase question is answered as a device question — its printed
+    /// digit is a yes, every other byte the pad can carry is a no — and
+    /// `Session::erase` is called from exactly one place, behind `Answer::Yes` on
+    /// `Flow::Erase`. A decline goes through `decline_erase` from one place too.
+    #[test]
+    fn the_erase_runs_only_on_the_digit_its_question_printed() {
+        let mut rng = Counter(7);
+        let confirm = ConfirmDigit::draw(&mut rng);
+        let (consent, last) = flow_consent(Flow::Erase(confirm));
+        assert!(matches!(consent, Consent::Question(c) if c == confirm) && last);
+        let mut yes = 0;
+        for key in 0..=u8::MAX {
+            match answer(Ok(Event::Down(key)), consent, last) {
+                Answer::Yes => {
+                    yes += 1;
+                    assert!(confirm.accepts(key));
+                }
+                Answer::No => assert!(!confirm.accepts(key)),
+                // `(9)next` on a last page is ignored, as on every question.
+                Answer::Wait => assert_eq!(key, ui::NEXT_KEY),
+                other => panic!("{key}: {other:?}"),
+            }
+        }
+        assert_eq!(yes, 1);
+        let src = production_source();
+        assert_eq!(src.matches("session.erase(").count(), 1);
+        assert!(src.contains(
+            "Flow::Erase(_) => match verdict {\n                    Answer::Wait => glass = Some(flow),\n                    Answer::Yes => {\n                        let erased = session.erase(&mut outbox);"
+        ));
+        assert_eq!(src.matches("session.decline_erase()").count(), 1);
+        assert_eq!(src.matches("show_erase(panel, &mut entropy, &mut glass)").count(), 1);
+    }
+
     #[test]
     fn the_recorded_ack_is_sent_from_one_place_and_only_on_the_digit() {
         let src = production_source();
@@ -4399,19 +4519,19 @@ mod tests {
         );
         assert_eq!(
             src.matches("Consent::Question(").count(),
-            2,
-            "two mentions and no more: `reveal_consent` builds it and `answer` reads \
-             it. A third is a second screen asking a question of its own, and it has \
-             to say what a yes to it buys"
+            3,
+            "three mentions and no more: `reveal_consent` and `flow_consent`'s erase \
+             arm build it and `answer` reads it. A fourth is another screen asking a \
+             question of its own, and it has to say what a yes to it buys"
         );
         // The screen and the gate must be the SAME digit. `show_backup_page` draws it
         // and hands it back in `Reveal::Recorded`; a second `draw` anywhere in the
         // recorded path would mean the glass and the gate disagreed.
         assert_eq!(
             src.matches("ui::ConfirmDigit::draw(").count(),
-            2,
-            "one draw per screen that prints a digit: `draw_batch` and the recorded \
-             question"
+            3,
+            "one draw per screen that prints a digit: `draw_batch`, the recorded \
+             question and the erase question (`show_erase`)"
         );
     }
 

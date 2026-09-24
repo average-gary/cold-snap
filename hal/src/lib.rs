@@ -126,6 +126,7 @@
 pub mod callgate;
 pub mod comms;
 pub mod display;
+pub mod erase;
 pub mod flash;
 pub mod heap;
 pub mod identity;
@@ -251,9 +252,21 @@ pub mod memmap {
     /// 4 sectors, 16 K, for the same A/B-page reason as [`FS_SHARE_LEN`].
     pub const FS_NAME_LEN: u32 = 16 * 1024;
 
-    /// First `FLASH_FS` byte no region claims — 440 K of the 512 K still
+    /// The erase-in-progress marker ([`crate::erase`]). Carved out of what was
+    /// `FS_FREE` (task 08) rather than out of any record region, so no stored
+    /// record moves: every offset above is unchanged.
+    ///
+    /// Everything BELOW this offset — identity, nonces, share, name — is the
+    /// cold-snap data region [`crate::erase`] destroys; the marker is the only
+    /// thing it writes, and nothing at or above [`FS_FREE_OFFSET`] is touched.
+    pub const FS_ERASE_OFFSET: u32 = FS_NAME_OFFSET + FS_NAME_LEN;
+    /// 2 sectors, 8 K: one `DBANK == 0` page, so clearing the marker cannot
+    /// reach the name region below it or anything above it.
+    pub const FS_ERASE_LEN: u32 = 8 * 1024;
+
+    /// First `FLASH_FS` byte no region claims — 432 K of the 512 K still
     /// unclaimed. Deliberately not carved up until something needs it.
-    pub const FS_FREE_OFFSET: u32 = FS_NAME_OFFSET + FS_NAME_LEN;
+    pub const FS_FREE_OFFSET: u32 = FS_ERASE_OFFSET + FS_ERASE_LEN;
 
     /// SRAM1 base = start of the contiguous SRAM1+2+3 window (`layout.ld:21`).
     pub const SRAM_BASE: u32 = 0x2000_0000;
@@ -410,6 +423,13 @@ pub mod memmap {
         // No region overlaps its neighbour and everything fits.
         assert!(FS_SHARE_OFFSET == FS_NONCE_OFFSET + FS_NONCE_LEN);
         assert!(FS_NAME_OFFSET == FS_SHARE_OFFSET + FS_SHARE_LEN);
+        assert!(FS_ERASE_OFFSET == FS_NAME_OFFSET + FS_NAME_LEN);
+        assert!(FS_ERASE_OFFSET % DBANK0_PAGE == 0);
+        assert!(FS_ERASE_LEN % DBANK0_PAGE == 0);
+        assert!(FS_FREE_OFFSET == FS_ERASE_OFFSET + FS_ERASE_LEN);
         assert!(FS_FREE_OFFSET <= FLASH_FS_LEN);
+        // The whole of `FLASH_FS` is above the bootloader's erase floor, so no
+        // FS-relative erase — the eraser's included — can name a bootloader page.
+        assert!(FLASH_FS_BASE >= FLASH_ERASE_FLOOR);
     };
 }

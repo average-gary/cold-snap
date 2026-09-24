@@ -129,14 +129,14 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 
 use coldsnap_firmware::{
-    firmware_digest, prompt_screen_at, quiz, wordentry, Checked, DebugFlash, Fault, Outbox,
-    Session, Shown, Typed,
+    erase_screen, firmware_digest, prompt_screen_at, quiz, wordentry, Checked, DebugFlash, Fault,
+    Outbox, Session, Shown, Typed,
 };
 use coldsnap_hal::comms::{decode_body, CoordinatorSendBody, Link, MAGIC_REPLY};
 use coldsnap_hal::flash::fake::FakeFlash;
 use coldsnap_hal::flash::ERASE_SIZE;
 use coldsnap_hal::rng::{mix_sources, Entropy, ProvenSeed, SE1_BYTES, SE2_BYTES, TRNG_BYTES};
-use coldsnap_hal::{identity, memmap, ui};
+use coldsnap_hal::{erase, identity, memmap, ui};
 use frostsnap_comms::{DeviceSendBody, ReceiveSerial, Upstream};
 use frostsnap_core::device::{restoration::ToUserRestoration, DeviceToUserMessage};
 use frostsnap_core::schnorr_fun::frost::Fingerprint;
@@ -381,6 +381,33 @@ fn glass_keys() -> String {
 ///    stashed `tmp_keygen_pending_finalize` but BEFORE the coordinator's
 ///    `Finalize` asks for it back. Expect the stub to die 2 with "device doesn't
 ///    have keygen for <keygen_id>" (`device/keygen.rs` `keygen_finalize`).
+/// Task 08: what each device answers its Nth ERASE question with, one byte per
+/// question, PER DEVICE (so `xy` declines every device's first `DataErase` and
+/// approves its second). `y` presses what the glass advertises; anything else is that
+/// literal key, and a missing byte is `x`. DEFAULT `x`: a run that does not ask for an
+/// erase never gets one, whatever a coordinator sends.
+fn erase_keys() -> String {
+    std::env::var("STUB_ERASE_KEYS").unwrap_or_else(|_| "x".into())
+}
+
+/// What [`drive`] did about an erase question, for `main` to act on.
+#[derive(PartialEq, Eq)]
+enum EraseOutcome {
+    NotAsked,
+    Declined,
+    /// `Session::erase` returned `Ok`: data verified blank, `EraseConfirmed` pushed
+    /// under the old id. The session is poisoned; `main` must rebuild it from flash.
+    Erased,
+}
+
+/// `(programs, erases)` on every flash, for the "a no writes nothing" check.
+fn flash_counters(flashes: &[RefCell<Flash>]) -> Vec<(u32, u32)> {
+    flashes
+        .iter()
+        .map(|f| (f.borrow().0.programs, f.borrow().0.erases))
+        .collect()
+}
+
 fn clear_tmp_mode() -> String {
     std::env::var("STUB_CLEAR_TMP").unwrap_or_else(|_| "finalize".into())
 }
@@ -1625,12 +1652,32 @@ fn blank_flashes() -> Vec<RefCell<Flash>> {
 fn open_sessions<'a>(
     flashes: &'a [RefCell<Flash>],
     rng: &mut Entropy,
-) -> BTreeMap<DeviceId, Session<'a, Flash>> {
+) -> (BTreeMap<DeviceId, Session<'a, Flash>>, BTreeMap<DeviceId, usize>) {
     let mut sessions = BTreeMap::new();
-    for flash in flashes {
+    let mut index = BTreeMap::new();
+    for (i, flash) in flashes.iter().enumerate() {
+        let session = open_one(flash, rng);
+        index.insert(session.device_id(), i);
+        if sessions.insert(session.device_id(), session).is_some() {
+            die(2, "two devices derived the SAME DeviceId from different flashes");
+        }
+    }
+    (sessions, index)
+}
+
+/// One device's boot, out of what is on its flash. See [`open_sessions`].
+fn open_one<'a>(flash: &'a RefCell<Flash>, rng: &mut Entropy) -> Session<'a, Flash> {
+    {
         // `load_or_create` wants `&mut Flash` and the session takes a shared
         // borrow of the same `RefCell` for its whole life, so the identity has to
         // be read first. Nothing else may hold a borrow here.
+        //
+        // And before THAT, `main.rs`'s step 8a: an interrupted erase is resumed
+        // before identity or nonces are read, and a damaged marker is fatal. The
+        // stub has no `main.rs` boot path, so it repeats the step here.
+        if let Err(e) = erase::recover(&mut *flash.borrow_mut()) {
+            die(2, &format!("erase::recover: {e:?}"));
+        }
         let secret = match identity::load_or_create(&mut *flash.borrow_mut(), rng) {
             Ok(secret) => secret,
             Err(e) => die(2, &format!("identity::load_or_create: {e:?}")),
@@ -1640,11 +1687,8 @@ fn open_sessions<'a>(
             Err(e) => die(2, &format!("Session::open: {e:?}")),
         };
         session.signer.keygen_fingerprint = keygen_fingerprint();
-        if sessions.insert(session.device_id(), session).is_some() {
-            die(2, "two devices derived the SAME DeviceId from different flashes");
-        }
+        session
     }
-    sessions
 }
 
 /// The digest the shipped `firmware_digest` computes, over a synthetic image.
@@ -1728,7 +1772,8 @@ fn drive(
     wire: &mut Vec<u8>,
     saved: &mut BTreeMap<DeviceId, AccessStructureRef>,
     paper: &mut BTreeMap<DeviceId, Sheet>,
-) {
+    erase_asks: &mut BTreeMap<DeviceId, usize>,
+) -> EraseOutcome {
     let id = session.device_id();
     // The shipped outbox: it applies the three framing caps (one nonce segment
     // per frame, `Debug` truncation, refuse an over-long `HeldShares2` whole) at
@@ -1756,6 +1801,48 @@ fn drive(
         }
         Err(e) => die(2, &format!("Session::recv({id}): {e:?}")),
     };
+
+    // TASK 08: the ERASE QUESTION. `recv` only raised it; this is main.rs's
+    // `show_erase` + `Flow::Erase` answer, done the same way every other consent here
+    // is: the shipped screen, a randomised digit, and a key read off the glass.
+    if session.erase_requested() {
+        let n = erase_asks.entry(id).or_insert(0);
+        *n += 1;
+        let scripted = erase_keys().as_bytes().get(*n - 1).copied().unwrap_or(b'x');
+        let digit = ui::ConfirmDigit::draw(rng);
+        let mut frame = ui::Frame::new();
+        if !erase_screen(&mut frame, digit) {
+            die(2, "the erase question does not fit the glass");
+        }
+        log_glass(&frame, 0, true);
+        let key = match scripted {
+            b'y' => advertised_key(&frame).unwrap_or(b'x'),
+            key => key,
+        };
+        let outcome = if digit.accepts(key) {
+            match session.erase(&mut out) {
+                Ok(()) => {
+                    eprintln!(
+                        "stub: {id} ERASED on the randomised digit read off the glass (erase \
+                         question #{n}); EraseConfirmed sent under this id after deletion"
+                    );
+                    EraseOutcome::Erased
+                }
+                Err(e) => die(2, &format!("Session::erase({id}): {e:?}")),
+            }
+        } else {
+            session.decline_erase();
+            eprintln!("stub: {id} DECLINED DataErase (erase question #{n}) -- nothing written");
+            if let Err(e) = out.push(DeviceSendBody::Debug {
+                message: "declined=DataErase".into(),
+            }) {
+                die(2, &format!("Debug(declined) refused by framing: {e:?}"));
+            }
+            EraseOutcome::Declined
+        };
+        wire.extend_from_slice(&out.take());
+        return outcome;
+    }
 
     while let Some(prompt) = prompts.pop_front() {
         match prompt {
@@ -2023,6 +2110,7 @@ fn drive(
     }
 
     wire.extend_from_slice(&out.take());
+    EraseOutcome::NotAsked
 }
 
 /// The upgrade listener's transport, over the same fd 0 / fd 1 the framed loop uses.
@@ -2089,8 +2177,9 @@ fn main() {
 
     let mut rng = entropy(salt());
     let flashes = blank_flashes();
-    let mut sessions = open_sessions(&flashes, &mut rng);
-    let ids: Vec<DeviceId> = sessions.keys().copied().collect();
+    let (mut sessions, mut flash_of) = open_sessions(&flashes, &mut rng);
+    let mut ids: Vec<DeviceId> = sessions.keys().copied().collect();
+    let mut erase_asks: BTreeMap<DeviceId, usize> = BTreeMap::new();
     // PARSED BY `tools/app-rig.py` — it reads the ids back off this line and refuses a
     // run in which two child processes announce the same one. Keep the
     // `flash-backed sessions: [..]` shape if you edit it.
@@ -2258,6 +2347,7 @@ fn main() {
         // mean one thing on this protocol.
         let mut rehello = false;
         let mut wire: Vec<u8> = Vec::new();
+        let mut erased: Vec<DeviceId> = Vec::new();
         let poll = link.poll::<ReceiveSerial<Upstream>, _>(&bytes, |frame| match frame {
             ReceiveSerial::Message(msg) => {
                 let mut dest = msg.target_destinations;
@@ -2282,7 +2372,8 @@ fn main() {
                         for id in targets {
                             let session =
                                 sessions.get_mut(&id).expect("id came from `sessions`");
-                            drive(
+                            let before = flash_counters(&flashes);
+                            match drive(
                                 session,
                                 body.clone(),
                                 &mut rng,
@@ -2290,7 +2381,15 @@ fn main() {
                                 &mut wire,
                                 &mut saved,
                                 &mut paper,
-                            );
+                                &mut erase_asks,
+                            ) {
+                                // A no to an erase wrote NOTHING, on any flash.
+                                EraseOutcome::Declined if flash_counters(&flashes) != before => {
+                                    die(2, &format!("{id} declined an erase and flash changed"))
+                                }
+                                EraseOutcome::Erased => erased.push(id),
+                                _ => {}
+                            }
                         }
                     }
                     // Over the inner limit, not valid bincode, or one of the two
@@ -2316,6 +2415,43 @@ fn main() {
             );
         }
 
+        // TASK 08: a device that erased RESETS. Its poisoned session is dropped and
+        // rebuilt from its flash exactly as a boot would (`erase::recover`, then
+        // `load_or_create`, then `Session::open`), and it must come back a DIFFERENT
+        // device holding nothing: a fresh id, no share, no name. Its Announce +
+        // NeedName follow the `EraseConfirmed` already in `wire`, which is the order a
+        // real unit's reset puts them in. (A real reset also drops USB and re-runs the
+        // magic handshake; one pty cannot model that for one of N sessions.)
+        for old in erased {
+            sessions.remove(&old);
+            let i = flash_of.remove(&old).expect("every session has a flash");
+            let fresh = open_one(&flashes[i], &mut rng);
+            let new = fresh.device_id();
+            if new == old || sessions.contains_key(&new) {
+                die(2, &format!("{old} erased but came back as {new}"));
+            }
+            let shares = fresh.signer.held_shares().count();
+            let name = fresh.stored_name();
+            if shares != 0 || name.is_some() {
+                die(
+                    2,
+                    &format!("{old} erased but {new} holds {shares} share(s), name {name:?}"),
+                );
+            }
+            let mut out = Outbox::new(new);
+            if let Err(e) = fresh.announce(digest, &mut out) {
+                die(2, &format!("announce({new}) after erase: {e:?}"));
+            }
+            wire.extend_from_slice(&out.take());
+            eprintln!(
+                "stub: {old} RESET after erase and rebuilt from flash as {new}: 0 shares, no \
+                 name; Announce+NeedName queued behind the EraseConfirmed"
+            );
+            flash_of.insert(new, i);
+            sessions.insert(new, fresh);
+            ids = sessions.keys().copied().collect();
+        }
+
         // The re-hello, which is a POWER CYCLE first. A cold-snap unit is USB-powered, so
         // an unplug/replug drops every byte of RAM: the sessions are rebuilt from the same
         // `FakeFlash` bytes BEFORE the re-announce, exactly as a boot would, and the
@@ -2326,7 +2462,7 @@ fn main() {
         // replugs. It must NOT fall through to the link-edge restart. See the `rehello`
         // comment above for the `main.rs` divergence.
         if rehello && link.is_linked() && was_linked && reannounce() {
-            sessions = open_sessions(&flashes, &mut rng);
+            (sessions, flash_of) = open_sessions(&flashes, &mut rng);
             let after: Vec<DeviceId> = sessions.keys().copied().collect();
             if after != ids {
                 die(
@@ -2414,7 +2550,7 @@ fn main() {
             //
             // The assert below is belt: it fails fast and by name, whereas the
             // coordinator's failure would be a keygen timeout.
-            sessions = open_sessions(&flashes, &mut rng);
+            (sessions, flash_of) = open_sessions(&flashes, &mut rng);
             let after: Vec<DeviceId> = sessions.keys().copied().collect();
             if after != ids {
                 die(

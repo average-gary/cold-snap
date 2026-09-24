@@ -99,7 +99,8 @@ starts <y>`. See PLAN.md §8 phase 4 and §9 item 12.
 
 Also asserted, and previously undocumented here: `hostcheck` forges a
 `CoordinatorSendBody::DataErase` at every device mid-run and fails unless all nine keygen
-devices **refuse** it and can still sign (the blank tenth is deliberately NOT driven
+devices **refuse** it (since task 08: raise a glass question the pass DECLINES; see M9 in
+`hostcheck/src/main.rs` for the approved erase at the blank device) and can still sign (the blank tenth is deliberately NOT driven
 through it: it would add a tenth `refused=DataErase` and fail that exact count, and the
 claim given up — "a device holding nothing also refuses an erase" — is strictly weaker
 than the one the nine already make. MEASURED, not assumed) (`hostcheck/src/main.rs`'s `Expect::Decline` and its `ASSERTION 2` block).
@@ -288,9 +289,10 @@ consent to a digest belongs to the phase that binds the burn.
 
 ### What the device refuses, and will keep refusing
 
-* **Wiping or decommissioning.** `DataErase` is refused on the wire; upstream's own
-  `EraseDevice` driver never completes against this device. There is no
-  factory-reset path. This is carried as known debt, not as a feature.
+* ~~Wiping or decommissioning.~~ **Superseded by task 08:** `DataErase` now raises a
+  consent question on the device's own glass; only its randomised digit runs a
+  resumable, marker-guarded erase that sends `EraseConfirmed` after deletion and
+  resets as a new device (host fakes only; STM32 erase physics are bench-only).
 * **A genuine-check challenge.** It needs an ESP32 RSA peripheral and a factory
   certificate this hardware does not have.
 * **Creating or changing a PIN.** cold-snap never offers to set one; see the note
@@ -446,7 +448,7 @@ bytes at once so it sits on the wire bound and the flash bound simultaneously, r
 flash on all nine keygen devices and comes back byte-exact as `SetName` — and
 **`erase_device`**,
 where upstream's own driver is now proven never to complete against a device that
-refuses `DataErase` outright.
+refuses `DataErase` outright (task 08 replaced that with decline-then-approve on the glass).
 
 **This said "every flow the device implements is now driven by a real coordinator" until
 a review falsified it**, and the exception is worth naming rather than rounding off:

@@ -177,5 +177,26 @@
       "Real 18/7 installation of a key-0 image (verify_firmware_in_ram verdict, burn, reset)",
       "Reset/power-interruption mid-burn recovery (psram_recover_firmware) and PSRAM retention across reset"
     ]
+  },
+  {
+    "task": "08",
+    "slug": "implement-resumable-device-erasure",
+    "status": "DEGRADED",
+    "reason": "Criterion 2 partial: an interrupted committed erase finished at boot by recover sends no completion signal, so the coordinator/app keeps the old share (PLAUSIBLE, untested coordinator-side); both CONFIRMED findings fixed; full frostsnap_coordinator test BLOCKED by user's coldcard_msg_len.rs",
+    "evidence": "08-implement-resumable-device-erasure.md",
+    "commit": {
+      "frostsnap": "76982a5eb33cd15764c817a77e7ad254f79c7ffb",
+      "cold-snap": "the commit that adds this entry"
+    },
+    "open_confirmed": [],
+    "criteria_met": 5,
+    "criteria_total": 6,
+    "bench_only": [
+      "STM32 page erase torn by power loss / ECC on half-erased cells, incl. torn marker clear reading Damaged",
+      "secure deletion from a physically compromised chip",
+      "real StmFlash erase at RDP=2; system_reset, USB re-enumeration and reconnect with fresh identity; EraseConfirmed IN transfer racing reset",
+      "SRAM holding old share/identity across soft reset",
+      "erase screen on the real panel"
+    ]
   }
 ]

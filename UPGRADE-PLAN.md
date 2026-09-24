@@ -140,7 +140,7 @@ one share, useless below `t`.
 | flash confidentiality | none (external SPI NOR) | RDP=2, internal flash | cold-snap |
 | secure boot | RSA-3072, prod key offline | signature required, **key 0 private key published** | upstream |
 | backup-reveal consent | none pre-reveal | randomised digit + `mark_sensitive` | cold-snap |
-| wipe / decommission | on-device consent | **none**, `DataErase` refused | upstream |
+| wipe / decommission | on-device consent | glass consent + resumable erase (task 08, host fakes only) | upstream |
 
 **Broadly equivalent: stronger on three axes, weaker on three.** "No PIN" matches a shipped design
 rather than cutting a corner. The two weaknesses worth carrying as debt — the plaintext identity
