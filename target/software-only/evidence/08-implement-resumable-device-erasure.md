@@ -429,3 +429,10 @@ script). Task-04 app rig: regtest backend ran (height 101, transactions accepted
 `cargo test -p frostsnap_coordinator` (cwd $HOME/repos/frostsnap) exit 101: BLOCKED by the user's untracked
 `frostsnap_coordinator/tests/coldcard_msg_len.rs:97` (E0308). Not a pass, not this change's failure;
 `--lib` and `--test device_profile_test` ran and passed.
+
+
+## Follow-up 2026-09-24 — fix 1
+
+The user's untracked `frostsnap_coordinator/tests/coldcard_msg_len.rs:97` E0308 (caused by frostsnap `b565de9`, `BitcoinBip32Path::external` now takes a `NormalIndex`) was fixed in place at :18 and :97. The file is still untracked and no assertion was changed. **Closed:** check 9 / "Blocked command". `cargo test -p frostsnap_coordinator` (cwd $HOME/repos/frostsnap) now exits 0, with 0 failures. **Still open:** criterion 2 partial (recover-at-boot sends no completion signal; PLAUSIBLE) and this task's other recorded items are unchanged.
+
+Detail: `10-followup.md` § Fix 1.

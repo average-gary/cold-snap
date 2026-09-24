@@ -467,3 +467,10 @@ Also open: whether the real bootloader accepts a high-S key-0 image. The referen
   `$HOME/repos/implementations/bitcoin-v31.1/build/bin/bitcoin-node` and `bitcoin-cli`, with a disposable datadir
   under target/. The log shows "All tests passed!" and the teardown "regtest down, 0 still alive". The user's testnet4 node
   (PID 13555) was never contacted.
+
+
+## Follow-up 2026-09-24 — fix 1
+
+The user's untracked `frostsnap_coordinator/tests/coldcard_msg_len.rs:97` E0308 (caused by frostsnap `b565de9`, `BitcoinBip32Path::external` now takes a `NormalIndex`) was fixed in place at :18 and :97. The file is still untracked and no assertion was changed. **Closed:** the `coordinator-verbatim` stage is now `passed rc=0`. It was `blocked rc=101`. This was a single-stage re-run, not a full profile run. **Still open:** pack-negative-bad-layout passes on any rc 1 (CONFIRMED, not in fix 1 scope); the stale 'known BLOCKED' note at `tools/check-software-readiness.py:347-348`; the full profile has not been re-run.
+
+Detail: `10-followup.md` § Fix 1.

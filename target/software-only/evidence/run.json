@@ -157,6 +157,16 @@
       "Real PSRAM self-test/read-back time versus the 5 s port timeout",
       "Install request and verified reconnect (task-07 installation-controller peer, then a device)",
       "Effect on a real ESP32 of Mk4 PrepareUpgrade2/EnterUpgradeMode sent while it is handshaken but unannounced"
+    ],
+    "followup": [
+      {
+        "fix": "1",
+        "commit": [],
+        "closed": [
+          "C1/C20/R-C1v verbatim cargo test --target aarch64-apple-darwin -p frostsnap_coordinator BLOCKED -> exit 0 / stage passed. coordinator-verbatim / cargo test -p frostsnap_coordinator no longer BLOCKED by user's untracked tests/coldcard_msg_len.rs:97 E0308 (b565de9 NormalIndex API change); fixed in place, file still untracked; verbatim exit 0"
+        ],
+        "still_open": []
+      }
     ]
   },
   {
@@ -197,6 +207,18 @@
       "real StmFlash erase at RDP=2; system_reset, USB re-enumeration and reconnect with fresh identity; EraseConfirmed IN transfer racing reset",
       "SRAM holding old share/identity across soft reset",
       "erase screen on the real panel"
+    ],
+    "followup": [
+      {
+        "fix": "1",
+        "commit": [],
+        "closed": [
+          "check 9 / Blocked command cargo test -p frostsnap_coordinator 101 -> exit 0. coordinator-verbatim / cargo test -p frostsnap_coordinator no longer BLOCKED by user's untracked tests/coldcard_msg_len.rs:97 E0308 (b565de9 NormalIndex API change); fixed in place, file still untracked; verbatim exit 0"
+        ],
+        "still_open": [
+          "criterion 2 partial: recover-at-boot sends no completion signal (PLAUSIBLE)"
+        ]
+      }
     ]
   },
   {
@@ -223,6 +245,20 @@
       "keypad/display timing, OTP floor, RDP/PCROP, PSRAM retention, SRAM wipe on soft reset",
       "task 01 U1-U4",
       "real bootloader acceptance of high-S key-0 signature"
+    ],
+    "followup": [
+      {
+        "fix": "1",
+        "commit": [],
+        "closed": [
+          "coordinator-verbatim stage blocked rc=101 -> passed rc=0 (single-stage run; runner classification unchanged). coordinator-verbatim / cargo test -p frostsnap_coordinator no longer BLOCKED by user's untracked tests/coldcard_msg_len.rs:97 E0308 (b565de9 NormalIndex API change); fixed in place, file still untracked; verbatim exit 0"
+        ],
+        "still_open": [
+          "pack-negative-bad-layout passes on any rc 1 (CONFIRMED)",
+          "stale 'known BLOCKED' note= at tools/check-software-readiness.py:347-348",
+          "full --profile full run not re-run after fix 1"
+        ]
+      }
     ]
   }
 ]

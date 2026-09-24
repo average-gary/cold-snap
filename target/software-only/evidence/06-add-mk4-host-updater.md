@@ -456,3 +456,10 @@ PLAUSIBLE (not confirmed, not counted against status): P1 Rust API can send Mk4 
 - Real PSRAM self-test and read-back time versus the 5 s port timeout (a slow digest verdict would surface as `StageNotConfirmed`).
 - "Report installation success only after the expected new firmware reconnects": `InstallRequested` and `VerifiedReconnect` need task 07's installation-controller peer and, for real installation, a device.
 - Whether an ESP32 that has handshaken but not announced is harmed by, or ignores, Mk4 `PrepareUpgrade2`/`EnterUpgradeMode` sent during that window.
+
+
+## Follow-up 2026-09-24 — fix 1
+
+The user's untracked `frostsnap_coordinator/tests/coldcard_msg_len.rs:97` E0308 (caused by frostsnap `b565de9`, `BitcoinBip32Path::external` now takes a `NormalIndex`) was fixed in place at :18 and :97. The file is still untracked and no assertion was changed. **Closed:** the verbatim `cargo test --target aarch64-apple-darwin -p frostsnap_coordinator` BLOCKED (C1, C20, R-C1v). The verbatim `cargo test -p frostsnap_coordinator` now exits 0, and the runner stage running the `--target aarch64-apple-darwin` form is `passed rc=0`. **Still open:** this task's own recorded findings are unchanged.
+
+Detail: `10-followup.md` § Fix 1.
