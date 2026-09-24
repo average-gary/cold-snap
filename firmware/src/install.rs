@@ -950,9 +950,15 @@ mod tests {
             s.update(&data[..h + 128 - 64]);
             s.update(body);
             let check: [u8; 32] = Sha256::digest(s.finalize()).into();
-            let Ok(sig) = secp256k1::ecdsa::Signature::from_compact(&hdr[64..128]) else {
+            let Ok(mut sig) = secp256k1::ecdsa::Signature::from_compact(&hdr[64..128]) else {
                 return false;
             };
+            // mk4-bootloader/verify.c:232 calls uECC_verify, which (micro-ecc/uECC.c:1411-1420)
+            // only range-checks
+            // r, s in [1, n) and has no low-S rule, and signit.py:354 never normalizes
+            // s, so a high-S key-0 signature is valid there. libsecp256k1 refuses
+            // high-S; normalizing first models the bootloader, not a looser gate.
+            sig.normalize_s();
             Secp256k1::verification_only()
                 .verify_ecdsa(
                     &Message::from_digest(check),
@@ -1168,6 +1174,32 @@ mod tests {
         assert_eq!(w.request_install(&mut g), Err(Refusal::Finished));
         assert_eq!(w.confirm(yes(&w)), Err(Refusal::Finished));
         assert_eq!(g.calls.len(), 2, "no call after the one request");
+    }
+
+    /// python-ecdsa (signit.py:354) does not normalize s, so about half of all
+    /// key-0 images carry a high-S signature. uECC_verify accepts it, so the gate
+    /// must too; a high-S signature over the wrong digest is still refused.
+    #[test]
+    fn gate_accepts_high_s_like_uecc_and_still_refuses_a_bad_one() {
+        let mut img = signed_image(SIZE, good());
+        let h = memmap::FW_HEADER_OFFSET as usize;
+        // s' = n - s, big-endian, on the low-S s that libsecp256k1 produced.
+        let n = secp256k1::constants::CURVE_ORDER;
+        let mut borrow = 0i16;
+        for i in (0..32).rev() {
+            let d = n[i] as i16 - img[h + 96 + i] as i16 - borrow;
+            img[h + 96 + i] = d.rem_euclid(256) as u8;
+            borrow = (d < 0) as i16;
+        }
+        let high = secp256k1::ecdsa::Signature::from_compact(&img[h + 64..h + 128]).unwrap();
+        let mut low = high;
+        low.normalize_s();
+        assert_ne!(low, high, "the fixture really is high-S");
+        let s = staged(&img);
+        let g = FakeGate::new(s.staged_view().unwrap(), None);
+        assert!(g.verify_in_ram(&img));
+        img[h + 200] ^= 1;
+        assert!(!g.verify_in_ram(&img));
     }
 
     /// PIN set: a wrong submission is one 18/0 + one 18/2 and nothing more; the

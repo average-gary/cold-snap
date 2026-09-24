@@ -483,7 +483,14 @@ def main():
 
     # --- 5. sign -------------------------------------------------------------
     signed = os.path.join(outdir, 'firmware-signed.bin')
-    prev = open(signed, 'rb').read() if os.path.exists(signed) else None
+    # The byte-identical rerun check only means something for the SAME inputs (ELF
+    # bytes, frozen timestamp, key), so those are kept beside the artifact. A new
+    # ELF simply replaces the artifact.
+    elf_sha = hashlib.sha256(open(elf, 'rb').read()).hexdigest()
+    inputs = '%s %s %d' % (elf_sha, ts.hex(), args.pubkey_num)
+    stamp_file = signed + '.inputs'
+    prev_inputs = open(stamp_file).read().strip() if os.path.exists(stamp_file) else None
+    prev = open(signed, 'rb').read() if os.path.exists(signed) and prev_inputs == inputs else None
     argv = ['sign', ver, '-k', str(args.pubkey_num), '-m', 'mk', '-b', outdir,
             '-o', signed, '-v', '--keydir', os.path.join(stm32, 'keys')]
     say('[5] sign')
@@ -587,6 +594,11 @@ def main():
             'byte-identical to' if prev == got else 'DIFFERS FROM (!)')
         if prev != got:
             raise Abort('output changed for the same ELF: reproducibility broken')
+    else:
+        say('    no previous artifact from these inputs (ELF sha256 %s, ts %s): nothing to compare',
+            elf_sha[:16], ts.hex())
+    with open(stamp_file, 'w') as f:
+        f.write(inputs + '\n')
     say('    deliver with:  ckcc upgrade %s   (stock firmware, after PIN login)',
         artifacts[-1])
     say('    the SD-card path CANNOT install this: sdcard.c:248 CheckMacs the world '

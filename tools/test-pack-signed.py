@@ -19,6 +19,7 @@ are read only; every byte this writes is under target/.
 """
 import importlib.util
 import os
+import shutil
 import subprocess
 import sys
 
@@ -175,7 +176,24 @@ def part_b():
            '-p', 'coldsnap_firmware', '--example', 'checkfw', '--', bent],
           1, 'REFUSE')
 
-    print('part B: 2 end-to-end refusals, both nonzero for the intended reason')
+    # The rerun check compares only against an artifact made from the same inputs:
+    # a new ELF/timestamp replaces the old artifact (it used to abort after already
+    # overwriting it), while a changed output for identical inputs still aborts.
+    rerun = os.path.join(FIXTURES, 'rerun-out')
+    shutil.rmtree(rerun, ignore_errors=True)
+    t = int(os.path.getmtime(ELF))
+    pack = [sys.executable, os.path.join(HERE, 'pack-signed.py'), '--pubkey-num', '0',
+            '--out', rerun, '--no-dfu', '--epoch']
+    shell(pack + [str(t)], 0, 'no previous artifact from these inputs')
+    shell(pack + [str(t)], 0, 'byte-identical to the previous')
+    shell(pack + [str(t + 1)], 0, 'no previous artifact from these inputs')
+    art = os.path.join(rerun, 'firmware-signed.bin')
+    blob = bytearray(open(art, 'rb').read())
+    blob[-1] ^= 0x01
+    open(art, 'wb').write(blob)
+    shell(pack + [str(t + 1)], 1, 'reproducibility broken')
+
+    print('part B: 2 end-to-end refusals plus 4 rerun cases, each for the intended reason')
 
 
 if __name__ == '__main__':

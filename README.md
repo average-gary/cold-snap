@@ -375,6 +375,47 @@ nonexistent path afterwards, which still fails inside cc-rs.
 
 ## Test
 
+### One command: software readiness (`tools/check-software-readiness.py`)
+
+```sh
+cd "$HOME/repos/cold-snap"
+python3 tools/check-software-readiness.py --profile full --output-dir target/software-readiness
+python3 tools/check-software-readiness.py --profile core   # cold-snap only; its success label names that scope
+python3 tools/check-software-readiness.py --list           # the plan: every stage, cwd and command
+python3 tools/test-software-readiness.py                   # the runner's own failure-path checks
+```
+
+It runs every implemented hardware-free check in dependency order (host suites, ARM
+clippy/build, reference/ELF, packaging/checkfw, pixel/heap, coordinator interop,
+compatibility, the real app on virtual devices, updater/controller/erase) and writes
+`results.json` (every command, cwd, exit code, time, prerequisite probe, parsed metrics,
+repo HEADs and dirty paths, tool versions, artifact and input sha256s) plus `summary.md`
+and per-stage logs under the output directory. Exit 0 only if every stage passed; 1 if any
+failed, timed out, consumed a STALE artifact (older than a cargo `.d` input or a packager
+input), or the source trees changed during the run; 2 if a prerequisite was missing, a
+tool printed SKIP, or a stage is BLOCKED. A cached report is never reused. The best label
+it prints is "software/pre-bench checks passed" -- never "hardware verified" -- and
+installation, erase and reset are mocked (fake callgate, FakeFlash); real installation is
+untested. `tools/qemu-boot.sh` is not a gate.
+
+Prerequisites, each reported as a missing required check if absent: rustc/cargo with the
+`aarch64-apple-darwin` and `thumbv7em-none-eabihf` targets; Homebrew LLVM (clang,
+llvm-readelf) at `/opt/homebrew/opt/llvm/bin`; the read-only reference checkout
+`~/repos/coldcard-firmware` (or `$COLDCARD_TREE`) with `cli/signit.py` and dev key 0;
+`target/pack-venv` with `ecdsa`; for `full` also `~/repos/frostsnap` (or
+`$FROSTSNAP_REPO`), its pinned Flutter at `frostsnapp/.fvm/flutter_sdk` matching
+`.fvmrc`, `just`, `flutter_rust_bridge_codegen`, Bitcoin Core's `bitcoin-node` at
+`~/repos/implementations/bitcoin-v31.1/build/bin` (regtest only, disposable datadir), and
+the fixtures under `target/software-only/fixtures/`. After any firmware change the
+repacked artifact has a new announced digest; register it with frostsnap's
+`frostsnap_coordinator/tools/register-mk4-firmware.py <image> <label>` (a tracked-file
+edit). The runner never edits the registry, so an unregistered artifact fails the run.
+
+Known today: `cargo test -p frostsnap_coordinator` in frostsnap is BLOCKED by an
+untracked local test file, so `full` exits nonzero and names it; the scoped per-target
+substitute runs beside it. No hosted CI runs this: cold-snap has no CI config, and a
+generic runner has neither the sibling repos nor the macOS Flutter toolchain.
+
 Host tests need an explicit `--target` to override `build.target`, and explicit
 features because the vendored manifests set `default = []`. **`cargo test
 --workspace` does not compile** — one test target

@@ -198,5 +198,31 @@
       "SRAM holding old share/identity across soft reset",
       "erase screen on the real panel"
     ]
+  },
+  {
+    "task": "09",
+    "slug": "automate-software-readiness-checks",
+    "status": "DEGRADED",
+    "reason": "open CONFIRMED: pack-negative-bad-layout stage passes on any rc 1 (no must= rule); full profile exits 2, coordinator-verbatim BLOCKED by user's tests/coldcard_msg_len.rs:97",
+    "evidence": "09-automate-software-readiness-checks.md",
+    "commit": {
+      "frostsnap": "0661c485eedf7690051678ba0a945a3ae6174d44",
+      "cold-snap": "the commit that adds this entry"
+    },
+    "open_confirmed": [
+      "tools/check-software-readiness.py:293-297 pack-negative-bad-layout sets expect_rc=1 with no must= rule, so a crashed packager (traceback, rc 1) is classified passed; fix: must=[r'(?m)^ABORT .*would load at 0x0818']"
+    ],
+    "criteria_met": 5,
+    "criteria_total": 5,
+    "bench_only": [
+      "real USB enumeration and timing",
+      "SE calls (SE1/SE2, callgate 18/0, 18/2, 18/7)",
+      "entropy",
+      "flash power loss mid-burn/mid-erase",
+      "actual installation and reset",
+      "keypad/display timing, OTP floor, RDP/PCROP, PSRAM retention, SRAM wipe on soft reset",
+      "task 01 U1-U4",
+      "real bootloader acceptance of high-S key-0 signature"
+    ]
   }
 ]
