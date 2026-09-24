@@ -162,6 +162,11 @@ use frostsnap_core::{
     AccessStructureRef, CoordShareDecryptionContrib, DeviceId, SymmetricKey, WireSignTask,
 };
 use sha2::{Digest, Sha256};
+use coldsnap_firmware::install::{Bootloader, CheckedImage, Confirmation, PinState, Workflow};
+use coldsnap_firmware::upgrade::{Stager, State};
+use coldsnap_hal::callgate::{Errno, PinAttempt, PA_IS_BLANK, PA_MAGIC_V2, PA_SUCCESSFUL};
+use coldsnap_hal::psram::fake::FakePsram;
+use frostsnap_comms::CoordinatorUpgradeMessage;
 
 // ------------------------------------------------------------ the allocator
 // Lifted from `hal/examples/heap_lifo.rs`'s `LIFO_MODE=lll` path, minus the bump
@@ -344,6 +349,7 @@ const PHASES: &[&str] = &[
     "nonces",
     "sign",
     "HeldShares2",
+    "install",
     "teardown",
 ];
 
@@ -719,6 +725,111 @@ impl Hep<'_> {
     }
 }
 
+// ------------------------------------------------ the install controller
+// Task 07's workload: stage an Mk4-shaped image, then `firmware::install::Workflow`
+// begin -> setup -> confirm -> (submit_pin) -> request_install, all inside the
+// device span, with the `Session` still alive (a device receiving an upgrade still
+// holds its session). Heap is measured by the arena counters like every other phase.
+
+/// A counting double, NOT the strict `FakeGate` of `install.rs`'s tests (that one
+/// is `#[cfg(test)]` and verifies HMAC/signature/downgrade). This one exists only
+/// to drive the controller's code path for measurement: it writes the magic and
+/// state flags a gate would, never calls any `callgate` function, and counts calls
+/// so the run asserts exactly one install request. It measures nothing about SE
+/// counters, flash timing or PSRAM retention.
+struct MeasureGate {
+    pin_set: bool,
+    setups: u32,
+    logins: u32,
+    installs: u32,
+    burn: Option<(u32, u32)>,
+}
+
+impl MeasureGate {
+    fn put(att: &mut PinAttempt, off: usize, v: u32) {
+        att.raw_mut()[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
+}
+
+impl Bootloader for MeasureGate {
+    fn setup(&mut self, att: &mut PinAttempt) -> Result<(), Errno> {
+        self.setups += 1;
+        Self::put(att, PinAttempt::OFF_MAGIC, PA_MAGIC_V2);
+        let flags = if self.pin_set { 0 } else { PA_IS_BLANK | PA_SUCCESSFUL };
+        Self::put(att, PinAttempt::OFF_STATE_FLAGS, flags);
+        Self::put(att, PinAttempt::OFF_ATTEMPTS_LEFT, 13);
+        Ok(())
+    }
+    fn login(&mut self, att: &mut PinAttempt) -> Result<(), Errno> {
+        self.logins += 1;
+        Self::put(att, PinAttempt::OFF_STATE_FLAGS, PA_SUCCESSFUL);
+        Ok(())
+    }
+    fn request_install(&mut self, att: &mut PinAttempt) -> Result<(), Errno> {
+        self.installs += 1;
+        self.burn = Some(att.firmware_request());
+        Ok(())
+    }
+}
+
+/// An Mk4-shaped image the install boundary accepts: magic, Mk4 `hw_compat`,
+/// header length == size, 4 KiB-aligned. UNSIGNED: `CheckedImage` checks shape,
+/// length and digest, not the signature (the bootloader does that, and this
+/// double does not model it).
+fn install_image(size: u32) -> Vec<u8> {
+    let mut v: Vec<u8> = (0..size as usize).map(|i| (i * 13 + i / 509) as u8).collect();
+    let h = memmap::FW_HEADER_OFFSET as usize;
+    v[h..h + 128].fill(0);
+    v[h..h + 4].copy_from_slice(&coldsnap_hal::image::FW_HEADER_MAGIC.to_le_bytes());
+    v[h + 4] = 0x25;
+    v[h + 5] = 0x09;
+    v[h + 12..h + 18].copy_from_slice(b"6.3.5X");
+    v[h + 24..h + 28].copy_from_slice(&size.to_le_bytes());
+    v[h + 32..h + 36].copy_from_slice(&0x28u32.to_le_bytes());
+    v
+}
+
+/// Stage `img` and run one full workflow against `gate`. Returns the arena's
+/// `(allocations, live bytes)` delta over the run; the caller asserts both. The
+/// footprint delta is not returned: keygen's earlier high-water masks it.
+fn install_workload(img: &[u8], gate: &mut MeasureGate) -> (usize, usize) {
+    // PSRAM is not heap: on device it is the external 8 MiB PSRAM window. The fake's
+    // backing `Vec` is built on `System`, before the span.
+    let psram = FakePsram::new(img.len());
+    let (allocs0, live0) = (ALLOCS.load(Relaxed), LIVE.load(Relaxed));
+    {
+        let _on = Dev::on(true);
+        let mut s = Stager::new(psram);
+        s.admit(&CoordinatorUpgradeMessage::PrepareUpgrade2 {
+            size: img.len() as u32,
+            firmware_digest: coldsnap_firmware::firmware_digest(img).expect("image digest"),
+        })
+        .expect("PrepareUpgrade2 admitted");
+        s.admit(&CoordinatorUpgradeMessage::EnterUpgradeMode)
+            .expect("EnterUpgradeMode admitted");
+        // 64 B per `feed`, the USB packet size; the chunk slices borrow the
+        // harness's image, which on device is the `Link` buffer.
+        for c in img.chunks(64) {
+            s.feed(c).expect("chunk fed");
+        }
+        assert_eq!(s.state(), State::Staged { size: img.len() as u32 });
+        let mut w = Workflow::begin(&s).expect("install boundary passed");
+        let shown = w.prompt();
+        let state = w.setup(gate).expect("18/0");
+        w.confirm(Confirmation::Confirmed { shown }).expect("consent");
+        if let PinState::PinSet { .. } = state {
+            w.submit_pin(gate, b"12-34").expect("one login");
+        }
+        let req = w.request_install(gate).expect("one install request");
+        assert_eq!(Some((req.start, req.len)), gate.burn);
+        assert_eq!(req.len, img.len() as u32);
+        drop(w);
+        drop(s);
+    }
+    let (allocs1, live1) = (ALLOCS.load(Relaxed), LIVE.load(Relaxed));
+    (allocs1 - allocs0, live1.wrapping_sub(live0))
+}
+
 fn knob(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -946,12 +1057,35 @@ fn main() {
     );
     snap(&format!("HeldShares2 ({shares} share(s))"));
 
+    // --- task 07: the install controller, blank-PIN then PIN-set, Session live.
+    phase(5);
+    let img = install_image(266_240);
+    let mut install_rows = Vec::new();
+    for pin_set in [false, true] {
+        let mut g = MeasureGate {
+            pin_set,
+            setups: 0,
+            logins: 0,
+            installs: 0,
+            burn: None,
+        };
+        let (dallocs, dlive) = install_workload(&img, &mut g);
+        assert_eq!(g.installs, 1, "exactly one install request");
+        assert_eq!(g.logins, u32::from(pin_set), "at most one login per submission");
+        // The controller is alloc-free by construction (install.rs's tripwire bans
+        // `Vec<`/`Box<`/`alloc`); this is the runtime measurement of that claim.
+        assert_eq!(dallocs, 0, "the install workload made {dallocs} arena allocation(s)");
+        assert_eq!(dlive, 0, "the install workload left {dlive} B live in the arena");
+        snap(if pin_set { "install workflow (PIN set)" } else { "install workflow (blank PIN)" });
+        install_rows.push((pin_set, dallocs, dlive, g.setups, g.logins));
+    }
+
     // --- what firmware can reclaim. THE ASSERT USES THE FIGURE BEFORE THIS CALL:
     // the shipped dispatch does not make it (`firmware/src/lib.rs` calls
     // `clear_tmp_data` on `Cancel` and nothing else), so what the device really
     // holds between frames is the pre-clear figure. Using the post-clear one would
     // be crediting the budget with a call that is not in the image.
-    phase(5);
+    phase(6);
     let (_, _, live_held, _) = now();
     {
         let _on = Dev::on(true);
@@ -1001,6 +1135,22 @@ fn main() {
     eprintln!(
         "  outbox parked at most      : {} B in {} frame(s)   (OUTBOX_CEILING = {OUTBOX_CEILING})",
         p.outbox_peak, p.outbox_frames
+    );
+    for (pin_set, dallocs, dlive, setups, logins) in &install_rows {
+        eprintln!(
+            "  install workflow ({}): {dallocs} arena allocation(s), live +{dlive} B, gate calls \
+             {setups} setup / {logins} login / 1 install",
+            if *pin_set { "PIN set" } else { "blank PIN" }
+        );
+    }
+    eprintln!(
+        "  install value sizes (host, stack/static, not heap): Workflow {} B, CheckedImage {} B, \
+         PinAttempt {} B, Stager<FakePsram> {} B (its PSRAM Vec excluded); call-frame depth NOT \
+         measured",
+        size_of::<Workflow<'static, FakePsram>>(),
+        size_of::<CheckedImage>(),
+        size_of::<PinAttempt>(),
+        size_of::<Stager<FakePsram>>()
     );
     if nulls == 0 {
         eprintln!("  NULLS: 0. Nothing was refused by the allocator.");

@@ -158,5 +158,24 @@
       "Install request and verified reconnect (task-07 installation-controller peer, then a device)",
       "Effect on a real ESP32 of Mk4 PrepareUpgrade2/EnterUpgradeMode sent while it is handshaken but unannounced"
     ]
+  },
+  {
+    "task": "07",
+    "slug": "build-upgrade-controller-with-mocked-callgate",
+    "status": "DEGRADED",
+    "reason": "Open CONFIRMED: check_view's separate psram::check_burn_len guard has no failing test (mutant no_check_burn_len survives, exit 0); all 10 criteria met against the fake gate",
+    "evidence": "07-build-upgrade-controller-with-mocked-callgate.md",
+    "commit": null,
+    "open_confirmed": [
+      "install.rs check_view: psram::check_burn_len guard untested; removing it leaves all tests passing (redundant with check_installable today)"
+    ],
+    "criteria_met": 10,
+    "criteria_total": 10,
+    "bench_only": [
+      "Does 18/0 move SE1 Counter[0] (21/3 read_counter0 before/between/after two 18/0)",
+      "Real 18/2 login on a PIN-set expendable unit (attempts_left, SE2 bad-PIN effects)",
+      "Real 18/7 installation of a key-0 image (verify_firmware_in_ram verdict, burn, reset)",
+      "Reset/power-interruption mid-burn recovery (psram_recover_firmware) and PSRAM retention across reset"
+    ]
   }
 ]

@@ -219,6 +219,12 @@ impl Errno {
     /// [`PinAttempt::new`] was given more than [`MAX_PIN_LEN`] bytes. Our own
     /// refusal; no call was made.
     pub const BAD_PIN_LEN: Errno = Errno(NonZeroU32::new(0xC500_0005).unwrap());
+    /// A bootloader operation that has no binding on this build. Our own code;
+    /// **no call was made**. Returned by every `firmware::install::Unbound`
+    /// method, which is the only `Bootloader` a device build has: 18/0 is bound
+    /// here but not yet approved for a boot path, and the login and install
+    /// sub-calls are not bound at all (bench phases 5 and 6, UPGRADE-PLAN §4).
+    pub const NOT_BOUND: Errno = Errno(NonZeroU32::new(0xC500_0006).unwrap());
 
     /// Build from the gate's raw `r0`. `Some` iff nonzero, so
     /// `match Errno::from_raw(rv) { None => success, Some(e) => .. }`.
@@ -721,6 +727,18 @@ pub const PA_IS_BLANK: u32 = 0x02;
 /// (`pins.h:45`).
 pub const PA_ZERO_SECRET: u32 = 0x10;
 
+/// `change_flags` value asking the install sub-call to burn an image from PSRAM
+/// (`pins.h:32` `CHANGE_FIRMWARE`; demanded by `pins.c:1289-1291`, else
+/// `EPIN_BAD_REQUEST`).
+///
+/// A FIELD VALUE, not a selector or an `arg2`: it is written into the
+/// [`PinAttempt`] buffer by [`PinAttempt::set_firmware_request`] and never passed
+/// to `call`. Typed `i32` because the C field is `int change_flags`
+/// (`pins.h:60`) — which is also what keeps it out of the frozen top-level `u32`
+/// count in `no_counted_or_destructive_selector_is_reachable_from_this_module`
+/// without that guard having to be touched.
+pub const CHANGE_FIRMWARE: i32 = 0x040;
+
 /// Selector 21 — OTP / downgrade protection (`dispatch.c:441-489`). `arg2` 2
 /// permanently raises the minimum firmware version and is not bound.
 pub const SELECTOR_OTP: u32 = 21;
@@ -916,6 +934,11 @@ impl PinAttempt {
     pub const OFF_STATE_FLAGS: usize = 60;
     /// `hmac[32]` (`pins.h:107`) — the gate's signature over the fields above.
     pub const OFF_HMAC: usize = 68;
+    /// `change_flags` (`pins.h:60`), the first field AFTER the HMAC window
+    /// (`offsetof(hmac) + 32`). Outside `_hmac_attempt`'s `[0, 68)` range
+    /// (`pins.c:356-361`), which is why the caller may set it on a struct the gate
+    /// has already signed.
+    pub const OFF_CHANGE_FLAGS: usize = 100;
     /// `secret[AE_SECRET_LEN]` (`pins.h:115`). The literal `176` in
     /// `PIN_ATTEMPT_SIZE_V2` (`pins.h:71`) is this offset, which is what proves
     /// the preceding fields carry no padding.
@@ -1020,6 +1043,52 @@ impl PinAttempt {
         self.word(Self::OFF_STATE_FLAGS)
     }
 
+    /// `change_flags` as the gate will read it. See [`CHANGE_FIRMWARE`].
+    #[must_use]
+    pub const fn change_flags(&self) -> u32 {
+        self.word(Self::OFF_CHANGE_FLAGS)
+    }
+
+    /// The `(start, len)` pair [`PinAttempt::set_firmware_request`] wrote into
+    /// `secret[0..8]`, which `pin_firmware_upgrade` reads as
+    /// `about = (uint32_t *)args->secret` (`pins.c:1293-1296`).
+    #[must_use]
+    pub const fn firmware_request(&self) -> (u32, u32) {
+        (self.word(Self::OFF_SECRET), self.word(Self::OFF_SECRET + 4))
+    }
+
+    /// Mark this (already gate-signed) struct as a request to burn `len` bytes
+    /// from PSRAM offset `start`: `change_flags = CHANGE_FIRMWARE`,
+    /// `secret = start || len || zeros` — exactly `pincodes.py:188-190`'s marshal.
+    ///
+    /// Touches ONLY bytes at or past [`PinAttempt::OFF_CHANGE_FLAGS`], none of
+    /// which the HMAC covers except `cached_main_pin`, which this leaves alone. So
+    /// the signed bytes `[0, 68)` and `cached_main_pin` are preserved verbatim
+    /// rather than reconstructed.
+    ///
+    /// **Pure and unchecked by design.** It writes whatever it is given: `start`
+    /// and `len` must come from the caller's install-boundary check
+    /// (`firmware::install`), because the bootloader burns this `len` while
+    /// verifying the header's (`pins.c:1296-1310`, `verify.c:247-290`) — nothing
+    /// downstream of this write re-checks their equality.
+    pub fn set_firmware_request(&mut self, start: u32, len: u32) {
+        self.raw[Self::OFF_CHANGE_FLAGS..Self::OFF_CHANGE_FLAGS + 4]
+            .copy_from_slice(&CHANGE_FIRMWARE.to_le_bytes());
+        let secret = &mut self.raw[Self::OFF_SECRET..Self::OFF_CACHED_MAIN_PIN];
+        secret.fill(0);
+        secret[0..4].copy_from_slice(&start.to_le_bytes());
+        secret[4..8].copy_from_slice(&len.to_le_bytes());
+    }
+
+    /// The raw buffer, for a host double of the gate. **`test-seam` only**: a fake
+    /// bootloader must read what the caller sent and write back what a gate would
+    /// (flags, counters, its HMAC), and it must do so on the same bytes the
+    /// controller then passes on verbatim. Not on any device build.
+    #[cfg(any(test, feature = "test-seam"))]
+    pub fn raw_mut(&mut self) -> &mut [u8; PIN_ATTEMPT_SIZE] {
+        &mut self.raw
+    }
+
     /// Pointer for the gate. Private, and ARM-only: handing a raw pointer to
     /// this buffer to anything but the one selector-18 wrapper is how an
     /// unauthorised `arg2` gets called, and off-ARM there is no gate to hand
@@ -1087,6 +1156,30 @@ pub const EPIN_I_AM_BRICK: i32 = -105;
 pub const EPIN_AE_FAIL: i32 = -106;
 /// `pins.h:90`. `is_secondary` was set; the feature is gone (`pins.c:541-545`).
 pub const EPIN_PRIMARY_ONLY: i32 = -114;
+/// `pins.h:76`. The struct's HMAC is wrong — including every struct signed in a
+/// previous boot, since the HMAC mixes the per-boot `reboot_nonce`
+/// (`pins.c:355`).
+pub const EPIN_HMAC_FAIL: i32 = -100;
+/// `pins.h:77`. An HMAC was required and absent.
+pub const EPIN_HMAC_REQUIRED: i32 = -101;
+/// `pins.h:80`. Bad `change_flags` — e.g. an install request without
+/// [`CHANGE_FIRMWARE`] (`pins.c:1289-1291`).
+pub const EPIN_BAD_REQUEST: i32 = -104;
+/// `pins.h:83`. Not waited long enough.
+pub const EPIN_MUST_WAIT: i32 = -107;
+/// `pins.h:84`. Zero-length PIN on a sub-call that needs one.
+pub const EPIN_PIN_REQUIRED: i32 = -108;
+/// `pins.h:85`. `PA_SUCCESSFUL` is not what the sub-call needs: set on a login
+/// (`pins.c:704-706`) or clear on an install request (`pins.c:1284-1287`).
+pub const EPIN_WRONG_SUCCESS: i32 = -109;
+/// `pins.h:86`. A recycled older attempt.
+pub const EPIN_OLD_ATTEMPT: i32 = -110;
+/// `pins.h:88`. Wrong PIN on a login (`pins.c:761-763`) — or, on an install
+/// request, an image `verify_firmware_in_ram` refused: bad header, downgrade,
+/// or signature (`pins.c:1305-1308`). The same code for both.
+pub const EPIN_AUTH_FAIL: i32 = -112;
+/// `pins.h:91`. (Mk4) an SE2 problem.
+pub const EPIN_SE2_FAIL: i32 = -115;
 
 /// Fill `att` with the free attempt report: [`SELECTOR_PIN`] with
 /// [`PIN_SUBCALL_SETUP`]. **ARM only.**
@@ -1564,6 +1657,9 @@ mod tests {
         assert_eq!(PinAttempt::OFF_ATTEMPTS_LEFT, 56);
         assert_eq!(PinAttempt::OFF_STATE_FLAGS, 60);
         assert_eq!(PinAttempt::OFF_HMAC, 68);
+        // hmac[32] ends at 100, and change_flags is the next `int`.
+        assert_eq!(PinAttempt::OFF_CHANGE_FLAGS, PinAttempt::OFF_HMAC + 32);
+        assert_eq!(PinAttempt::OFF_CHANGE_FLAGS, 100);
         assert_eq!(PinAttempt::OFF_SECRET, 176);
         assert_eq!(PinAttempt::OFF_CACHED_MAIN_PIN, 248);
 
@@ -1665,6 +1761,65 @@ mod tests {
         // secrets.h:43-44 -- 0x2000/32. Sanity, not an assertion about silicon.
         assert_eq!(u.avail + u.consumed, u.total);
         assert_eq!(u.total, 0x2000 / 32);
+    }
+
+    /// `set_firmware_request` writes `pincodes.py:188-190`'s marshal and NOTHING
+    /// the gate signed: bytes `[0, 100)` and `cached_main_pin` are unchanged, so a
+    /// struct signed by 18/0 or 18/2 stays valid for 18/7.
+    ///
+    /// THE MUTATION: have the setter write `secret` from `OFF_HMAC`, or zero the
+    /// whole buffer first — the preserved-bytes legs go red.
+    #[test]
+    fn a_firmware_request_touches_only_bytes_outside_the_hmac() {
+        let mut a = PinAttempt::new(b"12-34").unwrap();
+        for (i, b) in a.raw_mut().iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(37).wrapping_add(11);
+        }
+        let before = a.raw;
+        a.set_firmware_request(0, 266_240);
+        assert_eq!(
+            a.raw[..100],
+            before[..100],
+            "signed window and hmac untouched"
+        );
+        assert_eq!(a.raw[248..], before[248..], "cached_main_pin untouched");
+        assert_eq!(
+            a.raw[100..104],
+            0x40i32.to_le_bytes(),
+            "change_flags = CHANGE_FIRMWARE"
+        );
+        assert_eq!(a.change_flags(), 0x40);
+        assert_eq!(a.firmware_request(), (0, 266_240));
+        assert_eq!(a.raw[176..180], 0u32.to_le_bytes());
+        assert_eq!(a.raw[180..184], 266_240u32.to_le_bytes());
+        assert!(
+            a.raw[184..248].iter().all(|&b| b == 0),
+            "rest of secret zeroed"
+        );
+        // old_pin/new_pin (104..176) are the gate's zeros after 18/0; not ours to write.
+        assert_eq!(a.raw[104..176], before[104..176]);
+        assert_eq!(CHANGE_FIRMWARE, 0x040);
+    }
+
+    /// The EPIN codes added for the install workflow, as literals from
+    /// `pins.h:76-91`.
+    #[test]
+    fn workflow_pin_error_codes_are_pins_h_literals() {
+        assert_eq!(
+            (
+                EPIN_HMAC_FAIL,
+                EPIN_HMAC_REQUIRED,
+                EPIN_BAD_REQUEST,
+                EPIN_MUST_WAIT,
+                EPIN_PIN_REQUIRED,
+                EPIN_WRONG_SUCCESS,
+                EPIN_OLD_ATTEMPT,
+                EPIN_AUTH_FAIL,
+                EPIN_SE2_FAIL
+            ),
+            (-100, -101, -104, -107, -108, -109, -110, -112, -115)
+        );
+        assert_eq!(Errno::NOT_BOUND.get(), 0xC500_0006);
     }
 
     /// MUTATION TARGET: mis-decode an error return. The PIN layer's codes are

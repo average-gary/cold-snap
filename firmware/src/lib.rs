@@ -93,6 +93,7 @@ pub mod wordentry;
 // Firmware-upgrade STAGING, and deliberately NOT reachable from [`Session`] — see
 // its own module docs, and [`Refusal::FirmwareUpgrade`] for what the session still
 // refuses. A plain comment for the same reason `store` has one.
+pub mod install;
 pub mod upgrade;
 
 use store::{ShareStore, StoreFault};

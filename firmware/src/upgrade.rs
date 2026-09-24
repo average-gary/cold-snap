@@ -67,6 +67,7 @@ use frostsnap_comms::{
 };
 
 use crate::firmware_digest;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 /// Why staging was refused.
 ///
@@ -222,9 +223,27 @@ pub struct Stager<P: Psram> {
     /// Bytes actually written to PSRAM. Advances by word multiples only, so every
     /// offset handed to `check_write` is word-aligned by construction.
     written: u32,
+    /// Serial of the newest install workflow begun on this stager
+    /// (`install::Workflow::begin` claims the next one). Only the newest is live,
+    /// so two workflows on one `&Stager` can never both reach a request. Atomic
+    /// only for interior mutability through `&self`; RAM, so a reboot resets it,
+    /// and a `Prompt` cannot survive a reboot either.
+    workflow: AtomicU32,
 }
 
 impl<P: Psram> Stager<P> {
+    /// Claim the next workflow serial; every older workflow is superseded.
+    pub(crate) fn claim_workflow(&self) -> u32 {
+        self.workflow
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1)
+    }
+
+    /// The serial of the newest workflow.
+    pub(crate) fn live_workflow(&self) -> u32 {
+        self.workflow.load(Ordering::Relaxed)
+    }
+
     /// A stager over `psram`, in [`State::Idle`].
     pub fn new(psram: P) -> Self {
         Self {
@@ -234,6 +253,7 @@ impl<P: Psram> Stager<P> {
             carry: [0u8; psram::WRITE_ALIGN as usize],
             carry_len: 0,
             written: 0,
+            workflow: AtomicU32::new(0),
         }
     }
 
@@ -574,10 +594,10 @@ impl<P: Psram> Stager<P> {
     /// staged image be installable on an Mk4? Returns the header's
     /// `firmware_length` — the only length a burn may ever use.
     ///
-    /// Nothing calls this in this phase and nothing burns anything: it is the
-    /// checked-image predicate task 07 models installation against, and it is
-    /// `&self` because a validator that could mutate the thing it judges is not a
-    /// validator. The rules are `coldsnap_hal::image::check_installable`'s —
+    /// Its caller is `firmware::install::CheckedImage::check`, the controller's
+    /// install boundary, whose only device-build `Bootloader` is unbound — so
+    /// nothing burns anything. It is `&self` because a validator that could
+    /// mutate the thing it judges is not a validator. The rules are `coldsnap_hal::image::check_installable`'s —
     /// header magic, `hw_compat` admitting Mk4, the header's length agreeing with
     /// the announced one, the burn window, and 4 KiB installation alignment — and
     /// they are the SAME code the host pre-flight (`examples/checkfw.rs` R8/R13)
@@ -600,11 +620,32 @@ impl<P: Psram> Stager<P> {
         let State::Staged { size } = self.state else {
             return Err(NotInstallable::Unstaged);
         };
-        let view = self
-            .psram
+        image::check_installable(self.staged_view()?, size)
+    }
+
+    /// The staged window as PSRAM reads back NOW, `size` bytes from
+    /// `psram::PSRAM_STAGE_OFFSET`. For the install boundary's second read-back
+    /// (`firmware::install`), which must re-digest the bytes immediately before a
+    /// request rather than trust the verdict [`Stager::verify`] reached earlier.
+    ///
+    /// # Errors
+    ///
+    /// [`NotInstallable::Unstaged`] outside [`State::Staged`],
+    /// [`NotInstallable::Unreadable`] if the window will not view.
+    pub fn staged_view(&self) -> Result<&[u8], NotInstallable> {
+        let State::Staged { size } = self.state else {
+            return Err(NotInstallable::Unstaged);
+        };
+        self.psram
             .view(size)
-            .map_err(|_| NotInstallable::Unreadable)?;
-        image::check_installable(view, size)
+            .map_err(|_| NotInstallable::Unreadable)
+    }
+
+    /// The announced digest, and only once it has matched a PSRAM read-back
+    /// ([`State::Staged`]). `None` in every other state, so a digest that was
+    /// announced but never verified cannot be handed on as if it had been.
+    pub fn staged_digest(&self) -> Option<Sha256Digest> {
+        matches!(self.state, State::Staged { .. }).then_some(self.expected)
     }
 
     /// Record the refusal and report it. One place, so no refusal can leave a state
@@ -729,7 +770,12 @@ pub enum Outcome {
 /// PSRAM window that nothing can install. The phase that binds selector 18/7 must
 /// revisit it.
 pub fn run<W: Wire, P: Psram>(wire: &mut W, psram: P) -> Outcome {
-    let mut stager = Stager::new(psram);
+    serve(wire, &mut Stager::new(psram))
+}
+
+/// [`run`] over a caller-owned [`Stager`], so the staged image outlives the
+/// listener (the install workflow borrows it next). Same loop, same admission.
+pub fn serve<W: Wire, P: Psram>(wire: &mut W, stager: &mut Stager<P>) -> Outcome {
     let mut link = comms::Link::new();
     let mut buf = [0u8; usb::MAX_PACKET_SIZE];
 
