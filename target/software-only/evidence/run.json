@@ -132,6 +132,26 @@
       "Keypad timing: scan/debounce and randomised timing",
       "Other untested physical behaviour: SSD1306 init/timing/legibility, TRNG sources and health checks, callgate, panic->reset, real STM32 program/erase and power-loss durability, FROST latency on a 120 MHz M4F, OCTOSPI/PSRAM, RDP/PCROP",
       "Replug/restart physically: a real unplug power-cycles; the ARM image announces only on a link edge and does not re-announce on a coordinator re-open, so test 8 is not evidence the shipped firmware survives an app restart"
+    ],
+    "followup": [
+      {
+        "fix": "2b",
+        "commit": [
+          "frostsnap 366da527e9268195d5cf000b6cd92ca879a6a153",
+          "cold-snap: the fix 2b close-out commit (see git log; it cannot name its own SHA)"
+        ],
+        "closed": [
+          "criterion 3 app-restart half: a new app process reloads the persisted wallet/key/device names/next address/coin from the same app dir and signs a tx verified by the independent sighash check and regtest Core (M1/M2/M3 killed)",
+          "relative --dir leaked app-dir into the frostsnap tree (abspath)",
+          "Xcode ibtoold daemons outlived the rig carrying its env (run-token reaper)"
+        ],
+        "still_open": [
+          "criterion 3: stub process restart out of scope (in-memory FakeFlash), not faked",
+          "PLAUSIBLE: post-restart signing test omits fee/confirm-key/share-count/canBroadcast/tamper checks",
+          "restart relies on stub STUB_REANNOUNCE; shipped ARM firmware does not re-announce on port re-open",
+          "device-name reload check cannot distinguish DB from stub re-announce"
+        ]
+      }
     ]
   },
   {

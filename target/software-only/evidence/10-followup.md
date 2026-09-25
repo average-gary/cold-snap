@@ -219,3 +219,208 @@ Re-runner mutations: M1, M1h, M2, M2h, R1, R2 (scratch copy) and M4, M4b, M4c, M
 - Carried residuals: an ack is lost if power dies after recovery's `finish` and before the link comes up, and there is no live `EraseDevice` after an app restart. Both fail safe.
 
 **Forbidden shortcuts:** held. EraseConfirmed is sent only after verified deletion, in session and at recovery (M1/M2/M8/M9/R1/R2 killed). A stray ack is refused: before the request, from another id, a wrong body, or a duplicate. The port-spoof gap above is open. An interrupted erase resumes, or reboots `p` as the same id with its share (fail closed). No assertion was weakened. No new message and no bridge change. No device, serial, flash or network use; coldcard-firmware was not written; user files are untouched.
+
+## Fix 2b — app restart reloads wallet state
+
+**Status: FIXED (app-restart half of task 04 criterion 3).** Reason: a new app process reloads
+the persisted wallet, key, device names, next address and coin and gets a Taproot signature the
+independent sighash check and regtest Core accept (implementer, repair and re-runner round 2 all
+exit 0; M1/M2/M3 killed). All three CONFIRMED findings repaired; one PLAUSIBLE finding open (see
+"Fix 2b — close-out"). The implementer's commands are the table labelled "implementer" below;
+the re-runners' are in the close-out section. Closes the unmet part named in
+`evidence/04-test-real-app-with-virtual-devices.md` § Close-out, "Acceptance criteria" row 3
+("Not met: an app restart (never done)") and § "Residual questions" ("an app restart that
+reloads sqlite/bdk. Neither has been done"). The STUB PROCESS restart remains out of scope and
+was not attempted or faked: `FakeFlash` lives in the stub's memory, so a respawned stub has no
+shares. Scope of claim: software/pre-bench checks passed, virtual ptys, regtest only.
+
+### What the restart is
+
+`tools/app-rig.py --app-restart` runs the test command twice with the same stubs, the same
+`app-dir` (one `frostsnap.sqlite` holds the coordinator DB and the bdk wallet) and the same
+regtest node. Run 1 (`COLDSNAP_RIG_APP_RUN=1`) starts on an empty app dir and does keygen,
+naming, the address, signing, decline, backup, restore and replug. Then it writes
+`<rig dir>/app-restart.json` (pid, key id, access-structure id, key name, threshold, per-device
+id/name/share index, `nextAddress` index and address, utxo count) and exits. The rig then
+requires the whole process group (flutter, flutter_tools, the macOS test app) to be gone
+(`FAIL APP DID NOT STOP`, exit 4, otherwise) and the stubs to still be alive. Only then does it
+start run 2 (`COLDSNAP_RIG_APP_RUN=2`), a new `flutter test` and so a new app process. Run 2
+refuses a missing or empty app dir and never wipes it. It does no keygen and no funding. It
+asserts:
+- its `pid` differs from run 1's and `kill -0 <run-1 pid>` fails;
+- `keyState().keys` is exactly run 1's key id, with the same key name, access structure id,
+  threshold and devices;
+- every device's `getDeviceName`, its short share index, and a reconnect under that name;
+- `nextAddress` has the same index and address as run 1 derived, and the utxo count matches.
+Then the reloaded wallet builds a tx from the persisted coin, `startSigningTx` (real
+`WireSignTask::BitcoinTransaction`) with devices 0 and 1 consenting at the glass, and the
+recipient and amount are read off their rendered pixels. `verifyTaprootSignatures` (the
+independent BIP-341 recompute over the prevouts the reloaded wallet holds) must equal the input
+count, and Core `testmempoolaccept` must accept. Only then does run 2 countersign the snapshot
+(`reloadedByPid`). The erase tests run after that in run 2, because they destroy shares. The rig
+exits **6 `APP RESTART UNVERIFIED`** if run 2 exits 0 without the countersignature. Teardown
+removes `app-restart.json` along with the app dir. The regtest node is started by run 1 and
+stopped by run 2's `tearDownAll`, with the rig's `regtest.py down` as the backstop.
+
+### Files changed (none committed)
+
+- cold-snap `tools/app-rig.py`: :36-37 exit 6 documented; :45 `import json`; :138-140
+  `restart_snapshot`; :393 teardown removes it; :453-457 `--app-restart`; :562-613 the
+  two-run loop, one deadline over both runs, the `APP DID NOT STOP` check between them, and
+  the countersignature check.
+- cold-snap `tools/app-rig-test.sh`: :10-18 header; :60 `--app-restart`.
+- frostsnap `frostsnapp/integration_test/coldsnap_workflows_test.dart`: :32-36 header;
+  :103-113 `appRun`/`restartSnapshotPath`; :224-240 `inRun`/`firstApp`/`secondApp`;
+  :300-317 run-1 wipe vs run-2 refuse-empty; :330 regtest `up` in run 1 only; :338 `down` in
+  run 2 only; tests 2-8 at :407-1127 renamed `test(` -> `firstApp(` (bodies unchanged);
+  :1166 snapshot test; :1206 reload test; :1287 post-restart signing test (countersign :1370);
+  the erase tests :1380, :1501 renamed to `secondApp(`. The diff is 274+/14-, and every `-`
+  line is one of those renames or the gated setUp/tearDown lines. `dart format` was NOT
+  applied to the whole file, because it would reflow fix 2a's erase tests. The file is
+  already tracked (4b9edfa, 76982a5, 6d58541; `git status` shows ` M`), so `.git/info/exclude`
+  does not hide it and a plain `git add` stages it (`-f` is harmless, not needed). Never stage the
+  untracked `integration_test/testnet4_chooser_test.dart`. (Corrected in repair 1 of 1.)
+
+### Commands (implementer; exit = the process's own status, output redirected to the log)
+
+| # | Command | cwd | Exit | Elapsed | Log (`target/software-only/logs/`) |
+|---|---|---|---|---|---|
+| 1 | `/usr/bin/time -p tools/app-rig-test.sh` (first real run) | cold-snap | 0 | 85.63 s | `fix2b-rig-1.log`: run 1 `+9`, `app restart: first app process group gone`, run 2 `+5`, `app restart verified: pid 50792 persisted, pid 51956 reloaded and signed`, Core ACCEPTED x3 + REJECTED (Invalid Schnorr) x1 |
+| 2 | M1 rig run (below) | cold-snap | 1 | 82.52 s | `fix2b-mut-M1.log` |
+| 3 | M2 rig run | cold-snap | 6 | 71.24 s | `fix2b-mut-M2.log` |
+| 4 | M3 rig run | cold-snap | 1 | 92.87 s | `fix2b-mut-M3.log` |
+| 5 | `cargo build --target aarch64-apple-darwin -p coldsnap_firmware --example stub` | cold-snap | 0 | 1.87 s | `fix2b-check-build.log` |
+| 6 | `cargo run -- ../target/aarch64-apple-darwin/debug/examples/stub` | cold-snap/hostcheck | 0 | 32.30 s | `fix2b-check-hostcheck.log`, 4 `pass ok` |
+| 7 | `/usr/bin/time -p tools/app-rig-test.sh` (final, on the reverted tree) | cold-snap | 0 | 129.46 s | `fix2b-rig-final.log`: run 1 `+9`, run 2 `+5`, `pid 62948 persisted, pid 63845 reloaded and signed`, `teardown: ... regtest down, 0 still alive, all fds closed` |
+| 8 | `tools/app-rig-test.sh --timeout 40` (fires in run 1) | cold-snap | 5 | 41.47 s | `fix2b-timeout-40.log`; `pgrep -fl "examples/stub\|app-rig.py\|bitcoin-node -regtest\|flutter_tools\|Frostsnap.app"` exit 1; rig dir holds only `device-*.log`, `identities.tsv` |
+| 9 | `tools/app-rig-test.sh --timeout 75` | cold-snap | 0 | 74.06 s | `fix2b-timeout-75.log` (finished inside the bound, so it is not a fault-path probe) |
+| 10 | `tools/app-rig-test.sh --timeout 58` | cold-snap | 5 | 59.66 s | `fix2b-timeout-58.log`, fired in run 1; pgrep exit 1; clean dir |
+| 11 | `tools/app-rig-test.sh --timeout 68` (fires in RUN 2, after the restart) | cold-snap | 5 | 69.71 s | `fix2b-timeout-68.log`; `teardown: reaped [-15 x4], command group gone, regtest down` (the node run 1 left up); pgrep exit 1; no `app-dir`, no `app-restart.json` |
+| 12 | `env -u COLDSNAP_RIG_APP_RUN BUNDLE_FIRMWARE=0 flutter test integration_test/coldsnap_workflows_test.dart -d macos` (bare) | frostsnap/frostsnapp | 1 | 23.61 s | `fix2b-bare-flutter.log`: `Bad state: COLDSNAP_RIG_APP_RUN is not set ...`. A named failure, not a skip |
+| 13 | `flutter analyze` | frostsnap/frostsnapp | 0 | 27.45 s | `fix2b-analyze.log`, "No issues found!" |
+| 14 | `python3 -c "import ast;ast.parse(open('tools/app-rig.py').read())"`; `sh -n tools/app-rig-test.sh` | cold-snap | 0; 0 | <1 s | — |
+
+Every Flutter command ran with `$HOME/repos/frostsnap/frostsnapp/.fvm/flutter_sdk/bin` first on PATH.
+`flutter --version` printed 3.38.5 / Dart 3.10.4, and app-rig-test.sh verifies the version
+against `.fvmrc` on every run. The row 1 run's first attempt failed at the shell (`time -p` is not
+a command in this shell, exit 127, nothing ran) and was re-run with `/usr/bin/time -p`.
+
+### Mutations (each in-tree, then reverted; revert checked exactly)
+
+- **M1: run 2 wipes and recreates `app-dir` before loading** (a fresh app on the same stubs, not
+  a reload). Rig exit 1. Run 2 failed `after a real app restart ...` with
+  `Expected: ['c01dc871...'] Actual: []`, "the reloaded app does not hold exactly the first
+  process's wallet". The post-restart signing test and the erase tests failed after it. Reverted
+  by copying back the saved real file; `cmp` identical, and `git diff | grep -c MUTATION` = 0.
+- **M2: run 2 does not write `reloadedByPid`** (a second process that exits 0 without verifying).
+  Rig exit **6**: `FAIL APP RESTART UNVERIFIED: .../app-restart.json has no second-process
+  countersignature`. Reverted the same way, `cmp` identical.
+- **M3 (production code): `CoordSuperWallet::apply_update` applies the bdk update in memory but
+  persists an empty changeset** (`frostsnap_coordinator/src/bitcoin/wallet.rs:474`). Run 1
+  still passed (`+9`: in-memory state is enough within one process, which is exactly what task 04
+  could not tell apart). Run 2 failed on `address frontier not reloaded`
+  (`Expected: <1> Actual: <0>`), and the signing test on `TryFinishTxError.insufficientBalance`
+  (the coin was not reloaded). Rig exit 1. Reverted with `git checkout --` on a file that was
+  clean before (`git diff --quiet` checked before and after).
+
+### Not done, and why
+
+- A stub process restart is out of scope. `FakeFlash` is in memory, and faking it would be a
+  fresh device.
+- Not re-run: the full readiness profile (`tools/check-software-readiness.py`). Its `app-rig`
+  stage runs this same `tools/app-rig-test.sh` with a 1500 s bound, and the final rig takes about
+  130 s.
+- Carried residuals, unchanged: a SIGKILL of `app-rig.py` itself is uncatchable. Flutter screens
+  are not pumped; coverage is at the API level. The shipped ARM image does not re-announce on a
+  port re-open, so this restart relies on the stub's `STUB_REANNOUNCE`, as task 04 already
+  recorded.
+
+## Fix 2b — repair 1 of 1
+
+Uncommitted. Only cold-snap `tools/app-rig.py` and this file were changed.
+
+1. **Relative `--dir` leaked app-dir into frostsnapp/ (FIXED).** `main()` now sets
+   `args.dir = os.path.abspath(args.dir)` right after `parse_args()`, so `COLDSNAP_RIG_DIR`,
+   the lock line, the sheets wipe and `Rig.outdir` all use one absolute path. The Dart test's
+   `$rigDir/app-dir` and `$rigDir/app-restart.json` now resolve to the same place the rig
+   tears down. The older leak `frostsnapp/target/software-only/verify-rerun-app-restart/rig/app-dir`
+   (Sep 24, someone else's run) was left alone, as the verifier did.
+2. **"Hidden by .git/info/exclude" (FIXED, documentation).** The Files-changed entry above is
+   corrected: `coldsnap_workflows_test.dart` is tracked (4b9edfa, 76982a5, 6d58541, ` M`), so a plain
+   `git add` stages it. `testnet4_chooser_test.dart` must still stay unstaged.
+3. **ibtoold daemons outliving the rig (FIXED).** `Rig` now makes a per-run
+   `COLDSNAP_RIG_RUN_TOKEN` (`<rig pid>-<ns>`) and passes it only in the command's env. The new
+   `Rig.reap_env_strays()` runs in teardown on every exit path. It scans `ps -E -ww -A` for that
+   exact token (never a process name, and never `COLDSNAP_RIG_DIR`, which an ancestor shell
+   could carry), sends SIGTERM and then SIGKILL, and adds any survivors to `alive`, which fails the
+   run with exit 4 `FAIL ORPHANS`. Only descendants of the command's env can match, so the user's
+   node (PID 13555) and other Xcode users cannot.
+
+| # | Command | cwd | Exit | Log (`target/software-only/logs/`) |
+|---|---|---|---|---|
+| R1 | `python3 -c "import ast;ast.parse(open('tools/app-rig.py').read())"` | cold-snap | 0 | — |
+| R2 | `/usr/bin/time -p tools/app-rig-test.sh --dir target/software-only/repair2b-rel/rig` (RELATIVE) | cold-snap | 0 (72.12 s) | `fix2b-repair-rel.log`: run 1 `+9`, run 2 `+5`, `app restart verified: pid 33202 persisted, pid 34099 reloaded and signed`, `SIGTERM 2 process(es) still carrying COLDSNAP_RIG_RUN_TOKEN=32562-...: [32718, 32719]`, `teardown: ... 0 still alive` |
+| R3 | `ps -p 32718,32719` | cold-snap | 1 (gone) | — |
+| R4 | `find $HOME/repos/frostsnap/frostsnapp/target/software-only -maxdepth 3` | — | 0 | only the pre-existing Sep-24 `verify-rerun-app-restart/rig/app-dir`; nothing from `repair2b-rel` |
+| R5 | `/usr/bin/time -p tools/app-rig-test.sh --timeout 40 --dir target/software-only/repair2b-rel/rig` | cold-snap | 5 (41.41 s) | `fix2b-repair-timeout40.log`: `FAIL TIMEOUT`, `teardown: reaped [-15 x4], command group gone, regtest down, 0 still alive` |
+| R6 | `pgrep -fl "app-rig.py\|examples/stub\|bitcoin-node -regtest\|flutter_tools\|ibtoold"` after R2 and after R5 | cold-snap | 1 both times | — |
+
+After R2 and R5 the rig dir holds only `device-*.log` and `identities.tsv`: no `app-dir`,
+`sheets` or `app-restart.json`. R2 is the case the verifier reproduced as exit 1, and the
+restart check now passes with a relative `--dir`. Every Flutter command ran under the pinned SDK,
+which app-rig-test.sh checks against `.fvmrc` on every run.
+Not re-run: an absolute-`--dir` or default-dir rig. The only change on that path is `abspath` of a
+path that is already absolute, plus the token reaper, which R2 exercised. The full readiness runner
+was not re-run either.
+Residual: the reaper cannot see a process that clears its own environment, or a process running
+as another uid. The token only reaches descendants of the command's env.
+
+## Fix 2b — close-out
+
+**Status: FIXED**, scoped to the app restart. Task 04 stays DEGRADED in `run.json`: the stub
+process restart is out of scope (in-memory `FakeFlash`) and was not faked.
+
+### Re-runner commands (not the implementer's)
+
+Round 1 (before repair; logs `target/software-only/verify-rerun-app-restart/`,
+`logs/verify-faults-app-restart-{hold,accept}.log`): absolute-`--dir` rig exit 0 (96.87 s, run 1
++9, run 2 +5, "pid 17111 persisted, pid 17954 reloaded and signed"); M1 exit 1; M2 exit 6; M3b
+(run 2 deletes only bdk `wallet-*.sql`) exit 1 "address frontier not reloaded"; `--timeout 70`
+exit 5 in run 2 with clean teardown; relative `--dir` exit 1 (finding 1); SIGTERM at the restart
+point and during post-restart signing both exit 143 with 0 left (run-2 app pid 14550 held
+`frostsnap.sqlite`, `wallet-*.sql` and 4 ptys, in the rig's pgid); bare verbatim flutter exit 1
+"COLDSNAP_RIG_APP_RUN is not set"; `flutter analyze` 0; both cargo Checks 0.
+
+Round 2 (after repair; logs `logs/verify2b-r2-*.log`): default rig exit 0 (70.04 s, "pid 36834
+persisted, pid 37556 reloaded and signed", post-restart Core ACCEPTED, 2 token strays reaped,
+0 still alive); cargo build 0; hostcheck 0 (4 `pass ok`); bare flutter 1 (named); analyze 0;
+M1 1; M2 6; M3 (production `apply_update` empty changeset) 1; relative `--dir` 0 (82.19 s,
+nothing new under `frostsnapp/target`); `--timeout 40` 5 (run 1); `--timeout 70` 5 (run 2);
+`pgrep` 1 after each. Findings: none.
+
+### Findings
+
+| Verdict | Finding | Outcome |
+|---|---|---|
+| CONFIRMED | relative `--dir` leaked `app-dir` into the frostsnap tree and failed the restart check (pre-dates 2b) | FIXED (repair 1, `abspath`); re-runner round 2 exit 0 |
+| CONFIRMED | evidence claimed `.git/info/exclude` hides the test file | FIXED (repair 1, wording). Close-out note: the path is matched by an ignore rule, so plain `git add` on the tracked file stages it but prints the ignored-path hint and exits 1; `git add -f` is the clean form |
+| CONFIRMED | Xcode `ibtoold` daemons from run 1's build outlived the rig carrying its env | FIXED (repair 1, `COLDSNAP_RIG_RUN_TOKEN` reaper); round 2 saw 2 strays reaped, `pgrep` 1 |
+| PLAUSIBLE | the post-restart signing test does not repeat run 1's fee-on-glass, confirm-key, share-count (`gotShares == threshold`), `canBroadcast` or tamper checks | OPEN (not repaired) |
+
+### Still open
+
+- PLAUSIBLE finding above.
+- The restart relies on the stub's `STUB_REANNOUNCE`; shipped ARM firmware does not re-announce
+  on a port re-open, so this is not evidence that shipped firmware survives an app restart.
+- The device-name reload check cannot tell the sqlite DB from the name the stub re-announces from
+  flash (the key, share, frontier and coin checks, which M1/M3 kill, do test the DB).
+- Stub process restart: out of scope, not faked. SIGKILL of the rig is uncatchable. Flutter
+  screens not pumped. Full readiness runner not re-run.
+
+### Commits
+
+- frostsnap `366da527e9268195d5cf000b6cd92ca879a6a153` (`frostsnapp/integration_test/coldsnap_workflows_test.dart`).
+- cold-snap: the fix 2b close-out commit (`tools/app-rig.py`, `tools/app-rig-test.sh`, this file,
+  `run.json`, the 04 evidence file; see `git log`, it cannot name its own SHA).
+
+Scope of claim: software/pre-bench checks passed, virtual ptys, regtest only.

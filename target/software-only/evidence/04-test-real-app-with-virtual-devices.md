@@ -1623,3 +1623,13 @@ PLAUSIBLE, still open and not counted as CONFIRMED:
 
 Software/pre-bench checks passed, on virtual ptys, a regtest-only Bitcoin Core, and synthetic
 wallets. Nothing here is hardware verified.
+
+## Follow-up 2026-09-24 — fix 2b
+
+Closed: the app-restart half of criterion 3 ("Not met: an app restart (never done)") and the
+residual "an app restart that reloads sqlite/bdk". `tools/app-rig-test.sh` now runs the app
+twice against the same app dir and live stubs; the second app process reloads the wallet, key,
+device names and next address and signs a tx that the independent sighash check and regtest Core
+accept. Still open: a stub process restart (in-memory `FakeFlash`, not faked), so criterion 3 is
+not fully met and this file's status is unchanged; the post-restart signing test checks less than
+run 1's (PLAUSIBLE). Detail, commands and commits: `10-followup.md` § "Fix 2b".

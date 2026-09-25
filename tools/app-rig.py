@@ -33,6 +33,8 @@ Exit codes, all named on stderr:
     3   DUPLICATE TEST IDENTITY across child processes
     4   CHILD FAILED (a stub exited while the rig was up)
     5   TIMEOUT (identities never appeared, or the command outlived --timeout)
+    6   APP RESTART UNVERIFIED (--app-restart: the second app process exited 0 but never
+        recorded that it reloaded the first one's wallet)
     *   otherwise the command's own exit code, passed through
 """
 
@@ -40,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import json
 import os
 import pty
 import re
@@ -116,6 +119,8 @@ class Rig:
     def __init__(self, outdir: str) -> None:
         # Absolute, because children (regtest.py via the app) resolve it from other cwds.
         self.outdir = outdir = os.path.abspath(outdir)
+        # Set only in the command's env, so no ancestor of the rig can ever match it.
+        self.run_token = f"{os.getpid()}-{time.time_ns()}"
         self.masters: list[int] = []
         self.slaves: list[int] = []
         self.paths: list[str] = []
@@ -132,6 +137,9 @@ class Rig:
         self.regtest = os.path.join(outdir, "regtest")
         self.manifest = os.path.join(outdir, "ports.txt")
         self.identities = os.path.join(outdir, "identities.tsv")
+        # `--app-restart`: what the first app process persisted, written by it and
+        # countersigned by the second (`coldsnap_workflows_test.dart`).
+        self.restart_snapshot = os.path.join(outdir, "app-restart.json")
 
     def open_ptys(self, n: int) -> None:
         for _ in range(n):
@@ -352,6 +360,41 @@ class Rig:
             return False
         return True
 
+    def reap_env_strays(self) -> list[int]:
+        """Kill processes that left the command's group but still carry this run's env.
+
+        xcodebuild's ibtoold daemons reparent to launchd in their own group, so neither
+        stop_command nor the stub pgrep sees them. Matched by this run's unique
+        COLDSNAP_RIG_RUN_TOKEN, never by name, so no other process is ever touched. Returns
+        pids that outlived SIGKILL.
+        """
+        if not shutil.which("ps"):
+            return []
+        mark = f"COLDSNAP_RIG_RUN_TOKEN={self.run_token}"
+        def strays() -> list[int]:
+            out = subprocess.run(["ps", "-E", "-ww", "-A", "-o", "pid=,command="],
+                                 capture_output=True, text=True).stdout
+            pids = []
+            for line in out.splitlines():
+                pid, _, rest = line.strip().partition(" ")
+                if pid.isdigit() and \
+                        re.search(re.escape(mark) + r"(\s|$)", rest):
+                    pids.append(int(pid))
+            return pids
+        found = strays()
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            if not found:
+                return []
+            log(f"{sig.name} {len(found)} process(es) still carrying {mark}: {found}")
+            for pid in found:
+                try:
+                    os.kill(pid, sig)
+                except ProcessLookupError:
+                    pass
+            time.sleep(1.0)
+            found = strays()
+        return found
+
     def teardown(self) -> None:
         """Reap every child and close every fd, on success, failure and timeout alike.
 
@@ -384,7 +427,7 @@ class Rig:
         self.slaves.clear()
         # A stale manifest would point the next app run at dead ptys, which looks
         # like a transport bug rather than a leftover file.
-        for path in (self.manifest,):
+        for path in (self.manifest, self.restart_snapshot):
             try:
                 os.remove(path)
             except FileNotFoundError:
@@ -394,6 +437,7 @@ class Rig:
         for d in ("app-dir", "sheets"):
             shutil.rmtree(os.path.join(self.outdir, d), ignore_errors=True)
         alive = [c.pid for c in self.children if c.poll() is None] + cmd_left
+        alive += self.reap_env_strays()
         log(f"teardown: reaped {[c.returncode for c in self.children]}, "
             f"command group {'gone' if not cmd_left else cmd_left}, "
             f"regtest {'down' if regtest_ok else 'NOT DOWN'}, "
@@ -444,12 +488,20 @@ def main() -> int:
                          "power loss at the point its KEYS letter names (p before the "
                          "commit, c after it, a with the ack in RAM, f in finish; "
                          "default c); boot recovery finishes a committed one (repeatable).")
+    ap.add_argument("--app-restart", action="store_true",
+                    help="run the command TWICE against the same stubs and the same app dir: "
+                         "COLDSNAP_RIG_APP_RUN=1, then, once its whole process group is gone, "
+                         "COLDSNAP_RIG_APP_RUN=2 -- a new app process reloading what the first "
+                         "persisted. Exit 6 unless the second recorded that it did.")
     ap.add_argument("--force-duplicate-identities", action="store_true",
                     help="MUTATION PROBE: give every device the same salt. The rig must "
                          "then fail with exit 3; if it exits 0 the identity check is dead.")
     ap.add_argument("command", nargs=argparse.REMAINDER,
                     help="after --, the command to run with the rig up")
     args = ap.parse_args()
+    # Relative would resolve against the Flutter test's cwd (frostsnapp/), leaking its
+    # app-dir there where teardown, which resolves against ours, never looks.
+    args.dir = os.path.abspath(args.dir)
 
     if args.devices < 1 or args.devices > 12:
         # 12 is the declared envelope (`MAX_PARTIES`, DECISIONS.md 7). Above it the
@@ -537,6 +589,7 @@ def main() -> int:
         env = dict(os.environ)
         env["FROSTSNAP_TEST_SERIAL_PORTS"] = rig.manifest
         env["COLDSNAP_RIG_DIR"] = args.dir
+        env["COLDSNAP_RIG_RUN_TOKEN"] = rig.run_token
         env["COLDSNAP_REPO"] = REPO
         # The test's `regtest.py up`/`down` inherit this, so the node lives under this
         # rig's dir and `Rig.stop_regtest` stops the same one.
@@ -548,31 +601,58 @@ def main() -> int:
         env["COLDSNAP_RIG_LOSE_FIRST_SHARE"] = ",".join(str(i) for i in sorted(lose))
         env["COLDSNAP_RIG_ERASE"] = ",".join(str(i) for i in sorted(erase))
         env["COLDSNAP_RIG_ERASE_CUT"] = ",".join(f"{i}:{k}" for i, k in sorted(erase_cut.items()))
-        log(f"running: {' '.join(cmd)}")
-        # Popen, not `run`, so a dead stub is caught WHILE the command runs. It used to be
-        # checked only after: a device that died mid-suite then showed up as a workflow
-        # that stalled until the command's own timeout, with the real cause 10 minutes
-        # back in a log. A stub that died is a failure even if the command later passes.
-        # start_new_session: its own process group (and session, so a terminal ^C reaches
-        # the rig, which then tears the group down in order, not every process at once).
-        proc = rig.cmd = subprocess.Popen(cmd, env=env, start_new_session=True)
         deadline = time.monotonic() + args.timeout
-        try:
-            while True:
-                try:
-                    code = proc.wait(timeout=0.5)
-                    break
-                except subprocess.TimeoutExpired:
-                    pass
-                rig.check_children_alive()
-                if time.monotonic() > deadline:
-                    log(f"FAIL TIMEOUT: command outlived --timeout {args.timeout:g}s")
-                    return 5
-        finally:
-            # The whole group, not the leader: an exited leader can leave children.
-            rig.stop_command()
-        rig.check_children_alive()
-        log(f"command exited {code}")
+        runs = ["1", "2"] if args.app_restart else [None]
+        for run in runs:
+            if run is not None:
+                env["COLDSNAP_RIG_APP_RUN"] = run
+            log(f"running{f' (app run {run})' if run else ''}: {' '.join(cmd)}")
+            # Popen, not `run`, so a dead stub is caught WHILE the command runs. It used to be
+            # checked only after: a device that died mid-suite then showed up as a workflow
+            # that stalled until the command's own timeout, with the real cause 10 minutes
+            # back in a log. A stub that died is a failure even if the command later passes.
+            # start_new_session: its own process group (and session, so a terminal ^C reaches
+            # the rig, which then tears the group down in order, not every process at once).
+            proc = rig.cmd = subprocess.Popen(cmd, env=env, start_new_session=True)
+            try:
+                while True:
+                    try:
+                        code = proc.wait(timeout=0.5)
+                        break
+                    except subprocess.TimeoutExpired:
+                        pass
+                    rig.check_children_alive()
+                    if time.monotonic() > deadline:
+                        log(f"FAIL TIMEOUT: command outlived --timeout {args.timeout:g}s")
+                        return 5
+            finally:
+                # The whole group, not the leader: an exited leader can leave children.
+                left = rig.stop_command()
+            rig.check_children_alive()
+            log(f"command exited {code}")
+            if code != 0:
+                return code
+            if run == "1":
+                # THE RESTART. Every process the first run started -- flutter, flutter_tools,
+                # the macOS test app -- is gone before the second starts; the stubs, their
+                # FakeFlash and the regtest node stay up, and the app dir is not touched.
+                if left:
+                    log(f"FAIL APP DID NOT STOP before the restart: {left} still in its group")
+                    return 4
+                log("app restart: first app process group gone; stubs "
+                    f"{[c.pid for c in rig.children]} still up; same app dir")
+        if args.app_restart:
+            try:
+                with open(rig.restart_snapshot) as fh:
+                    snap = json.load(fh)
+            except (OSError, ValueError) as err:
+                snap = {"error": str(err)}
+            if not snap.get("reloadedByPid") or snap.get("reloadedByPid") == snap.get("pid"):
+                log(f"FAIL APP RESTART UNVERIFIED: {rig.restart_snapshot} has no second-process "
+                    f"countersignature ({snap})")
+                return 6
+            log(f"app restart verified: pid {snap['pid']} persisted, pid "
+                f"{snap['reloadedByPid']} reloaded and signed")
         return code
     finally:
         rig.teardown()
