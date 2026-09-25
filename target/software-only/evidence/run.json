@@ -135,6 +135,24 @@
       "Whether real Mk4 hardware can be told apart from an ESP32 development build at all: an unregistered Mk4 is wire-indistinguishable (the only magic-bytes-time discriminator is DeviceSupportedFeatures { conch_enabled }), and closing that without a factory certificate is a bench-and-provisioning question this task does not touch and introduced no gate for.",
       "erase_all_devices with mixed hardware: whether a daisy-chained Mk4 downstream of an addressed ESP32 forwards the DataErase cleanly and drops it is device behaviour, unexercised here. The dialog also says nothing about the skipped Mk4.",
       "NOT bench-only and must not be cited later as measured: the evil-maid hole is untouched and open. Key 0's private key is published, so a key-0 signature is a FORMAT check and not an authorisation check; the registry changes that in neither direction and is compatibility, not permission to install."
+    ],
+    "followup": [
+      {
+        "fix": "4",
+        "commit": [
+          "cold-snap: the fix 4 close-out commit (see git log; it cannot name its own SHA)"
+        ],
+        "closed": [
+          "#13 CONFIRMED: hostcheck/Cargo.toml:59 unpinned path dependency on ../../frostsnap. hostcheck/frostsnap.rev pins frostsnap 366da527e9268195d5cf000b6cd92ca879a6a153, checked by hostcheck/build.rs before main.rs compiles and by the readiness stage frostsnap-pin. Older/diverged/pin-absent/non-git/missing fail by name with both SHAs and the fix (0 error[E lines vs baseline E0432); a descendant builds with warnings and fails the stage (exit 3)"
+        ],
+        "still_open": [
+          "full readiness profile exit 1 at the pinned pair: coldsnap-mk4-registry.txt lacks current image digest c86392bc (registry-matches-artifact, app-rig, updater-local-artifact); predates fix 4",
+          "no check that FROSTSNAP_REPO and ../../frostsnap are the same tree",
+          "PLAUSIBLE: tracked edits only warn, so old crate sources under HEAD==pin still reach E0432",
+          "PLAUSIBLE: pin-absent remedy omits git fetch; shallow descendant lacking the pin classified as pin-absent",
+          "missing ../../frostsnap fails in cargo path resolution before build.rs (no SHAs printed)"
+        ]
+      }
     ]
   },
   {

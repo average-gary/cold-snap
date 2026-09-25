@@ -339,6 +339,12 @@ def stages(out):
         S('stub-build', 'coordinator', 'virtual-device stub build', CS,
           ['cargo', 'build', '--target', HOST, '-p', 'coldsnap_firmware', '--example', 'stub'],
           needs=['cargo', 'rust-host']),
+        # No `needs`: a missing or non-git frostsnap is this stage's own named failure, not
+        # 'unavailable'. Exit 3 (frostsnap ahead of the pin, or its crates edited) fails too:
+        # the report must describe the recorded pair (hostcheck/frostsnap.rev).
+        S('frostsnap-pin', 'coordinator', 'frostsnap HEAD is the revision hostcheck is pinned to', CS,
+          ['sh', 'hostcheck/check-frostsnap-pin.sh', FS], timeout=60,
+          must=[r'(?m)^FROSTSNAP PIN: OK: HEAD is the pin']),
         S('hostcheck-tests', 'coordinator', 'hostcheck unit + golden vector', os.path.join(CS, 'hostcheck'),
           ['cargo', 'test', '--target', HOST], needs=['cargo', 'frostsnap'], must=[TESTS_RAN]),
         S('hostcheck-run', 'coordinator', 'real coordinator vs stub over a pty', os.path.join(CS, 'hostcheck'),

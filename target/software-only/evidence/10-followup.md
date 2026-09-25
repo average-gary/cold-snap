@@ -555,3 +555,230 @@ Note: the `07-rerun2/mut-summary.txt` correction lives under ignored `target/sof
 
 ### Commit
 - cold-snap: the fix 3 close-out commit (`tools/test-pack-signed.py`, `tools/check-reference-contracts.py`, `firmware/src/install.rs`, `tools/check-software-readiness.py`, `tools/test-software-readiness.py`, this file, `run.json`, the 01/03/07/09 evidence files; see `git log`, it cannot name its own SHA).
+
+## Fix 4 — pin cold-snap hostcheck to a frostsnap revision
+
+**Status: FIXED** (re-run by verifiers; repair 1 applied; final status in § "Fix 4 — close-out"). The original implementer status line read: FIXED (implementer; not yet re-run by a verifier, not committed). Closes the open CONFIRMED finding #13 of
+`target/software-only/evidence/02-recognize-coldsnap-in-app.md` (STATUS block at :13-22, table row at :1199):
+`hostcheck/Cargo.toml:59` was a path dependency on `../../frostsnap` that recorded no revision, so a mismatched
+checkout broke hostcheck with unrelated compile errors (reproduced below as `E0432 unresolved import
+frostsnap_coordinator::DeviceProfile`). Task 02's status in run.json is not changed here. Only claim: software/pre-bench
+checks passed, for these checks.
+
+**Commands below are the IMPLEMENTER's.** Logs: `target/software-only/logs/10-fix4/`. Scratch trees:
+`target/software-only/fix4/` (ignored). `$HOME/repos/frostsnap` was only read (`rev-parse`, `clone --no-local`
+source, `archive`); nothing was checked out, reset, or worktree'd there.
+
+### Real Cargo pin: tried, works, not adopted
+
+`git = "file:///Users/garykrause/repos/frostsnap", rev = "366da527…"` for both `frostsnap_coordinator` and `frost_backup`, in
+a scratch copy of hostcheck (`target/software-only/fix4/gitpin`): `cargo test --target aarch64-apple-darwin` exit **0**,
+2 passed (the first attempt exited 101 only because the scratch copy lacked `../../golden`). Cargo.lock recorded
+`source = "git+file:///Users/garykrause/repos/frostsnap?rev=366da527…#366da527…"` and resolved the same package versions.
+Not adopted, for these measured or structural reasons:
+1. Cargo rejects relative git URLs: `git = "../../../../../frostsnap"` gives exit 101 `invalid url ...: relative URL
+   without a base`; `file:../../…` resolves to `file:///frostsnap` and fails. So the pin would hardcode one user's
+   absolute path in `hostcheck/Cargo.toml` and `Cargo.lock`. Today the manifest only assumes a sibling checkout.
+2. It ignores `$FROSTSNAP_REPO`, and it builds a cargo-cached clone of the commit rather than the tree every other
+   readiness stage tests.
+3. Its only mismatch failure (rev absent from the repo) happens in cargo's dependency resolution. That runs before
+   any build script, so nothing could print both SHAs and the fix.
+Also noted: `$HOME/repos/frostsnap` is a shallow repository (`rev-parse --is-shallow-repository` → `true`).
+
+### What was built instead (recorded revision, checked twice)
+
+- `hostcheck/frostsnap.rev` (new): 3 comment lines + `366da527e9268195d5cf000b6cd92ca879a6a153`. This equals
+  `git -C "$HOME/repos/frostsnap" rev-parse HEAD` after fixes 2a/2b (`366da52`, fix 2b's frostsnap commit).
+- `hostcheck/check-frostsnap-pin.sh` (new, POSIX sh, shellcheck exit 0): one implementation of the policy. Exit 0 = HEAD is the pin
+  and no tracked edits in `Cargo.toml frostsnap_coordinator frostsnap_core frostsnap_comms frost_backup macros` (the
+  path packages in `hostcheck/Cargo.lock`: :46-48). Exit 3 = HEAD descends from the pin, or those crates have tracked
+  edits (:35-37, :50-52). Exit 1 = a named failure: pin file unreadable or not a 40-hex SHA (:20-22), checkout missing (:23),
+  not a git repo (:26), not its own checkout, e.g. an export sitting inside cold-snap (:27), no HEAD (:28), pin not in
+  the repo (:33-34), HEAD older than the pin (:38-40), or diverged (:41-43). Every mismatch prints `pinned <sha>`,
+  `HEAD <sha>` and both fixes: check out the pin, or bump after verifying (:13-17).
+- `hostcheck/build.rs` (new): runs the script before `src/main.rs` compiles. 0 → nothing; 3 → `cargo:warning` lines;
+  anything else → prints the output and exits 1. `rerun-if-changed` is on the pin file, the script, and
+  `../../frostsnap/.git/{HEAD,packed-refs,refs/heads}`. It reads `CARGO_MANIFEST_DIR` at run time: the first draft
+  used `env!`, which baked in the directory the script was first compiled in. Caught by the scratch pairs (every pair
+  reported pair-work-old's HEAD) and fixed before any result below.
+- `hostcheck/Cargo.toml:24-37`: documents the pin, the policy and why a Cargo pin was not used; `:71` bump note.
+- `tools/check-software-readiness.py:342-347`: new stage `frostsnap-pin` (group coordinator, ahead of hostcheck-tests),
+  `sh hostcheck/check-frostsnap-pin.sh $FS`, cwd cold-snap, and `must` = the `OK: HEAD is the pin` line. It has no
+  `needs`, so a missing frostsnap is this stage's own named failure, not `unavailable`.
+- `tools/test-software-readiness.py:226-278` (block ends before :280): 10 new cases. They run the real stage on the real checkout (passed),
+  then the same argv on a synthetic repo with its own pin file: equal → passed; older → failed rc 1 with both SHAs
+  and "bump"; ahead → failed rc 3; diverged → rc 1; tracked edit → rc 3 EDITED; pin absent → rc 1; unreadable pin
+  file; missing dir; a non-checkout directory inside cold-snap.
+- `README.md:508-533`: "Bumping the frostsnap pin", with the policy table and the bump recipe.
+
+**Policy, and why.** A *descendant* has every commit cold-snap depends on. hostcheck builds against it with a
+warning that names both SHAs, because building against the new HEAD is how you verify it before a bump. Refusing
+would block the verification. The runner still fails the stage (rc 3), because its report must describe the
+recorded pair, and a descendant is unverified. Tracked edits in the pinned crates get the same treatment: the build
+is then not the pin. *Older, diverged, or pin-absent* trees lack code hostcheck names, which is exactly the
+confusing-compile-error case, so they fail the build and the stage by name. *Missing or not a git repo*: the
+revision is unknowable, so it is a named failure. The one exception is a missing
+`../../frostsnap/frostsnap_coordinator`: cargo's own path resolution fails first ("failed to read
+…/frostsnap/frost_backup/Cargo.toml"), before any build script. That is early, names the path, and produces no
+compile errors, but it does not print SHAs. The runner stage covers it by name.
+
+### Commands (implementer)
+
+| # | command | cwd | exit | time |
+|---|---|---|---|---|
+| 1 | `git status --porcelain` / `git diff --stat` both repos | both | 0 | <1 s | clean apart from the user's files
+| 2 | git-pin scratch `cargo test --target aarch64-apple-darwin` (no golden) | fix4/gitpin | 101 | 21 s |
+| 3 | same, golden copied | fix4/gitpin | **0** (2 passed) | 1 s |
+| 4 | `cargo metadata` with relative git URL / `file:` relative URL | fix4/gitpin | 101 / 101 | <1 s |
+| 5 | `sh hostcheck/check-frostsnap-pin.sh $HOME/repos/frostsnap` | cold-snap | **0** OK | 0 s |
+| 6 | same script vs demo/{old,ahead,diverged,absent,archive,dirty-src,nonexistent}, bad pin file | fix4 | 1,3,1,1,1,3,1,1 | <1 s each |
+| 7 | `GIT_CEILING_DIRECTORIES=demo sh … demo/archive` | fix4 | 1 "is not a git repository" | <1 s |
+| 8 | BASELINE: HEAD's hostcheck (`git archive HEAD hostcheck`) `cargo build --offline` vs demo/old (9d7f55b = e31dea9^) | fix4/demo/pair-*-head-old | **101**, `error[E0432]: unresolved import frostsnap_coordinator::DeviceProfile` | 15 s / 7 s (final) |
+| 9 | new hostcheck `cargo build --offline` vs old / diverged / absent / archive | fix4/demo/pair-work-* | 101 each, **0 `error[E`**, "failed to run custom build command" + MISMATCH/not its own checkout | 1-8 s |
+| 10 | same vs ahead / dirty-src | pair-work-* | **0**, `warning: hostcheck@0.1.0: FROSTSNAP PIN: AHEAD` / `EDITED` | 7-9 s |
+| 11 | rerun-if-changed: build OK at pin; `reset --hard 9d7f55b` in demo/moving → rebuild; reset to pin → rebuild; no-op rebuild | pair-moving | 0 → **101** MISMATCH → 0 → 0 | ~7 s |
+| 12 | missing frostsnap (dangling symlink) `cargo build --offline` | pair-missing | 101, cargo's "failed to load manifest for dependency `frost_backup`" | 0 s |
+| 13 | runner stage alone (`R.run_stage` of `frostsnap-pin`) on the real checkout | cold-snap | passed rc 0 | 0.04 s |
+| 14 | same with `FROSTSNAP_REPO=demo/old`, `demo/ahead`, `demo/archive` | cold-snap | failed rc 1 / rc 3 / rc 1 | <1 s |
+| 15 | `cargo build --target aarch64-apple-darwin -p coldsnap_firmware --example stub` | cold-snap | 0 | 6 s |
+| 16 | `cargo test --target aarch64-apple-darwin` | hostcheck | **0**, 2 passed, no FROSTSNAP line | 4 s |
+| 17 | `cargo run -- ../target/aarch64-apple-darwin/debug/examples/stub` | hostcheck | **0**, `M1+…+M13 PASS` | 19 s |
+| 18 | `cargo clippy --target aarch64-apple-darwin` | hostcheck | 0, 0 warnings | 6 s |
+| 19 | `shellcheck check-frostsnap-pin.sh` | hostcheck | 1 (SC2086), then fixed → 0 | <1 s |
+| 20 | `python3 tools/test-software-readiness.py` (final) | cold-snap | **0**, `PASS: 0 failed case(s)`, 83 ok | 56 s |
+| 21 | final pairs, fresh scratch target dir: new vs old / ahead | fix4 | 101 (0 `error[E`) / 0 (AHEAD warning) | 7 s / 10 s |
+| 22 | `cargo test` (final script) | hostcheck | 0, 2 passed; `git diff --quiet hostcheck/Cargo.lock` → 0 | 1 s |
+
+Harness note: a first "final" pair (row 21's first attempt) showed `E0432`. The scratch pairs shared one
+`CARGO_TARGET_DIR`, and `tar` kept build.rs's original mtime, which was older than M3's mutated copy, so cargo reused M3's
+build-script binary. With the scratch target dir deleted, the result is the one in row 21. This only affects the
+scratch harness: the real hostcheck has its own target dir and build.rs is not copied.
+
+While fixing SC2086 I first piped `git diff` into `tr`, which would have hidden git's exit status. It now captures
+git's status first and filters separately (script :50-51).
+
+### Mutations (each fails for its named reason; real code passes, rows 16-22)
+
+| id | mutation (in-tree script restored byte-exact from `logs/10-fix4/pin.sh.orig`; sha256 `363ac4f0…` before = after, a PRE-shellcheck version, NOT the final script `590b2a79…`; M1/M2/M4 re-run on the final script in "Fix 4 — repair 1 of 1") | result |
+|---|---|---|
+| M0 | none: HEAD's hostcheck vs older tree | E0432 (the original confusing failure) |
+| M1 | `if [ "$head" != "$pin" ]` → `if false` | self-test exit 1: older, ahead, diverged, pin-absent cases FAIL (55 s) |
+| M2 | drop the `top = real` check | self-test exit 1: "not its own git checkout" case FAIL (57 s) |
+| M4 | drop the dirty check | self-test exit 1: EDITED case FAIL (56 s) |
+| M3 | scratch build.rs: failure branch → warnings only (`Some(3)` → `_`) | build vs old: rc 101 with `error[E0432]` behind the MISMATCH warning. The hard failure is what prevents the confusing error. |
+
+The sha-256 values above are for the pre-shellcheck script. The script was then edited (:50-51), and rows 20-22 re-ran on the
+final version.
+
+### Left undone
+- The runner's `FS` (`$FROSTSNAP_REPO`) and hostcheck's compiled `../../frostsnap` can still be different trees when
+  the variable is overridden. build.rs checks the sibling and the stage checks `FS`, so each tree is checked, but
+  nothing asserts they are the same tree. This is a pre-existing runner property, not introduced here.
+- No full readiness profile run. The new stage and hostcheck stages were run on their own (rows 13, 16, 17).
+
+## Fix 4 — repair 1 of 1
+
+### Findings
+- **F1/F3 (EDITED warning goes stale after a clean build): FIXED.** Cause: `hostcheck/build.rs` printed
+  `rerun-if-changed` only for `frostsnap.rev`, the script and frostsnap's `.git/{HEAD,packed-refs,refs/heads}`, so
+  cargo never re-ran it for a crate-source edit. build.rs now also prints `rerun-if-changed` for every entry on the
+  script's own `crates="..."` line (read from `check-frostsnap-pin.sh` at run time, so the lists cannot drift; a
+  missing line panics with a `FROSTSNAP PIN:` message). Cargo scans a listed directory recursively.
+  README "Bumping the frostsnap pin" now states when the check re-runs; build.rs header says the same.
+- **F2 (mutation provenance sha): FIXED.** The :662 table header now says `363ac4f0…` is the pre-shellcheck script,
+  and M1/M2/M4 were re-run on the final script (below).
+
+### Commands (cwd given; exit = the process's own status)
+| # | command | cwd | exit / result |
+|---|---|---|---|
+| 1 | `git clone --no-hardlinks $HOME/repos/frostsnap demo/pinclean; git -C demo/pinclean checkout 366da52…` | fix4/demo | 0, HEAD = pin |
+| 2 | `pair-r1.sh r1 pinclean work build --offline` (new build.rs, fresh target dir `demo/target-r1`) | fix4 | 0, 0 PIN lines (`logs/10-fix4/pair-r1.log`) |
+| 3 | `cargo build --offline` no-op | pair-r1/cold-snap/hostcheck | 0, 0 PIN lines (`r1-noop.log`) |
+| 4 | append `// r1 edit` to pinclean/frostsnap_coordinator/src/lib.rs; `cargo build --offline` | same | **0, 3 PIN lines, `EDITED: … frostsnap_coordinator/src/lib.rs`** (`r1-edit.log`) — the finding's exact scenario |
+| 5 | rebuild again, edit still present | same | 0, EDITED replayed (`r1-edit-again.log`) |
+| 6 | `git -C pinclean checkout -- …lib.rs`; rebuild; no-op rebuild | same | 0, 0 PIN lines / 0, 0 (`r1-reverted.log`, `r1-noop2.log`) |
+| M5 | scratch copy of build.rs only: delete the new `for c in crates` loop; build; then same edit; build | same | 0, 0 PIN lines / **0, 0 PIN lines** — reproduces the finding; the loop is what fixes it. pinclean restored, `status --porcelain` empty |
+| 7 | `target/software-only/logs/10-fix4r/muts.sh`: final script sha256 `590b2a79b3cb47eb07e209a61239dc738d5bfeb3a12e5f8815d1ba1dbc432be6` saved as `logs/10-fix4r/pin.sh.final`; each mutation applied in-tree, `python3 tools/test-software-readiness.py`, restored | cold-snap | M1 (`if false`) rc 1: older/ahead/diverged/pin-absent FAIL; M2 (drop top=real) rc 1: not-its-own-checkout FAIL; M4 (drop dirty check) rc 1: EDITED FAIL (`mut-M{1,2,4}.log`) |
+| 8 | after restore: sha256 = `590b2a79…` and `cmp` with pin.sh.final | cold-snap | 0, byte-exact |
+| 9 | `python3 tools/test-software-readiness.py` | cold-snap | **0**, `PASS: 0 failed case(s)` (`logs/10-fix4r/selftest-final.log`) |
+| 10 | `cargo test --target aarch64-apple-darwin` | hostcheck | **0**, 2 passed, 0 PIN lines |
+| 11 | `cargo clippy --target aarch64-apple-darwin` | hostcheck | 0, 0 warnings |
+| 12 | `git diff --quiet hostcheck/Cargo.lock` | cold-snap | 0 |
+| 13 | `sh check-frostsnap-pin.sh $HOME/repos/frostsnap`; `git -C $HOME/repos/frostsnap rev-parse HEAD` | hostcheck | 0 OK; HEAD `366da527…` = pin |
+
+### Files changed (working tree only, not committed)
+`hostcheck/build.rs`, `README.md` (pin section), this evidence file. `check-frostsnap-pin.sh` unchanged (sha above).
+
+### Not re-run
+`cargo run` of hostcheck against the stub (build.rs change does not touch `src/`; `cargo test` compiled it). No full readiness profile.
+
+## Fix 4 — close-out
+
+**Status: FIXED**, scoped to software/pre-bench checks. Finding #13 of task 02 (the unpinned path
+dependency at `hostcheck/Cargo.toml:59`) is closed. cold-snap now records frostsnap `366da527e9268195d5cf000b6cd92ca879a6a153`
+in `hostcheck/frostsnap.rev`. That equals frostsnap HEAD after fixes 2a/2b. The pin is checked by `hostcheck/build.rs`
+before `src/main.rs` compiles, and by the readiness stage `frostsnap-pin`. A mismatch fails by name, prints both SHAs
+and the fix, and produces 0 `error[E` lines. A real Cargo `git`+`rev` pin was tried: it builds, but it was not
+adopted, because cargo rejects relative git URLs and the pin would hardcode an absolute path in Cargo.toml and
+Cargo.lock (reasons in § "Real Cargo pin"). Policy: an ahead (descendant) tree builds with warnings but fails the
+stage (exit 3); an older, diverged, pin-absent, missing or non-git tree fails both (exit 1). This is documented in
+README "Bumping the frostsnap pin". This fix changed cold-snap only; frostsnap was only read.
+The full readiness profile does **not** pass at this pair, for a cause that predates fix 4 (finding R2-1 below).
+
+### Implementer commands (IMPLEMENTER; see § "Fix 4" and § "Fix 4 — repair 1 of 1")
+The pin script ran against old/ahead/diverged/absent/archive/dirty/nonexistent/bad-pin trees: 1/3/1/1/1/3/1/1.
+Baseline: HEAD's hostcheck built against 9d7f55b gives 101 with E0432. The new hostcheck against old/diverged/absent/archive
+gives 101 with 0 `error[E`; against ahead/dirty it gives 0 with warnings. Other results: `cargo test` 0 (2 passed), `cargo run` vs stub 0,
+clippy 0, shellcheck 0, `tools/test-software-readiness.py` 0 (83 ok), Cargo.lock unchanged. Repair: the rerun sequence
+clean/no-op/edit/rebuild/revert/no-op gave 0 at each step, with EDITED appearing after the edit. Mutation M5 brings the stale-warning bug back. M1/M2/M4 were re-run
+on the final script (sha256 `590b2a79…`), each self-test rc 1.
+
+### Re-runner commands (RE-RUNNER, not the implementer; scratch `target/software-only/verify-rerun-pin/`)
+| command | cwd | exit / result |
+|---|---|---|
+| `sh hostcheck/check-frostsnap-pin.sh $HOME/repos/frostsnap` | cold-snap | 0, "OK: HEAD is the pin" |
+| same vs own trees older / ahead / diverged / dirty / archive / plain-nested / missing / empty | cold-snap | 1 / 3 / 1 / 3 / 1 / 1 / 1 / 1, each named |
+| bad / 7-char / absent pin file | cold-snap | 1 / 1 / 1 |
+| baseline HEAD hostcheck vs 9d7f55b `cargo build` | scratch | 101, E0432 DeviceProfile |
+| new hostcheck vs old / diverged / archive | scratch | 101 each, 0 `error[E`, MISMATCH message |
+| new hostcheck vs ahead / dirty / real | scratch | 0 / 0 (warnings) / 0 (no pin lines) |
+| new hostcheck, frostsnap missing | scratch | 101, cargo "failed to load manifest" (no SHAs; disclosed) |
+| repaired rerun sequence on a clone at the pin (clean/no-op/edit/rebuild/revert/no-op) | scratch | 0 each; PIN lines 0/0/3/3/0/0 |
+| M5 (build.rs rerun loop removed, scratch) | scratch | bug returns: 0 PIN lines after edit |
+| M1/M2/M4 on scratch copies of the final script | scratch | each gives the wrong outcome its self-test case asserts against |
+| `frostsnap-pin` stage, `FROSTSNAP_REPO` = real / old / ahead / archive / missing | cold-snap | passed rc0 / failed rc1 / rc3 / rc1 / rc1 |
+| `python3 tools/test-software-readiness.py` | cold-snap | 0, 83 ok, `PASS: 0 failed case(s)` |
+| `cargo test` / `cargo clippy` (`--target aarch64-apple-darwin`) | hostcheck | 0 (2 passed) / 0 (0 warnings) |
+| `shellcheck check-frostsnap-pin.sh`; `git diff --quiet hostcheck/Cargo.lock` | hostcheck / cold-snap | 0; 0 |
+| `python3 tools/check-software-readiness.py --profile full --output-dir target/software-only/verify-rerun-pin/full` | cold-snap | **1**, NOT PASSED: registry-matches-artifact, app-rig (rc4), updater-local-artifact (rc101); 39 passed incl. frostsnap-pin, hostcheck-tests, hostcheck-run, coordinator-verbatim |
+
+### CONFIRMED findings
+1. R1-F1 / R1-F3: build.rs did not re-run on edits to the pinned crates' sources, so the EDITED warning went stale after
+   a clean build. **Fixed** by repair 1: build.rs reads the script's `crates=` line and prints `rerun-if-changed` for each entry.
+   The re-runner reproduced this, and M5 kills it.
+2. R1-F2: the evidence's mutation sha256 `363ac4f0…` was the pre-shellcheck script, not the final one. **Fixed** by repair 1: the
+   header is corrected, and M1/M2/M4 were re-run on the final `590b2a79…`.
+3. R2-1: at the recorded pin the full profile fails. `registry-matches-artifact`, `app-rig` (`unrecognized-c86392`) and
+   `updater-local-artifact` all fail because frostsnap's `coldsnap-mk4-registry.txt` lacks the current cold-snap image
+   digest `c86392bc…`. **Not fixed; not caused by fix 4**, which touches no firmware. It predates this fix and is the same
+   stale-registry item recorded in § "Fix 3 — close-out". It needs task 02's `register-mk4-firmware.py` plus a
+   frostsnap commit and a pin bump. The README bump steps check hostcheck only, so "frostsnap-pin passed" does not
+   mean the pair passes readiness.
+
+### PLAUSIBLE findings (recorded, not fixed)
+- Under the edits-only-warn policy, old coordinator sources under HEAD==pin still reach the compiler (EDITED warnings,
+  then E0432). The warning names the cause.
+- In the "pin not in this checkout" case, the printed `git checkout <pin>` remedy cannot work without a fetch first. `$HOME/repos/frostsnap`
+  is a shallow clone. A shallow descendant that lacks the pin fails as pin-absent, not as AHEAD.
+- For OLDER or diverged trees, the "bump the pin" remedy wording could suggest pinning an older HEAD. Behaviour is correct.
+
+### Still open
+- Nothing checks that `$FROSTSNAP_REPO` (the runner) and `../../frostsnap` (build.rs) are the same tree. This gap predates the fix.
+- R2-1 registry staleness (above). The full profile stays red until then.
+- README "Known today" still says coordinator-verbatim is blocked, which fix 1 made stale.
+- If `../../frostsnap` does not exist at all, cargo fails in path resolution before build.rs runs. That is early and names the path, but prints no SHAs.
+
+### Commit
+- cold-snap: the fix 4 close-out commit (`hostcheck/Cargo.toml`, `hostcheck/build.rs`, `hostcheck/check-frostsnap-pin.sh`,
+  `hostcheck/frostsnap.rev`, `README.md`, `tools/check-software-readiness.py`, `tools/test-software-readiness.py`, this
+  file, `run.json`, the 02 evidence file). See `git log`; the commit cannot name its own SHA. frostsnap: no commit (unchanged).

@@ -505,6 +505,36 @@ cargo build --target $T -p coldsnap_firmware --example stub
 (cd hostcheck && cargo run)   # prints "M1+M2+M3+M5+M7+M8+M9+M12+M13 PASS: ..."; failures name the state
 ```
 
+#### Bumping the frostsnap pin
+
+`hostcheck` compiles `../../frostsnap` by path (the two workspaces cannot share a
+lockfile; see `hostcheck/Cargo.toml`), and `hostcheck/frostsnap.rev` records the
+frostsnap commit it was last built and verified against. `hostcheck/build.rs` runs
+`hostcheck/check-frostsnap-pin.sh` before `src/main.rs` compiles, and again whenever
+frostsnap's HEAD or branch refs move, `frostsnap.rev` or the script change, or any file
+under the pinned crates listed below changes, so an edit made after a clean build still
+warns on the next `cargo build`:
+
+| frostsnap checkout | hostcheck build | readiness `frostsnap-pin` stage |
+|---|---|---|
+| HEAD is the pin, pinned crates unedited | builds | passed |
+| HEAD descends from the pin, or tracked edits in `frostsnap_coordinator`/`_core`/`_comms`/`frost_backup`/`macros`/`Cargo.toml` | builds, with `FROSTSNAP PIN:` warnings | failed (exit 3) |
+| HEAD older than the pin, diverged, pin not in the repo, not its own git repo, or missing | fails with both SHAs and the fix (a missing `frostsnap_coordinator` fails even earlier, in cargo's own path resolution) | failed (exit 1) |
+
+A descendant still has every commit cold-snap depends on, so it is allowed to build:
+that is how you verify it before bumping. It is not verified, so the runner does not
+pass it. An older or diverged tree lacks code hostcheck names, so it fails fast
+instead of as unrelated compile errors. To bump, after frostsnap's commits land:
+
+```sh
+cd "$HOME/repos/cold-snap/hostcheck"
+cargo test && cargo run -- ../target/aarch64-apple-darwin/debug/examples/stub   # against the new HEAD
+git -C "$HOME/repos/frostsnap" rev-parse HEAD   # put this on the SHA line of frostsnap.rev
+sh check-frostsnap-pin.sh "$HOME/repos/frostsnap"   # must print "OK: HEAD is the pin"
+```
+
+Commit `frostsnap.rev` with the cold-snap change that needed the new frostsnap commit.
+
 One more gate, and it is the last one before a bench: `firmware/examples/checkfw.rs`
 asks whether the Mk4 bootloader's `verify_firmware()` would ACCEPT a packaged
 artifact. Run it on whatever the packaging step emitted (raw `signit.py` output or

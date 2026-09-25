@@ -21,7 +21,20 @@
 # `cargo build --release` for thumbv7em. Do not "tidy" this into the root
 # workspace members list; it will not resolve.
 #
-# Requires a sibling checkout at ../../frostsnap (upstream, read-only).
+# Requires a sibling checkout at ../../frostsnap AT THE COMMIT IN frostsnap.rev.
+# build.rs runs check-frostsnap-pin.sh before src/main.rs compiles: a checkout that
+# is older than, diverged from, or missing the pin (or is not its own git repo)
+# fails the build by name with both SHAs and the fix; one AHEAD of the pin, or with
+# tracked edits in the crates below, builds with a warning. The readiness runner's
+# `frostsnap-pin` stage fails on both. Bumping: README "Bumping the frostsnap pin".
+#
+# Why a recorded revision and not a Cargo pin: `{ git = "file:///...", rev = ... }`
+# was tried (2026-09-25) and builds, but Cargo rejects relative git URLs ("relative
+# URL without a base"), so it would hardcode one user's absolute path in this file
+# and in Cargo.lock, ignore $FROSTSNAP_REPO, and test a different tree from the one
+# every other readiness stage tests; and its only mismatch failure (rev not in the
+# repo) happens in dependency resolution, before any build script could name both
+# SHAs.
 ####################################################################
 [package]
 name = "hostcheck"
@@ -55,7 +68,7 @@ publish = false
 #  - The bitcoin wallet churn in that range (bitcoin/send.rs +845) is not reachable from
 #    this harness, which drives keygen, signing and restoration and never a bdk wallet.
 #
-# Re-run those two `git diff --stat` invocations when the sibling moves.
+# Re-run those two `git diff --stat` invocations when the sibling moves, then bump frostsnap.rev.
 frostsnap_coordinator = { path = "../../frostsnap/frostsnap_coordinator" }
 # Not a direct dependency: `frostsnap_coordinator` re-exports the serialport
 # crate (`pub use serialport;`), so taking it from there makes two versions of it

@@ -223,6 +223,60 @@ def main():
     check('source drift during a run -> exit 1, named, no success label',
           code == 1 and 'SOURCE DRIFT' in lab and lab.startswith('NOT PASSED'), lab)
 
+    # frostsnap pin: the real stage, pointed at synthetic checkouts and its own pin file
+    pin_st = next(s for s in R.stages(OUT) if s.name == 'frostsnap-pin')
+    r = R.run_stage(pin_st, os.path.join(OUT, 'logs'), {}, 1.0, GRACE)
+    check('frostsnap-pin on the real checkout -> passed', r['status'] == 'passed', r)
+    fs = os.path.join(OUT, 'fs')
+    g = lambda *a: subprocess.run(['git', '-C', fs, '-c', 'user.name=t', '-c', 'user.email=t@t', *a],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+    os.makedirs(os.path.join(fs, 'frostsnap_coordinator'))
+    subprocess.run(['git', 'init', '-q', fs], check=True)
+    for n in ('a', 'b'):
+        open(os.path.join(fs, 'frostsnap_coordinator', 'lib.rs'), 'w').write(n)
+        g('add', '-A'), g('commit', '-qm', n)
+    a, b = g('rev-parse', 'HEAD~1'), g('rev-parse', 'HEAD')
+    pinf = os.path.join(OUT, 'frostsnap.rev')
+    open(pinf, 'w').write(f'# comment\n{b}\n')
+
+    def pin(tree=fs, pinfile=pinf):
+        st = R.Stage('pin', 'coordinator', 'pin', pin_st.cwd, pin_st.argv[:-1] + [tree, pinfile],
+                     must=pin_st.must)
+        res = one(st)
+        return res, open(res['stdout_log']).read() if res.get('stdout_log') else ''
+
+    r, o = pin()
+    check('pin: HEAD is the pin -> passed', r['status'] == 'passed', o)
+    g('checkout', '-q', a)
+    r, o = pin()
+    check('pin: HEAD older than the pin -> failed rc 1, both SHAs and the fix printed',
+          r['status'] == 'failed' and r['rc'] == 1 and 'OLDER' in o and a in o and b in o and 'bump' in o, o)
+    g('checkout', '-q', b), g('commit', '-q', '--allow-empty', '-m', 'c')
+    r, o = pin()
+    check('pin: HEAD ahead of the pin -> failed rc 3 (AHEAD), not passed',
+          r['status'] == 'failed' and r['rc'] == 3 and 'AHEAD' in o, o)
+    g('checkout', '-q', a), g('commit', '-q', '--allow-empty', '-m', 'd')
+    r, o = pin()
+    check('pin: diverged -> failed rc 1', r['status'] == 'failed' and r['rc'] == 1 and 'diverged' in o, o)
+    g('checkout', '-q', b)
+    open(os.path.join(fs, 'frostsnap_coordinator', 'lib.rs'), 'w').write('edited')
+    r, o = pin()
+    check('pin: tracked edit in a pinned crate -> failed rc 3 (EDITED)',
+          r['status'] == 'failed' and r['rc'] == 3 and 'EDITED' in o, o)
+    g('checkout', '-q', '--', '.')
+    open(pinf, 'w').write('0' * 40 + '\n')
+    r, o = pin()
+    check('pin: pinned commit absent -> failed rc 1', r['status'] == 'failed' and 'not in this checkout' in o, o)
+    r, o = pin(pinfile=os.path.join(OUT, 'no-such.rev'))
+    check('pin: unreadable pin file -> failed', r['status'] == 'failed' and 'unreadable' in o, o)
+    r, o = pin(tree=os.path.join(OUT, 'no-such-frostsnap'))
+    check('pin: frostsnap missing -> failed by name, not unavailable', r['status'] == 'failed' and 'missing' in o, o)
+    plain = os.path.join(OUT, 'plain')
+    os.makedirs(plain)
+    r, o = pin(tree=plain)
+    check('pin: a directory that is not its own git checkout -> failed',
+          r['status'] == 'failed' and 'not its own git checkout' in o, o)
+
     # the runner itself interrupted mid-stage
     d = os.path.join(OUT, 'run-interrupted')
     pf = pidfile('intr')

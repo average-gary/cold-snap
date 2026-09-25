@@ -1328,3 +1328,14 @@ for a cause outside this task's diff: `frostsnap_coordinator/tests/coldcard_msg_
 is untracked protected user work that cannot compile at HEAD either, and it was not
 touched, formatted, relaxed or deleted. Not hardware verified. Not safe for funds.
 The real-app virtual-device integration run is task 04's and has not been done.
+
+## Follow-up 2026-09-24 — fix 4
+
+Closed: open CONFIRMED finding #13 (STATUS block and table row 13), the unpinned path dependency at
+`hostcheck/Cargo.toml:59`. `hostcheck/frostsnap.rev` now records frostsnap `366da527e9268195d5cf000b6cd92ca879a6a153`.
+`hostcheck/build.rs` checks it before `src/main.rs` compiles, and the readiness stage `frostsnap-pin` checks it too. An
+older, diverged, or missing checkout fails by name with both SHAs and the fix, instead of with E0432. A descendant
+builds with warnings but fails the stage. The dependency is still a path dependency, because a Cargo git pin would hardcode
+an absolute path. Still open: the full readiness profile fails at this pair because frostsnap's Mk4 registry lacks the
+current cold-snap image digest (predates fix 4). This file's status is unchanged. Detail, commands and commit:
+`10-followup.md` § "Fix 4" and § "Fix 4 — close-out".
