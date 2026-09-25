@@ -144,6 +144,17 @@ class Log:
                                            % (what, fmt(got), fmt(want)))
         return self.ok(group, ident, '%s == %s' % (what, fmt(want)))
 
+    def need(self, group, ident, rs, *names):
+        """The named cold-snap ints, or None after FAILING `ident` with the missing
+        names. For arithmetic/bound checks, where a defaulted 0 would pass silently."""
+        bad = [n for n in names if not isinstance(rs.get(n), int)]
+        if bad:
+            self.fail(group, ident, 'could not read the cold-snap side of %s (renamed, '
+                      'removed or ambiguous?): %s'
+                      % ('/'.join(names), ', '.join('%s=%r' % (n, rs.get(n)) for n in bad)))
+            return None
+        return [rs[n] for n in names]
+
     def note(self, text):
         self.notes.append(text)
 
@@ -587,8 +598,10 @@ def check_elf(log, elf, mm, lx, pk):
     if end_sym is None:
         log.fail(g, 'static-ram-below-stack', '_end missing from the ELF')
     else:
-        log.eq(g, 'end-below-bl-sram', end_sym < mm.get('BL_SRAM_BASE', 0), True,
-               '_end (0x%08x) below BL_SRAM_BASE (the 8 K the callgate wipes)' % end_sym)
+        bl = log.need(g, 'end-below-bl-sram', mm, 'BL_SRAM_BASE')
+        if bl is not None:
+            log.eq(g, 'end-below-bl-sram', end_sym < bl[0], True,
+                   '_end (0x%08x) below BL_SRAM_BASE (the 8 K the callgate wipes)' % end_sym)
         head = sp - end_sym
         if head <= 0:
             log.fail(g, 'static-ram-below-stack',
@@ -747,10 +760,11 @@ def main(argv=None):
            'shared/utils.py:401-417 only, never by verify.c)')
     log.eq(a, 'burn-len-min', rs.get('BURN_LEN_MIN'), abi['FW_MIN_LENGTH'],
            'psram::BURN_LEN_MIN vs the bootloader\'s own floor (psram.c:264)')
-    log.eq(a, 'burn-len-max-within-fw-max',
-           rs.get('BURN_LEN_MAX', 0) <= abi['FW_MAX_LENGTH_MK4'], True,
-           'psram::BURN_LEN_MAX (%s) <= FW_MAX_LENGTH_MK4 (%s)'
-           % (f"{rs.get('BURN_LEN_MAX', 0):,}", f"{abi['FW_MAX_LENGTH_MK4']:,}"))
+    v = log.need(a, 'burn-len-max-within-fw-max', rs, 'BURN_LEN_MAX')
+    if v:
+        log.eq(a, 'burn-len-max-within-fw-max', v[0] <= abi['FW_MAX_LENGTH_MK4'], True,
+               'psram::BURN_LEN_MAX (%s) <= FW_MAX_LENGTH_MK4 (%s)'
+               % (f"{v[0]:,}", f"{abi['FW_MAX_LENGTH_MK4']:,}"))
     log.eq(a, 'dfu-flag-len', rs.get('DFU_FLAG_LEN'), abi['sizeof_dfu_flag'],
            'memmap::DFU_FLAG_LEN vs sizeof(dfu_flag_t) on ARM32')
     log.eq(a, 'dfu-flag-addr', rs.get('DFU_FLAG_ADDR'), abi['dfu_flag_addr'],
@@ -759,10 +773,10 @@ def main(argv=None):
     log.eq(a, 'psram-len', rs.get('PSRAM_LEN'), abi['PSRAM_SIZE'], 'PSRAM_LEN vs PSRAM_SIZE')
     log.eq(a, 'flash-erase-floor', rs.get('FLASH_ERASE_FLOOR'), abi['FIRMWARE_START'],
            'memmap::FLASH_ERASE_FLOOR vs verify.h:9 FIRMWARE_START')
-    log.eq(a, 'flash-header-base-mk4',
-           rs.get('FLASH_ISR_BASE', 0) + rs.get('FW_HEADER_OFFSET', 0),
-           abi['FLASH_HEADER_BASE_MK4'],
-           'FLASH_ISR_BASE + FW_HEADER_OFFSET vs sigheader.h:82')
+    v = log.need(a, 'flash-header-base-mk4', rs, 'FLASH_ISR_BASE', 'FW_HEADER_OFFSET')
+    if v:
+        log.eq(a, 'flash-header-base-mk4', sum(v), abi['FLASH_HEADER_BASE_MK4'],
+               'FLASH_ISR_BASE + FW_HEADER_OFFSET vs sigheader.h:82')
     # the reference's own struct-format contract, which cold-snap's packer relies on
     fwh = re.search(r'#define\s+FWH_PY_FORMAT\s+"([^"]+)"',
                     open(os.path.join(mk4, 'sigheader.h')).read())
@@ -805,9 +819,10 @@ def main(argv=None):
     lo, ll = lx.get('FLASH_ISR', (None, None))
     log.eq(m, 'linkx-flash-isr-origin', lo, rs.get('FLASH_ISR_BASE'),
            'link.x FLASH_ISR ORIGIN')
-    log.eq(m, 'linkx-flash-isr-fits-header', lo + ll if lo is not None else None,
-           rs.get('FLASH_ISR_BASE', 0) + rs.get('FW_HEADER_OFFSET', 0),
-           'link.x FLASH_ISR end vs the reserved signature slot')
+    v = log.need(m, 'linkx-flash-isr-fits-header', rs, 'FLASH_ISR_BASE', 'FW_HEADER_OFFSET')
+    if v:
+        log.eq(m, 'linkx-flash-isr-fits-header', lo + ll if lo is not None else None, sum(v),
+               'link.x FLASH_ISR end vs the reserved signature slot')
     lto, ltl = lx.get('FLASH_TEXT', (None, None))
     log.eq(m, 'linkx-flash-text', (lto, ltl),
            (rs.get('FLASH_TEXT_BASE'), rs.get('FLASH_TEXT_LEN')),
@@ -839,13 +854,15 @@ def main(argv=None):
                     'psram.c no longer spells RECHDR_POS as PSRAM_SIZE - N')
     else:
         rec_off = abi['PSRAM_SIZE'] - int(mm_r.group(1))
-        stage_end = rs.get('PSRAM_STAGE_OFFSET', 0) + rs.get('PSRAM_STAGE_LEN', 0)
-        if stage_end <= rec_off:
+        v = log.need(m, 'psram-stage-below-recovery-header', rs,
+                     'PSRAM_STAGE_OFFSET', 'PSRAM_STAGE_LEN')
+        stage_end = sum(v) if v else None
+        if v and stage_end <= rec_off:
             log.ok(m, 'psram-stage-below-recovery-header',
                    'staging ends at +0x%06x, recovery header at +0x%06x (psram.c '
                    'RECHDR_POS = PSRAM_BASE + PSRAM_SIZE - %s)'
                    % (stage_end, rec_off, mm_r.group(1)))
-        else:
+        elif v:
             log.fail(m, 'psram-stage-below-recovery-header',
                      'staging ends at +0x%06x, past the bootloader recovery header '
                      'at +0x%06x' % (stage_end, rec_off))
@@ -855,9 +872,10 @@ def main(argv=None):
            '(psram.c:261-266)')
     log.eq(m, 'burn-base-is-firmware-start', rs.get('BURN_BASE'), abi['FIRMWARE_START'],
            'psram::BURN_BASE vs verify.h FIRMWARE_START (psram.c:326 dest)')
-    log.eq(m, 'burn-len-max-reaches-flash-fs',
-           rs.get('BURN_BASE', 0) + rs.get('BURN_LEN_MAX', 0), rs.get('FLASH_FS_BASE'),
-           'BURN_BASE + BURN_LEN_MAX vs FLASH_FS_BASE (a burn cannot reach the share)')
+    v = log.need(m, 'burn-len-max-reaches-flash-fs', rs, 'BURN_BASE', 'BURN_LEN_MAX', 'FLASH_FS_BASE')
+    if v:
+        log.eq(m, 'burn-len-max-reaches-flash-fs', v[0] + v[1], v[2],
+               'BURN_BASE + BURN_LEN_MAX vs FLASH_FS_BASE (a burn cannot reach the share)')
 
     # The two packer alignments, read out of `cli/signit.py` rather than retyped.
     # `align_to(len(body), 512)` is every product's rule and is `FW_BODY_ALIGN`;
@@ -881,11 +899,14 @@ def main(argv=None):
     # And the reason the whole-image length may be judged by the body's rule:
     # `signit.py:315` puts exactly FW_HEADER_OFFSET + FW_HEADER_SIZE bytes ahead of
     # the body, and that prefix is itself a whole number of 4,096-byte units.
-    log.eq(m, 'install-align-divides-header-prefix',
-           (rs.get('FW_HEADER_OFFSET', 0) + rs.get('FW_HEADER_SIZE', 0))
-           % max(rs.get('FW_INSTALL_ALIGN', 1), 1), 0,
-           'FW_HEADER_OFFSET + FW_HEADER_SIZE is a multiple of FW_INSTALL_ALIGN '
-           '(so firmware_length is 4 K-aligned exactly when the body is)')
+    v = log.need(m, 'install-align-divides-header-prefix', rs,
+                 'FW_HEADER_OFFSET', 'FW_HEADER_SIZE', 'FW_INSTALL_ALIGN')
+    if v and v[2] <= 0:
+        log.fail(m, 'install-align-divides-header-prefix', 'FW_INSTALL_ALIGN is %d' % v[2])
+    elif v:
+        log.eq(m, 'install-align-divides-header-prefix', (v[0] + v[1]) % v[2], 0,
+               'FW_HEADER_OFFSET + FW_HEADER_SIZE is a multiple of FW_INSTALL_ALIGN '
+               '(so firmware_length is 4 K-aligned exactly when the body is)')
 
     say('\n[4] registers: compiler-resolved CMSIS/HAL vs the HAL\'s literals')
     reg = dict(zip(REG_KEYS, probe('reg-probe', REG_C, ref, defs)))

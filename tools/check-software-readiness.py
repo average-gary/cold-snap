@@ -294,7 +294,10 @@ def stages(out):
           [PY, 'tools/pack-signed.py', '--elf', os.path.join(FIX, 'bad-layout.elf'),
            '--out', os.path.join(out, 'bad-layout-out'), '--no-dfu'], core=True, timeout=300,
           needs=['reference', 'signit', 'pack-venv', 'fixture-bad-layout'], expect_rc=1,
-          after=['pack-tests'], consumes=[os.path.join(FIX, 'bad-layout.elf')]),
+          after=['pack-tests'], consumes=[os.path.join(FIX, 'bad-layout.elf')],
+          # `(Abort)` is the deliberate refusal class; a crash also exits 1 via pack-signed.py's
+          # catch-all, but as `ABORT (KeyError)` etc. or a traceback, which must not count.
+          must=[r'(?m)^ABORT \(Abort\): firmware0\.bin would load at 0x08180000, not 0x08020000:']),
         S('checkfw-bin', 'package', 'image geometry/installation validation of firmware-signed.bin', CS,
           ['cargo', 'run', '--release', '--target', HOST, '-p', 'coldsnap_firmware', '--example', 'checkfw',
            '--', ART], core=True, needs=['cargo', 'rust-host'], after=['pack'], consumes=[ART],

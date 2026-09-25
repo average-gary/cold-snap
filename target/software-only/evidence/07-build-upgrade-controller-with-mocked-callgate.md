@@ -368,3 +368,9 @@ Finding: "New test inserted between an existing doc comment and its test, misatt
 - Checked in the current tree: the "MUTATION TARGET: mis-decode an error return" doc is at `hal/src/callgate.rs:1825`, directly above `pin_error_codes_decode_to_pins_h_values` (:1830). `a_firmware_request_touches_only_bytes_outside_the_hmac` (:1773) now has only its own doc (:1766-1771).
 - Re-run (cwd `$HOME/repos/cold-snap`): `cargo test --target aarch64-apple-darwin -p coldsnap_hal --features coldsnap_hal/fake-flash,coldsnap_hal/test-seam --lib callgate` exited 0, with 24 passed and 0 failed. Log: `target/software-only/logs/07-r3/hal-callgate-test.log`.
 - This is a doc-only finding, so there is no mutation to run.
+
+## Follow-up 2026-09-24 — fix 3
+
+- **Closed:** the surviving `no_check_burn_len` mutant. `check_view` delegates to `check_view_with(…, installable)`; new test `header_call_guard_refuses_without_check_installables_own_comparison` stands in a `check_installable` without the header==call comparison and fails (rc 101) when the `psram::check_burn_len` guard is removed. Source guards/tripwires unchanged and passing.
+- **Closed:** the record error in `logs/07-rerun2/mut-summary.txt` line 1 (tripwire mutant listed as exit 0); corrected to exit 101 with a dated note (original kept at `logs/10-fix3/07-rerun2-mut-summary.txt.orig`). Re-run of the tripwire mutant: rc 101.
+- Detail, commands and mutation logs: `10-followup.md`, sections `## Fix 3 …`. Scope: software/pre-bench checks passed, for these checks only.

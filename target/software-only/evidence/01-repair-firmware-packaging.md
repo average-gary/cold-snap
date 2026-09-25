@@ -464,3 +464,8 @@ One honest limitation of the roll-up: a commit cannot contain its own SHA, so
 is written into it immediately afterwards, leaving that one file modified in the working
 tree for the next task's close-out to carry. The SHA is reported in this task's return
 value. No amend, no rewrite — the history stays one commit for this task.
+
+## Follow-up 2026-09-24 — fix 3
+
+- **Closed:** finding 10 (the checkfw corrupted-signature negative in `tools/test-pack-signed.py` asserted only `REFUSE`). It now asserts `[FAIL] R12 signature over double-SHA256(signed range)`; a bare `R12` would still match checkfw's `[PASS] R12` line. Mutation A (append 4 KiB, so checkfw refuses on R9 with `[PASS] R12`): new assertion exit 1, old exit 0.
+- Detail, commands and mutation logs: `10-followup.md`, sections `## Fix 3 …`. Scope: software/pre-bench checks passed, for these checks only.

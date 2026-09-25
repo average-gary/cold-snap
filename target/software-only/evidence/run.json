@@ -16,6 +16,18 @@
       "U2 OTP min-version floor (verify.c:143,181) - install path only, and it ratchets with every install already done on that unit",
       "U3 RDP level (verify.c:340) - decides Factory boot vs red light, and whether a failed verify can still reach enter_dfu",
       "U4 that an install path exists at all - only pins.c:1276-1340 from a logged-in MicroPython installs new firmware; sdcard_recovery cannot (sdcard.c:248 needs SE1 to already hold this image's world hash)"
+    ],
+    "followup": [
+      {
+        "fix": "3",
+        "commit": [
+          "cold-snap: the fix 3 close-out commit (see git log; it cannot name its own SHA)"
+        ],
+        "closed": [
+          "tools/test-pack-signed.py corrupted-signature negative asserted only 'REFUSE'; now asserts '[FAIL] R12 signature over double-SHA256(signed range)' (mutation A: new exit 1, old exit 0)"
+        ],
+        "still_open": []
+      }
     ]
   },
   {
@@ -45,6 +57,18 @@
       "B5 startup instruction order on target: the reset-entry.asm review sits one frame above the VTOR/CPACR stores; nothing proves the VTOR store precedes the first faulting instruction",
       "B6 the bootloader's PSRAM recovery path: RECHDR_POS and the psram.c:261-266 gate are compared as bounds only; psram_recover_firmware() is never exercised and no arg2=7 burn is bound",
       "B7 the 40-constant register set is bounded by design; every other HAL register transcription is unchecked"
+    ],
+    "followup": [
+      {
+        "fix": "3",
+        "commit": [
+          "cold-snap: the fix 3 close-out commit (see git log; it cannot name its own SHA)"
+        ],
+        "closed": [
+          "F7 silent ', 0' defaults in check-reference-contracts.py: Log.need() fails the check by id and names the key; both named sites plus FW_INSTALL_ALIGN (default 1, always-pass) and BL_SRAM_BASE (alias mm) fixed; renames fail by name, real code 136/0/0"
+        ],
+        "still_open": []
+      }
     ]
   },
   {
@@ -206,6 +230,19 @@
       "Real 18/2 login on a PIN-set expendable unit (attempts_left, SE2 bad-PIN effects)",
       "Real 18/7 installation of a key-0 image (verify_firmware_in_ram verdict, burn, reset)",
       "Reset/power-interruption mid-burn recovery (psram_recover_firmware) and PSRAM retention across reset"
+    ],
+    "followup": [
+      {
+        "fix": "3",
+        "commit": [
+          "cold-snap: the fix 3 close-out commit (see git log; it cannot name its own SHA)"
+        ],
+        "closed": [
+          "no_check_burn_len mutant survived: new test header_call_guard_refuses_without_check_installables_own_comparison fails rc 101 with the guard removed (check_view_with seam, production unchanged)",
+          "mut-summary.txt listed the tripwire mutant as exit 0; corrected to 101 (ignored log, dated note, original kept)"
+        ],
+        "still_open": []
+      }
     ]
   },
   {
@@ -298,6 +335,21 @@
           "pack-negative-bad-layout passes on any rc 1 (CONFIRMED)",
           "stale 'known BLOCKED' note= at tools/check-software-readiness.py:347-348",
           "full --profile full run not re-run after fix 1"
+        ]
+      },
+      {
+        "fix": "3",
+        "commit": [
+          "cold-snap: the fix 3 close-out commit (see git log; it cannot name its own SHA)"
+        ],
+        "closed": [
+          "pack-negative-bad-layout passes on any rc 1 (CONFIRMED): must= '^ABORT \\(Abort\\): firmware0\\.bin would load at 0x08180000, not 0x08020000:' from a real run; self-test proves traceback rc 1 and ABORT (KeyError) rc 1 classify failed"
+        ],
+        "still_open": [
+          "stale 'known BLOCKED' note at tools/check-software-readiness.py:347-348",
+          "full --profile full not re-run after fix 3",
+          "registry-matches-artifact fails: rebuilt artifact digest not in coldsnap-mk4-registry.txt (not caused by fix 3; needs task 02 register-mk4-firmware.py)",
+          "checkfw-negative-signature pattern '[FAIL] R12 ' also matches the range-unusable variant"
         ]
       }
     ]

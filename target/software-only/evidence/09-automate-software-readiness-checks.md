@@ -474,3 +474,9 @@ Also open: whether the real bootloader accepts a high-S key-0 image. The referen
 The user's untracked `frostsnap_coordinator/tests/coldcard_msg_len.rs:97` E0308 (caused by frostsnap `b565de9`, `BitcoinBip32Path::external` now takes a `NormalIndex`) was fixed in place at :18 and :97. The file is still untracked and no assertion was changed. **Closed:** the `coordinator-verbatim` stage is now `passed rc=0`. It was `blocked rc=101`. This was a single-stage re-run, not a full profile run. **Still open:** pack-negative-bad-layout passes on any rc 1 (CONFIRMED, not in fix 1 scope); the stale 'known BLOCKED' note at `tools/check-software-readiness.py:347-348`; the full profile has not been re-run.
 
 Detail: `10-followup.md` § Fix 1.
+
+## Follow-up 2026-09-24 — fix 3
+
+- **Closed:** `pack-negative-bad-layout` accepted any rc 1. It now requires `must=[r'(?m)^ABORT \(Abort\): firmware0\.bin would load at 0x08180000, not 0x08020000:']`, copied from a real refusal run. `tools/test-software-readiness.py` proves, using the real stage's rule, that a traceback with rc 1 and `ABORT (KeyError)` with rc 1 are classified failed. Mutation D1 (crash in the refusal path): new rule failed, old rule passed.
+- **Still open:** full profile not re-run; `registry-matches-artifact` fails because the rebuilt artifact's digest is unregistered (not caused by fix 3; needs task 02's registration); stale "known BLOCKED" comment at `tools/check-software-readiness.py:347-348`.
+- Detail, commands and mutation logs: `10-followup.md`, sections `## Fix 3 …`. Scope: software/pre-bench checks passed, for these checks only.

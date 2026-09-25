@@ -543,3 +543,8 @@ of it.
   `psram_recover_firmware()`, and no `arg2 = 7` burn is bound in cold-snap.
 - **B7 The 40-constant register set is bounded.** Every other register offset, mask
   and bit in the HAL is transcription that this run does not check.
+
+## Follow-up 2026-09-24 — fix 3
+
+- **Closed:** F7 (silent `, 0` defaults). `tools/check-reference-contracts.py` gained `Log.need()`, which fails the check by id and names the missing key. It replaces both named sites plus four more of the same class (incl. `FW_INSTALL_ALIGN` defaulting to 1, an always-pass, and `BL_SRAM_BASE` read as 0 under the alias `mm`). Mutations renaming `PSRAM_STAGE_OFFSET`, `BURN_LEN_MAX`, `FW_INSTALL_ALIGN`, `BL_SRAM_BASE` each now fail by name; real code 136 COVERED / 0 FAILED.
+- Detail, commands and mutation logs: `10-followup.md`, sections `## Fix 3 …`. Scope: software/pre-bench checks passed, for these checks only.

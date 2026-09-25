@@ -424,3 +424,134 @@ nothing new under `frostsnapp/target`); `--timeout 40` 5 (run 1); `--timeout 70`
   `run.json`, the 04 evidence file; see `git log`, it cannot name its own SHA).
 
 Scope of claim: software/pre-bench checks passed, virtual ptys, regtest only.
+
+## Fix 3 — tighten the weak checks
+
+**Status: FIXED (a, b, c, d).** Each strengthened check was mutated and failed for its named reason, then passed on the real code; two independent re-runners reproduced every mutation, and the one CONFIRMED finding against this fix (a silent `BL_SRAM_BASE` default under the alias `mm`) was repaired (repair 1 of 1). Scope: the four named guards and the 9 affected stages; the full readiness profile was not re-run and is expected to stay red on `registry-matches-artifact` (not caused by this fix, see close-out).
+Commands below are the IMPLEMENTER's. cwd is `/Users/garykrause/repos/cold-snap` for every command. Logs are in `target/software-only/logs/10-fix3/`.
+Exit codes are the process's own status: output was redirected to the log and never piped. Scope: software/pre-bench checks only.
+The affected readiness stages were run through `R.run`. The full readiness profile was **not** re-run.
+
+**Closes:**
+- (a) finding 10 in `01-repair-firmware-packaging.md` (:413): the checkfw negative asserted only `REFUSE`.
+- (b) F7 in `03-check-coldcard-reference-contracts.md` (:8-12, :412ff): silent `, 0` defaults.
+- (c) the OPEN finding in `07-build-upgrade-controller-with-mocked-callgate.md` (:3, :73, :87): `no_check_burn_len` survived. Also the record inconsistency at :25 (`mut-summary.txt` said the tripwire exited 0).
+- (d) the OPEN CONFIRMED finding in `09-automate-software-readiness-checks.md` (:3-4, :379, :453): pack-negative-bad-layout passed on any rc 1.
+
+### Files changed (working tree only)
+- `tools/test-pack-signed.py:177`: the expected substring changed from `'REFUSE'` to `'[FAIL] R12 signature over double-SHA256(signed range)'`. The one-word `'R12'` fix proposed in 01 would still be weak, because checkfw prints `[PASS] R12 signature ...` on an accepted image (seen in the checkfw-bin output). A bare `R12` therefore matches a refusal for any other reason.
+- `tools/check-reference-contracts.py:147-156`: new `Log.need(group, ident, rs, *names)`. It returns the named cold-snap ints. If any name is missing or ambiguous (not an int), it FAILS that check id and names the key.
+  - Every `rs.get(X, <default>)` read now goes through it: `:761` burn-len-max-within-fw-max (F7 site 1), `:774` flash-header-base-mk4, `:820` linkx-flash-isr-fits-header, `:855` psram-stage-below-recovery-header (F7 site 2), `:873` burn-len-max-reaches-flash-fs, `:900` install-align-divides-header-prefix.
+  - The last one was a third silent pass of the same class: `max(rs.get('FW_INSTALL_ALIGN', 1), 1)` made `x % 1 == 0` COVERED.
+  - `grep 'rs.get([^)]*, [0-9])'` now finds nothing (exit 1). Real-code result is unchanged: 136 COVERED / 0 FAILED / 0 UNAVAILABLE.
+- `firmware/src/install.rs`:
+  - `:364` `check_view` now delegates to the new `:375 check_view_with(view, announced, call_len, installable: fn(&[u8], u32) -> Result<u32, NotInstallable>)` and passes `coldsnap_hal::image::check_installable`. Production behaviour is identical.
+  - The guard `psram::check_burn_len` (`:388`) is unchanged.
+  - New test `:1587 header_call_guard_refuses_without_check_installables_own_comparison`. It stands in a `check_installable` that has lost its header==call comparison (it judges the image at the header's own length, the refactor the guard's comment names). It asserts that the stand-in accepts the disagreeing call and that `check_view_with` still returns `NotInstallable(Length(LengthMismatch))`.
+  - Tripwires and census are unchanged and pass. The new code contains no banned needle and no `crate::`.
+- `tools/check-software-readiness.py:298-300`: the pack-negative-bad-layout stage gained `must=[r'(?m)^ABORT \(Abort\): firmware0\.bin would load at 0x08180000, not 0x08020000:']`.
+  - The pattern was read from a real run (`bad-layout-real.log`: `ABORT (Abort): firmware0.bin would load at 0x08180000, not 0x08020000: signit lays ...`).
+  - `(Abort)` is essential. `pack-signed.py:622-625` turns every exception into `ABORT (<Type>): ...` with exit 1, so a crash also prints `ABORT` with rc 1.
+- `tools/test-software-readiness.py:100-111`: the self-test takes the REAL stage's `expect_rc`/`must` from `R.stages()`, not a copy. It asserts:
+  - the real refusal line with rc 1 → passed;
+  - a `Traceback`/`KeyError` with rc 1 → failed;
+  - `ABORT (KeyError): ...` with rc 1 → failed.
+  Self-test total: 73/73 ok.
+- Evidence record fix: `target/software-only/logs/07-rerun2/mut-summary.txt`. Line 1 changed from `tripwire_gated_call exit 0 ...` to `exit 101`, with a dated correction note that cites the log lines. The other lines are byte-identical. The original is kept at `logs/10-fix3/07-rerun2-mut-summary.txt.orig`.
+
+### Commands (implementer)
+| # | command | exit | elapsed | result |
+|---|---|---|---|---|
+| 1 | `cargo build --release` | 0 | 1.9 s | up to date |
+| 2 | `python3 tools/pack-signed.py --pubkey-num 0 --out target/software-only/package` | 0 | 0.9 s | before edits |
+| 3 | `python3 tools/test-pack-signed.py` (before edits) | 0 | 5.7 s | OK: 22 cases |
+| 4 | `python3 tools/pack-signed.py --elf target/software-only/fixtures/bad-layout.elf --out target/software-only/logs/10-fix3/bad-layout-out --no-dfu` | 1 | 0.17 s | the real refusal line used for (d) |
+| 5 | `python3 -B tools/test-software-readiness.py` (after the (d) edit) | 0 | 61.5 s | 73 ok, the 3 new bad-layout cases ok |
+| 6 | `python3 -B logs/10-fix3/run-stages.py tools/check-software-readiness.py target/software-only/fix3-stage-real arm-build-release pack pack-tests pack-negative-bad-layout` | 0 | 20.5 s | pack-negative-bad-layout passed rc=1 |
+| 7 | `python3 -B logs/10-fix3/one-stage.py target/software-only/fix3-one-real` (only that stage via `R.run_stage`, upstream marked passed) | 0 | 0.33 s | passed rc=1 on `ABORT (Abort): ...` |
+| 8 | `python3 tools/test-pack-signed.py` (after the (a) edit) | 0 | 1.7 s | OK: 22 cases |
+| 9 | `python3 tools/check-reference-contracts.py --json target/software-only/fix3-refcheck/result.json` | 0 | 14.1 s | PASS: 136 checks |
+| 10 | `python3 tools/test-reference-contracts.py` | 0 | 27.5 s | 6/6 negative cases behaved |
+| 11 | `cargo test --target aarch64-apple-darwin -p coldsnap_firmware --features coldsnap_hal/fake-flash,coldsnap_hal/test-seam --lib install::tests` | 0 | 6.6 s | 28 passed, 1 ignored (the existing xproc test) |
+| 12 | `cargo test --target aarch64-apple-darwin -p coldsnap_hal -p coldsnap_firmware --features coldsnap_hal/fake-flash,coldsnap_hal/test-seam` | 0 | 11.5 s | 553 passed, 0 failed (summed from this log) |
+| 13 | `cargo build --release` | 0 | 6.3 s | |
+| 14 | `cargo clippy --release --target thumbv7em-none-eabihf -p coldsnap_hal -p coldsnap_firmware` | 0 | 1.0 s | 18 warnings, all in `vendor/frostsnap/*`, none in cold-snap crates |
+| 15 | `cargo clippy --target thumbv7em-none-eabihf -p coldsnap_hal -p coldsnap_firmware` | 0 | 1.2 s | same 18 vendor warnings |
+| 16 | `cargo run --release --target aarch64-apple-darwin -p coldsnap_firmware --example heap_session --features coldsnap_hal/test-seam,frostsnap_core/coordinator` | 0 | 11.3 s | FITS, slack 10860 B (parsed from this run) |
+| 17 | `python3 -B logs/10-fix3/run-stages.py tools/check-software-readiness.py target/software-only/fix3-stages-final arm-build-release refcheck refcheck-negatives pack pack-tests pack-negative-bad-layout checkfw-bin checkfw-dfu checkfw-negative-signature` (after every edit) | 0 | 67.6 s | all 9 passed. refcheck 136/0/0. "software/pre-bench checks passed", scoped to these 9 stages |
+
+Commands 12-16 are the four task-07 checks plus release build (`logs/10-fix3/checks07-summary.txt`, `c07-{1..5}.log`).
+
+### Mutations (each bit for the named reason)
+| id | mutation | where | result with the new check | result with HEAD's check |
+|---|---|---|---|---|
+| A | the test corrupts by appending 4096 B of 0xff instead of flipping the signature bit, so checkfw refuses on R9/R14 while printing `[PASS] R12` | in-tree `tools/test-pack-signed.py`, restored from a copy, `cmp` 0 | exit 1: `AssertionError: exit 1 but not for the intended reason (wanted '[FAIL] R12 signature over double-SHA256(signed range)')` (`tps-mutA-fixed.log`) | exit 0, `OK: 22 cases` (`tps-mutA-head.log`), the weakness reproduced |
+| B0 | control: symlink-farm mirror with no rename | `target/software-only/fix3-mut/B0-*` | rc 2: 135 COVERED / 0 FAILED / 1 UNAVAILABLE (pixel skipped inside the mirror with `--skip-pixel`, because pixel-check cannot build its simulator there) | same |
+| B1 | `PSRAM_STAGE_OFFSET` declaration renamed in a mirror copy of `hal/src/psram.rs` | mirror | rc 1: `FAILED memory/psram-stage-below-recovery-header -- could not read the cold-snap side of PSRAM_STAGE_OFFSET/PSRAM_STAGE_LEN ...: PSRAM_STAGE_OFFSET=None` | rc 2, identical to control: the rename is invisible, as F7 said |
+| B2 | `BURN_LEN_MAX` renamed | mirror | rc 1: `FAILED abi/burn-len-max-within-fw-max -- ... BURN_LEN_MAX=None`; burn-len-max-reaches-flash-fs also names it | rc 1 only through the sibling; its own row is `COVERED ... BURN_LEN_MAX (0) <= ...` |
+| B3 | `FW_INSTALL_ALIGN` renamed in a mirror copy of `hal/src/lib.rs` | mirror | rc 1: `FAILED memory/install-align-divides-header-prefix -- ... FW_INSTALL_ALIGN=None` | that row COVERED `== 0` (fails only via signit-install-align) |
+| C1 | `no_check_burn_len`: the two guard lines removed from `check_view_with` | in-tree `firmware/src/install.rs`, restored, `cmp` 0 | rc 101: `header_call_guard_refuses_without_check_installables_own_comparison ... FAILED`, left `Ok(CheckedImage{len: 266240..})`, right `Err(NotInstallable(Length(LengthMismatch)))`; 27 passed, 1 failed (`install-tests-mutC1.log`) | rc 0 per `07-rerun2/mut-no_check_burn_len.log` (the survivor) |
+| C2 | tripwire: the documented `#[cfg(target_arch = "arm")] return coldsnap_hal::callgate::pin_setup_attempt(_att);` in `Unbound::setup`, run with the full check-1 command | in-tree, restored, `cmp` 0 | rc 101 in 4.4 s: `nothing_here_reaches_a_real_gate_or_an_identity ... FAILED`, `` `pin_setup_attempt` in install.rs production code `` (`mut-tripwire_gated_call.log`). This is the direct status that corrects mut-summary.txt | n/a |
+| D1 | `{}['.vector_table']` inserted just before `raise Abort(` at the moved-base check, so the packager crashes in its refusal path | in-tree `tools/pack-signed.py`, restored, `git diff --quiet` 0 and `cmp` vs HEAD 0 | `one-stage.py`: stage `failed rc=1 exit 1 but output lacks /(?m)^ABORT \(Abort\): .../`; stderr `ABORT (KeyError): '.vector_table'` | `one-stage.py ... head-rule` (`must=()` as at HEAD): `passed rc=1`, the weakness reproduced. pack-tests also caught D1 with rc 1 in the chain run |
+| D2 | the new `must=` removed from the runner | in-tree, restored from a copy, `cmp` 0 | self-test rc 1 in 54.8 s: `FAIL ... bad-layout-traceback rc 1 -> failed` and `... bad-layout-crash-abort`; the real-refusal case stays ok | n/a |
+
+A first D1 placement (the crash at the top of `main()`) hit `pack` first, so the negative never ran. It was reverted and placed at the refusal site instead (`stages-mutD1.log` is the second placement).
+
+### Not done
+- The full readiness profile was not re-run. Only the 9 affected stages were run (command 17).
+- The stale "known BLOCKED" note at `tools/check-software-readiness.py:347-348` (09 evidence :474) is out of this fix's scope.
+- The runner's `checkfw-negative-signature` pattern `[FAIL] R12 ` also matches R12's "range unusable" variant. It was left as is (not a named weak guard). Tightening it is optional.
+- Nothing was committed. The earlier evidence files were not edited, apart from the `07-rerun2/mut-summary.txt` correction above.
+
+## Fix 3 — repair 1 of 1
+
+Finding: `check_elf` read `mm.get('BL_SRAM_BASE', 0)` (the alias `mm` for `rs`). The earlier `rs.get(X, <n>)` grep missed it because of the alias.
+
+### Change
+- `tools/check-reference-contracts.py:601-604`: `end-below-bl-sram` now gets `BL_SRAM_BASE` through `log.need(g, 'end-below-bl-sram', mm, 'BL_SRAM_BASE')`. If the key is missing, that row FAILS and names the key. The comparison runs only when the key is an int.
+- `grep -nE "\.get\([^)]*,\s*[0-9]" tools/check-reference-contracts.py` exits 1 (no matches). That covers every alias, not only `rs.`. The other `.get(..., default)` calls are env vars, a K/M multiplier table, and `(None, None)` tuple defaults, which fail loudly through `log.eq`.
+
+### Mutation (driver `target/software-only/logs/10-fix3r/mut-bl-sram.py` wraps `rust_consts` and pops `BL_SRAM_BASE`; no source or reference file mutated except the temporary swap below)
+| # | command | exit | result |
+|---|---|---|---|
+| 1 | `python3 -B target/software-only/logs/10-fix3r/mut-bl-sram.py tools/check-reference-contracts.py --skip-pixel --json …/mut-new.json` (fixed code) | 1 | `FAILED elf/end-below-bl-sram -- could not read the cold-snap side of BL_SRAM_BASE (renamed, removed or ambiguous?): BL_SRAM_BASE=None` |
+| 2 | same driver, with `tools/check-reference-contracts.py` temporarily set to the pre-fix `:601` line only (restored after; sha1 matched `fixed.sha`) | 1 | `FAILED elf/end-below-bl-sram -- _end (0x20018058) below BL_SRAM_BASE …: cold-snap has False`. The failure blames `_end`, which is the misattribution this finding describes. |
+| 3 | `python3 -B tools/check-reference-contracts.py --json target/software-only/fix3-refcheck/result.json` (real) | 0 | PASS: 136 checks. `COVERED elf/end-below-bl-sram … == True` |
+| 4 | `python3 -B tools/test-reference-contracts.py` | 0 | 6/6 negative cases behaved |
+
+Logs: `target/software-only/logs/10-fix3r/{mut-new,mut-old,real,selftest}.log`. Not committed.
+
+## Fix 3 — close-out
+
+**Status: FIXED (a, b, c, d)**, scoped to software/pre-bench checks of those four guards. Committed in cold-snap only (frostsnap unchanged by this fix).
+
+### Re-runner commands (RE-RUNNER, not the implementer; cwd `/Users/garykrause/repos/cold-snap`, logs under `target/software-only/verify-rerun-tighten/`)
+| command | exit | result |
+|---|---|---|
+| `cargo test --target aarch64-apple-darwin -p coldsnap_hal -p coldsnap_firmware --features coldsnap_hal/fake-flash,coldsnap_hal/test-seam` | 0 | 553 passed, 0 failed; the new install test ok |
+| `python3 -B tools/check-reference-contracts.py --json …/refcheck.json` | 0 | PASS: 136 checks |
+| `python3 -B tools/test-reference-contracts.py` | 0 | 6/6 |
+| `python3 -B tools/test-pack-signed.py` | 0 | OK: 22 cases |
+| `python3 -B tools/test-software-readiness.py` | 0 | 73 ok, incl. the 3 new bad-layout cases |
+| `cargo build --release`; `pack-signed.py --pubkey-num 0`; checkfw on `.bin` and `.dfu` | 0 / 0 / 0 / 0 | |
+| `cargo clippy [--release] --target thumbv7em-none-eabihf -p coldsnap_hal -p coldsnap_firmware` | 0 / 0 | 18 warnings, all in vendor/frostsnap |
+| `cargo run --release … --example heap_session …` | 0 | FITS, slack 10860 B |
+| mutations A, B0-B3, C1, C2, D1, D2 (mirror or in-place + restore, `cmp`/`shasum -c` verified) | as implementer | every new guard failed for its named reason; HEAD's guard missed A, B1, D1 and passed B2/B3's own rows |
+| 24 readiness stages touching the changed files via `run-stages.py` | wrapper rc not captured | 23 passed; `registry-matches-artifact` failed |
+
+Repair re-run (REPAIRER): `mut-bl-sram.py` driver exit 1 naming `BL_SRAM_BASE` on fixed code vs exit 1 blaming `_end` on the pre-fix line; real `check-reference-contracts.py` exit 0 (136); `test-reference-contracts.py` exit 0 (6/6); `grep -nE "\.get\([^)]*,\s*[0-9]"` exit 1 (no match). Logs `target/software-only/logs/10-fix3r/`.
+
+### CONFIRMED findings
+1. `tools/check-reference-contracts.py:601` still read `mm.get('BL_SRAM_BASE', 0)` (alias of `rs`), so a missing key failed as a misattributed `_end` placement. **Fixed** by repair 1 (`log.need`).
+2. Readiness stage `registry-matches-artifact` fails: the rebuilt artifact's announced digest is not in `frostsnap_coordinator/src/coldsnap-mk4-registry.txt`. **Not caused by fix 3 and not fixed here**: HEAD's install.rs builds a byte-identical firmware0/1.bin; any relink changes the header timestamp and so the digest, and the registry has been stale since 6b2e5c2/161c0ba. Needs task 02's `register-mk4-firmware.py`; the full profile stays red until then.
+
+### Still open (not this fix's scope)
+- Full readiness profile not re-run.
+- `registry-matches-artifact` (above).
+- Stale "known BLOCKED" comment at `tools/check-software-readiness.py:347-348`.
+- `checkfw-negative-signature`'s `[FAIL] R12 ` also matches R12's "range unusable" variant.
+
+Note: the `07-rerun2/mut-summary.txt` correction lives under ignored `target/software-only/logs/` and is not committed; the original is at `logs/10-fix3/07-rerun2-mut-summary.txt.orig`.
+
+### Commit
+- cold-snap: the fix 3 close-out commit (`tools/test-pack-signed.py`, `tools/check-reference-contracts.py`, `firmware/src/install.rs`, `tools/check-software-readiness.py`, `tools/test-software-readiness.py`, this file, `run.json`, the 01/03/07/09 evidence files; see `git log`, it cannot name its own SHA).

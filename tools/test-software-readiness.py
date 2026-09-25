@@ -98,6 +98,18 @@ def main():
     r = one(sh('neg-accepts', 'echo ACCEPT; exit 0', expect_rc=1, must=['R12']))
     check('negative that accepts -> failed', r['status'] == 'failed', r)
 
+    # The real stage's rule, not a copy: a crash that also exits 1 must not pass as a refusal.
+    bl = next(s for s in R.stages(OUT) if s.name == 'pack-negative-bad-layout')
+    real = ('ABORT (Abort): firmware0.bin would load at 0x08180000, not 0x08020000: signit lays the '
+            'vectors, header and body down at fixed offsets')
+    for nm, script, want in [
+            ('bad-layout-refusal', f'echo; echo "{real}" >&2; exit 1', 'passed'),
+            ('bad-layout-traceback', 'echo "Traceback (most recent call last):" >&2; '
+             'echo "KeyError: \'.vector_table\'" >&2; exit 1', 'failed'),
+            ('bad-layout-crash-abort', 'echo "ABORT (KeyError): \'.vector_table\'" >&2; exit 1', 'failed')]:
+        r = one(sh(nm, script, expect_rc=bl.expect_rc, must=bl.must))
+        check(f'pack-negative-bad-layout rule: {nm} rc 1 -> {want}', r['status'] == want, r)
+
     r = one(sh('zero-tests', 'echo "test result: ok. 0 passed; 0 failed"', must=[R.TESTS_RAN]))
     check('cargo run testing nothing -> failed', r['status'] == 'failed', r)
 

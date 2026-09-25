@@ -366,12 +366,23 @@ fn check_view(
     announced: Sha256Digest,
     call_len: u32,
 ) -> Result<CheckedImage, ImageFault> {
+    check_view_with(view, announced, call_len, coldsnap_hal::image::check_installable)
+}
+
+/// [`check_view`] with the shared image rules passed in, so a test can stand in a
+/// `check_installable` that lost its header == call comparison and show that the
+/// separate `check_burn_len` guard still refuses on its own.
+fn check_view_with(
+    view: &[u8],
+    announced: Sha256Digest,
+    call_len: u32,
+    installable: fn(&[u8], u32) -> Result<u32, NotInstallable>,
+) -> Result<CheckedImage, ImageFault> {
     // Header magic, Mk4 family, header == call length within the burn window,
     // 4 KiB alignment. `check_installable` is the one implementation shared with
     // `Stager::installable` and `checkfw`; called again here on `call_len` so the
     // length that ships is the one it compared.
-    let len = coldsnap_hal::image::check_installable(view, call_len)
-        .map_err(ImageFault::NotInstallable)?;
+    let len = installable(view, call_len).map_err(ImageFault::NotInstallable)?;
     // The decoupling guard, stated on its own so no refactor of
     // `check_installable` can drop it silently: header == call.
     psram::check_burn_len(view, call_len)
@@ -1566,6 +1577,30 @@ mod tests {
         let mut other = d;
         other.0[31] ^= 1;
         assert_eq!(check_view(&img, other, SIZE), Err(ImageFault::Digest));
+    }
+
+    /// The separate header == call guard (`psram::check_burn_len` in
+    /// `check_view_with`) on its own: with `check_installable` replaced by one that
+    /// has lost that comparison — the refactor the guard exists for — a call length
+    /// that disagrees with the header must still be refused as `LengthMismatch`.
+    #[test]
+    fn header_call_guard_refuses_without_check_installables_own_comparison() {
+        // `check_installable` judged at the header's own length, whatever the call says.
+        fn lost_compare(view: &[u8], _call: u32) -> Result<u32, NotInstallable> {
+            let header = psram::staged_burn_len(view).map_err(NotInstallable::Length)?;
+            image::check_installable(view, header)
+        }
+        let img = signed_image(SIZE, good());
+        let d = firmware_digest(&img).unwrap();
+        // The stand-in really has lost it, so nothing before the guard refuses.
+        assert_eq!(lost_compare(&img, SIZE - 4096), Ok(SIZE));
+        assert!(check_view_with(&img, d, SIZE, lost_compare).is_ok());
+        assert_eq!(
+            check_view_with(&img, d, SIZE - 4096, lost_compare),
+            Err(ImageFault::NotInstallable(NotInstallable::Length(
+                StageError::LengthMismatch
+            )))
+        );
     }
 
     #[test]

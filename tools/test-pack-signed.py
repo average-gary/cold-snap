@@ -174,7 +174,7 @@ def part_b():
     open(bent, 'wb').write(blob)
     shell(['cargo', 'run', '--quiet', '--target', 'aarch64-apple-darwin',
            '-p', 'coldsnap_firmware', '--example', 'checkfw', '--', bent],
-          1, 'REFUSE')
+          1, '[FAIL] R12 signature over double-SHA256(signed range)')   # bare 'R12' matches [PASS] R12
 
     # The rerun check compares only against an artifact made from the same inputs:
     # a new ELF/timestamp replaces the old artifact (it used to abort after already
