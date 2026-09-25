@@ -782,3 +782,79 @@ on the final script (sha256 `590b2a79…`), each self-test rc 1.
 - cold-snap: the fix 4 close-out commit (`hostcheck/Cargo.toml`, `hostcheck/build.rs`, `hostcheck/check-frostsnap-pin.sh`,
   `hostcheck/frostsnap.rev`, `README.md`, `tools/check-software-readiness.py`, `tools/test-software-readiness.py`, this
   file, `run.json`, the 02 evidence file). See `git log`; the commit cannot name its own SHA. frostsnap: no commit (unchanged).
+
+## Fix 5 — full readiness profile
+
+**Fix 5 status: NOT FIXED.** Reason: the full profile ran verbatim to completion but exits 1, and the goal was exit 0 with every stage passed. The cause is outside this pass's source changes and needs the user's go-ahead: the current image's digest is not registered through task 02's workflow. See "Fix 5 — close-out".
+
+**Run status: NOT PASSED (exit 1).** 42 stages: 39 passed, 3 failed, 0 blocked/unavailable. All three failures have one cause: frostsnap's
+`frostsnap_coordinator/src/coldsnap-mk4-registry.txt` lacks the announced digest of the current cold-snap image,
+`c86392bc005ddfc8d019eb545b4b05876cc8da5ab22ebb941b514c17c6d9e7ce`. Fix 2a's firmware change (cold-snap 6b2e5c2) made the registry stale. This was already recorded
+in § "Fix 3 — close-out" item 2 and § "Fix 4 — close-out" R2-1. The digest is stable across rebuilds: this run's
+`pack` produced the same c86392bc as fix 4's run.
+
+Pair tested: cold-snap `45a3f85` (clean apart from user files), frostsnap `366da52` == `hostcheck/frostsnap.rev` (clean apart from user files).
+No source file changed in this fix, so there were no mutations. The runner, stages and assertions are unchanged.
+
+### Commands (implementer)
+| command | cwd | exit | elapsed |
+|---|---|---|---|
+| `python3 tools/test-software-readiness.py` | cold-snap | 0 (`PASS: 0 failed case(s)`) | 56 s |
+| `python3 tools/check-software-readiness.py --profile full --output-dir target/software-readiness` (background, log `target/software-only/logs/10-fix5/full.log`) | cold-snap | **1** | 375 s |
+| `python3 frostsnap_coordinator/tools/register-mk4-firmware.py …/package/firmware-signed.bin mk4-2026-09-25` | frostsnap | NOT RUN: the auto-mode permission classifier denied the write to the registry | — |
+
+Report: `target/software-readiness/results.json` (started 2026-09-25T16:32:44-04:00, finished 16:38:59, label
+`NOT PASSED: registry-matches-artifact=failed, app-rig=failed, updater-local-artifact=failed`). Copies are in `target/software-only/logs/10-fix5/`.
+
+### Per-stage (from results.json)
+Passed (rc, s): host-frostsnap-macros 0/2.42, host-frostsnap-embedded-std 0/1.7, host-frostsnap-comms 0/2.1, host-frostsnap-core 0/19.71,
+host-frost-backup 0/5.13, host-coldsnap-firmware 0/2.17, host-coldsnap-hal 0/3.79, arm-clippy-dev 0/0.57, arm-clippy-release 0/0.57,
+arm-build-release 0/0.68, refcheck 0/13.87, refcheck-negatives 0/27.3, pack 0/0.84, pack-tests 0/1.82, pack-negative-bad-layout 1/0.2,
+checkfw-bin 0/0.53, checkfw-dfu 0/0.36, checkfw-negative-signature 1/0.42, checkfw-negative-misaligned 1/0.42, checkfw-negative-family 1/0.41,
+pixel-check 0/0.89, heap-session 0/0.8, stub-build 0/0.25, frostsnap-pin 0/0.08, hostcheck-tests 0/1.49, hostcheck-run 0/17.95,
+coordinator-verbatim 0/7.05, coordinator-scoped 0/2.57, rust-lib-frostsnapp 0/2.3, register-self-check 0/0.08, flutter-analyze 0/28.68,
+flutter-test 0/3.39, bridge-gen-reproducible 0/33.5, build-runner-reproducible 0/18.62, updater-stub-ignored 0/2.83, updater-lib-ignored 0/3.75,
+app-bridge-ignored 0/6.16, controller-erase-fake 0/6.17, install-xproc 0/2.3. (The negative stages expect rc 1.)
+
+Failed:
+- `registry-matches-artifact` rc 0, 0.04 s: digest c86392bc… is not in the registry (`logs/registry-matches-artifact.out`).
+- `app-rig` rc 4, 127.33 s: the app refused keygen with `unrecognized-c86392` (`logs/app-rig.out:8,20`). Device 3 then exited 2 with no reveal sheet (`app-rig/device-3.log`), so this is a downstream effect.
+- `updater-local-artifact` rc 101, 0.53 s: `mk4_firmware_artifacts.rs:377` `assertion failed: registered_mk4_revision(&raw.digest()).is_some()`.
+
+### Orphans
+`ps -axo pid,pgid,command` filtered for coldsnap/stub/flutter/frostsnapp/bitcoin-node/qemu/ibtoold/app-rig after the run: only PID 13555
+(the user's testnet4 node, not ours). No orphans. `git status --porcelain` in both repos shows only the pre-existing user files.
+
+### Left undone
+Registration was not done. It is task 02's explicit workflow (spec 09 Work item 6), and it was not bypassed. For a green full profile:
+1. In frostsnap, run `python3 frostsnap_coordinator/tools/register-mk4-firmware.py "$HOME/repos/cold-snap/target/software-only/package/firmware-signed.bin" mk4-2026-09-25`
+   and commit the registry. A commit is required, because an uncommitted edit makes `frostsnap-pin` fail with EDITED (rc 3).
+2. Bump `hostcheck/frostsnap.rev` to the new frostsnap HEAD after hostcheck passes against it (README "Bumping the frostsnap pin"), and commit it.
+3. Re-run the full profile. This report cannot stand in for that run.
+The only claim available is "software/pre-bench checks passed" for the 39 passed stages. The full profile is not passed.
+
+## Fix 5 — re-runner checks and findings
+
+Re-runner 1 (independent full run, output dir redirected so the implementer's report was not overwritten; command otherwise verbatim):
+| command | cwd | exit |
+|---|---|---|
+| `python3 tools/test-software-readiness.py` (log `target/software-only/verify-rerun-final/logs/selftest.log`) | cold-snap | 0 (`PASS: 0 failed case(s)`) |
+| `python3 tools/check-software-readiness.py --profile full --output-dir target/software-only/verify-rerun-final/software-readiness` (background, log `target/software-only/verify-rerun-final/logs/full.log`) | cold-snap | 1 (39 passed, 3 failed, 0 blocked; 16:43:04 to 16:48:30) |
+| `grep c86392 frostsnap_coordinator/src/coldsnap-mk4-registry.txt` | frostsnap | 1 (no match) |
+
+Same three failures with the same cause: registry-matches-artifact rc 0/0.04 s, app-rig rc 4/121.89 s (`unrecognized-c86392`), updater-local-artifact rc 101/0.68 s (`mk4_firmware_artifacts.rs:377:5`). orphans_after_run `[]`; only PID 13555 (user's node) in `ps`.
+
+Re-runner 2 (read-only): the implementer's `target/software-readiness/results.json` is byte-identical to `logs/10-fix5/results.json`; `full.exit` reads `exit=1 elapsed=375s`; no source diff in either repo; frostsnap HEAD 366da52 == `hostcheck/frostsnap.rev`.
+
+CONFIRMED findings: none from either re-runner. Repair: none needed. (Re-runner 2 noted, as framing, that the stale registry follows from this pass's fix 2a `6b2e5c2`, so "pre-existing" is loose; recorded here, not a defect.)
+
+## Fix 5 — close-out
+
+- **Status: NOT FIXED.** Two independent full-profile runs from this pass both exit 1 with 39/42 passed and 3 failed, 0 blocked/skipped. No stage was removed, reclassified or relaxed. No earlier results.json was reused.
+- **Closed by this fix:** "full profile not re-run after fixes 1 and 3" (09 follow-ups). It has now run, twice. `coordinator-verbatim` passes in the full profile (rc 0), and so do `frostsnap-pin`, `hostcheck-run` and `pack-negative-bad-layout` (the fix 3 and fix 4 stages).
+- **Still open:**
+  1. `registry-matches-artifact`, `app-rig`, `updater-local-artifact` fail: digest `c86392bc005ddfc8d019eb545b4b05876cc8da5ab22ebb941b514c17c6d9e7ce` is not in `frostsnap_coordinator/src/coldsnap-mk4-registry.txt`. To finish (needs the user's go-ahead): run `register-mk4-firmware.py … mk4-2026-09-25` in frostsnap and commit it, bump `hostcheck/frostsnap.rev` once hostcheck passes, then re-run the full profile.
+  2. The stale "known BLOCKED" note still sits at `tools/check-software-readiness.py:356` (formerly :347-348). It does not affect classification. Source is out of scope for close-out.
+  3. `checkfw-negative-signature` pattern `[FAIL] R12 ` also matches the range-unusable variant (from fix 3, unchanged).
+- **Commits:** cold-snap evidence-only close-out commit (this file, 09 evidence, run.json). frostsnap: none.
+- The only claim available is "software/pre-bench checks passed", for the 39 passed stages. Real USB enumeration, timing, SE calls, entropy, flash power loss and actual installation remain bench-only and untested.

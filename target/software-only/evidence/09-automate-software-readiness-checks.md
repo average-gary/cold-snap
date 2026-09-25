@@ -480,3 +480,9 @@ Detail: `10-followup.md` § Fix 1.
 - **Closed:** `pack-negative-bad-layout` accepted any rc 1. It now requires `must=[r'(?m)^ABORT \(Abort\): firmware0\.bin would load at 0x08180000, not 0x08020000:']`, copied from a real refusal run. `tools/test-software-readiness.py` proves, using the real stage's rule, that a traceback with rc 1 and `ABORT (KeyError)` with rc 1 are classified failed. Mutation D1 (crash in the refusal path): new rule failed, old rule passed.
 - **Still open:** full profile not re-run; `registry-matches-artifact` fails because the rebuilt artifact's digest is unregistered (not caused by fix 3; needs task 02's registration); stale "known BLOCKED" comment at `tools/check-software-readiness.py:347-348`.
 - Detail, commands and mutation logs: `10-followup.md`, sections `## Fix 3 …`. Scope: software/pre-bench checks passed, for these checks only.
+
+## Follow-up 2026-09-24 — fix 5
+
+- **Closed:** "full profile not re-run" (fix 1 and fix 3 follow-ups). The full profile ran verbatim on 2026-09-25 against cold-snap `45a3f85` and frostsnap `366da52`, and a re-runner repeated it independently. `coordinator-verbatim` now passes in the full profile (rc 0), and so do `frostsnap-pin`, `hostcheck-run` and `pack-negative-bad-layout`.
+- **Still open:** the full profile exits 1 (39 passed, 3 failed, 0 blocked). `registry-matches-artifact`, `app-rig` and `updater-local-artifact` fail because the current image digest `c86392bc…` is not registered. Registering it through task 02's workflow needs the user's go-ahead. Also still open: the stale "known BLOCKED" note at `tools/check-software-readiness.py:356`, and the loose `checkfw-negative-signature` pattern.
+- Detail: `10-followup.md` § Fix 5. Scope: software/pre-bench checks passed, for the 39 passed stages only.
