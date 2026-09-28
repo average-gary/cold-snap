@@ -1,4 +1,4 @@
 # The frostsnap commit hostcheck was last built and verified against. Read by
 # check-frostsnap-pin.sh (from build.rs and the readiness runner's frostsnap-pin stage).
 # Bump it only after hostcheck passes against the new commit: README "Bumping the frostsnap pin".
-366da527e9268195d5cf000b6cd92ca879a6a153
+c2bcd65cd8d0924de6cdb7378883ebdf0dc030de
