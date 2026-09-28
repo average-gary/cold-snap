@@ -444,3 +444,10 @@ Detail: `10-followup.md` § Fix 1.
 
 Detail: `10-followup.md` § Fix 2a (status PARTLY FIXED).
 
+
+## Follow-up 2026-09-28 — fix 6
+
+**Closed:** the CONFIRMED "real ARM boot's link-edge send of the recovered ack (`firmware/src/main.rs:2614-2616`) is covered by no test". The send is now the `send_recovered_erase_ack!` macro (lib.rs), which boot expands and the host test `the_link_edge_sends_one_recovered_erase_ack_from_the_original_id` drives. The test requires exactly one `EraseConfirmed` from the original id across two link edges after recovery. Source pins tie boot's single expansion to the link edge, before the announce, and tie `recovered_erase` to `erase::recover`'s result. Deleting the send, commenting it out or dropping the id each fails the test. The release image is byte-identical, so c86392bc is still the registered digest.
+**Still open:** a `#[cfg(not(target_arch = "arm"))]` attribute on the send line still removes it with every gate green (CONFIRMED). `link.is_linked()` is not executed on the host. The fix 2a PLAUSIBLE residuals are unchanged. Criterion 2 is now tested for main.rs's send at host level. It is not hardware-verified.
+
+Detail: `10-followup.md` § Fix 6 (status PARTLY FIXED).

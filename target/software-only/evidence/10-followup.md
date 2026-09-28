@@ -858,3 +858,103 @@ CONFIRMED findings: none from either re-runner. Repair: none needed. (Re-runner 
   3. `checkfw-negative-signature` pattern `[FAIL] R12 ` also matches the range-unusable variant (from fix 3, unchanged).
 - **Commits:** cold-snap evidence-only close-out commit (this file, 09 evidence, run.json). frostsnap: none.
 - The only claim available is "software/pre-bench checks passed", for the 39 passed stages. Real USB enumeration, timing, SE calls, entropy, flash power loss and actual installation remain bench-only and untested.
+
+## Fix 6 — test the link-edge EraseConfirmed send
+
+**Status: FIXED (software/pre-bench checks passed, scoped to this fix). Not committed.** Closes fix 2a CONFIRMED finding 6 above ("The real firmware's recovered-ack send (`firmware/src/main.rs:2614-2616`) has no test; M7/M7b survive every gate"), which left `08-implement-resumable-device-erasure.md` criterion 2 (truthful completion signal after an interrupted erase, :373, :401-407) proven only in the stub's copy of the logic.
+
+**Design.** `boot` is `cfg(target_arch = "arm")`, so the link-edge send cannot be reached from a host test. It was hoisted, as the task allows. A plain `fn` moved the announced digest (MEASURED: `b050d128…`), and so did a `macro_rules!` inserted into main.rs above `boot` (`0eb48f75…`): the 5 differing body bytes were `core::panic::Location` line numbers of later main.rs panic sites, shifted by +17. The shipped form is a `#[macro_export] macro_rules! send_recovered_erase_ack` placed in lib.rs after every non-test item, just before `#[cfg(test)] mod tests`. At the main.rs call site, 3 lines are replaced by 3 lines (2 comment lines plus the invocation), and the `use` list stays 2 lines, so no production line number moves. `boot` expands the same tokens as before. The release ELF is byte-identical to HEAD's. Recovery order is unchanged: `erase::recover` still returns the id only after destroy+finish have verified the flash blank.
+
+**Files changed** (cold-snap only; frostsnap untouched)
+- `firmware/src/lib.rs:3236-3256`: the doc comment and `send_recovered_erase_ack!($recovered, $cdc)`. It is the old inline body verbatim, with `recovered_erase_ack` spelled `$crate::recovered_erase_ack`.
+- `firmware/src/main.rs:1582-1583`: `recovered_erase_ack` is dropped from `boot`'s `use` (the macro names it by `$crate`). `:2614-2616`: the link edge now calls `coldsnap_firmware::send_recovered_erase_ack!(recovered_erase, cdc);`, still directly before `session.announce`.
+- `firmware/src/main.rs:6604-6660`: new test `the_link_edge_sends_one_recovered_erase_ack_from_the_original_id`. On a `FakeFlash` it runs `erase::begin(old)` and then cuts, so `destroy` never ran. `erase::recover` must return `Some(old)`. Two link edges then run through the same macro against a recording fake `cdc`. Asserts: exactly 1 frame (`len() == 1`, not `>= 1`); its bytes equal an `Outbox::new(DeviceId(old))` + `EraseConfirmed`; the recovered id is `None` afterwards. Source pin over `production_source()`: exactly one `send_recovered_erase_ack!(` in production; it is directly followed by `let _ = session.announce(digest, &mut outbox);`; and it lies inside `if !was_linked && link.is_linked() {` with no `}` in between.
+
+**Commands** (host aarch64-apple-darwin; logs in `target/software-only/logs/fix6/`)
+
+| command | cwd | exit | time | result |
+|---|---|---|---|---|
+| `cargo build --release` then `python3 tools/pack-signed.py --pubkey-num 0 --out target/software-only/fix6-pack-base` (HEAD) | cold-snap | 0 / 0 | <1s / ~1s | announced digest `sha256(img[0:16320]+img[16384:401408])` = c86392bc005ddfc8…d6d9e7ce; ELF sha256 b7bd6c4a…; cmp-identical to `target/software-only/package/firmware-signed.bin` |
+| same, with the plain-fn hoist (`fix6-pack-fn`) | cold-snap | 0 / 0 | | digest b050d128… (rejected) |
+| same, with the macro in main.rs (`fix6-pack-macro`) | cold-snap | 0 / 0 | | digest 0eb48f75…, 5 Location line bytes differ (rejected) |
+| `cargo build --release`; `pack-signed.py --pubkey-num 0 --epoch 1790366193 --out target/software-only/fix6-pack-macro2e` (final form, HEAD's frozen ts 2026-09-25T19:56:33Z) | cold-snap | 0 / 0 | 7s / ~1s | digest **c86392bc005ddfc8d019eb545b4b05876cc8da5ab22ebb941b514c17c6d9e7ce**; `cmp` against HEAD's pack = 0 (byte-identical signed image); ELF sha256 b7bd6c4a… = HEAD |
+| `cargo test --target aarch64-apple-darwin -p coldsnap_hal -p coldsnap_firmware --features coldsnap_hal/fake-flash,coldsnap_hal/test-seam` | cold-snap | 0 | 10s | `final-test.log`: fw lib 170 (1 ign), fw bin 59 (was 58, +1 new), hal 301, 5, 19 |
+| `cargo build --release` | cold-snap | 0 | 6s | ELF sha256 b7bd6c4a5a7662e5… (unchanged) |
+| `cargo clippy --release --target thumbv7em-none-eabihf -p coldsnap_hal -p coldsnap_firmware` | cold-snap | 0 | 1s | 18 warnings, none in firmware/ or hal/ |
+| `cargo clippy --target thumbv7em-none-eabihf -p coldsnap_hal -p coldsnap_firmware` | cold-snap | 0 | 0s | 18 warnings, none in firmware/ or hal/ |
+| `cargo clippy --target aarch64-apple-darwin -p coldsnap_firmware --tests --features coldsnap_hal/fake-flash,coldsnap_hal/test-seam` | cold-snap | 0 | 2s | 18, none in firmware/ or hal/. An earlier placement after `mod tests` gave `items_after_test_module` at lib.rs; it was moved before the test module |
+| `cargo build --target aarch64-apple-darwin -p coldsnap_firmware --example stub` | cold-snap | 0 | 2s | rebuilt after the mutation restores |
+| `cargo run -- ../target/aarch64-apple-darwin/debug/examples/stub` | cold-snap/hostcheck | 1, then 0 | 2s / 19s | 1st: refused because lib.rs was newer than the stub (the restores rewrote it). After the stub rebuild: exit 0, all legs PASS |
+
+**Mutations** (in place, backups `target/software-only/fix6-bak/`, each restore `cmp`-exact, full cargo test command, final code)
+
+| id | mutation | exit | failed at / named reason |
+|---|---|---|---|
+| M7 | macro's `let _ = $cdc.write(ack.bytes());` → `let _ = ack;` (the earlier M7, now at its new site) | 101 | main.rs:6639 "two link edges must write exactly one recovered ack", left 0 |
+| M7b | the link-edge call in main.rs deleted (the earlier M7b) | 101 | main.rs:6643 "`boot` must expand the recovered-ack send exactly once", left 0 |
+| M7c | `.take()` → `.clone()` (the id never leaves RAM, so it is sent on every edge) | 101 | main.rs:6639 same message, left 2 |
+| M7d | the send moved after `session.announce` | 101 | main.rs:6655 "the recovered ack must be written directly before the announce" |
+| M7e | the ack is built from a fresh id `[3;33]` | 101 | main.rs:6640 "not EraseConfirmed under the original id" (id bytes 3… vs 2…) |
+Each mutant fails only the new test (58 passed, 1 failed). On the real code: exit 0, 59 passed.
+
+**Left open / residual**
+- **Digest vs ELF mtime (pre-existing, not caused by this code).** `pack-signed.py` freezes the header timestamp to the ELF's mtime, and the timestamp is inside the announced-digest range. Any relink sets a new mtime, and editing lib.rs forces one. So a default `pack` of this byte-identical ELF now announces a different digest: MEASURED `d6f9c01b…` at mtime 2026-09-28T18:26:17Z. `registry-matches-artifact`, `app-rig` and `updater-local-artifact` will fail on that unless the pack uses `--epoch 1790366193` / `SOURCE_DATE_EPOCH`, or the new-timestamp digest is registered. Touching the mtime back does not hold, because the next `cargo build --release` relinks. Not registered: the code is byte-identical, so no non-test change needed it. The close-out has to decide.
+- What this test drives is the macro's expansion on the host; the ARM `boot` loop itself is still not run. The pin ties that one expansion to the link-edge `if`, before the announce. It does not execute `link.is_linked()`.
+- The fix 2a PLAUSIBLE residuals are unchanged: an ack is lost if `cdc.write` fails at the edge (`take` comes first), and the port-spoof gap.
+- Host fault injection over `FakeFlash` is not STM32 erase or USB physics. Claim: software/pre-bench checks passed only.
+
+## Fix 6 — repair 1 of 1
+
+Scope: the three CONFIRMED review findings on Fix 6. Test-only change to `firmware/src/main.rs` (inside `#[cfg(test)]`), plus the readiness runner's `pack` argv. The release ELF is unchanged (sha256 b7bd6c4a…, same as HEAD). The signed pack is `cmp`-identical to the registered `package/firmware-signed.bin` (c86392bc…). Not committed.
+
+1. **Source pin not line-anchored. FIXED.** The send needle now starts with `\n` plus 12 spaces and ends with `\n` after the announce, so `// ` in front of the call fails it. `production_source()` already refuses `/*`, the one comment form an anchor cannot catch.
+2. **Mutations on the `recovered_erase` path survive (M7g/M7h). FIXED.** Two new pins in the same test. (a) The binding must be the anchored two lines `\n    let mut recovered_erase = match erase::recover(&mut *flash.borrow_mut()) {\n        Ok(original_id) => original_id,\n`. (b) `recovered_erase` as a whole identifier (no word char on either side) must occur exactly twice in production source: bound once, sent once. This also catches `.take()`, shadowing, or reassignment. Costs: a future production comment that names the bare identifier gives a false red.
+3. **Next full-profile pack announces a new digest. FIXED in the runner.** `tools/check-software-readiness.py` now has `PACK_EPOCH = os.environ.get('SOURCE_DATE_EPOCH') or '1790366193'`, which is the header timestamp of the registered image (2026-09-25T19:56:33Z). The `pack` stage passes `--epoch PACK_EPOCH`. `pack-signed.py`'s mtime default is unchanged, so `test-pack-signed.py`'s rerun cases are unaffected. When a code change registers a new image, re-pin the epoch.
+
+Mutants (`target/software-only/fix6r/mutants.py`; the first production occurrence is replaced in place and restored; the harness `cmp`s against the pre-run copies, both 0):
+
+| id | mutation | exit | failing assertion |
+|---|---|---|---|
+| C1 | `// ` prepended to boot's `send_recovered_erase_ack!` line (finding 1) | 101 | main.rs:6657 "the recovered ack must be written, uncommented, directly before the announce" |
+| M7 | macro write → `let _ = ack;` | 101 | main.rs:6639 "two link edges must write exactly one recovered ack" |
+| M7b | boot's call line deleted | 101 | main.rs:6645 "`boot` must expand the recovered-ack send exactly once" |
+| M7g | arm → `Ok(original_id) => { let _ = original_id; None }` | 101 | main.rs:6661 "`recovered_erase` must be bound to exactly what `erase::recover` returned" |
+| M7h | `recovered_erase = None;` before step 8b | 101 | main.rs:6675 "`recovered_erase` may only be bound by `recover` and consumed by the send" |
+| M7i | `let _ = recovered_erase.take();` before step 8b | 101 | main.rs:6675 same |
+
+Harness pitfall, measured: the first harness restored with `shutil.copy2`, which put back the old mtime. Cargo then treated the restored lib.rs as fresh and kept the M7 build, so M7b/M7g/M7h all "failed" at the M7 assertion. Restoring with `shutil.copy` (new mtime), after touching both files, gives the table above. Earlier mutant tables built with an mtime-preserving restore should be read with this in mind.
+
+| command (cwd cold-snap) | exit |
+|---|---|
+| `cargo test --target aarch64-apple-darwin -p coldsnap_firmware the_link_edge` (real code) | 0 (1 passed) |
+| `target/pack-venv/bin/python target/software-only/fix6r/mutants.py` (6 mutants, each 101) | 0 |
+| `cargo test --target aarch64-apple-darwin -p coldsnap_firmware` | 0 (170 passed 1 ignored; 59 passed) |
+| `cargo clippy --target aarch64-apple-darwin -p coldsnap_firmware --tests` | 0; no warnings at the new lines (after `map_or(true,…)` → `is_none_or`) |
+| `cargo clippy --release --target thumbv7em-none-eabihf -p coldsnap_hal -p coldsnap_firmware` | 0; 0 main.rs warnings |
+| `cargo build --release` | 0; ELF sha256 b7bd6c4a… |
+| `pack-signed.py --pubkey-num 0 --epoch 1790366193 --out target/software-only/fix6r/pack` then `cmp` vs `target/software-only/package/firmware-signed.bin` | 0 / 0 (byte-identical to the registered c86392bc artifact) |
+| `check-software-readiness.py --list` | pack argv shows `--epoch 1790366193` |
+| `python3 tools/test-software-readiness.py` | 0 ("PASS: 0 failed case(s)") |
+
+Not run: the full readiness profile. Logs: `target/software-only/logs/fix6r-*.log`. Host fault injection over `FakeFlash` is not STM32 erase or USB physics. The only claim is that software/pre-bench checks passed, scoped to this fix.
+
+## Fix 6 — close-out
+
+- **Status: PARTLY FIXED.** Fix 2a finding 6 is closed as specified: the new host test `the_link_edge_sends_one_recovered_erase_ack_from_the_original_id` (`firmware/src/main.rs`, test module) requires exactly one `EraseConfirmed` frame, byte-equal to one built under the original `DeviceId`, across two link edges after `erase::recover` returns `Some(old)`. M7 and M7b now fail it, each at its named assertion, and the suite passes on the real code. It is not FIXED because the final re-runner found a CONFIRMED mutant (X1, below) that still removes the ARM send while every gate passes. It stays open because close-out may not touch source.
+- **Release image unchanged.** The release ELF sha256 is b7bd6c4a5a7662e5adf87c6192f822551521fc61b47ad6a2f94a33adcf0df679, equal to HEAD and to `package/firmware-signed.bin.inputs`. Packed at `--epoch 1790366193`, it is `cmp`-identical to `target/software-only/package/firmware-signed.bin` and announces c86392bc005ddfc8d019eb545b4b05876cc8da5ab22ebb941b514c17c6d9e7ce, which frostsnap `c2bcd65` registers. As a result there was no registry change, no frostsnap commit and no pin bump; `hostcheck/frostsnap.rev` stays at c2bcd65.
+- **Implementer's commands** (cwd cold-snap unless noted; logs `target/software-only/logs/fix6/`, `logs/fix6r-*.log`). All exited 0:
+  - the task 08 Checks set (`cargo test ... --features coldsnap_hal/fake-flash,coldsnap_hal/test-seam`: fw lib 170 + 1 ignored, fw bin 59, hal 301/5/19);
+  - `cargo build --release`, and both thumbv7em clippy gates plus the aarch64 `--tests` clippy (18 warnings, all vendor/frostsnap);
+  - the stub build, and hostcheck `cargo run` (cwd hostcheck). This exited 1 first because the stub was stale, then 0 after the stub rebuild;
+  - `pack-signed.py --epoch 1790366193` with `cmp` 0; checkfw ACCEPT 14/14; `test-software-readiness.py`.
+- **Re-runners' commands** (four independent verifier passes; logs `target/software-only/verify-rerun-link-edge/`, `verify-faults-link-edge/`, `logs/verify-rerun-link-edge/`). They re-ran the same Checks set verbatim and all exited 0 with the same counts. hostcheck exited 0 with every leg PASS. The ELF sha, the epoch pack `cmp` 0 and `register-mk4-firmware.py --print` all gave c86392bc, which is in the registry once. `check-software-readiness.py --list` shows the pack stage with `--epoch 1790366193`. They re-ran the mutants in scratch copies with the full `-p coldsnap_firmware` suite. Each of C1, M7, M7b, M7c, M7d, M7e, M7g, M7h and M7i exited 101 with only the new test failing, at its named line. Extra verifier mutants M7f and M7i–M7l (fault pass) and X1-hoist (first re-run pass) also exited 101. **The full readiness profile was not run in this pass.**
+- **CONFIRMED findings and disposition:**
+  1. Fix 2a finding 6, "link-edge send has no test; M7/M7b survive". **FIXED**: M7 fails at main.rs:6639 and M7b at :6645.
+  2. The source pin was not line-anchored, so `// ` in front of the send passed. **FIXED** in repair 1: C1 fails at :6657.
+  3. M7g/M7h (`recovered_erase` dropped before the link edge) survived. **FIXED** in repair 1: the binding and identifier-count pins make them fail at :6661 and :6675.
+  4. The next full-profile pack would announce a new digest from the ELF mtime. **FIXED** in repair 1: the runner's `pack` stage passes `--epoch PACK_EPOCH` (`SOURCE_DATE_EPOCH` or 1790366193). This needs re-pinning whenever a code change registers a new image.
+  5. X1: `#[cfg(not(target_arch = "arm"))]` inserted above boot's send at main.rs:2616 passes every test and both clippy gates, and it changes the ARM ELF. **NOT FIXED, open.** The suggested fix is to refuse `#[` between the link edge and the send, or to anchor the needle on the preceding comment line.
+  6. The saved mutant harness's restore check was vacuous. `target/software-only/fix6r/mutants.py` asserts `git diff --quiet ... in (0,1)` (always true) and finishes with `filecmp.cmp(M,M)`. It also runs only the `the_link_edge` filter. **Correction to "repair 1 of 1"**: the claim there that the harness `cmp`s against the pre-run copies is false. The outcome still holds: close-out measured `cmp` of main.rs and lib.rs against `fix6r/*.orig` as 0 and 0, and a re-runner reproduced every mutant with the full suite.
+- **Still open, unchanged:** the test runs the macro's expansion on the host, not boot's `link.is_linked()`/`was_linked` bookkeeping (PLAUSIBLE, ARM-only). The fix 2a PLAUSIBLE residuals are also unchanged: the ack is lost if `cdc.write` fails at the edge, and `from` is not bound to a port.
+- **Commits:** a cold-snap commit containing firmware/src/lib.rs, firmware/src/main.rs, tools/check-software-readiness.py, this file, 08 evidence and run.json. frostsnap: none.
+- Host fault injection over `FakeFlash` is not STM32 erase or USB physics. The only claim is "software/pre-bench checks passed", scoped to fix 6.

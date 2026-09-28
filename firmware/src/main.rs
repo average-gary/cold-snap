@@ -1579,8 +1579,8 @@ pub unsafe extern "C" fn entry_point() -> ! {
 #[cfg(target_arch = "arm")]
 fn boot() -> ! {
     use coldsnap_firmware::{
-        firmware_digest, prompt_screen_at, quiz, recovered_erase_ack, Checked, DebugFlash, Fault,
-        Outbox, Session, Shown, Typed,
+        firmware_digest, prompt_screen_at, quiz, Checked, DebugFlash, Fault, Outbox, Session,
+        Shown, Typed,
     };
     use coldsnap_hal::panic::{bump_counter, clear_counter, BootHealth, Counter};
     use coldsnap_hal::{comms, display, erase, flash, identity, psram, rng, usb};
@@ -2611,9 +2611,9 @@ fn boot() -> ! {
         if !was_linked && link.is_linked() {
             // The erase boot's step 8a finished for the device this unit USED to
             // be: its ack first, under that old id, once (it leaves RAM with it).
-            if let Some(Ok(ack)) = recovered_erase.take().map(recovered_erase_ack) {
-                let _ = cdc.write(ack.bytes());
-            }
+            // `send_recovered_erase_ack!` (lib.rs) is shared with the host test; it
+            // is a macro, so this image is byte-identical to the inline form.
+            coldsnap_firmware::send_recovered_erase_ack!(recovered_erase, cdc);
             let _ = session.announce(digest, &mut outbox);
         }
 
@@ -6598,6 +6598,87 @@ mod tests {
                 "Some(match screen {\n            quiz::Screen::Word { .. } => Check::Asking,\n            quiz::Screen::Passed { .. } => Check::Passed,\n        })"
             ),
             "the cursor must be read off the screen that reached the panel"
+        );
+    }
+
+    /// Follow-up fix 6: boot's link-edge send of the recovered erase ack, driven on
+    /// the host. A committed erase is cut before `destroy` (the marker is all that was
+    /// written), `erase::recover` finishes it and hands back the ORIGINAL id, and then
+    /// the link comes up TWICE through the same `send_recovered_erase_ack!` expansion
+    /// `boot` uses. Exactly one frame may go out, it must be `EraseConfirmed` under the
+    /// original id, and the recovered id must be gone. The source pin then holds that
+    /// `boot` expands it once, inside the link-edge `if`, directly before the announce.
+    /// Host fault injection over `FakeFlash`, not STM32 erase or USB physics.
+    #[test]
+    fn the_link_edge_sends_one_recovered_erase_ack_from_the_original_id() {
+        use coldsnap_firmware::Outbox;
+        use coldsnap_hal::{erase, flash::fake::FakeFlash};
+        use frostsnap_comms::{CommsMisc, DeviceSendBody};
+        use frostsnap_core::DeviceId;
+
+        struct Cdc(Vec<Vec<u8>>);
+        impl Cdc {
+            fn write(&mut self, bytes: &[u8]) -> Result<(), ()> {
+                self.0.push(bytes.to_vec());
+                Ok(())
+            }
+        }
+
+        let old = [0x02; erase::ID_LEN];
+        let mut flash = FakeFlash::new((memmap::FS_FREE_OFFSET / frostsnap_embedded::SECTOR_SIZE as u32) as usize);
+        erase::begin(&mut flash, &old).unwrap();
+        let mut recovered_erase = erase::recover(&mut flash).unwrap();
+        assert_eq!(recovered_erase, Some(old), "recovery lost the original id");
+
+        let mut cdc = Cdc(Vec::new());
+        for _link_edge in 0..2 {
+            coldsnap_firmware::send_recovered_erase_ack!(recovered_erase, cdc);
+        }
+        let mut want = Outbox::new(DeviceId(old));
+        want.push(DeviceSendBody::Misc(CommsMisc::EraseConfirmed)).unwrap();
+        assert_eq!(cdc.0.len(), 1, "two link edges must write exactly one recovered ack");
+        assert_eq!(cdc.0[0], want.bytes(), "not EraseConfirmed under the original id");
+        assert_eq!(recovered_erase, None, "the recovered id must leave RAM with its ack");
+
+        // Depth-anchored (leading `\n` + indent), so a `// ` prefix on any pinned line
+        // fails it; `production_source` refuses `/*`, the one comment an anchor misses.
+        let src = production_source();
+        assert_eq!(
+            src.matches("send_recovered_erase_ack!(").count(),
+            1,
+            "`boot` must expand the recovered-ack send exactly once"
+        );
+        let edge = src.find("if !was_linked && link.is_linked() {").expect("link edge");
+        let send = src
+            .find(
+                "\n            coldsnap_firmware::send_recovered_erase_ack!(recovered_erase, cdc);\n            \
+                 let _ = session.announce(digest, &mut outbox);\n",
+            )
+            .expect("the recovered ack must be written, uncommented, directly before the announce");
+        // What the macro sends is boot's own `recover` result, unaltered on the way: the
+        // arm hands the id through, and `recovered_erase` as a whole identifier occurs
+        // exactly twice (bound, sent), so no reassignment, `take`, or shadow can empty it.
+        assert!(
+            src.contains(
+                "\n    let mut recovered_erase = match erase::recover(&mut *flash.borrow_mut()) {\n        \
+                 Ok(original_id) => original_id,\n"
+            ),
+            "`recovered_erase` must be bound to exactly what `erase::recover` returned"
+        );
+        let ident = |i: usize| {
+            let b = src.as_bytes();
+            let word = |c: u8| c == b'_' || c.is_ascii_alphanumeric();
+            (i == 0 || !word(b[i - 1]))
+                && b.get(i + "recovered_erase".len()).is_none_or(|&c| !word(c))
+        };
+        assert_eq!(
+            src.match_indices("recovered_erase").filter(|&(i, _)| ident(i)).count(),
+            2,
+            "`recovered_erase` may only be bound by `recover` and consumed by the send"
+        );
+        assert!(
+            edge < send && !src[edge..send].contains('}'),
+            "the recovered ack must be sent inside the link-edge `if`"
         );
     }
 }

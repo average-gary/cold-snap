@@ -314,6 +314,22 @@
           "PLAUSIBLE: no timeout on the erase wait; Dart test does not pump the dialog; the f-cut duplicate count is racy",
           "hostcheck DECLINE deadline intermittent 1 in 3 in repair 1"
         ]
+      },
+      {
+        "fix": "6",
+        "commit": [
+          "cold-snap: the fix 6 close-out commit (see git log; it cannot name its own SHA)"
+        ],
+        "closed": [
+          "CONFIRMED: main.rs:2614-2616 link-edge send of the recovered ack has no test (M7/M7b survive every gate) -> host test the_link_edge_sends_one_recovered_erase_ack_from_the_original_id kills M7, M7b, C1, M7c-M7e, M7g-M7i; release ELF byte-identical, digest c86392bc unchanged",
+          "readiness runner pack stage now pins --epoch so a relink of identical code keeps the registered digest"
+        ],
+        "still_open": [
+          "CONFIRMED: #[cfg(not(target_arch = \"arm\"))] on boot's send line (X1) removes the ARM send and passes every gate",
+          "PLAUSIBLE: host test runs the macro expansion, not boot's link.is_linked()/was_linked",
+          "PLAUSIBLE: main.rs takes the recovered id then discards the cdc.write result",
+          "PLAUSIBLE: EraseConfirmed from is not bound to a port (pre-existing)"
+        ]
       }
     ]
   },

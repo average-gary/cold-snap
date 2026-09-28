@@ -152,6 +152,11 @@ def _depinfo(artifact):
     return [x.replace('\\ ', ' ') for x in re.split(r'(?<!\\) ', head.strip()) if x]
 
 
+# The signed header's timestamp lies inside the announced-digest range, and pack-signed.py
+# defaults it to the ELF's mtime, so every relink of byte-identical code moved the digest off
+# the registry. Pinned to the header timestamp of the registered image (c86392bc, 2026-09-25
+# 19:56:33Z); SOURCE_DATE_EPOCH overrides. Re-pin it when a code change registers a new image.
+PACK_EPOCH = os.environ.get('SOURCE_DATE_EPOCH') or '1790366193'
 PACK_INPUTS = lambda: [ELF, os.path.join(CS, 'tools', 'pack-signed.py'),
                        os.path.join(REF, 'cli', 'signit.py'), os.path.join(REF, 'stm32', 'keys', '00.pem')]
 BUILT = {  # artifact -> what it is built from; an artifact older than any input is STALE
@@ -285,7 +290,7 @@ def stages(out):
 
         # 4 packaging / signature / checkfw
         S('pack', 'package', 'key-0 signed package from this run\'s ELF', CS,
-          [PY, 'tools/pack-signed.py', '--pubkey-num', '0', '--out', PKG], core=True, timeout=300,
+          [PY, 'tools/pack-signed.py', '--pubkey-num', '0', '--epoch', PACK_EPOCH, '--out', PKG], core=True, timeout=300,
           needs=['reference', 'signit', 'pack-venv', 'llvm'], after=['arm-build-release'], consumes=[ELF]),
         S('pack-tests', 'package', 'packaging tests', CS, [PY, 'tools/test-pack-signed.py'], core=True,
           timeout=300, needs=['reference', 'signit', 'pack-venv', 'llvm'], after=['pack'],

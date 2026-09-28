@@ -3233,6 +3233,28 @@ pub fn firmware_digest(image: &[u8]) -> Option<Sha256Digest> {
     Some(Sha256Digest(h.finalize().into()))
 }
 
+/// Boot's link-edge send of the ack [`erase::recover`] owes (task 08, follow-up fix 6).
+///
+/// `recovered` is boot step 8a's `Option<[u8; ID_LEN]>`, which `recover` fills with
+/// the ORIGINAL id only after the data region and marker verified blank. At the link
+/// edge this writes ONE `EraseConfirmed` under that id through `cdc.write` and
+/// `take`s it, so no later edge sends it again. Boot is `cfg(target_arch = "arm")`;
+/// this is the same code expanded there and in `main.rs`'s host test
+/// `the_link_edge_sends_one_recovered_erase_ack_from_the_original_id`. A macro, not a
+/// fn, and placed after every other non-test item, so the release image stays byte-identical
+/// (its registered digest with it): a fn moved the digest, and so did new lines above
+/// any panic site, MEASURED.
+///
+/// [`erase::recover`]: coldsnap_hal::erase::recover
+#[macro_export]
+macro_rules! send_recovered_erase_ack {
+    ($recovered:expr, $cdc:expr) => {
+        if let Some(Ok(ack)) = $recovered.take().map($crate::recovered_erase_ack) {
+            let _ = $cdc.write(ack.bytes());
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
