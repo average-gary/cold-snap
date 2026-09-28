@@ -486,3 +486,9 @@ Detail: `10-followup.md` § Fix 1.
 - **Closed:** "full profile not re-run" (fix 1 and fix 3 follow-ups). The full profile ran verbatim on 2026-09-25 against cold-snap `45a3f85` and frostsnap `366da52`, and a re-runner repeated it independently. `coordinator-verbatim` now passes in the full profile (rc 0), and so do `frostsnap-pin`, `hostcheck-run` and `pack-negative-bad-layout`.
 - **Still open:** the full profile exits 1 (39 passed, 3 failed, 0 blocked). `registry-matches-artifact`, `app-rig` and `updater-local-artifact` fail because the current image digest `c86392bc…` is not registered. Registering it through task 02's workflow needs the user's go-ahead. Also still open: the stale "known BLOCKED" note at `tools/check-software-readiness.py:356`, and the loose `checkfw-negative-signature` pattern.
 - Detail: `10-followup.md` § Fix 5. Scope: software/pre-bench checks passed, for the 39 passed stages only.
+
+## Follow-up 2026-09-28 — fix 7
+
+- **Closed:** the stale "known BLOCKED" note on `coordinator-verbatim` (still open in the fix 1, 3 and 5 follow-ups) is corrected at `tools/check-software-readiness.py:363-364`. Only the string changed: `blocked_re` and the classification are the same. README "Known today" (`README.md:414-418`) now says the stage runs since 036b945 and is still named BLOCKED if the user's file stops compiling. The loose `checkfw-negative-signature` pattern (fix 5 follow-up) is tightened to the R12 signature-verification line, and `tools/test-software-readiness.py` proves the "range unusable" line is now classified failed.
+- **Still open:** PLAUSIBLE only. The tightened R12 line is also printed for pubkey_num != 0 and signature-parse failures. The full profile was not re-run in fix 7.
+- Detail: `10-followup.md` § Fix 7. Scope: software/pre-bench checks passed, for fix 7 only.

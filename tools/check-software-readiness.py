@@ -316,7 +316,9 @@ def stages(out):
            '--', os.path.join(FIX, 'bad-signature.bin')], core=True,
           needs=['cargo', 'rust-host', 'fixture-bad-signature'], expect_rc=1,
           after=['pack-tests'], consumes=[os.path.join(FIX, 'bad-signature.bin')],
-          must=[r'(?m)^RESULT: REFUSE\b', r'(?m)^\s*\[FAIL\] R12 ']),
+          # Only the signature-verification line: R12's other [FAIL] variant, "signature (range
+          # unusable)", is a refusal for a length reason and must not count.
+          must=[r'(?m)^RESULT: REFUSE\b', r'(?m)^\s*\[FAIL\] R12 signature over double-SHA256\(signed range\): ']),
         S('checkfw-negative-misaligned', 'package', 'checkfw refuses a misaligned image (R8)', CS,
           ['cargo', 'run', '--release', '--target', HOST, '-p', 'coldsnap_firmware', '--example', 'checkfw',
            '--', os.path.join(FIX, '05', 'misaligned-397824.bin')], core=True,
@@ -358,8 +360,8 @@ def stages(out):
         S('coordinator-verbatim', 'coordinator', 'frostsnap_coordinator, every target', FS,
           cargo_test('-p', 'frostsnap_coordinator'), needs=['cargo', 'frostsnap'], must=[TESTS_RAN],
           blocked_re=r'tests/coldcard_msg_len\.rs',
-          note='known BLOCKED by the user\'s untracked tests/coldcard_msg_len.rs (E0308); '
-               'never edited by this runner'),
+          note='blocked_re names the user\'s untracked tests/coldcard_msg_len.rs, never edited by this '
+               'runner; its E0308 was fixed in place by follow-up fix 1 (036b945), so this stage runs'),
         S('coordinator-scoped', 'coordinator', 'frostsnap_coordinator lib/bins + named tests', FS,
           cargo_test('-p', 'frostsnap_coordinator', '--lib', '--bins', '--test', 'device_profile_test',
                      '--test', 'firmware_digest_test', '--test', 'mk4_firmware_artifacts',

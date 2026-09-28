@@ -411,10 +411,11 @@ repacked artifact has a new announced digest; register it with frostsnap's
 `frostsnap_coordinator/tools/register-mk4-firmware.py <image> <label>` (a tracked-file
 edit). The runner never edits the registry, so an unregistered artifact fails the run.
 
-Known today: `cargo test -p frostsnap_coordinator` in frostsnap is BLOCKED by an
-untracked local test file, so `full` exits nonzero and names it; the scoped per-target
-substitute runs beside it. No hosted CI runs this: cold-snap has no CI config, and a
-generic runner has neither the sibling repos nor the macOS Flutter toolchain.
+Known today: `cargo test -p frostsnap_coordinator` in frostsnap runs (stage
+`coordinator-verbatim`); the untracked local test file that blocked it compiles since
+2026-09-24 (cold-snap 036b945). If that file stops compiling again, `full` exits
+nonzero and names the stage BLOCKED; the scoped per-target substitute runs beside it.
+No hosted CI runs this: cold-snap has no CI config, and a generic runner has neither the sibling repos nor the macOS Flutter toolchain.
 
 Host tests need an explicit `--target` to override `build.target`, and explicit
 features because the vendored manifests set `default = []`. **`cargo test

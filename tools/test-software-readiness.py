@@ -110,6 +110,22 @@ def main():
         r = one(sh(nm, script, expect_rc=bl.expect_rc, must=bl.must))
         check(f'pack-negative-bad-layout rule: {nm} rc 1 -> {want}', r['status'] == want, r)
 
+    # The real stage's rule on checkfw's real lines (target/software-only/fix7/checkfw-*.log):
+    # R12 has a second [FAIL] variant, "range unusable", which is a refusal for a length reason.
+    sig = next(s for s in R.stages(OUT) if s.name == 'checkfw-negative-signature')
+    res = 'RESULT: REFUSE — 1 of 14 rules failed. Read each citation:'
+    for nm, line, want in [
+            ('sig-verify-failed', '  [FAIL] R12 signature over double-SHA256(signed range): expected valid '
+             'under approved_pubkeys[0], actual signature failed verification; fw_check 265f  [verify.c:226+232]',
+             'passed'),
+            ('sig-range-unusable', '  [FAIL] R12 signature (range unusable): expected firmware_digest() -> Some, '
+             'actual None: one of length >= 262144 / length % 512 == 0 / length <= 397312 failed  '
+             '[coldsnap_firmware::firmware_digest]', 'failed'),
+            ('sig-passed-other-refusal', '  [PASS] R12 signature over double-SHA256(signed range): expected valid '
+             'under approved_pubkeys[0], actual valid (S normalized); fw_check 265f  [verify.c:226+232]', 'failed')]:
+        r = one(sh(nm, f"printf '%s\\n%s\\n' '{line}' '{res}'; exit 1", expect_rc=sig.expect_rc, must=sig.must))
+        check(f'checkfw-negative-signature rule: {nm} rc 1 -> {want}', r['status'] == want, r)
+
     r = one(sh('zero-tests', 'echo "test result: ok. 0 passed; 0 failed"', must=[R.TESTS_RAN]))
     check('cargo run testing nothing -> failed', r['status'] == 'failed', r)
 

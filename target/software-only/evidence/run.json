@@ -27,6 +27,18 @@
           "tools/test-pack-signed.py corrupted-signature negative asserted only 'REFUSE'; now asserts '[FAIL] R12 signature over double-SHA256(signed range)' (mutation A: new exit 1, old exit 0)"
         ],
         "still_open": []
+      },
+      {
+        "fix": "7",
+        "commit": [
+          "cold-snap: the fix 7 close-out commit (see git log; it cannot name its own SHA)"
+        ],
+        "closed": [
+          "tools/check-software-readiness.py checkfw-negative-signature must-pattern '[FAIL] R12 ' also matched R12's 'range unusable' refusal; now requires '[FAIL] R12 signature over double-SHA256(signed range): ' (self-test: range-unusable -> failed; mutants M1/M2 caught)"
+        ],
+        "still_open": [
+          "PLAUSIBLE: the same R12 line is printed for pubkey_num != 0 and sig-parse failures"
+        ]
       }
     ]
   },
@@ -398,6 +410,21 @@
           "full profile exits 1: registry-matches-artifact, app-rig, updater-local-artifact fail because digest c86392bc005ddfc8d019eb545b4b05876cc8da5ab22ebb941b514c17c6d9e7ce is not in coldsnap-mk4-registry.txt (needs user go-ahead for task 02 register-mk4-firmware.py, commit, then bump hostcheck/frostsnap.rev and re-run)",
           "stale 'known BLOCKED' note at tools/check-software-readiness.py:356",
           "checkfw-negative-signature pattern '[FAIL] R12 ' also matches the range-unusable variant"
+        ]
+      },
+      {
+        "fix": "7",
+        "commit": [
+          "cold-snap: the fix 7 close-out commit (see git log; it cannot name its own SHA)"
+        ],
+        "closed": [
+          "stale 'known BLOCKED' note on coordinator-verbatim (tools/check-software-readiness.py:363-364, string only)",
+          "stale README 'Known today' saying coordinator-verbatim is blocked (README.md:414-418)",
+          "checkfw-negative-signature pattern matched R12 'range unusable'; tightened with a self-test"
+        ],
+        "still_open": [
+          "PLAUSIBLE: tightened R12 line also printed for pubkey_num != 0 and sig-parse failures",
+          "full profile not re-run in fix 7"
         ]
       }
     ]

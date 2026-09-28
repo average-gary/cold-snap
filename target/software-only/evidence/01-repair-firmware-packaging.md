@@ -469,3 +469,9 @@ value. No amend, no rewrite — the history stays one commit for this task.
 
 - **Closed:** finding 10 (the checkfw corrupted-signature negative in `tools/test-pack-signed.py` asserted only `REFUSE`). It now asserts `[FAIL] R12 signature over double-SHA256(signed range)`; a bare `R12` would still match checkfw's `[PASS] R12` line. Mutation A (append 4 KiB, so checkfw refuses on R9 with `[PASS] R12`): new assertion exit 1, old exit 0.
 - Detail, commands and mutation logs: `10-followup.md`, sections `## Fix 3 …`. Scope: software/pre-bench checks passed, for these checks only.
+
+## Follow-up 2026-09-28 — fix 7
+
+- **Closed:** the readiness runner's `checkfw-negative-signature` stage (the runner's copy of this task's corrupted-signature negative) matched any `[FAIL] R12 `, including R12's "range unusable" length refusal. It now requires `[FAIL] R12 signature over double-SHA256(signed range): `, copied from a real checkfw run on `fixtures/bad-signature.bin`. A self-test proves the range-unusable line comes out failed; the old pattern (M1) and a looser one (M2) both fail that test. checkfw and the R12 codes are unchanged.
+- **Still open:** PLAUSIBLE only. That same line is also printed for pubkey_num != 0 and signature-parse failures.
+- Detail: `10-followup.md` § Fix 7.

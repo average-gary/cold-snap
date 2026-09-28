@@ -958,3 +958,58 @@ Not run: the full readiness profile. Logs: `target/software-only/logs/fix6r-*.lo
 - **Still open, unchanged:** the test runs the macro's expansion on the host, not boot's `link.is_linked()`/`was_linked` bookkeeping (PLAUSIBLE, ARM-only). The fix 2a PLAUSIBLE residuals are also unchanged: the ack is lost if `cdc.write` fails at the edge, and `from` is not bound to a port.
 - **Commits:** a cold-snap commit containing firmware/src/lib.rs, firmware/src/main.rs, tools/check-software-readiness.py, this file, 08 evidence and run.json. frostsnap: none.
 - Host fault injection over `FakeFlash` is not STM32 erase or USB physics. The only claim is "software/pre-bench checks passed", scoped to fix 6.
+
+## Fix 7 — stale notes and the R12 stage pattern
+
+Implementer pass, 2026-09-28. Not committed. frostsnap untouched (HEAD c2bcd65 = `hostcheck/frostsnap.rev`, so no pin bump is needed). No source outside `tools/` and README changed, and there was no firmware change.
+
+### Files changed (cold-snap)
+- `tools/check-software-readiness.py:319-321`: in the `checkfw-negative-signature` must-pattern, `(?m)^\s*\[FAIL\] R12 ` becomes `(?m)^\s*\[FAIL\] R12 signature over double-SHA256\(signed range\): ` with a two-line comment. It only strengthens the check. The R12 codes and checkfw output are unchanged.
+- `tools/check-software-readiness.py:363-364`: in coordinator-verbatim, the note= text "known BLOCKED ... (E0308)" is replaced by a sentence saying E0308 was fixed in place by follow-up fix 1 (036b945). This is a string change only. `blocked_re` and the classification are unchanged.
+- `README.md:414-418`: "Known today" now says the stage runs (the untracked file has compiled since 2026-09-24, 036b945). It still says `full` exits nonzero and names the stage BLOCKED if the file stops compiling again, which matches the unchanged `blocked_re` behaviour.
+- `tools/test-software-readiness.py:113-127`: new self-test that runs the REAL stage's `must`/`expect_rc` (taken from `R.stages()`, not copied) against three fed outputs built from checkfw's real lines: sig-verify-failed (expected passed), sig-range-unusable (expected failed), and `[PASS] R12` with a REFUSE caused by something else (expected failed).
+
+### Real checkfw output (source of the lines)
+- `target/software-only/fix7/checkfw-bad-signature.log`, R12 line: `[FAIL] R12 signature over double-SHA256(signed range): expected valid under approved_pubkeys[0], actual signature failed verification; ...`
+- `target/software-only/fix7/checkfw-range-unusable.log` (input is `target/software-only/fix7/range-unusable.bin` = the first 397312 B of `fixtures/bad-signature.bin`, a scratch fixture): `[FAIL] R12 signature (range unusable): expected firmware_digest() -> Some, actual None: ...`
+
+### Commands (every cwd is /Users/garykrause/repos/cold-snap)
+| command | exit | elapsed |
+|---|---|---|
+| `cargo run --release --target aarch64-apple-darwin -p coldsnap_firmware --example checkfw -- target/software-only/fixtures/bad-signature.bin` | 1 (REFUSE, expected) | 1s |
+| `head -c 397312 target/software-only/fixtures/bad-signature.bin > target/software-only/fix7/range-unusable.bin` then checkfw on it | 1 (REFUSE, 3 of 14) | 0s |
+| `python3 tools/test-software-readiness.py` (new self-test, OLD pattern) → `fix7/tsr-before-tighten.log` | 1: `FAIL ... sig-range-unusable rc 1 -> failed` (status was passed) | 56s |
+| `python3 tools/test-software-readiness.py` (tightened) → `fix7/tsr-after.log` | 0, `PASS: 0 failed case(s)` | 55s |
+| `python3 target/software-only/fix7/drive-stage.py` (REAL stage on REAL checkfw, pack-tests seeded passed, single-stage drive, not a profile run) → `fix7/drive-stage.log` | 0: the real stage is passed, and the range-unusable input is failed with `output lacks /...R12 signature over.../` | 1s |
+| M2 in tree: pattern loosened to `\[FAIL\] R12 signature`; self-test → `fix7/tsr-mutM2.log` | 1, the sig-range-unusable case | 55s |
+| M2: drive-stage.py → `fix7/drive-stage-mutM2.log` | 1 (the range-unusable input is classified passed) | 1s |
+| M1 in tree: pattern restored to the old `\[FAIL\] R12 `; drive-stage.py → `fix7/drive-stage-mutM1.log` | 1 (the range-unusable input is classified passed) | 1s |
+| after each mutation: `cp fix7/check-software-readiness.py.orig tools/...; cmp` | cmp 0 both times | - |
+| `python3 tools/check-software-readiness.py --list` | 0 | <1s |
+
+### Mutation results
+- M1 (the old pattern): the new self-test fails at sig-range-unusable, and the real-binary drive classifies a range-unusable refusal as passed. This is the defect, reproduced.
+- M2 (the looser `[FAIL] R12 signature`): it is caught by the same self-test case and by the drive.
+- Real code: the self-test exits 0 and the drive exits 0.
+
+### Closes
+- Fix 3 open item "`checkfw-negative-signature`'s `[FAIL] R12 ` also matches R12's 'range unusable' variant" (this file, § Fix 3 :503 and :552; § Fix 5 close-out :858).
+- The stale "known BLOCKED" note (§ Fix 1 :44 and :62; § Fix 3 :502 and :551; § Fix 5 close-out :857).
+- README "Known today" being stale (§ Fix 4 close-out :778).
+
+### Not done
+- The full readiness profile was not re-run: the only changes are a string note, a README paragraph and a stricter pattern, and that pattern was exercised against the real checkfw output above. The claim is software/pre-bench checks passed, scoped to this fix.
+
+## Fix 7 — close-out
+
+- **Status: FIXED (software/pre-bench checks passed, scoped to fix 7).** All three items are done, and both verifier passes found no CONFIRMED finding, so no repair was needed. (a) The coordinator-verbatim `note=` at `tools/check-software-readiness.py:363-364` no longer says "known BLOCKED". Only the string changed: `blocked_re` and the classification are the same. (b) README "Known today" (`README.md:414-418`) now says the stage runs because of 036b945, dated 2026-09-24. (c) The `checkfw-negative-signature` pattern at `:321` is now `(?m)^\s*\[FAIL\] R12 signature over double-SHA256\(signed range\): `, and a new self-test (`tools/test-software-readiness.py:113-127`) classifies the real "range unusable" line as failed. checkfw output and the R12 codes are unchanged.
+- **Implementer's commands** (cwd cold-snap; logs `target/software-only/fix7/`): checkfw on `fixtures/bad-signature.bin` exited 1 (REFUSE, the R12 verify line). checkfw on the 397312 B scratch truncation exited 1 (R12 range unusable). The self-test exited 1 with the old pattern (at sig-range-unusable) and 0 with the tightened one. `fix7/drive-stage.py` exited 0 on the real code. Mutants M1 (old pattern) and M2 (`\[FAIL\] R12 signature`) were each caught by both the self-test and the drive. The file was restored from `.orig` with `cmp` 0 each time, and `--list` exited 0.
+- **Re-runners' commands** (two verifier passes; scratch `target/software-only/verify-rerun-loose-ends/fix7/`). They ran the stage's checkfw argv verbatim: exit 1, R12 verify line. checkfw on their own 397312 B and unaligned 300000 B truncations exited 1 (range unusable). Their drive of the real stage exited 0 for both fixtures. The real-tree self-test exited 0. In scratch copies, the M1 and M2 self-tests each exited 1 at sig-range-unusable. They applied the real `stages()` patterns to the implementer's logs (exit 0). They confirmed `git status` was unchanged, frostsnap HEAD c2bcd65 equal to `hostcheck/frostsnap.rev`, and 036b945 dated 2026-09-24.
+- **Close-out's own check:** `python3 tools/test-software-readiness.py` (cwd cold-snap) exited 0 with `PASS: 0 failed case(s)`, including the 3 new `checkfw-negative-signature rule` cases (log `target/software-only/logs/fix7-closeout/tsr.log`).
+- **CONFIRMED findings:** none.
+- **Closed by this fix:** the fix 3 open item "`[FAIL] R12 ` also matches the range-unusable variant" (§ Fix 3, § Fix 5 close-out item 3; 01 evidence, fix 3 follow-up), the stale "known BLOCKED" note (§ Fix 1, § Fix 3, § Fix 5 close-out item 2; 09 evidence, fix 1/3/5 follow-ups), and the stale README "Known today" text (§ Fix 4 close-out).
+- **Still open:**
+  - PLAUSIBLE, not repaired: checkfw prints the same `[FAIL] R12 signature over double-SHA256(signed range): ` prefix for two other failures, pubkey_num != 0 ("cannot verify: only approved_pubkeys[0] is embedded here") and "sig parse: ...". So a re-minted fixture that fails for one of those reasons would still pass the stage. Matching `actual signature failed verification` would close it. Today's fixture fails for the verification reason.
+  - The full readiness profile was not re-run in this fix. `cargo test -p frostsnap_coordinator` was also not re-run here: the README statement that it runs rests on fix 1 and the earlier 41/42 full run.
+- **Commits:** one cold-snap commit containing `tools/check-software-readiness.py`, `tools/test-software-readiness.py`, `README.md`, this file, the 01 and 09 evidence files and run.json. frostsnap: none, so no pin bump.
+- Real USB enumeration, timing, SE calls, entropy, flash power loss and actual installation remain bench-only and untested.
