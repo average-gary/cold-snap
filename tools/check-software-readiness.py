@@ -607,10 +607,11 @@ def overall(results, profile):
     return 0, 'software/pre-bench checks passed'
 
 
-def _cmd(argv, cwd=None):
+def _cmd(argv, cwd=None, lines=False):
+    # lines=True keeps leading whitespace: porcelain's ' M' (unstaged) must not become 'M' (staged).
     try:
-        return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=60,
-                              env=_env()).stdout.strip()
+        out = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=60, env=_env()).stdout
+        return out.splitlines() if lines else out.strip()
     except (OSError, subprocess.SubprocessError) as e:
         return f'unavailable: {e}'
 
@@ -620,7 +621,7 @@ def identity():
     for n, p in (('cold-snap', CS), ('frostsnap', FS), ('coldcard-firmware', REF)):
         repos[n] = dict(path=p, head=_cmd(['git', '-C', p, 'rev-parse', 'HEAD']),
                         branch=_cmd(['git', '-C', p, 'rev-parse', '--abbrev-ref', 'HEAD']),
-                        dirty=_cmd(['git', '-C', p, 'status', '--porcelain=v1']).splitlines())
+                        dirty=_cmd(['git', '-C', p, 'status', '--porcelain=v1'], lines=True))
     tools = dict(rustc=_cmd(['rustc', '-V']), cargo=_cmd(['cargo', '-V']), python=sys.version.split()[0],
                  flutter=_cmd([os.path.join(FLUTTER_BIN, 'flutter'), '--version']).splitlines()[:1])
     return dict(repos=repos, tools=tools)

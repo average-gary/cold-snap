@@ -1013,3 +1013,74 @@ Implementer pass, 2026-09-28. Not committed. frostsnap untouched (HEAD c2bcd65 =
   - The full readiness profile was not re-run in this fix. `cargo test -p frostsnap_coordinator` was also not re-run here: the README statement that it runs rests on fix 1 and the earlier 41/42 full run.
 - **Commits:** one cold-snap commit containing `tools/check-software-readiness.py`, `tools/test-software-readiness.py`, `README.md`, this file, the 01 and 09 evidence files and run.json. frostsnap: none, so no pin bump.
 - Real USB enumeration, timing, SE calls, entropy, flash power loss and actual installation remain bench-only and untested.
+
+## Fix 8 — full readiness profile
+
+Date 2026-09-28. Inputs: cold-snap HEAD ad3d6b2 (fix 7 close-out), frostsnap HEAD c2bcd65 = `hostcheck/frostsnap.rev`. Both trees contained only the user's pre-existing dirty files at start (`git status --porcelain` in each). Nothing was left over from an earlier attempt.
+
+| # | Command | cwd | Exit | Elapsed | Log |
+|---|---|---|---|---|---|
+| 1 | `python3 tools/test-software-readiness.py` | `$HOME/repos/cold-snap` | 0 ("PASS: 0 failed case(s)") | 54 s | `target/software-only/logs/12-fix8/tsr.log` |
+| 2 | `python3 tools/check-software-readiness.py --profile full --output-dir target/software-readiness` (background) | `$HOME/repos/cold-snap` | 0, label "software/pre-bench checks passed" | 367 s (results.json 15:18:31 to 15:24:38 -04:00) | `target/software-only/logs/12-fix8/full.log` |
+
+The report comes from this run: `target/software-readiness/results.json` and `summary.md` were written at 15:24:38 on 2026-09-28. It records identity cold-snap ad3d6b2, frostsnap c2bcd65, `source_drift: []`, `orphans_after_run: []` and no stale artifacts. Release ELF sha256 b7bd6c4a... is the same one fix 6 recorded.
+
+All 42 stages passed. There were no failed, blocked, skipped or timed-out stages. The rc=1 stages are expected-failure negatives that the runner classifies as passed. Times are elapsed seconds from results.json:
+
+host: frostsnap-macros 2.67, frostsnap-embedded-std 1.72, frostsnap-comms 2.23, frostsnap-core 21.94, frost-backup 7.37, coldsnap-firmware 4.88, coldsnap-hal 4.18.
+arm: clippy-dev 0.41, clippy-release 0.30, build-release 0.45.
+reference: refcheck 11.20, refcheck-negatives 28.06.
+package: pack 0.41, pack-tests 1.72, pack-negative-bad-layout 0.20 (rc=1), checkfw-bin 0.42, checkfw-dfu 0.41, checkfw-negative-signature 0.42 (rc=1), checkfw-negative-misaligned 0.42 (rc=1), checkfw-negative-family 0.43 (rc=1).
+pixel-heap: pixel-check 0.90, heap-session 10.95.
+coordinator: stub-build 0.25, frostsnap-pin 0.04, hostcheck-tests 2.70, hostcheck-run 18.08, coordinator-verbatim 10.25, coordinator-scoped 2.54, rust-lib-frostsnapp 3.60, register-self-check 0.08, registry-matches-artifact 0.05.
+compat: flutter-analyze 35.33, flutter-test 3.61, bridge-gen-reproducible 36.94, build-runner-reproducible 12.67.
+app: app-rig 90.42.
+upgrade-erase: updater-stub-ignored 2.78, updater-lib-ignored 3.74, updater-local-artifact 0.84, app-bridge-ignored 8.04, controller-erase-fake 7.37, install-xproc 2.24.
+
+The short times come from warm incremental build caches. No build or test input changed since the fix 6 and fix 7 runs.
+
+Orphans: after the run, `ps -axo pid,ppid,command` filtered for cold-snap/target, regtest, frostsnapp, qemu-system, coldsnap, app-rig, flutter_tester, install-xproc and check-software matched nothing (grep rc=1). The only bitcoin-node was the user's PID 13555 (-testnet4 -rpcport=48335). It was not touched.
+
+Files changed: none apart from this evidence section. The image digest was unchanged and already registered (c86392bc at frostsnap c2bcd65), so no registration was needed. There was no frostsnap commit and no pin bump. No stage was edited, reclassified or relaxed.
+
+Mutations: none. This fix adds no new or strengthened check. The runner's failure paths were exercised by run 1: its self-tests cover failed, timed-out, skipped-required, stale-input, hung-child and SIGTERM cases, and fix 7 added the R12 cases.
+
+This closes the fix 6 note "The full readiness profile was not re-run this pass" and fix 5's unmet criterion, which was full-profile exit 0 (39/42 in fix 5; 41/42 after c2bcd65 because frostsnap-pin was pending). Task 09's acceptance criterion "the full profile runs every required implemented check" is now met with exit 0 (see 09-automate-software-readiness-checks.md). Still open: fix 6 mutant X1 and the other known-open findings.
+
+Claim: software/pre-bench checks passed. This is scoped to the hardware-free full profile. Real USB enumeration, timing, SE calls, entropy, flash power loss and actual installation remain bench-only and untested. The mocked bootloader and install effects are not real installation.
+
+## Fix 8 — repair 1 of 1
+
+Finding (CONFIRMED): `identity()` recorded `dirty` from `_cmd(...).strip().splitlines()`. This removed the leading space of the first porcelain line, so the unstaged ` M` was recorded as the staged `M `.
+
+- **Fix:** `tools/check-software-readiness.py` `_cmd(argv, cwd=None, lines=False)`. When `lines=True` it returns `stdout.splitlines()` without stripping, and `identity()` passes `lines=True` for `git status --porcelain=v1`. Other callers are unchanged: they still get `.strip()` for single-value outputs such as rev-parse, rustc -V and the flutter first line.
+- **Check:** `tools/test-software-readiness.py` adds "identity: unstaged first line keeps porcelain ' M', not staged 'M '". It points `R.FS` at the synthetic pin repo while its `lib.rs` has an unstaged edit, calls the runner's real `identity()`, and requires `dirty == [' M frostsnap_coordinator/lib.rs']`.
+
+| # | Command (cwd `$HOME/repos/cold-snap`) | Exit | Log |
+|---|---|---|---|
+| 1 | `python3 tools/test-software-readiness.py` | 0 (87 ok, 0 FAIL) | `target/software-only/logs/12-fix8/selftest-repair1.log` |
+| 2 | Mutant: `tools/check-software-readiness.py` temporarily set back to `out.strip().splitlines()`, then self-tests run, then the fixed file restored (cmp identical) | 1. Exactly one FAIL, the new identity check, got `['M frostsnap_coordinator/lib.rs']`. Mutant killed | `target/software-only/logs/12-fix8/mutant/run.log` |
+| 3 | `python3 tools/check-software-readiness.py --profile full --output-dir target/software-readiness` (background) | 0, "software/pre-bench checks passed" | `target/software-only/logs/12-fix8/full-repair1.log` |
+
+The run 3 report was freshly written: results.json at 15:47 on 2026-09-28, started 15:40:50 and finished 15:47:03 -04:00. It shows 42/42 passed, `orphans_after_run: []` and `source_drift: []`. Identity: cold-snap ad3d6b2, frostsnap c2bcd65 (= pin), coldcard-firmware 0431fd2. `dirty[0]` now reads correctly: frostsnap `' M frostsnapp/.gitignore'`, coldcard-firmware `' M docs/dice-code-walkthrough.html'`, cold-snap `' M target/software-only/evidence/10-followup.md'`.
+
+Stage elapsed (s): host-frostsnap-macros 2.78, embedded-std 1.77, comms 2.19, core 21.2, frost-backup 7.34, coldsnap-firmware 2.74, coldsnap-hal 5.59; arm clippy-dev 0.31, clippy-release 0.3, build-release 0.57; refcheck 10.9, refcheck-negatives 27.36; pack 0.36, pack-tests 1.71, pack-negative-bad-layout 0.19, checkfw-bin 0.47, checkfw-dfu 0.48, checkfw-negative-signature 0.42, -misaligned 0.47, -family 0.48; pixel-check 0.89, heap-session 0.79; stub-build 0.25, frostsnap-pin 0.04, hostcheck-tests 1.06, hostcheck-run 18.08, coordinator-verbatim 9.34, coordinator-scoped 2.44, rust-lib-frostsnapp 3.21, register-self-check 0.08, registry-matches-artifact 0.05; flutter-analyze 31.44, flutter-test 10.08, bridge-gen-reproducible 43.01, build-runner-reproducible 18.59; app-rig 90.33; updater-stub-ignored 3.48, updater-lib-ignored 3.86, updater-local-artifact 0.57, app-bridge-ignored 9.37, controller-erase-fake 7.95, install-xproc 2.36.
+
+Orphans: `ps -axo pid,command` filtered for cold-snap/target, regtest, frostsnapp, qemu-system, app-rig, flutter_tester, install-xproc, check-software and bitcoin-node matched only the user's PID 13555 (-testnet4 -rpcport=48335), which was not touched.
+
+Files changed: `tools/check-software-readiness.py` and `tools/test-software-readiness.py`, plus this section. frostsnap unchanged, so no registration and no pin bump. No stage was removed, reclassified or relaxed. Not committed; commit is for close-out. Claim: software/pre-bench checks passed, scoped to the hardware-free full profile.
+
+## Fix 8 — close-out
+
+- **Status: PARTLY FIXED (software/pre-bench checks passed, scoped to the hardware-free full profile).** The goal is met: the full profile ran verbatim and exited 0 with 42/42 stages passed, both before and after repair 1. The one CONFIRMED finding on the original run (porcelain dirty-state record) is FIXED. One CONFIRMED finding raised against repair 1's own `_cmd` change is NOT repaired, because close-out may not edit source (see below). It is a low-severity error path only and affects no stage or exit code.
+- **Implementer's commands** (cwd `$HOME/repos/cold-snap`): `python3 tools/test-software-readiness.py` exited 0 (log `target/software-only/logs/12-fix8/tsr.log`). `python3 tools/check-software-readiness.py --profile full --output-dir target/software-readiness` in the background exited 0, 42/42, 15:18:31 to 15:24:38 (log `.../12-fix8/full.log`). Repair 1: self-tests exited 0, 87 ok (`.../12-fix8/selftest-repair1.log`). The mutant (old `.strip().splitlines()`) made the self-tests exit 1 on the new identity case only (`.../12-fix8/mutant/run.log`). The full profile exited 0, 42/42, 15:40:50 to 15:47:03 (`.../12-fix8/full-repair1.log`).
+- **Re-runners' commands:** verifier 1 ran the self-tests (exit 0) and the full profile to `target/software-only/verify-rerun-final/software-readiness` (exit 0, 42/42, 15:30:12 to 15:34:54). It also grepped the negative-stage outputs: signature fails R12 only, misaligned fails R8, family fails R13, and all print RESULT: REFUSE. Verifier 2 was read-only: it checked results.json, the logs, the git state and ps. Verifier 3 (after repair) ran the full profile verbatim (exit 0, 42/42, 15:49:05 to 15:54:02, log `.../12-fix8/rerun2/full.log`) and the self-tests (exit 0, 87 ok, `.../12-fix8/rerun2/selftest.log`). It also ran an out-of-tree mutant check against a scratch repo: the fixed code gave `[' M a.txt','M  b.txt']` and the old code gave `['M a.txt','M  b.txt']`.
+- **Close-out's own check:** `target/software-readiness/results.json` is verifier 3's run. It has argv `--profile full --output-dir target/software-readiness`, exit 0, label "software/pre-bench checks passed", 42 passed, `orphans_after_run: []` and `source_drift: []`. It records cold-snap ad3d6b2 and frostsnap c2bcd65 (= `hostcheck/frostsnap.rev`), and frostsnap `dirty[0]` is `' M frostsnapp/.gitignore'`. `python3 tools/test-software-readiness.py` (cwd cold-snap) exited 0 with "PASS: 0 failed case(s)" (log `target/software-only/logs/12-fix8/closeout/tsr.log`). A `ps` check afterwards found only the user's bitcoin-node, PID 13555 (-testnet4 -rpcport=48335), which was not touched.
+- **CONFIRMED findings:**
+  1. `identity()` dropped the first porcelain line's leading space, so the unstaged ` M` was recorded as the staged `M ` (`tools/check-software-readiness.py:613/:623`, from task 09). **FIXED** by repair 1: `_cmd(..., lines=True)` splits without stripping, and a new self-test covers it with its mutant killed.
+  2. Found by verifier 3 in repair 1's code: when git cannot be run, `_cmd(lines=True)` returns the string `'unavailable: ...'` instead of a list (`tools/check-software-readiness.py:610-616`). `dirty` then becomes a string, and `summary.md` counts its characters as dirty paths. **NOT REPAIRED:** close-out may not edit source. Reproduced only with `subprocess.run` patched to raise OSError; the normal run is unaffected. The fix is one line: return `[msg]` when `lines` is True.
+- **Registration and pin:** image digest c86392bc was unchanged and already registered (frostsnap c2bcd65). There was no registration, no frostsnap commit and no pin bump. No stage was removed, reclassified or relaxed.
+- **Closed by this fix:** the fix 6 note "full readiness profile was not re-run", fix 5's unmet full-profile exit 0 (39/42, then 41/42), and task 09's acceptance criterion that the full profile runs every required implemented check with exit 0. The task 09 finding about porcelain dirty-state is also closed.
+- **Still open:** finding 2 above. Fix 6 mutant X1. The fix 7 PLAUSIBLE item: the R12 prefix is shared with the pubkey_num and sig-parse failures.
+- **Commits:** one cold-snap commit containing `tools/check-software-readiness.py`, `tools/test-software-readiness.py`, this file, the 09 evidence file and run.json. frostsnap: none.
+- Real USB enumeration, timing, SE calls, entropy, flash power loss and actual installation remain bench-only and untested. The install and bootloader effects in the profile are mocked.

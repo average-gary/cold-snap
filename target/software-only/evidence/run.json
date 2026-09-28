@@ -426,6 +426,20 @@
           "PLAUSIBLE: tightened R12 line also printed for pubkey_num != 0 and sig-parse failures",
           "full profile not re-run in fix 7"
         ]
+      },
+      {
+        "fix": "8",
+        "commit": [
+          "cold-snap: the fix 8 close-out commit (see git log; it cannot name its own SHA)"
+        ],
+        "closed": [
+          "full profile exits 0: 42/42 passed, 'software/pre-bench checks passed' (was 39/42 in fix 5, not re-run in fix 7)",
+          "identity() dropped the first porcelain line's leading space (unstaged ' M' recorded as staged 'M '); fixed with _cmd(lines=True) plus a self-test"
+        ],
+        "still_open": [
+          "CONFIRMED, low: _cmd(lines=True) returns a str, not a list, when git cannot run (tools/check-software-readiness.py:610-616); summary.md would count characters as dirty paths",
+          "PLAUSIBLE: tightened R12 line also printed for pubkey_num != 0 and sig-parse failures"
+        ]
       }
     ]
   }

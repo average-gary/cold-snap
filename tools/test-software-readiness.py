@@ -279,6 +279,11 @@ def main():
     r, o = pin()
     check('pin: tracked edit in a pinned crate -> failed rc 3 (EDITED)',
           r['status'] == 'failed' and r['rc'] == 3 and 'EDITED' in o, o)
+    real_fs, R.FS = R.FS, fs   # the runner's own identity() on a first-line unstaged edit
+    dirty = R.identity()['repos']['frostsnap']['dirty']
+    R.FS = real_fs
+    check("identity: unstaged first line keeps porcelain ' M', not staged 'M '",
+          dirty == [' M frostsnap_coordinator/lib.rs'], dirty)
     g('checkout', '-q', '--', '.')
     open(pinf, 'w').write('0' * 40 + '\n')
     r, o = pin()
