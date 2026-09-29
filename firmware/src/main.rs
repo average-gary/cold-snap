@@ -1576,7 +1576,7 @@ pub unsafe extern "C" fn entry_point() -> ! {
 /// (`UsbError::OversizePacket`), so panicking there would hand a hostile
 /// coordinator a remote reset loop. The FIFO is drained on that error anyway, so the link resynchronises
 /// on the next packet; dropping the error is the fail-safe direction here.
-#[cfg(target_arch = "arm")]
+#[cfg(target_arch = "arm")] #[forbid(unused_variables)]
 fn boot() -> ! {
     use coldsnap_firmware::{
         firmware_digest, prompt_screen_at, quiz, Checked, DebugFlash, Fault, Outbox, Session,
@@ -6680,5 +6680,71 @@ mod tests {
             edge < send && !src[edge..send].contains('}'),
             "the recovered ack must be sent inside the link-edge `if`"
         );
+
+        // Follow-up fix 11: an attribute (`#[cfg(not(target_arch = "arm"))]`, a
+        // `cfg_attr`, anything) on the send, on the link-edge `if`, or inside the macro
+        // removes the ARM send while this host expansion still runs. What stops the first
+        // two IN THE ARM BUILD is `boot`'s `forbid(unused_variables)`: the send is
+        // `recovered_erase`'s only use, so cfg-ing it out is a hard compile error, and a
+        // `forbid` cannot be `allow`ed back. Pin that attribute, then refuse attribute
+        // syntax at each site by source (the macro's own lints are silenced at an
+        // external expansion, MEASURED, so its body is pinned whole).
+        assert!(
+            src.contains("\n#[cfg(target_arch = \"arm\")] #[forbid(unused_variables)]\nfn boot() -> ! {\n"),
+            "`boot` must forbid unused variables, so an ARM-only cfg on the send cannot compile"
+        );
+        // Repair 1: the edge line's own tail counts too (nothing may trail its `{`),
+        // and the code line above the `if` is judged with its `//` tail cut off, so
+        // `#[cfg(..)] // }` does not pass for a closing brace.
+        let after_edge = &src[edge + "if !was_linked && link.is_linked() {".len()..send];
+        assert!(
+            after_edge.starts_with('\n')
+                && after_edge.lines().skip(1).all(|l| l.trim_start().starts_with("//")),
+            "only comments may sit between the link edge and the recovered-ack send"
+        );
+        let above_edge = src[..edge]
+            .lines()
+            .rev()
+            .skip(1)
+            .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with("//"))
+            .expect("a statement before the link edge");
+        let above_code = above_edge.split("//").next().unwrap_or_default().trim_end();
+        assert!(
+            src[..edge].ends_with("\n        ")
+                && !above_code.contains('#')
+                && [';', '}', '{'].iter().any(|&c| above_code.ends_with(c)),
+            "no attribute may apply to the link-edge `if`: {above_edge:?}"
+        );
+        assert!(
+            include_str!("lib.rs").contains(
+                "\n/// [`erase::recover`]: coldsnap_hal::erase::recover\n#[macro_export]\n\
+                 macro_rules! send_recovered_erase_ack {\n    \
+                 ($recovered:expr, $cdc:expr) => {\n        \
+                 if let Some(Ok(ack)) = $recovered.take().map($crate::recovered_erase_ack) {\n            \
+                 let _ = $cdc.write(ack.bytes());\n        \
+                 }\n    \
+                 };\n\
+                 }\n"
+            ),
+            "`send_recovered_erase_ack!` must be defined unconditionally, with no attribute in its body"
+        );
+        // Repair 1: pinning the macro's text cannot see an ARM-only SECOND definition
+        // shadowing it, nor a cfg on its callee `recovered_erase_ack` (or anything else
+        // in lib.rs). lib.rs promises no `cfg(target_arch)` (its `//!` header); hold the
+        // stronger form: its production code (everything above `mod tests`, which must
+        // be the last item) holds no `cfg`, `cfg_attr` or `cfg!` at all, comments aside.
+        let (lib_prod, lib_tests) = include_str!("lib.rs")
+            .split_once("\n#[cfg(test)]\nmod tests {\n")
+            .expect("lib.rs's test module");
+        assert!(
+            lib_tests.ends_with("\n}\n")
+                && lib_tests.lines().all(|l| l.is_empty() || l.starts_with(' ') || l == "}"),
+            "lib.rs's `mod tests` must be its last item, so nothing hides below the cut"
+        );
+        let cfgs: Vec<&str> = lib_prod
+            .lines()
+            .filter(|l| l.split("//").next().unwrap_or_default().contains("cfg"))
+            .collect();
+        assert!(cfgs.is_empty(), "lib.rs production code must be unconditional: {cfgs:?}");
     }
 }

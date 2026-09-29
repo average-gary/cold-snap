@@ -451,3 +451,10 @@ Detail: `10-followup.md` § Fix 2a (status PARTLY FIXED).
 **Still open:** a `#[cfg(not(target_arch = "arm"))]` attribute on the send line still removes it with every gate green (CONFIRMED). `link.is_linked()` is not executed on the host. The fix 2a PLAUSIBLE residuals are unchanged. Criterion 2 is now tested for main.rs's send at host level. It is not hardware-verified.
 
 Detail: `10-followup.md` § Fix 6 (status PARTLY FIXED).
+
+## Follow-up 2026-09-29 — fix 11
+
+**Closed:** the CONFIRMED open item from fix 6, where a `#[cfg(not(target_arch = "arm"))]` on boot's `send_recovered_erase_ack!` line removed the send with every gate green (X1). `boot` now carries `#[forbid(unused_variables)]` on its ARM cfg line, so removing the send or the link-edge `if` on ARM fails the ARM build (unused `recovered_erase`). Host-test guards reject any attribute between the link edge and the send, any attribute on the `if`, any change to the macro body, and any `cfg` in lib.rs production code. The release ELF is byte-identical, so c86392bc is still registered.
+**Still open:** a cfg line in lib.rs prefixed with `/* // */` or `#[doc = "//"]` can shadow the macro or stub `recovered_erase_ack` on ARM while every gate passes (CONFIRMED, W1–W3). A cfg on a block enclosing the link-edge `if` is caught only by the ARM lint. The ARM guarantee is lint-level, not a symbol or link check. The fix 6/2a PLAUSIBLE residuals are unchanged.
+
+Detail: `10-followup.md` § Fix 11 close-out (status PARTLY FIXED).

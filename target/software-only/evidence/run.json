@@ -354,6 +354,22 @@
           "PLAUSIBLE: main.rs takes the recovered id then discards the cdc.write result",
           "PLAUSIBLE: EraseConfirmed from is not bound to a port (pre-existing)"
         ]
+      },
+      {
+        "fix": "11",
+        "commit": [
+          "cold-snap: the fix 11 close-out commit (see git log; it cannot name its own SHA)"
+        ],
+        "closed": [
+          "fix 6 X1: ARM-only cfg on boot's send_recovered_erase_ack! line removed the send with every gate green (forbid(unused_variables) on boot + host source guards; ELF byte-identical)",
+          "V1-V4 as tested (shadow macro, callee stub, trailing attr on link-edge line, '// }' attr line)"
+        ],
+        "still_open": [
+          "W1-W3: cfg line in lib.rs prefixed '/* // */' or '#[doc = \"//\"]' bypasses guard (e); ARM image loses EraseConfirmed with every gate green (CONFIRMED)",
+          "W4: cfg on block enclosing the link-edge if caught only by ARM lint",
+          "ARM gate is lint-level (cap-lints could demote); no symbol/link-level check (PLAUSIBLE)",
+          "link.is_linked() not executed on host (fix 6 PLAUSIBLE)"
+        ]
       }
     ]
   },

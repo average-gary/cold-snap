@@ -1194,3 +1194,126 @@ Status: **FIXED**, uncommitted. This closes the fix 7 close-out PLAUSIBLE R12-pr
 - **Still open:** fix 6 mutant X1, and the fix 9 PLAUSIBLE `_cmd` returncode note. The full profile was not re-run for this fix. The last full run is fix 9's verbatim 42/42 on 2026-09-29, before this pattern change.
 - **Commits:** one cold-snap commit containing `tools/check-software-readiness.py`, `tools/test-software-readiness.py`, this file, the 01 and 09 evidence files and run.json. frostsnap: none, so no pin bump.
 - Real USB enumeration, timing, SE calls, entropy, flash power loss and actual installation remain bench-only and untested.
+
+## Fix 11 — an ARM-only cfg cannot silently remove the recovered-erase ack
+
+**Status: FIXED (software/pre-bench checks passed, scoped to this fix). Not committed.** This closes finding 5 in the fix 6 close-out (this file, § Fix 6 close-out), which was CONFIRMED and still open: "X1: `#[cfg(not(target_arch = "arm"))]` inserted above boot's send at main.rs:2616 passes every test and both clippy gates … NOT FIXED, open". The same item is carried open in `08-implement-resumable-device-erasure.md` § Follow-up 2026-09-28 — fix 6: "Still open: a `#[cfg(not(target_arch = "arm"))]` attribute on the send line still removes it with every gate green".
+
+**Design.**
+- The main check is structural and runs in the ARM build itself: `boot` now carries `#[forbid(unused_variables)]`. The send is the only use of `recovered_erase`; fix 6's identifier-count pin holds the count at two, bound and sent. So if a cfg or cfg_attr removes the send on ARM, or removes the enclosing link-edge `if`, `recovered_erase` becomes unused. `cargo build --release` and both thumbv7em clippy gates then fail with `error: unused variable: `recovered_erase``.
+- It is `forbid` rather than `deny` so that an `#[allow(unused_variables)]` added to hide the error is itself an error (E0453).
+- A cfg on the macro definition makes the ARM build fail with E0433, because boot cannot resolve the macro.
+- Lint attributes do not change codegen. The attribute sits on the existing `#[cfg(target_arch = "arm")]` line, so no line moves and no `core::panic::Location` changes. The release ELF is byte-identical.
+- One case is invisible to the ARM build, MEASURED in probe `logs/15-fix11/probe-X4.log` (exit 0): a cfg inside the macro body. rustc silences `unused_variables` in an expansion that comes from another crate. That case, and removal of the `forbid` itself, are closed by source pins added to the fix 6 host test. The pins reject any attribute, not one exact string.
+
+**Files changed** (cold-snap only; frostsnap untouched)
+- `firmware/src/main.rs:1579`: `#[cfg(target_arch = "arm")]` becomes `#[cfg(target_arch = "arm")] #[forbid(unused_variables)]`, on the same line, before `fn boot() -> ! {`.
+- `firmware/src/main.rs:6683-6723`: new assertions inside `the_link_edge_sends_one_recovered_erase_ack_from_the_original_id`, appended after the existing ones. None of the existing assertions changed. The new ones check that:
+  - (a) the `forbid` line sits directly above `fn boot() -> ! {`;
+  - (b) every line strictly between the link-edge `if` line and the send line is a `//` comment, which rejects any attribute, cfg_attr, block or statement there;
+  - (c) walking back from the `if` over comment and blank lines, the first code line ends in `;`, `}` or `{`, and the `if` starts its line at depth 8. This rejects any outer attribute on the `if`, including one separated from it by comments;
+  - (d) `lib.rs` contains the whole `send_recovered_erase_ack!` definition verbatim, from its last doc line through the closing `}`. This rejects any attribute on or inside the definition.
+
+**Commands** (cwd `/Users/garykrause/repos/cold-snap` unless noted; logs in `target/software-only/logs/15-fix11/`; each exit is the process's own, with output redirected to the log)
+
+| command | exit | time | result |
+|---|---|---|---|
+| `cargo build --release` (HEAD, before edit) → `build-base.log` | 0 | <1s | ELF sha256 b7bd6c4a5a7662e5adf87c6192f822551521fc61b47ad6a2f94a33adcf0df679 |
+| `cargo build --release` (forbid added) → `build-forbid.log` | 0 | 6s | 0 warnings; ELF sha256 b7bd6c4a… (unchanged) |
+| probe: cfg on the macro's `write` line, then `cargo build --release` → `probe-X4.log`; lib.rs restored, `cmp` 0 | 0 | — | the ARM build does not see it (lints are suppressed in external macro expansions), hence pin (d) |
+| `cargo test --target aarch64-apple-darwin -p coldsnap_firmware --features coldsnap_hal/fake-flash,coldsnap_hal/test-seam` (fixed) → `test-fixed.log` | 0 | 17s | fw lib 170 (1 ign), fw bin 59 |
+| `python3 -B target/software-only/fix11/mutants.py` → `mutants.log`: 13 mutants, each run through the ARM release build and the full host fw suite, then restored with `shutil.copy` and byte-compared | 0 | 143s | every mutant caught, every restore exact |
+| `cargo test --target aarch64-apple-darwin -p coldsnap_hal -p coldsnap_firmware --features coldsnap_hal/fake-flash,coldsnap_hal/test-seam` → `checks-test.log` | 0 | 38s | fw lib 170 (1 ign), fw bin 59, hal 301, 5, 19 |
+| `cargo build --release` → `build-release.log` | 0 | 6s | ELF sha256 b7bd6c4a… = HEAD |
+| `cargo clippy --release --target thumbv7em-none-eabihf -p coldsnap_hal -p coldsnap_firmware` → `clippy-rel.log` | 0 | 1s | 18 warnings, 0 in firmware/ or hal/ |
+| `cargo clippy --target thumbv7em-none-eabihf -p coldsnap_hal -p coldsnap_firmware` → `clippy-dbg.log` | 0 | 1s | 18, 0 in firmware/ or hal/ |
+| `cargo clippy --target aarch64-apple-darwin -p coldsnap_firmware --tests --features coldsnap_hal/fake-flash,coldsnap_hal/test-seam` → `clippy-tests.log` | 0 | 3s | 18, 0 in firmware/ or hal/ |
+| `cargo build --target aarch64-apple-darwin -p coldsnap_firmware --example stub` → `stub.log` | 0 | 2s | |
+| `python3 tools/pack-signed.py --pubkey-num 0 --epoch 1790366193 --out target/software-only/fix11/pack` → `pack.log`; `cmp target/software-only/fix11/pack/firmware-signed.bin target/software-only/package/firmware-signed.bin` | 0 / 0 | 1s | byte-identical to the registered c86392bc… artifact |
+| `cargo run -- ../target/aarch64-apple-darwin/debug/examples/stub` (cwd hostcheck) → `hostcheck.log` | 0 | 20s | all legs PASS, 0 `FAIL` lines |
+
+**Mutations** (script `target/software-only/fix11/mutants.py`; each edits the production occurrence in the tree; `CFG` = `#[cfg(not(target_arch = "arm"))]`)
+
+| id | mutation | ARM `cargo build --release` | host fw suite (only the fix 6/11 test fails) |
+|---|---|---|---|
+| X1 | `CFG` on its own line above boot's send (the fix 6 finding) | 101 `error: unused variable: `recovered_erase`` | 101 main.rs:6697 "only comments may sit between the link edge and the recovered-ack send" |
+| X1b | `CFG` on the send line itself | 101 same | 101 main.rs:6657 "…uncommented, directly before the announce" (fix 6 pin) |
+| X1c | `#[cfg_attr(target_arch = "arm", cfg(any()))]` above the send | 101 same | 101 main.rs:6697 same as X1 |
+| X1d | `CFG`, then a `//` line, then the send | 101 same | 101 main.rs:6698 same as X1 |
+| X1e | X1 + `#[allow(unused_variables)]` on the `let mut recovered_erase` | 101 `error[E0453]: allow(unused_variables) incompatible with previous forbid` | 101 main.rs:6698 same as X1 |
+| X2 | `CFG` on the enclosing link-edge `if` | 101 unused `recovered_erase` (and `digest`) | 101 main.rs:6707 "no attribute may apply to the link-edge `if`" |
+| X2b | `CFG`, a `//` line, then the `if` | 101 same | 101 main.rs:6708 same |
+| X2c | send wrapped in a `CFG { … }` block | 101 unused `recovered_erase` | 101 main.rs:6660 fix 6 needle |
+| X3 | `CFG` between `#[macro_export]` and `macro_rules!` | 101 `error[E0433]: … could not find `send_recovered_erase_ack`` | 101 main.rs:6711 "`send_recovered_erase_ack!` must be defined unconditionally, with no attribute in its body" |
+| X3b | `CFG` above the macro's doc comment | 101 E0433 same | 0 (the host keeps the macro; only the ARM build catches this) |
+| X4 | `CFG` on the macro's `let _ = $cdc.write(…)` | **0** (lint silenced in external expansion) | 101 main.rs:6711 same as X3 |
+| X5 | `CFG` on the macro's `if let` | 101 unused `recovered_erase` | 101 main.rs:6711 same |
+| X6 | X1 with the `forbid` removed | **0** | 101 main.rs:6693 "`boot` must forbid unused variables, so an ARM-only cfg on the send cannot compile" |
+
+Every mutant fails at least one gate in the task 08 Checks set, and each fails for the named reason. The real code passes every one of those gates (tables above). X4 and X6 are caught only by the host source pins. X3b is caught only by the ARM build.
+
+**Left open / residual**
+- The source pins are text checks over source that the host can see. They are not the ARM image. On the ARM side, the guarantee is the compile-time lint. It proves the send statement is present in `boot`'s source as compiled for ARM. It does not prove that `cdc.write` runs on a device. `link.is_linked()` is still not executed on the host (fix 6 PLAUSIBLE, unchanged).
+- A mutant that cfgs the send out and also adds another use of `recovered_erase` is a code change, not an attribute. Fix 6's identifier-count pin (exactly 2) catches it.
+- `forbid(unused_variables)` covers all of `boot`, so a future unused binding there becomes a hard error rather than a warning. This is intended; `let _x` still works.
+- There was no registry change, no frostsnap commit and no pin bump. The ELF and the epoch pack are byte-identical: c86392bc, registered at frostsnap `c2bcd65`, which is also the commit in `hostcheck/frostsnap.rev`. The full readiness profile was not run for this fix.
+- Host fault injection over `FakeFlash` is not STM32 erase or USB physics. The only claim is "software/pre-bench checks passed", scoped to fix 11.
+
+## Fix 11 — repair 1 of 1
+
+Scope: the four CONFIRMED verify findings V1–V4. Only `firmware/src/main.rs` changed, and only inside the test `the_link_edge_sends_one_recovered_erase_ack_from_the_original_id`. `lib.rs`, `boot`, the fix 6 assertions, and pins (a) and (d) are unchanged. Not committed.
+
+**Changes** (in the fix 11 assertions in that test)
+- V3, guard (b): the tail of the link-edge line now counts. After `if !was_linked && link.is_linked() {`, the next character must be `\n`, and every line after that, up to the send, must be a `//` comment. Before this, `.lines().skip(1)` skipped the edge line's own tail.
+- V4, guard (c): the code line above the `if` has its `//` tail cut off before it is judged. What remains must contain no `#` and must end in `;`, `}` or `{`. So `#[cfg(..)] // }` no longer passes as a closing brace.
+- V1, V2 (new guard e): `lib.rs` is split at `\n#[cfg(test)]\nmod tests {\n`. The test module must be the file's last item: it ends `\n}\n`, and every non-empty line in it is indented except the final `}`. Everything above that split is lib.rs's production code, and no line of it may contain `cfg` once any `//` tail is cut off. That covers `cfg`, `cfg_attr` and `cfg!`. It enforces the stronger form of lib.rs's own `//!` promise that there is no `cfg(target_arch)`. It closes an ARM-only shadow macro (V1), an ARM-only replacement of the callee `recovered_erase_ack` (V2), and any other cfg on lib.rs's side of the send path (`Outbox::new`/`push` live in lib.rs). Measured on the real tree, lib.rs production code has zero such lines.
+
+**Commands** (cwd `/Users/garykrause/repos/cold-snap`; logs in `target/software-only/logs/15-fix11/`; each exit code is the process's own)
+
+| command | exit | result |
+|---|---|---|
+| `cargo test --target aarch64-apple-darwin -p coldsnap_firmware --features coldsnap_hal/fake-flash,coldsnap_hal/test-seam` → `r1-test.log` | 0 | fw lib 170 (1 ignored), fw bin 59 |
+| `python3 -B target/software-only/fix11/mutants.py` → `r1-mutants.log`: X1–X6 plus new V1–V4. `.fixed` copies were refreshed from the repaired tree first | 0 | all 17 caught, every restore byte-exact |
+| `cargo build --release` → `r1-build-release.log` | 0 | ELF sha256 b7bd6c4a5a7662e5adf87c6192f822551521fc61b47ad6a2f94a33adcf0df679, the same as HEAD |
+| `cargo clippy --release --target thumbv7em-none-eabihf -p coldsnap_hal -p coldsnap_firmware` → `r1-clippy-rel.log` | 0 | 0 warnings in firmware/ or hal/ |
+| `cargo clippy --target thumbv7em-none-eabihf -p coldsnap_hal -p coldsnap_firmware` → `r1-clippy-dbg.log` | 0 | 0 in firmware/ or hal/ |
+| `cargo clippy --target aarch64-apple-darwin -p coldsnap_firmware --tests --features coldsnap_hal/fake-flash,coldsnap_hal/test-seam` → `r1-clippy-tests.log` | 0 | 0 in firmware/ or hal/ |
+| `cargo test --target aarch64-apple-darwin -p coldsnap_hal -p coldsnap_firmware --features coldsnap_hal/fake-flash,coldsnap_hal/test-seam` → `r1-checks-test.log` | 0 | 170 (1 ignored), 59, 301, 5, 19 |
+| `python3 tools/pack-signed.py --pubkey-num 0 --epoch 1790366193 --out target/software-only/fix11/pack-r1` → `r1-pack.log`, then `cmp` against `target/software-only/package/firmware-signed.bin` | 0 / 0 | byte-identical to the registered c86392bc… artifact |
+
+**New mutants** (from `r1-mutants.log`)
+
+| id | mutation | ARM release build | host fw suite |
+|---|---|---|---|
+| V1 | `CFG` between the macro's doc lines, plus an ARM-only shadow `send_recovered_erase_ack!` that only does `take()` | **0** | 101 main.rs:6748 "lib.rs production code must be unconditional" |
+| V2 | `CFG` on `recovered_erase_ack`, plus an ARM-only version that returns an empty `Outbox` | **0** | 101 main.rs:6748 same |
+| V3 | `CFG` trailing on the link-edge line | 101 unused `recovered_erase` | 101 main.rs:6700 "only comments may sit between the link edge and the recovered-ack send" |
+| V4 | `CFG // }` line, then a comment, then the `if` | 101 unused `recovered_erase`, `digest` | 101 main.rs:6714 "no attribute may apply to the link-edge `if`" |
+
+X1–X6 are still caught, with the same reasons as in the fix 11 table. X3b is now also caught on the host, by guard (e) at :6748, where before only the ARM build caught it. V3 and V4 now have two independent gates each: the ARM lint and the host text.
+
+**Left open / residual**
+- Guard (e) is a text check over lib.rs. It is not the ARM image. It catches conditional compilation spelled with `cfg`. It does not catch target-dependent behaviour that needs no cfg, such as a branch on `size_of::<usize>()`. That would be a code change rather than an attribute, and it is out of scope for "attribute or cfg".
+- The callee chain beyond lib.rs (the `frostsnap_comms` encoding, and `coldsnap_hal`) is not covered by guard (e).
+- No firmware change was made, so there was no registry edit, no frostsnap commit and no pin bump. The full readiness profile was not run for this repair.
+- The only claim is "software/pre-bench checks passed", scoped to fix 11 repair 1.
+
+## Fix 11 — close-out
+
+- **Status: PARTLY FIXED (software/pre-bench checks passed, scoped to fix 11 repair 1).** X1 itself, together with every cousin that the implementer, the verifier and the re-runner tested, fails at least one gate, with the one exception of the comment-prefix spelling below. That spelling hides a cfg on the macro definition or on its callee, and the ARM image then loses the recovered EraseConfirmed while every gate stays green. The fix's goal that a cfg on the macro definition must fail a gate is therefore not fully met. `boot` gained `#[forbid(unused_variables)]` on its existing `#[cfg(target_arch = "arm")]` line (main.rs:1579). Every other change is host-test code in `the_link_edge_sends_one_recovered_erase_ack_from_the_original_id` (guards a–e). The release ELF is byte-identical (b7bd6c4a…), and the epoch pack `cmp`s equal to the registered c86392bc artifact. There was no registry edit, no frostsnap commit and no pin bump. frostsnap HEAD c2bcd65 is still `hostcheck/frostsnap.rev`.
+- **Implementer's commands:** § Fix 11 and § Fix 11 — repair 1 of 1 above (logs `target/software-only/logs/15-fix11/`, including `r1-*.log`; mutants `target/software-only/fix11/mutants.py`, 17 caught).
+- **Verifier's commands:** scratch copy `target/software-only/verify-faults-x1-guard/` (mut.py, elf.py, logs/). It reproduced X1, X3b, X4 and X6 and the byte-identical pack. It found V1–V4.
+- **Re-runner's commands (after repair 1):** `target/software-only/verify-rerun-x1-guard/` (mutants.py, logs/). It repeated every implementer command with the same exits: host suites 170 (1 ignored)/59/301/5/19, release ELF b7bd6c4a…, three clippy runs exit 0 with none in firmware/ or hal/, stub, hostcheck 15 PASS/0 FAIL, pack `cmp` 0, and `register-mk4-firmware.py --print` c86392bc. It then ran W1–W4. The scratch copy cannot link ARM because `-Tfirmware/link.x` is added twice there, so every ARM result that depends on linking was re-run in place and restored with a `cmp` check.
+- **Close-out's own checks** (cwd cold-snap, logs `target/software-only/logs/15-fix11/closeout/`): `cargo test --target aarch64-apple-darwin -p coldsnap_firmware --features coldsnap_hal/fake-flash,coldsnap_hal/test-seam` exit 0 (170 passed with 1 ignored, then 59). `cargo build --release` exit 0, ELF sha256 b7bd6c4a5a7662e5…df679. `cmp firmware/src/main.rs target/software-only/fix11/main.rs.fixed` exit 0. lib.rs has no diff against HEAD. I also read the re-runner's W logs: `mut-W1-host.log` and `mut-W3-host.log` end ok 170/59, `inplace-W1-arm.log` ends `Finished release`, and `inplace-W4-arm.log` fails on unused `recovered_erase`/`digest`.
+- **CONFIRMED findings and outcome:**
+  - fix 6 finding 5, X1 (a cfg above boot's send): **FIXED.** The ARM build fails on unused `recovered_erase` and the host test fails at main.rs:6697/:6701.
+  - V1, an ARM-only shadow macro: **FIXED for the tested spelling** by guard (e) (host :6748). It is reopened by W1/W2 below.
+  - V2, an ARM-only `recovered_erase_ack` stub: **FIXED for the tested spelling** by guard (e). It is reopened by W3.
+  - V3, an attribute trailing on the link-edge line: **FIXED.** ARM lint plus host guard (b) at :6700.
+  - V4, a `#[cfg(..)] // }` line above the `if`: **FIXED.** ARM lint plus host guard (c) at :6714.
+  - W1/W2/W3, guard (e) cutting at the first `//`, so a `/* // */ ` or `#[doc = "//"] ` prefix hides a cfg line in lib.rs (the V1/V2 attacks): **NOT FIXED, open.** The ARM release build exits 0 with ELF 5339b72e… and the host firmware suite exits 0. Only the full profile's registry-matches-artifact would notice, and only until the new digest is registered. Nothing further was repaired, because repair 1 of 1 was the last one.
+  - W4, a cfg on a block enclosing the link-edge `if`: **caught by one gate only**, the ARM forbid lint (exit 101). Host guard (c) accepts the `{` line. This is not a survivor, but it has no second gate.
+- **PLAUSIBLE, not repaired:** the ARM gates are lint-level, and `--cap-lints=warn` in rustflags would demote them (not run). X4 (a cfg inside the macro body) and X6 (removing the `forbid`) are caught only by host text pins. No symbol-level or link-level check shows that the write is present in the ARM image.
+- **Still open:** W1–W3, W4's single gate, and the PLAUSIBLE items above. Guard (e) is text, not the ARM image, and it does not reach `frostsnap_comms` or `coldsnap_hal`. `link.is_linked()` is not executed on the host (fix 6 PLAUSIBLE). The fix 9 `_cmd` returncode note is unchanged. The full readiness profile was not run for this fix.
+- **Commits:** one cold-snap commit containing `firmware/src/main.rs`, this file, the 08 evidence file and run.json. frostsnap: none, so no pin bump.
+- Host tests are not the ARM image, and the host tests do not prove ARM behaviour. Real USB, reset/re-enumeration and flash power loss remain bench-only and untested.
