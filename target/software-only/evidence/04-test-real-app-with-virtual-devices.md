@@ -1633,3 +1633,18 @@ device names and next address and signs a tx that the independent sighash check 
 accept. Still open: a stub process restart (in-memory `FakeFlash`, not faked), so criterion 3 is
 not fully met and this file's status is unchanged; the post-restart signing test checks less than
 run 1's (PLAUSIBLE). Detail, commands and commits: `10-followup.md` § "Fix 2b".
+
+## Follow-up 2026-09-29 — fix 12
+
+Closed: the stub-process-restart half of criterion 3 (§ Close-out row 3, "stub process restart
+(not possible with in-memory FakeFlash)"), the residual "a stub process restart", and fix 2b's
+"Still open: a stub process restart". The host stub now has a file-backed FakeFlash
+(`STUB_FLASH_FILE`, written through on every program/erase with FakeFlash's own rules, loaded at
+start). `tools/app-rig-test.sh` now, after the app restart run, stops every stub, starts new
+processes (different pids) on the same flash files, checks they come back with the same ids, names
+and share indices, and the real app gets a signature that the independent sighash check and
+regtest Core accept. A stub restarted on blank flash fails by name. The ARM image is
+byte-identical (c86392bc). Still open: shares of devices 2/3 checked by index only, no independent
+file-fidelity or FileFlash unit test, the device-name reload check cannot distinguish DB from
+announce, and the full readiness profile was not re-run with this change. This file's status is
+unchanged. Detail, commands and commits: `10-followup.md` § "Fix 12".

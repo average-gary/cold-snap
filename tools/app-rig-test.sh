@@ -8,14 +8,18 @@
 #
 # Exit status is the rig's, which is the flutter test's unless the rig itself failed
 # first: 2 precondition, 3 duplicate identity, 4 child failure, 5 timeout, 6 app restart
-# unverified (`tools/app-rig.py --help`).
+# unverified, 7 stub restart failed (`tools/app-rig.py --help`).
 #
 # THE APP IS RESTARTED ONCE (`--app-restart`): the test file runs as two separate app
-# processes against the same stubs and the same app dir. Run 1 keygens, names, signs,
-# restores and replugs; its whole process group is reaped; run 2 reloads the sqlite/bdk
-# state from disk, checks it against what run 1 recorded, signs again, then erases. The
-# stubs are NOT restarted: their FakeFlash lives in memory, so a stub process restart
-# would lose every share and is out of scope.
+# processes against the same app dir. Run 1 keygens, names, signs, restores and replugs;
+# its whole process group is reaped; run 2 reloads the sqlite/bdk state from disk, checks
+# it against what run 1 recorded, signs again, then erases.
+#
+# THE STUBS ARE RESTARTED TOO (`--stub-restart`), between the two app runs: each stub's
+# FakeFlash is written through to `<rig dir>/flash/device-N.bin`, every stub process is
+# stopped, and new ones (new pids) boot from those files. The rig exits 7 unless each
+# reloaded its exact bytes and came back with the same DeviceId, name and share; run 2
+# then signs with the restarted devices.
 #
 # WHY A SCRIPT AND NOT A `just` RECIPE: cold-snap has no justfile, and frostsnap's is
 # uncommitted work in progress. One POSIX file beats introducing a build system for one
@@ -58,6 +62,7 @@ exec python3 "$REPO/tools/app-rig.py" \
     --erase-cut 0:a \
     --erase-cut 3:f \
     --app-restart \
+    --stub-restart \
     --timeout 1200 \
     "$@" \
     -- /bin/sh -c "cd '$APP/frostsnapp' && BUNDLE_FIRMWARE=0 exec flutter test $TEST -d macos"

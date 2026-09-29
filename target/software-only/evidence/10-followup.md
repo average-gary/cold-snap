@@ -1317,3 +1317,127 @@ X1–X6 are still caught, with the same reasons as in the fix 11 table. X3b is n
 - **Still open:** W1–W3, W4's single gate, and the PLAUSIBLE items above. Guard (e) is text, not the ARM image, and it does not reach `frostsnap_comms` or `coldsnap_hal`. `link.is_linked()` is not executed on the host (fix 6 PLAUSIBLE). The fix 9 `_cmd` returncode note is unchanged. The full readiness profile was not run for this fix.
 - **Commits:** one cold-snap commit containing `firmware/src/main.rs`, this file, the 08 evidence file and run.json. frostsnap: none, so no pin bump.
 - Host tests are not the ARM image, and the host tests do not prove ARM behaviour. Real USB, reset/re-enumeration and flash power loss remain bench-only and untested.
+
+## Fix 12 — stub device process restart reloads persisted flash
+
+- **Status:** software/pre-bench checks passed. No hardware was used: virtual ptys, FakeFlash and regtest only. Nothing is committed.
+- **Closes:** 04-test-real-app-with-virtual-devices.md § Close-out row 3, "stub process restart (not possible with in-memory FakeFlash)"; § Residual questions, "a stub process restart"; and fix 2b's "Still open: Stub process restart".
+- **What the restart is:**
+  - Each stub's FakeFlash is written through on every program/erase to `target/software-only/app-rig/flash/device-N.bin`.
+  - Between app run 1 and app run 2, the rig SIGTERMs and waits for every stub process.
+  - It then starts new processes (the rig checks the pids differ) with `STUB_BOOT=1` and the same files.
+  - There is no in-memory reset, no re-keygen and no share re-import. A new boot also draws new TRNG bytes, so a blank flash would derive a different DeviceId.
+- **Files changed:**
+  - `firmware/examples/stub.rs`:
+    - :165 `type Flash = DebugFlash<FileFlash>`.
+    - :585 `boot()` (`STUB_BOOT`); :1647 the TRNG varies per boot.
+    - :1668 `blank_flashes()` reads `STUB_FLASH_FILE` and dies unless there is one session.
+    - :1694 `FileFlash`: Deref to FakeFlash. NorFlash delegates to FakeFlash, so its erase/program rules (bits-only-clear, alignment, refuse knobs) still apply.
+    - :1720 `mirror` writes the changed range through, then re-reads the whole file and dies with "DIVERGED" on any mismatch.
+    - :1778 `load_flash_file`:
+      - An empty file becomes 0xff.
+      - A wrong size dies.
+      - Otherwise the image is programmed through `FakeFlash::write`.
+      - It logs the state and sha256.
+    - :2466 prints the "booted from STUB_FLASH_FILE: name, shares" line.
+    - :71 module doc.
+  - `tools/app-rig.py`:
+    - :38 exit 7; :83-84 FLASH_RE/BOOTED_RE; :150 flash_dir; :268 `launch`.
+    - :287 `restart_stubs`, with the FAIL messages at :311 (blank before restart), :326 (pid reuse), :343 (restarted with blank flash), :347 (not reloaded), :354 (changed identity), :361 (lost state).
+    - :599 `--stub-restart`; :652 it requires `--app-restart`.
+    - :676 stale flash removed; :541 flash removed at teardown; :761 the call.
+  - `tools/app-rig-test.sh`: :11 and :18-22 docs; :65 `--stub-restart`.
+  - Diff: 3 files, +337/-31. Scratch files are under `target/software-only/fix12/` (mut.py, the .real copies, pack/).
+- **Commands** (cwd /Users/garykrause/repos/cold-snap; logs in `target/software-only/logs/16-fix12/`):
+
+| command | exit | elapsed | log |
+|---|---|---|---|
+| `cargo build --target aarch64-apple-darwin -p coldsnap_firmware --example stub` | 0 | 5.19 s | build-1 |
+| `cargo build --release && python3 tools/pack-signed.py --pubkey-num 0 --epoch 1790366193 --out target/software-only/fix12/pack && cmp .../pack/firmware-signed.bin target/software-only/package/firmware-signed.bin` | 0 | 2 s (final re-run) | release.log, release-2.log |
+| `/usr/bin/time -p tools/app-rig-test.sh` (rig-1, first design) | 0 | 103.69 s | rig-1.log |
+| same (rig-2, with the whole-file divergence check) | 0 | 90.81 s | rig-2.log |
+| same (rig-3) | 0 | 79.12 s | rig-3.log |
+| same (rig-4, final tree) | 0 | 91.84 s | rig-4.log |
+| `tools/app-rig-test.sh --timeout 55` (timeout fires in app run 2, after the stub restart) | 5 | 58 s | timeout-55.log |
+| `python3 target/software-only/fix12/mut.py` (final mutant set) | 0 | rig runs sum 328.7 s (driver total not timed) | mut-summary-3.log |
+| `cargo clippy --target aarch64-apple-darwin -p coldsnap_firmware --example stub` | 0 | 4 s | check-clippy (only the pre-existing too_many_arguments on `drive`) |
+| cwd `hostcheck/`: `cargo run -- ../target/aarch64-apple-darwin/debug/examples/stub` (RAM-only path) | 0 | 21 s | check-hostcheck.log (4 "pass ok") |
+| `pgrep -fl "app-rig.py\|examples/stub\|bitcoin-node -regtest\|flutter_tools\|Frostsnap.app"` after every run | 1 | - | - |
+
+- **rig-4 details:**
+  - Flutter 3.38.5 is pinned. Run 1 `+9: All tests passed`; run 2 `+5: All tests passed`.
+  - "stub restart verified: pids [21742, 21743, 21744, 21745] -> [22603, 22604, 22605, 22606]".
+  - Bitcoin Core: ACCEPTED x3 (the third, a962b851…, after the stub restart) and REJECTED x1 (the tamper, Invalid Schnorr).
+  - "app restart verified: pid 22354 persisted, pid 23096 reloaded and signed".
+  - Teardown: 0 still alive, all fds closed. The rig dir holds only device-*.log and identities.tsv.
+- **timeout-55 details:** the stub restart was verified, the timeout fired in run 2, and exit 5. Teardown reaped 4 stubs, regtest went down, 0 were still alive, and pgrep exited 1.
+- **Mutants** (mut-summary-3.log). Every mutant restored byte-identical and the real stub was rebuilt (exit 0):
+
+| mutant | rig exit | caught by |
+|---|---|---|
+| MS1: loaded image not programmed into cells | 7 | FAIL STUB RESTARTED WITH BLANK FLASH (blank sha f9eb1e3e…) |
+| MS2: mirror returns early (no write-through) | 7 | FAIL STUB FLASH BLANK BEFORE RESTART |
+| MS3: erase not mirrored | 4 | device 1: "STUB_FLASH_FILE DIVERGED from the flash at 0x28" (survived with exit 0 under the first per-range design; fixed by the whole-file check) |
+| MR1: rig drops STUB_FLASH_FILE on relaunch | 7 | FAIL STUB RESTARTED WITH BLANK FLASH (no load line) |
+| MR2: snapshot compared against device (i+1)%n | 7 | FAIL STUB RESTART LOST STATE |
+| MR3: id compared against ids[(i+1)%n] | 7 | FAIL STUB RESTART CHANGED IDENTITY |
+
+- **ARM image:** the release pack still cmp's equal to the registered firmware-signed.bin (c86392bc…). examples/ is not in the ARM build, and there is no registry change.
+- **Still open:**
+  - The rig checks names and shares against app-restart.json. The app-side name check still cannot tell the DB from the announce.
+  - Post-restart signing uses devices 0 and 1 only.
+  - `STUB_LOSE_FIRST_SHARE` is re-armed on restarted device 3 and is not exercised in run 2.
+  - SIGKILL of the rig is uncatchable, so teardown cannot run.
+  - The mirror re-reads 80 KB per op (ponytail comment).
+  - The full readiness profile was not re-run.
+  - Flash power loss mid-write is not modelled (the write-through is not atomic).
+- **Commits:** none, as instructed.
+
+## Fix 12 — repair 1 of 1
+
+- **Scope:** the three CONFIRMED findings on `tools/app-rig.py` `restart_stubs`. Only `tools/app-rig.py` changed in this repair (host tool). `firmware/examples/stub.rs` was not touched, so the ARM image is not affected and the release was not rebuilt in this round (the fix-12 cmp against firmware-signed.bin above still holds).
+- **Changes (`tools/app-rig.py`):**
+  - :289 onward, `restart_stubs` reads and validates `app-restart.json` BEFORE any stub is stopped. The file must exist and parse, and `devices[str(i)]` must hold `name` and `share` for every device. Otherwise the rig fails with `FAIL STUB RESTART NO BASELINE` (exit 7). Before this, the rig raised FileNotFoundError or KeyError.
+  - :326 a flash file that cannot be read fails with `FAIL STUB FLASH MISSING BEFORE RESTART` (exit 7). Before this, the rig raised FileNotFoundError.
+  - :355-367 the wait also ends when a new stub announces ids. A stub with no load line that exited fails with `FAIL STUB RESTART FLASH UNLOADABLE`, quoting the stub's own FAIL line (exit 7). A stub with no load line and no announce by the deadline fails with `FAIL TIMEOUT` (exit 5). `STUB RESTARTED WITH BLANK FLASH` is now reported only for a blank or non-`loaded` load line, or for an announce without a load.
+  - :35-41 the exit 5 and exit 7 docs were updated.
+- **Commands** (cwd /Users/garykrause/repos/cold-snap). The fault harness is `target/software-only/fix12/repair/{cmdR.sh,run.sh}`, a fake app that edits the flash dir in run 1. It uses the verifier's stub build. Logs are in `target/software-only/logs/16-fix12/repair/`.
+
+| scenario | rig exit | named failure | elapsed |
+|---|---|---|---|
+| del: `rm device-0.bin` in run 1 | 7 | FAIL STUB FLASH MISSING BEFORE RESTART | 0.64 s |
+| trunc: `truncate -s 40960 device-0.bin` | 7 | FAIL STUB RESTART FLASH UNLOADABLE ... "is 40960 B, the flash is 81920 B" | 0.44 s |
+| nosnap: no app-restart.json | 7 | FAIL STUB RESTART NO BASELINE (FileNotFoundError) | 0.41 s |
+| emptysnap: `{"devices":{}}` | 7 | FAIL STUB RESTART NO BASELINE (KeyError: '0') | 0.43 s |
+| slow: the new stub sleeps 30 s, `--id-timeout 8` | 5 | FAIL TIMEOUT: device 0 ... no STUB_FLASH_FILE load within 8s | 8.47 s |
+| baseline: the full snapshot with made-up shares | 7 | FAIL STUB RESTART LOST STATE (passes every new check) | 0.53 s |
+| MR1 mutant (rig drops STUB_FLASH_FILE on relaunch; restored and cmp'd) | 7 | FAIL STUB RESTARTED WITH BLANK FLASH (no load line) | 0.38 s |
+| `/usr/bin/time -p tools/app-rig-test.sh` (real app, Flutter 3.38.5 pinned) | 0 | - | 82.03 s |
+
+- The first attempt of the slow run exited 1. That was my runner's bug: `$x` was passed as one argument. It was re-run with the args split, and the table shows the re-run.
+- **Every run:** teardown printed "0 still alive, all fds closed". Each rig dir held only device-*.log and identities.tsv. `pgrep -fl "app-rig.py|examples/stub|bitcoin-node -regtest|flutter_tools|Frostsnap.app"` exited 1.
+- **Full rig:**
+  - "stub restart verified: pids [43256..43259] -> [43916..43919]".
+  - ACCEPTED x3 (the third, dee97420…, after the stub restart) and REJECTED x1 (Invalid Schnorr).
+  - Run 2 `+5: All tests passed!`.
+  - "app restart verified: pid 43779 persisted, pid 44415 reloaded and signed".
+- **Not done:** the full readiness profile was not re-run. Nothing is committed.
+
+## Fix 12 — close-out
+
+- **Status: FIXED (software/pre-bench checks passed, scoped to fix 12 and its repair 1).** A stub restarted as a new process (different pid) on the same `STUB_FLASH_FILE` comes back with the same DeviceId, name and share index, and the real app (Flutter 3.38.5 pinned) then gets a Taproot signature that the independent sighash check and regtest `testmempoolaccept` accept. A stub restarted on blank flash fails the rig by name (exit 7). Teardown runs on every catchable exit path. The change is host/stub only (`firmware/examples/stub.rs`, `tools/app-rig.py`, `tools/app-rig-test.sh`). The release pack `cmp`s equal to the registered c86392bc `firmware-signed.bin`, so there was no registry edit, no frostsnap commit and no pin bump (frostsnap HEAD c2bcd65 is still `hostcheck/frostsnap.rev`).
+- **Implementer's commands:** § Fix 12 and § Fix 12 — repair 1 of 1 above (logs `target/software-only/logs/16-fix12/`, repair logs under `repair/`; mutants `target/software-only/fix12/mut.py`; fault harness `target/software-only/fix12/repair/`).
+- **Verifiers' commands:** `target/software-only/verify-rerun-stub-restart/` (full rig exit 0 in 77.74 s, release rebuild + key-0 epoch-1790366193 pack `cmp` exit 0, all six mutants reproduced, direct stub negatives exit 2) and `target/software-only/verify-faults-stub-restart/` (kill-mid-restart and kill-during-start exit 143 with teardown, hung restart, file tampering, rig mutants; fake app against the real stub and the real `tools/app-rig.py`).
+- **Re-runner's commands (after repair 1):** `target/software-only/verify-rerun-stub-restart/logs/`: full real-app rig exit 0 in 80 s (pids [46513..46516] -> [48147..48150]; fa583966… accepted after the stub restart; tamper rejected, Invalid Schnorr; run 2 `+5: All tests passed!`; 0 alive), fault scenarios del/trunc/grow/nosnap/emptysnap/noshare/listsnap/baseline/blankfile/swap exit 7 by name, slow exit 5 FAIL TIMEOUT, MS1–MS3 and MR1–MR3 with the claimed exits, release rebuild + pack `cmp` exit 0, hostcheck exit 0, clippy exit 0 (the one stub.rs warning is on the untouched `drive`). No discrepancies.
+- **Close-out's own checks** (cwd cold-snap): `python3 -m py_compile tools/app-rig.py` exit 0; `bash -n tools/app-rig-test.sh` exit 0; `cmp target/software-only/fix12/pack/firmware-signed.bin target/software-only/package/firmware-signed.bin` exit 0; `pgrep -fl "app-rig.py|examples/stub|bitcoin-node -regtest|flutter_tools|Frostsnap.app"` exit 1; `target/software-only/app-rig/` holds only device-*.log and identities.tsv (no flash/ dir). Code diff at commit: stub.rs +190/-7, app-rig.py +164/-19, app-rig-test.sh +11/-6 (the round-1 "+337/-31" predates the repair).
+- **CONFIRMED findings and outcome:**
+  - Flash file deleted between processes crashed the rig with FileNotFoundError (exit 1): **FIXED** — `FAIL STUB FLASH MISSING BEFORE RESTART`, exit 7 (repair del run; re-runner del).
+  - Missing or incomplete `app-restart.json` crashed `restart_stubs` (FileNotFoundError / KeyError): **FIXED** — the snapshot is validated before any stub is stopped; `FAIL STUB RESTART NO BASELINE`, exit 7 (nosnap, emptysnap; re-runner also noshare, listsnap).
+  - Truncated file and hung restart both misreported as "RESTARTED WITH BLANK FLASH": **FIXED** — truncated/oversize file gives `FAIL STUB RESTART FLASH UNLOADABLE` (exit 7) quoting the stub's own FAIL line; a hung restart gives `FAIL TIMEOUT` (exit 5). MR1 still gives BLANK FLASH.
+- **PLAUSIBLE, not repaired:**
+  - "Same shares" for devices 2 and 3 is checked by share index plus identical flash bytes only; share content is proven by signing only for devices 0 and 1.
+  - The rig has no independent check that the flash file matches the old process's final flash; write-through fidelity rests on the stub's own whole-file `mirror` read-back, and a missed mirror on the very last op before SIGTERM would go unseen.
+  - FileFlash's refusal semantics (no program over non-erased bits, bounds, alignment) hold by code reading (delegates to FakeFlash first) but have no unit test.
+  - The readiness profile's `app-rig` stage now includes `--stub-restart` but the full profile was not re-run.
+- **Still open:** the four PLAUSIBLE items above; the app-side name check cannot tell the DB from the device announce; `STUB_LOSE_FIRST_SHARE` is re-armed on restarted device 3 but not exercised in run 2; SIGKILL of the rig skips teardown; the write-through is not atomic, so flash power loss mid-write is not modelled; the mirror re-reads 80 KB per op (ponytail comment). The stub restart is a host process restart, not evidence that the shipped ARM image survives a real power cycle or re-announces on port re-open.
+- **Commits:** one cold-snap commit containing `firmware/examples/stub.rs`, `tools/app-rig.py`, `tools/app-rig-test.sh`, this file, the 04 evidence file and run.json. frostsnap: none, so no pin bump.

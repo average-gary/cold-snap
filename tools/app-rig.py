@@ -32,9 +32,13 @@ Exit codes, all named on stderr:
         another rig run holds target/software-only/app-rig.lock)
     3   DUPLICATE TEST IDENTITY across child processes
     4   CHILD FAILED (a stub exited while the rig was up)
-    5   TIMEOUT (identities never appeared, or the command outlived --timeout)
+    5   TIMEOUT (identities or a restarted stub's flash load never appeared, or the
+        command outlived --timeout)
     6   APP RESTART UNVERIFIED (--app-restart: the second app process exited 0 but never
         recorded that it reloaded the first one's wallet)
+    7   STUB RESTART failed (--stub-restart: a flash file was blank, MISSING or UNLOADABLE,
+        app-restart.json held NO BASELINE name and share per device, or a new stub process
+        came back on BLANK flash, with a different image, DeviceId, name or share)
     *   otherwise the command's own exit code, passed through
 """
 
@@ -42,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import pty
@@ -75,6 +80,10 @@ DEFAULT_IMAGE = os.path.join(REPO, "target/software-only/package/firmware-signed
 
 # The line `firmware/examples/stub.rs` prints once its flash-backed sessions exist.
 IDS_RE = re.compile(r"flash-backed sessions[^:]*: \[(.*)\]")
+# Fix 12: what a stub on `STUB_FLASH_FILE` printed at start (`stub.rs::load_flash_file`
+# and the `booted from STUB_FLASH_FILE` line after its sessions opened).
+FLASH_RE = re.compile(r"STUB_FLASH_FILE \S+: (loaded|created blank), \d+ B, sha256 ([0-9a-f]{64})")
+BOOTED_RE = re.compile(r"booted from STUB_FLASH_FILE: name (None|Some\(\"(.*)\"\)), shares \[([0-9a-f,]*)\]")
 
 
 def log(msg: str) -> None:
@@ -140,6 +149,9 @@ class Rig:
         # `--app-restart`: what the first app process persisted, written by it and
         # countersigned by the second (`coldsnap_workflows_test.dart`).
         self.restart_snapshot = os.path.join(outdir, "app-restart.json")
+        # `--stub-restart`: one flash image per device, written through by the stub.
+        self.flash_dir: str | None = None
+        self.envs: list[dict[str, str]] = []
 
     def open_ptys(self, n: int) -> None:
         for _ in range(n):
@@ -174,7 +186,7 @@ class Rig:
         for stale in os.listdir(self.outdir):
             if stale.startswith("device-") and stale.endswith(".log"):
                 os.remove(os.path.join(self.outdir, stale))
-        for i, master in enumerate(self.masters):
+        for i in range(len(self.masters)):
             logpath = os.path.join(self.outdir, f"device-{i}.log")
             logfh = open(logpath, "w")
             self.logs.append(logpath)
@@ -249,21 +261,137 @@ class Rig:
                 # A committed cut reboots into `erase::recover`, which finishes the
                 # erase and sends the EraseConfirmed under the old id.
                 env["STUB_ERASE_KEYS"] = erase_cut[i]
-            child = subprocess.Popen(
-                [stub],
-                stdin=master,
-                stdout=master,
-                stderr=logfh,
-                close_fds=True,  # no other master, and no slave, reaches the child
-                env=env,
-            )
-            logfh.close()  # the child holds its own dup
-            self.children.append(child)
-            log(f"device {i}: pid {child.pid} on {self.paths[i]} "
-                f"(STUB_SALT={env['STUB_SALT']}, "
-                f"consent={env.get('COLDSNAP_GLASS_KEYS', 'yyy')}, log {logpath})")
+            if self.flash_dir:
+                # Fix 12: the flash array is this file, so a new process is a power cycle.
+                env["STUB_FLASH_FILE"] = os.path.join(self.flash_dir, f"device-{i}.bin")
+            self.envs.append(env)
+            self.launch(stub, i, logfh)
 
-    def await_identities(self, timeout: float) -> list[str]:
+    def launch(self, stub: str, i: int, logfh) -> None:
+        env = self.envs[i]
+        child = subprocess.Popen(
+            [stub],
+            stdin=self.masters[i],
+            stdout=self.masters[i],
+            stderr=logfh,
+            close_fds=True,  # no other master, and no slave, reaches the child
+            env=env,
+        )
+        logfh.close()  # the child holds its own dup
+        if i < len(self.children):
+            self.children[i] = child
+        else:
+            self.children.append(child)
+        log(f"device {i}: pid {child.pid} on {self.paths[i]} "
+            f"(STUB_SALT={env['STUB_SALT']}, "
+            f"consent={env.get('COLDSNAP_GLASS_KEYS', 'yyy')}, log {self.logs[i]})")
+
+    def restart_stubs(self, stub: str, ids: list[str], timeout: float) -> None:
+        """Fix 12: stop every stub PROCESS and start new ones on the same flash files.
+
+        Not a reset of in-memory state: the old processes are reaped first, and the new
+        ones (new pids, `STUB_BOOT=1` so their RNG does not replay) read nothing but the
+        image files. Each must report it LOADED the exact bytes the old one left, then
+        announce the same DeviceId and hold the name and share the first app process
+        recorded (`app-restart.json`). Any miss is exit 7, by name.
+        """
+        # The baseline is read BEFORE anything is stopped: without every device's name
+        # and share from the first app process there is nothing to hold the restart to.
+        try:
+            with open(self.restart_snapshot) as fh:
+                snap = json.load(fh)["devices"]
+            for i in range(len(self.children)):
+                if not {"name", "share"} <= snap[str(i)].keys():
+                    raise KeyError(f"{i}: {snap[str(i)]}")
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as err:
+            log(f"FAIL STUB RESTART NO BASELINE: {self.restart_snapshot} does not record every "
+                f"device's name and share ({type(err).__name__}: {err})")
+            sys.exit(7)
+        old = [c.pid for c in self.children]
+        for child in self.children:
+            child.terminate()
+        for i, child in enumerate(self.children):
+            try:
+                child.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+            log(f"stub restart: device {i} pid {child.pid} stopped ({child.returncode})")
+        left: list[bytes] = []
+        for i, env in enumerate(self.envs):
+            try:
+                with open(env["STUB_FLASH_FILE"], "rb") as fh:
+                    left.append(fh.read())
+            except OSError as err:
+                log(f"FAIL STUB FLASH MISSING BEFORE RESTART: device {i}'s "
+                    f"{env['STUB_FLASH_FILE']} cannot be read ({err})")
+                sys.exit(7)
+            if left[i].strip(b"\xff") == b"":
+                log(f"FAIL STUB FLASH BLANK BEFORE RESTART: device {i}'s "
+                    f"{env['STUB_FLASH_FILE']} holds nothing; nothing was written through")
+                sys.exit(7)
+        offsets = [os.path.getsize(p) for p in self.logs]
+        for i, env in enumerate(self.envs):
+            env["STUB_BOOT"] = "1"
+            logfh = open(self.logs[i], "a")
+            logfh.write(f"app-rig: ===== STUB PROCESS RESTART (old pid {old[i]}) =====\n")
+            logfh.flush()
+            offsets[i] = logfh.tell()
+            self.launch(stub, i, logfh)
+        new = [c.pid for c in self.children]
+        if set(new) & set(old):
+            log(f"FAIL STUB RESTART reused a pid: old {old}, new {new}")
+            sys.exit(7)
+        def segment(i: int) -> str:
+            with open(self.logs[i]) as fh:
+                fh.seek(offsets[i])
+                return fh.read()
+        # The load line is printed before the new process touches its flash, so it is
+        # judged FIRST: a blank boot is named as one even if the child then dies of it.
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not all(
+                FLASH_RE.search(segment(i)) or IDS_RE.search(segment(i)) or c.poll() is not None
+                for i, c in enumerate(self.children)):
+            time.sleep(0.05)
+        for i, child in enumerate(self.children):
+            flash = FLASH_RE.search(segment(i))
+            if not flash and child.poll() is not None:
+                why = [ln for ln in segment(i).splitlines() if "FAIL" in ln]
+                log(f"FAIL STUB RESTART FLASH UNLOADABLE: device {i} (pid {new[i]}) exited "
+                    f"{child.returncode} before loading its flash file: "
+                    f"{why[-1] if why else 'no FAIL line'}; see {self.logs[i]}")
+                sys.exit(7)
+            if not flash and not IDS_RE.search(segment(i)):
+                log(f"FAIL TIMEOUT: device {i} (pid {new[i]}) reported no STUB_FLASH_FILE load "
+                    f"within {timeout:g}s of its restart; see {self.logs[i]}")
+                sys.exit(5)
+            blank = hashlib.sha256(b"\xff" * len(left[i])).hexdigest()
+            if not flash or flash.group(1) != "loaded" or flash.group(2) == blank:
+                log(f"FAIL STUB RESTARTED WITH BLANK FLASH: device {i} (pid {new[i]}) reported "
+                    f"{flash.group(0) if flash else 'no STUB_FLASH_FILE load'}; see {self.logs[i]}")
+                sys.exit(7)
+            if flash.group(2) != hashlib.sha256(left[i]).hexdigest():
+                log(f"FAIL STUB FLASH NOT RELOADED: device {i} holds sha256 {flash.group(2)}, "
+                    f"its file held {hashlib.sha256(left[i]).hexdigest()}")
+                sys.exit(7)
+        again = self.await_identities(timeout, offsets)
+        for i in range(len(self.children)):
+            booted = BOOTED_RE.search(segment(i))
+            if again[i] != ids[i]:
+                log(f"FAIL STUB RESTART CHANGED IDENTITY: device {i} was {ids[i]}, "
+                    f"is {again[i]}")
+                sys.exit(7)
+            want = snap[str(i)]
+            shares = [int(x, 16) for x in booted.group(3).split(",") if x] if booted else []
+            name = booted.group(2) if booted else None
+            if name != want["name"] or want["share"] not in shares:
+                log(f"FAIL STUB RESTART LOST STATE: device {i} booted with name {name!r}, "
+                    f"shares {shares}; the first app recorded {want}")
+                sys.exit(7)
+        log(f"stub restart verified: pids {old} -> {new}; every device reloaded its flash "
+            f"file and came back with the same id, name and share")
+
+    def await_identities(self, timeout: float, offsets: list[int] | None = None) -> list[str]:
         """Read each child's announced DeviceId off its own log, then demand N distinct.
 
         This is the only place duplicate identities ACROSS processes can be caught:
@@ -281,6 +409,7 @@ class Rig:
                         f"{child.returncode} before announcing; see {self.logs[i]}")
                     sys.exit(4)
                 with open(self.logs[i]) as fh:
+                    fh.seek(offsets[i] if offsets else 0)
                     match = IDS_RE.search(fh.read())
                 if match:
                     ids = [x.strip() for x in match.group(1).split(",") if x.strip()]
@@ -433,8 +562,9 @@ class Rig:
             except FileNotFoundError:
                 pass
         regtest_ok = self.stop_regtest()
-        # The app's sqlite/bdk files and the synthetic backup words are this run's alone.
-        for d in ("app-dir", "sheets"):
+        # The app's sqlite/bdk files, the synthetic backup words and the flash images
+        # (identity secrets and shares) are this run's alone.
+        for d in ("app-dir", "sheets", "flash"):
             shutil.rmtree(os.path.join(self.outdir, d), ignore_errors=True)
         alive = [c.pid for c in self.children if c.poll() is None] + cmd_left
         alive += self.reap_env_strays()
@@ -493,6 +623,11 @@ def main() -> int:
                          "COLDSNAP_RIG_APP_RUN=1, then, once its whole process group is gone, "
                          "COLDSNAP_RIG_APP_RUN=2 -- a new app process reloading what the first "
                          "persisted. Exit 6 unless the second recorded that it did.")
+    ap.add_argument("--stub-restart", action="store_true",
+                    help="with --app-restart: back each stub's flash with a file under "
+                         "<dir>/flash and, between the two app runs, stop every stub process "
+                         "and start new ones on the same files. Exit 7 unless each comes back "
+                         "with the same flash bytes, DeviceId, name and share.")
     ap.add_argument("--force-duplicate-identities", action="store_true",
                     help="MUTATION PROBE: give every device the same salt. The rig must "
                          "then fail with exit 3; if it exits 0 the identity check is dead.")
@@ -540,6 +675,9 @@ def main() -> int:
         log(f"FAIL no image at {args.image}; build task 01's package, or pass --image '' "
             f"to announce the stub's synthetic digest on purpose")
         return 2
+    if args.stub_restart and not args.app_restart:
+        log("FAIL --stub-restart needs --app-restart: it runs between the two app runs")
+        return 2
     refuse_if_stale(args.stub)
     # Before ANYTHING in the rig dir is touched: the sheets rmtree below and the test's
     # app-dir wipe are exactly what destroyed a concurrent run's state.
@@ -561,9 +699,14 @@ def main() -> int:
     # reveal rather than corrupt it, which is the right direction but a confusing
     # message. Cleared here, where the reason is visible.
     shutil.rmtree(os.path.join(args.dir, "sheets"), ignore_errors=True)
+    # Same for flash images: a leftover would boot this run's devices into an old wallet.
+    shutil.rmtree(os.path.join(args.dir, "flash"), ignore_errors=True)
     cmd = [x for x in args.command if x != "--"]
 
     rig = Rig(args.dir)
+    if args.stub_restart:
+        rig.flash_dir = os.path.join(args.dir, "flash")
+        os.makedirs(rig.flash_dir)
     # SIGTERM/SIGINT/SIGHUP must run `finally`, not skip it, or the children outlive us.
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, lambda s, _f: sys.exit(128 + s))
@@ -577,7 +720,7 @@ def main() -> int:
         watchdog_scale = max(1, int((args.timeout + args.id_timeout) // 240) + 1)
         rig.spawn(args.stub, args.salt_base, args.force_duplicate_identities,
                   args.image, decline, watchdog_scale, lose, erase, erase_cut)
-        rig.await_identities(args.id_timeout)
+        ids = rig.await_identities(args.id_timeout)
         if not cmd:
             log(f"rig up; holding for {args.timeout:g}s (^C to stop). "
                 f"Point the app at {rig.manifest}")
@@ -641,6 +784,8 @@ def main() -> int:
                     return 4
                 log("app restart: first app process group gone; stubs "
                     f"{[c.pid for c in rig.children]} still up; same app dir")
+                if args.stub_restart:
+                    rig.restart_stubs(args.stub, ids, args.id_timeout)
         if args.app_restart:
             try:
                 with open(rig.restart_snapshot) as fh:

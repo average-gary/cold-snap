@@ -65,9 +65,10 @@
 //! announce, so if `identity::load_or_create` had failed to read back what it
 //! wrote, the ids would differ and the coordinator would never complete a keygen
 //! with them. That is the end-to-end proof that flash-backed identity survives a
-//! reset. HONEST LIMIT: it is an in-process restart. `FakeFlash` lives in RAM, so
-//! a second OS process would need the flash image persisted to a file, which is
-//! harness plumbing, not device code — see the open list.
+//! reset. It is an in-process restart. A PROCESS restart needs the flash to outlive
+//! the process: `STUB_FLASH_FILE` (one session per process, the app rig's shape) backs
+//! the `FakeFlash` with an image file — see [`FileFlash`] — and `tools/app-rig.py
+//! --stub-restart` starts new processes on the same files.
 //!
 //! NOT evidence about the shipped device. An `examples/` target here compiles
 //! `coldsnap_hal` with `fake-flash` AND `test-seam` on; both are BYPASSES. The
@@ -134,7 +135,8 @@ use coldsnap_firmware::{
 };
 use coldsnap_hal::comms::{decode_body, CoordinatorSendBody, Link, MAGIC_REPLY};
 use coldsnap_hal::flash::fake::FakeFlash;
-use coldsnap_hal::flash::ERASE_SIZE;
+use coldsnap_hal::flash::{FlashError, ERASE_SIZE};
+use embedded_storage::nor_flash::{ErrorType, NorFlash, ReadNorFlash};
 use coldsnap_hal::rng::{mix_sources, Entropy, ProvenSeed, SE1_BYTES, SE2_BYTES, TRNG_BYTES};
 use coldsnap_hal::{erase, identity, memmap, ui};
 use frostsnap_comms::{DeviceSendBody, ReceiveSerial, Upstream};
@@ -160,7 +162,7 @@ const ALL_DEVICES: usize = N_DEVICES + 1;
 
 /// One flash per device, at the shipped geometry. `DebugFlash` is only the
 /// `core::fmt::Debug` shim `FrostSigner::new` demands — see its doc in the lib.
-type Flash = DebugFlash<FakeFlash>;
+type Flash = DebugFlash<FileFlash>;
 
 /// Named so a stall is a diagnosis rather than a mystery.
 ///
@@ -575,6 +577,17 @@ fn salt() -> u8 {
         // NOT a silent default: a typo'd salt would mean duplicate identities, which
         // is the one failure this variable exists to prevent.
         Err(e) => die(2, &format!("STUB_SALT={raw:?} is not a u8: {e}")),
+    }
+}
+
+/// Which boot of this device's flash this process is (`STUB_BOOT`, default 0). See
+/// [`entropy`].
+fn boot() -> u8 {
+    match std::env::var("STUB_BOOT") {
+        Err(_) => 0,
+        Ok(raw) => raw
+            .parse()
+            .unwrap_or_else(|e| die(2, &format!("STUB_BOOT={raw:?} is not a u8: {e}"))),
     }
 }
 
@@ -1630,7 +1643,11 @@ fn entropy(salt: u8) -> Entropy {
         }
         b
     };
-    let t = varying(TRNG_BYTES, salt);
+    let mut t = varying(TRNG_BYTES, salt);
+    // A new boot draws new TRNG bytes (`STUB_BOOT`, 0 by default = every existing
+    // measurement): the app rig's stub restart sets it, so the new process does not replay
+    // the old one's RNG stream, and a restart onto BLANK flash derives a different id.
+    t[0] = t[0].wrapping_add(boot());
     let s1 = varying(SE1_BYTES, salt.wrapping_add(1));
     let s2 = varying(SE2_BYTES, salt.wrapping_add(2));
     let seed: ProvenSeed = mix_sources(&t[..TRNG_BYTES], &s1[..SE1_BYTES], &s2[..SE2_BYTES])
@@ -1645,11 +1662,159 @@ fn entropy(salt: u8) -> Entropy {
 /// `Session` borrows its `RefCell<Flash>`, and the restart works by dropping all
 /// the sessions while the flashes stay exactly as they are — which is what a
 /// power cycle does.
+///
+/// FIX 12: with `STUB_FLASH_FILE` the one flash is loaded from that file instead (see
+/// [`FileFlash`]), so a NEW PROCESS on the same file is a power cycle too.
 fn blank_flashes() -> Vec<RefCell<Flash>> {
     let sectors = memmap::FS_FREE_OFFSET as usize / ERASE_SIZE;
+    let path = std::env::var("STUB_FLASH_FILE").ok();
+    if path.is_some() && session_count() != 1 {
+        die(2, "STUB_FLASH_FILE backs ONE flash; it needs STUB_SESSIONS=1");
+    }
     (0..session_count())
-        .map(|_| RefCell::new(DebugFlash(FakeFlash::new(sectors))))
+        .map(|_| {
+            let mut cells = FakeFlash::new(sectors);
+            let file = path.as_deref().map(|p| load_flash_file(&mut cells, p));
+            RefCell::new(DebugFlash(FileFlash { cells, file }))
+        })
         .collect()
+}
+
+/// FIX 12 — `FakeFlash` with every ACCEPTED program/erase written through to an image
+/// file, so the flash outlives the process (`STUB_FLASH_FILE`, the app rig's stub
+/// restart). Unset, `file` is `None` and this is exactly the RAM-only `FakeFlash`.
+///
+/// NO MORE PERMISSIVE THAN `FakeFlash`, by construction: every call goes to the inner
+/// `FakeFlash` first, only an `Ok` is mirrored, and what the file receives is read back
+/// OUT OF the fake's cells, never the caller's bytes. So a refused, misaligned,
+/// out-of-bounds or bit-setting (unerased) program reaches neither, and the file only
+/// ever holds bytes `FakeFlash` accepted. `Deref`
+/// is there so the fault-injection knobs (`refuse_*`, `heal`, the counters) stay the
+/// inner fake's. A host-test facility only; nothing like it is in the ARM image.
+struct FileFlash {
+    cells: FakeFlash,
+    file: Option<std::fs::File>,
+}
+
+impl std::ops::Deref for FileFlash {
+    type Target = FakeFlash;
+    fn deref(&self) -> &FakeFlash {
+        &self.cells
+    }
+}
+
+impl std::ops::DerefMut for FileFlash {
+    fn deref_mut(&mut self) -> &mut FakeFlash {
+        &mut self.cells
+    }
+}
+
+impl FileFlash {
+    /// Copy `len` cells at `offset`, as the fake now holds them, to the same offset in
+    /// the file, then check the WHOLE file equals the whole fake. The check is what makes
+    /// an operation that was never mirrored (an erase, say, leaving stale bytes a later
+    /// boot would read as an older A/B generation) die here, by name, at the next op.
+    ///
+    /// ponytail: re-reads the whole 80 KB image per op; fine at the rig's op count, drop
+    /// to a dirty-range check if a run ever gets slow.
+    fn mirror(&mut self, offset: u32, len: usize) {
+        use std::os::unix::fs::FileExt;
+        let Some(file) = &self.file else { return };
+        let mut now = vec![0u8; self.cells.len()];
+        if let Err(e) = self.cells.read(0, &mut now) {
+            die(2, &format!("STUB_FLASH_FILE mirror read: {e:?}"));
+        }
+        let range = offset as usize..offset as usize + len;
+        if let Err(e) = file.write_all_at(&now[range], u64::from(offset)) {
+            die(2, &format!("STUB_FLASH_FILE write-through at {offset:#x}: {e}"));
+        }
+        let mut disk = vec![0u8; now.len()];
+        if let Err(e) = file.read_exact_at(&mut disk, 0) {
+            die(2, &format!("STUB_FLASH_FILE read-back: {e}"));
+        }
+        if disk != now {
+            let at = disk.iter().zip(&now).position(|(d, n)| d != n).unwrap_or(0);
+            die(2, &format!("STUB_FLASH_FILE DIVERGED from the flash at {at:#x}"));
+        }
+    }
+}
+
+impl ErrorType for FileFlash {
+    type Error = FlashError;
+}
+
+impl ReadNorFlash for FileFlash {
+    const READ_SIZE: usize = FakeFlash::READ_SIZE;
+    fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), FlashError> {
+        self.cells.read(offset, bytes)
+    }
+    fn capacity(&self) -> usize {
+        self.cells.capacity()
+    }
+}
+
+impl NorFlash for FileFlash {
+    const WRITE_SIZE: usize = FakeFlash::WRITE_SIZE;
+    const ERASE_SIZE: usize = FakeFlash::ERASE_SIZE;
+    fn erase(&mut self, from: u32, to: u32) -> Result<(), FlashError> {
+        self.cells.erase(from, to)?;
+        self.mirror(from, (to - from) as usize);
+        Ok(())
+    }
+    fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), FlashError> {
+        self.cells.write(offset, bytes)?;
+        self.mirror(offset, bytes.len());
+        Ok(())
+    }
+}
+
+/// Open (or create, all-`0xff`) the image at `path` and program it into the blank
+/// `cells` through `FakeFlash`'s own `write`, so a load obeys the same rules a program
+/// does. A file of the wrong size dies: it is not this device's flash.
+///
+/// PARSED BY `tools/app-rig.py`: the `sha256` is of the cells AFTER the load, read back
+/// out of the fake, which is what the rig compares with the file the previous process
+/// left. Keep the `STUB_FLASH_FILE <path>: ..., sha256 <hex>` shape.
+fn load_flash_file(cells: &mut FakeFlash, path: &str) -> std::fs::File {
+    use sha2::{Digest, Sha256};
+    let open = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path);
+    let mut file = open.unwrap_or_else(|e| die(2, &format!("STUB_FLASH_FILE={path:?}: {e}")));
+    let mut image = Vec::new();
+    if let Err(e) = file.read_to_end(&mut image) {
+        die(2, &format!("STUB_FLASH_FILE={path:?} unreadable: {e}"));
+    }
+    let state = if image.is_empty() {
+        image = vec![0xff; cells.len()];
+        if let Err(e) = file.write_all(&image) {
+            die(2, &format!("STUB_FLASH_FILE={path:?} not created: {e}"));
+        }
+        "created blank"
+    } else if image.len() != cells.len() {
+        die(
+            2,
+            &format!("STUB_FLASH_FILE={path:?} is {} B, the flash is {} B", image.len(), cells.len()),
+        )
+    } else {
+        if let Err(e) = cells.write(0, &image) {
+            die(2, &format!("STUB_FLASH_FILE={path:?} does not program: {e:?}"));
+        }
+        "loaded"
+    };
+    let mut held = vec![0u8; cells.len()];
+    if let Err(e) = cells.read(0, &mut held) {
+        die(2, &format!("read back STUB_FLASH_FILE={path:?}: {e:?}"));
+    }
+    eprintln!(
+        "stub: STUB_FLASH_FILE {path}: {state}, {} B, sha256 {}",
+        held.len(),
+        hex(&Sha256::digest(&held))
+    );
+    file
 }
 
 /// Sessions by id, each id's flash index, and `(fresh, original)` per recovered erase.
@@ -2287,6 +2452,24 @@ fn main() {
         "stub: {hosted} flash-backed sessions (salt {:#04x}): {ids:?}",
         salt()
     );
+    // FIX 12, PARSED BY `tools/app-rig.py` after a stub restart: what this boot read off
+    // the file, compared there with what the previous process's app recorded.
+    if std::env::var_os("STUB_FLASH_FILE").is_some() {
+        for s in sessions.values() {
+            let shares: Vec<String> = s
+                .signer
+                .held_shares()
+                .filter(|h| h.access_structure_ref.is_some())
+                .map(|h| h.share_image.index.to_string())
+                .collect();
+            eprintln!(
+                "stub: {} booted from STUB_FLASH_FILE: name {:?}, shares [{}]",
+                s.device_id(),
+                s.stored_name(),
+                shares.join(",")
+            );
+        }
+    }
 
     let (digest, digest_from) = announced_digest();
     eprintln!(

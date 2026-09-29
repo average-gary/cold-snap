@@ -217,6 +217,24 @@
           "restart relies on stub STUB_REANNOUNCE; shipped ARM firmware does not re-announce on port re-open",
           "device-name reload check cannot distinguish DB from stub re-announce"
         ]
+      },
+      {
+        "fix": "12",
+        "commit": [
+          "cold-snap: the fix 12 close-out commit (see git log; it cannot name its own SHA)"
+        ],
+        "closed": [
+          "criterion 3 stub-process-restart half: new stub processes (different pids) on the same file-backed FakeFlash come back with the same ids, names and share indices, and the real app gets a signature verified by the independent sighash check and regtest Core; a blank-flash restart fails the rig by name (MS1-MS3, MR1-MR3 killed)",
+          "fix 2b still-open: stub process restart (in-memory FakeFlash)",
+          "CONFIRMED: deleted flash file / missing app-restart.json crashed the rig with a traceback; truncated file and hung restart misnamed BLANK FLASH (now named failures, exit 7 / exit 5)"
+        ],
+        "still_open": [
+          "PLAUSIBLE: shares of devices 2 and 3 checked by index plus flash bytes only; only devices 0 and 1 sign after the restart",
+          "PLAUSIBLE: no rig-side check that the flash file matches the old process's final flash (relies on the stub's own mirror read-back)",
+          "PLAUSIBLE: no unit test of FileFlash refusal semantics",
+          "full readiness profile not re-run with --stub-restart in the app-rig stage",
+          "device-name reload check cannot distinguish DB from stub announce; STUB_LOSE_FIRST_SHARE not exercised after restart; write-through not atomic (power loss not modelled)"
+        ]
       }
     ]
   },
