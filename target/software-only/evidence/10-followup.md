@@ -1126,3 +1126,71 @@ The full readiness profile was not re-run. The change touches only the git-unava
 - **Still open:** the PLAUSIBLE returncode note above, fix 6 mutant X1, and the fix 7 PLAUSIBLE R12-prefix item.
 - **Commits:** one cold-snap commit containing `tools/check-software-readiness.py`, `tools/test-software-readiness.py`, this file, the 09 evidence file and run.json. frostsnap was unchanged, so there was no registration and no pin bump.
 - Real USB enumeration, timing, SE calls, entropy, flash power loss and actual installation remain bench-only and untested. The install and bootloader effects in the profile are mocked.
+
+## Fix 10 — R12 stage passes only on a real signature verification failure
+
+Closes the fix 7 close-out PLAUSIBLE item (this file, § Fix 7 close-out :1012; still listed open in § Fix 8 close-out :1084 and § Fix 9 close-out :1126). Before this fix, `checkfw-negative-signature` accepted any `[FAIL] R12 signature over double-SHA256(signed range): ` line, and that prefix is shared by three failures: verification failed, pubkey_num != 0, and sig parse.
+
+Real checkfw output for each variant. Scratch fixtures are under `target/software-only/fix10/`. They are copies of `target/software-only/fixtures/bad-signature.bin`, which was not modified.
+- `fixtures/bad-signature.bin` → `fix10/checkfw-bad-signature.log`: `[FAIL] R12 signature over double-SHA256(signed range): expected valid under approved_pubkeys[0], actual signature failed verification; fw_check 265fc08b...`
+- `fix10/pubkey1.bin` (header u32 @0x3f80+20 set to 1; R7 still PASS) → `fix10/checkfw-pubkey1.log`: `... expected valid under approved_pubkeys[1], actual cannot verify: only approved_pubkeys[0] is embedded here, and key 1 is not ...`
+- `fix10/sig-unparseable.bin` (header bytes 0x3f80+64..128 set to 0xff) → `fix10/checkfw-sig-unparseable.log`: `... expected valid under approved_pubkeys[0], actual sig parse: malformed signature; ...`
+- All three print `RESULT: REFUSE — 1 of 14 rules failed` and exit 1. The details can already be told apart, so **checkfw was not changed** (no R-code or verdict change).
+
+Files changed (cold-snap, uncommitted):
+- `tools/check-software-readiness.py:319-322`: the must-pattern now also requires `expected valid under approved_pubkeys\[0\], actual signature failed verification; `, and the comment names the three excluded variants.
+- `tools/test-software-readiness.py:13` adds `import shlex`. `:114-115` updates the comment. `:125-131` adds two cases built from the real lines above: `sig-pubkey-num-1` and `sig-parse-failed`, both expected failed. `:134` changes the printf args to `shlex.quote` because the pubkey line contains an apostrophe (`Coinkite's`). The existing cases are unchanged.
+
+Commands (cwd `/Users/garykrause/repos/cold-snap`, logs in `target/software-only/fix10/`):
+
+| command | exit | time |
+|---|---|---|
+| python mint of `fix10/pubkey1.bin`, `fix10/sig-unparseable.bin` from copies of the fixture | 0 | <1s |
+| `cargo run --release --target aarch64-apple-darwin -p coldsnap_firmware --example checkfw -- target/software-only/fixtures/bad-signature.bin` | 1 | 1s |
+| same with `target/software-only/fix10/pubkey1.bin` | 1 | 0s |
+| same with `target/software-only/fix10/sig-unparseable.bin` | 1 | 0s |
+| `python3 -B tools/test-software-readiness.py` (fixed) → `tsr-after.log` | 0, `PASS: 0 failed case(s)`, 5 R12 rule cases ok | 67s |
+| `python3 -B target/software-only/fix10/drive-stage.py` (fixed; REAL stage + REAL checkfw, pack-tests seeded, single-stage drive, not a profile run) → `drive-stage.log` | 0: bad-signature passed; range-unusable, pubkey1, sig-unparseable failed with `output lacks /...actual signature failed verification; /` | 2s |
+| M1 in tree (fix 7 pattern restored from `fix10/check-software-readiness.py.orig`): self-test → `tsr-mutM1.log` | 1: `FAIL: 2 failed case(s): [... sig-pubkey-num-1 ..., ... sig-parse-failed ...]` | 63s |
+| M1: drive-stage.py → `drive-stage-mutM1.log` | 1: pubkey1 and sig-unparseable classified `passed` (WRONG) | 2s |
+| restore from `fix10/check-software-readiness.py.fixed`; `cmp` | 0 | — |
+| `python3 -B tools/check-software-readiness.py --list` | 0 (42 stages) | <1s |
+
+Mutation result: M1, the pre-fix pattern, is caught by both the self-test (the 2 new cases, for the named reason) and the real-stage drive. The fixed code passes both. After the restore, `git status` shows only the 2 intended files modified, and the user's work is untouched. No full profile was run. Only the self-tests and a single-stage drive ran, so the claim is limited to "software/pre-bench checks passed" for this stage rule.
+
+### Fix 10 — verified re-run (implementer, 2026-09-29 ~10:30-10:34)
+
+The first attempt above was interrupted before it returned. I re-checked its edits against the real code and re-ran every command. Logs are in `target/software-only/logs/14-fix10/`, cwd is `/Users/garykrause/repos/cold-snap` for all commands, and exit codes are the process's own (no pipeline).
+- The scratch fixtures differ from `target/software-only/fixtures/bad-signature.bin` (sha256 522d7458…7e04, unchanged) only where named: `pubkey1.bin` at 1 byte, 0x3f94 (= 0x3f80+20); `sig-unparseable.bin` at 64 bytes, 0x3fc0-0x3fff (= 0x3f80+64..127). Both have the same length.
+- checkfw source read at `firmware/examples/checkfw.rs:188-198` (`pubkey()` "cannot verify") and `:454-475` ("sig parse:" / verify error). The three R12 details are already distinct, so checkfw was not changed.
+
+| command | exit | time | log |
+|---|---|---|---|
+| `cargo run --release --target aarch64-apple-darwin -p coldsnap_firmware --example checkfw -- target/software-only/fixtures/bad-signature.bin` | 1 (`actual signature failed verification;`) | 1s | `checkfw-bad-signature.log` |
+| same, `target/software-only/fix10/pubkey1.bin` | 1 (`approved_pubkeys[1], actual cannot verify:`) | 1s | `checkfw-pubkey1.log` |
+| same, `target/software-only/fix10/sig-unparseable.bin` | 1 (`actual sig parse: malformed signature;`) | 0s | `checkfw-sig-unparseable.log` |
+| `python3 -B tools/test-software-readiness.py` (fixed) | 0, `PASS: 0 failed case(s)`, 90 ok (fix 9 had 88, plus 2 new) | 75s | `tsr-fixed.log` |
+| `python3 -B target/software-only/fix10/drive-stage.py` (fixed; REAL stage + REAL checkfw, single stage, pack-tests seeded, not a profile run) | 0: bad-signature passed; range-unusable, pubkey1, sig-unparseable failed with `output lacks /…actual signature failed verification; /` | 2s | `drive-fixed.log` |
+| M1 in tree (the must-pattern reverted to fix 7's prefix-only regex): self-test | 1: `FAIL: 2 failed case(s): ['… sig-pubkey-num-1 rc 1 -> failed', '… sig-parse-failed rc 1 -> failed']` (status `passed`, wanted `failed`) | 64s | `tsr-mutM1.log` |
+| M1: drive-stage.py | 1: pubkey1 and sig-unparseable `passed … WRONG` | 2s | `drive-mutM1.log` |
+| restore from `csr.fixed.py`; `cmp` | 0 (byte-exact) | — | — |
+| `python3 -B tools/check-software-readiness.py --list` | 0, 42 stages | <1s | `list.log` |
+
+Status: **FIXED**, uncommitted. This closes the fix 7 close-out PLAUSIBLE R12-prefix item. frostsnap was not changed, so no pin bump is needed. No full profile was run. The claim is limited to "software/pre-bench checks passed" for this stage rule. Installation and bootloader effects remain mocked and bench-only.
+
+## Fix 10 — close-out
+
+- **Status: FIXED (software/pre-bench checks passed, scoped to this stage rule).** The `checkfw-negative-signature` must-pattern (`tools/check-software-readiness.py:319-322`) now requires `expected valid under approved_pubkeys\[0\], actual signature failed verification; ` after the R12 prefix. So the pubkey_num != 0 ("cannot verify"), "sig parse:" and "range unusable" R12 failures are all classified failed. checkfw was not changed: its three R12 details already differ (`firmware/examples/checkfw.rs:188-198`, `:454-475`). No R-code or verdict changed. The fixture `fixtures/bad-signature.bin` was not mutated. The scratch copies `fix10/pubkey1.bin` (1 byte at 0x3f94) and `fix10/sig-unparseable.bin` (64 bytes at 0x3fc0-0x3fff) were used instead.
+- **Implementer's commands:** see the two tables above (logs `target/software-only/fix10/` and `target/software-only/logs/14-fix10/`). checkfw exited 1 on each of the three inputs, with the three distinct details. The self-test exited 0 with 90 ok. drive-stage.py exited 0. Mutant M1 (fix 7's prefix-only pattern) made the self-test exit 1 on exactly the 2 new cases and the drive exit 1 (pubkey1 and sig-unparseable `passed … WRONG`). The file was restored and `cmp` exited 0. `--list` exited 0 with 42 stages.
+- **Re-runner's commands (close-out; no independent verifier ran).** cwd `/Users/garykrause/repos/cold-snap`, logs `target/software-only/logs/14-fix10/closeout/`, each exit is the python process's own status with output redirected:
+  - `python3 -B tools/test-software-readiness.py` (fixed) exited 0 with `PASS: 0 failed case(s)` (`tsr-fixed.log`).
+  - `python3 -B target/software-only/fix10/drive-stage.py` (fixed; the real stage and real checkfw, one stage only, not a profile run) exited 0. bad-signature passed. range-unusable, pubkey1 and sig-unparseable failed with `output lacks /…actual signature failed verification; /` (`drive-fixed.log`).
+  - M1 was applied in the tree (the pattern reverted to `…\(signed range\): '` only). The self-test exited 1 with `FAIL: 2 failed case(s): ['checkfw-negative-signature rule: sig-pubkey-num-1 rc 1 -> failed', 'checkfw-negative-signature rule: sig-parse-failed rc 1 -> failed']` (`tsr-mutM1.log`). The drive exited 1, with pubkey1 and sig-unparseable `passed … WRONG` and range-unusable still failed (`drive-mutM1.log`).
+  - After restoring from `csr.fixed.py`, `cmp` exited 0. `git status` in both repos showed only the 3 fix files modified plus the user's untouched files.
+  - frostsnap HEAD c2bcd65 matched `hostcheck/frostsnap.rev`.
+  - I checked the self-test strings against the real checkfw lines in `logs/14-fix10/checkfw-*.log`. They are identical except that fw_check is abbreviated, and the pattern does not read that field.
+- **CONFIRMED findings:** none (the verifier list was empty; no repair).
+- **Closed by this fix:** the fix 7 close-out PLAUSIBLE R12-prefix item (§ Fix 7 close-out). It was carried open in § Fix 8 and § Fix 9 close-outs, in the 01 evidence (fix 7 follow-up), the 09 evidence (fix 8 and fix 9 follow-ups) and run.json.
+- **Still open:** fix 6 mutant X1, and the fix 9 PLAUSIBLE `_cmd` returncode note. The full profile was not re-run for this fix. The last full run is fix 9's verbatim 42/42 on 2026-09-29, before this pattern change.
+- **Commits:** one cold-snap commit containing `tools/check-software-readiness.py`, `tools/test-software-readiness.py`, this file, the 01 and 09 evidence files and run.json. frostsnap: none, so no pin bump.
+- Real USB enumeration, timing, SE calls, entropy, flash power loss and actual installation remain bench-only and untested.

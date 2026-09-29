@@ -475,3 +475,9 @@ value. No amend, no rewrite — the history stays one commit for this task.
 - **Closed:** the readiness runner's `checkfw-negative-signature` stage (the runner's copy of this task's corrupted-signature negative) matched any `[FAIL] R12 `, including R12's "range unusable" length refusal. It now requires `[FAIL] R12 signature over double-SHA256(signed range): `, copied from a real checkfw run on `fixtures/bad-signature.bin`. A self-test proves the range-unusable line comes out failed; the old pattern (M1) and a looser one (M2) both fail that test. checkfw and the R12 codes are unchanged.
 - **Still open:** PLAUSIBLE only. That same line is also printed for pubkey_num != 0 and signature-parse failures.
 - Detail: `10-followup.md` § Fix 7.
+
+## Follow-up 2026-09-29 — fix 10
+
+- **Closed:** the fix 7 PLAUSIBLE R12-prefix item. The readiness runner's `checkfw-negative-signature` stage now passes only on `[FAIL] R12 … expected valid under approved_pubkeys[0], actual signature failed verification; `. The other R12 failures (pubkey_num != 0 "cannot verify", "sig parse:", "range unusable") are classified failed. Two new self-test cases are built from real checkfw output on scratch fixtures under `target/software-only/fix10/`. They fail under the old pattern (M1) and pass on the fixed code. checkfw and the R12 codes are unchanged.
+- **Still open:** fix 6 mutant X1, and the fix 9 PLAUSIBLE `_cmd` returncode note.
+- Detail: `10-followup.md` § Fix 10. Scope: software/pre-bench checks passed, for this stage rule only.

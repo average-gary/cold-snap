@@ -10,6 +10,7 @@ nonzero overall exit. Output under target/software-readiness-selftest/.
 import importlib.util
 import json
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -110,8 +111,8 @@ def main():
         r = one(sh(nm, script, expect_rc=bl.expect_rc, must=bl.must))
         check(f'pack-negative-bad-layout rule: {nm} rc 1 -> {want}', r['status'] == want, r)
 
-    # The real stage's rule on checkfw's real lines (target/software-only/fix7/checkfw-*.log):
-    # R12 has a second [FAIL] variant, "range unusable", which is a refusal for a length reason.
+    # The real stage's rule on checkfw's real lines (target/software-only/fix7/ and fix10/checkfw-*.log):
+    # R12 also fails for "range unusable", pubkey_num != 0 and an unparseable signature.
     sig = next(s for s in R.stages(OUT) if s.name == 'checkfw-negative-signature')
     res = 'RESULT: REFUSE — 1 of 14 rules failed. Read each citation:'
     for nm, line, want in [
@@ -121,9 +122,16 @@ def main():
             ('sig-range-unusable', '  [FAIL] R12 signature (range unusable): expected firmware_digest() -> Some, '
              'actual None: one of length >= 262144 / length % 512 == 0 / length <= 397312 failed  '
              '[coldsnap_firmware::firmware_digest]', 'failed'),
+            ('sig-pubkey-num-1', '  [FAIL] R12 signature over double-SHA256(signed range): expected valid '
+             'under approved_pubkeys[1], actual cannot verify: only approved_pubkeys[0] is embedded here, and '
+             "key 1 is not (1-5 are Coinkite's, >= 6 does not exist — firmware-keys.h:5,8). Refusing rather "
+             'than waving it through; fw_check 8ed6  [verify.c:226+232]', 'failed'),
+            ('sig-parse-failed', '  [FAIL] R12 signature over double-SHA256(signed range): expected valid '
+             'under approved_pubkeys[0], actual sig parse: malformed signature; fw_check 265f  [verify.c:226+232]',
+             'failed'),
             ('sig-passed-other-refusal', '  [PASS] R12 signature over double-SHA256(signed range): expected valid '
              'under approved_pubkeys[0], actual valid (S normalized); fw_check 265f  [verify.c:226+232]', 'failed')]:
-        r = one(sh(nm, f"printf '%s\\n%s\\n' '{line}' '{res}'; exit 1", expect_rc=sig.expect_rc, must=sig.must))
+        r = one(sh(nm, f"printf '%s\\n%s\\n' {shlex.quote(line)} {shlex.quote(res)}; exit 1", expect_rc=sig.expect_rc, must=sig.must))
         check(f'checkfw-negative-signature rule: {nm} rc 1 -> {want}', r['status'] == want, r)
 
     r = one(sh('zero-tests', 'echo "test result: ok. 0 passed; 0 failed"', must=[R.TESTS_RAN]))

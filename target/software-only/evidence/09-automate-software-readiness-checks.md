@@ -504,3 +504,9 @@ Detail: `10-followup.md` § Fix 1.
 - **Closed:** the fix 8 follow-up's CONFIRMED low item. When git cannot run, `_cmd(lines=True)` now returns a one-item list, not a string (`tools/check-software-readiness.py:616-617`), so summary.md no longer counts characters as dirty paths. The self-test "identity: git unavailable -> dirty is a one-item list" fails on the old code and passes on the fixed code. A verbatim full profile exited 0 with 42/42 on 2026-09-29.
 - **Still open:** PLAUSIBLE: `_cmd` ignores returncode, so a git that runs but fails records `dirty == []`, which reads as clean. Also still open: the fix 7 PLAUSIBLE R12-prefix item.
 - Detail: `10-followup.md` § Fix 9. Scope: software/pre-bench checks passed, for fix 9 only.
+
+## Follow-up 2026-09-29 — fix 10
+
+- **Closed:** the fix 7 PLAUSIBLE R12-prefix item. The readiness runner's `checkfw-negative-signature` stage now passes only on `[FAIL] R12 … expected valid under approved_pubkeys[0], actual signature failed verification; `. The other R12 failures (pubkey_num != 0 "cannot verify", "sig parse:", "range unusable") are classified failed. Two new self-test cases are built from real checkfw output on scratch fixtures under `target/software-only/fix10/`. They fail under the old pattern (M1) and pass on the fixed code. checkfw and the R12 codes are unchanged.
+- **Still open:** fix 6 mutant X1, and the fix 9 PLAUSIBLE `_cmd` returncode note.
+- Detail: `10-followup.md` § Fix 10. Scope: software/pre-bench checks passed, for this stage rule only.

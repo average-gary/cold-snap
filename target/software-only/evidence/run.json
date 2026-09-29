@@ -39,6 +39,18 @@
         "still_open": [
           "PLAUSIBLE: the same R12 line is printed for pubkey_num != 0 and sig-parse failures"
         ]
+      },
+      {
+        "fix": "10",
+        "commit": [
+          "cold-snap: the fix 10 close-out commit (see git log; it cannot name its own SHA)"
+        ],
+        "closed": [
+          "PLAUSIBLE (fix 7): checkfw-negative-signature matched the shared '[FAIL] R12 signature over double-SHA256(signed range): ' prefix, so pubkey_num != 0 and sig-parse failures also passed; must-pattern now requires 'expected valid under approved_pubkeys[0], actual signature failed verification; ', self-test cases sig-pubkey-num-1/sig-parse-failed from real checkfw output kill the old pattern (M1)"
+        ],
+        "still_open": [
+          "none from this fix"
+        ]
       }
     ]
   },
@@ -452,6 +464,19 @@
         "still_open": [
           "PLAUSIBLE: _cmd ignores returncode, so git that runs but fails records dirty == [] (reads as clean)",
           "PLAUSIBLE: tightened R12 line also printed for pubkey_num != 0 and sig-parse failures"
+        ]
+      },
+      {
+        "fix": "10",
+        "commit": [
+          "cold-snap: the fix 10 close-out commit (see git log; it cannot name its own SHA)"
+        ],
+        "closed": [
+          "PLAUSIBLE (fix 7): checkfw-negative-signature matched the shared '[FAIL] R12 signature over double-SHA256(signed range): ' prefix, so pubkey_num != 0 and sig-parse failures also passed; must-pattern now requires 'expected valid under approved_pubkeys[0], actual signature failed verification; ', self-test cases sig-pubkey-num-1/sig-parse-failed from real checkfw output kill the old pattern (M1)"
+        ],
+        "still_open": [
+          "fix 9 PLAUSIBLE: _cmd ignores returncode, so git rc!=0 with empty stdout records dirty == []",
+          "fix 6 mutant X1 (task 08)"
         ]
       }
     ]

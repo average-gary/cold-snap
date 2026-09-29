@@ -316,9 +316,10 @@ def stages(out):
            '--', os.path.join(FIX, 'bad-signature.bin')], core=True,
           needs=['cargo', 'rust-host', 'fixture-bad-signature'], expect_rc=1,
           after=['pack-tests'], consumes=[os.path.join(FIX, 'bad-signature.bin')],
-          # Only the signature-verification line: R12's other [FAIL] variant, "signature (range
-          # unusable)", is a refusal for a length reason and must not count.
-          must=[r'(?m)^RESULT: REFUSE\b', r'(?m)^\s*\[FAIL\] R12 signature over double-SHA256\(signed range\): ']),
+          # Only a genuine verification failure under key 0. R12 also fails for "range unusable"
+          # (length), "cannot verify" (pubkey_num != 0) and "sig parse:"; none of those count.
+          must=[r'(?m)^RESULT: REFUSE\b', r'(?m)^\s*\[FAIL\] R12 signature over double-SHA256\(signed range\): '
+                r'expected valid under approved_pubkeys\[0\], actual signature failed verification; ']),
         S('checkfw-negative-misaligned', 'package', 'checkfw refuses a misaligned image (R8)', CS,
           ['cargo', 'run', '--release', '--target', HOST, '-p', 'coldsnap_firmware', '--example', 'checkfw',
            '--', os.path.join(FIX, '05', 'misaligned-397824.bin')], core=True,
