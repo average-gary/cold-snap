@@ -1441,3 +1441,45 @@ X1–X6 are still caught, with the same reasons as in the fix 11 table. X3b is n
   - The readiness profile's `app-rig` stage now includes `--stub-restart` but the full profile was not re-run.
 - **Still open:** the four PLAUSIBLE items above; the app-side name check cannot tell the DB from the device announce; `STUB_LOSE_FIRST_SHARE` is re-armed on restarted device 3 but not exercised in run 2; SIGKILL of the rig skips teardown; the write-through is not atomic, so flash power loss mid-write is not modelled; the mirror re-reads 80 KB per op (ponytail comment). The stub restart is a host process restart, not evidence that the shipped ARM image survives a real power cycle or re-announces on port re-open.
 - **Commits:** one cold-snap commit containing `firmware/examples/stub.rs`, `tools/app-rig.py`, `tools/app-rig-test.sh`, this file, the 04 evidence file and run.json. frostsnap: none, so no pin bump.
+
+## Fix 13 — full readiness profile
+
+Implementer run, 2026-09-29. Trees at start: cold-snap HEAD b9aaf74, frostsnap HEAD c2bcd65 (= `hostcheck/frostsnap.rev`); only the user's pre-existing dirty files were present. No interrupted partial edits were found.
+
+| command | cwd | exit | elapsed |
+|---|---|---|---|
+| `python3 tools/test-software-readiness.py` (log target/software-only/logs/13-fix13/tsr.log) | /Users/garykrause/repos/cold-snap | 0 (90 `ok`, 0 FAIL, "PASS: 0 failed case(s)") | 79 s |
+| `python3 tools/check-software-readiness.py --profile full --output-dir target/software-readiness` (background, log target/software-only/logs/13-fix13/full.log, rc in full.rc) | /Users/garykrause/repos/cold-snap | 0, label "software/pre-bench checks passed" | 390 s (12:52:55–12:59:25) |
+| `pgrep -fl 'examples/stub\|app-rig\.py\|bitcoin-node.*-regtest\|flutter_tools\|Frostsnap\.app'` after the run | /Users/garykrause/repos/cold-snap | 1 (none) | — |
+
+Report is fresh from this run: results.json mtime 12:59:25, `started` 2026-09-29T12:52:55-04:00, `finished` 12:59:25; `orphans_after_run` [], `source_drift` []. identity: cold-snap b9aaf74, frostsnap c2bcd65. Only bitcoin-node still running is the user's PID 13555 (testnet4, port 48335), not touched.
+
+Per-stage (42 stages, 42 passed, 0 failed/blocked/skipped/unavailable; rc, seconds):
+host-frostsnap-macros 0 3.4; host-frostsnap-embedded-std 0 2.1; host-frostsnap-comms 0 2.5; host-frostsnap-core 0 24.3; host-frost-backup 0 8.0; host-coldsnap-firmware 0 3.0; host-coldsnap-hal 0 6.7; arm-clippy-dev 0 1.3; arm-clippy-release 0 1.3; arm-build-release 0 0.6; refcheck 0 18.6; refcheck-negatives 0 34.2; pack 0 0.3; pack-tests 0 2.0; pack-negative-bad-layout 1(expected) 0.2; checkfw-bin 0 4.4; checkfw-dfu 0 0.5; checkfw-negative-signature 1(expected) 0.5; checkfw-negative-misaligned 1(expected) 0.5; checkfw-negative-family 1(expected) 0.5; pixel-check 0 1.0; heap-session 0 13.2; stub-build 0 0.3; frostsnap-pin 0 0.1; hostcheck-tests 0 1.3; hostcheck-run 0 17.4; coordinator-verbatim 0 8.4; coordinator-scoped 0 2.6; rust-lib-frostsnapp 0 1.8; register-self-check 0 0.1; registry-matches-artifact 0 0.0; flutter-analyze 0 21.1; flutter-test 0 3.2; bridge-gen-reproducible 0 37.6; build-runner-reproducible 0 19.1; app-rig 0 85.1; updater-stub-ignored 0 2.7; updater-lib-ignored 0 3.8; updater-local-artifact 0 0.6; app-bridge-ignored 0 8.1; controller-erase-fake 0 16.2; install-xproc 0 2.8.
+
+Stages that reach fixes 9–12 (no runner stage had to be added):
+- Fix 9 (`_cmd(lines=True)`) and fix 10 (R12 pattern): the self-test run above covers both. The full run's `checkfw-negative-signature` stage uses the fix 10 must-pattern (tools/check-software-readiness.py:319-322) and passed on the real R12 failure.
+- Fix 11: `arm-build-release` builds `boot` with `#[forbid(unused_variables)]` (firmware/src/main.rs:1579). `host-coldsnap-firmware`/`controller-erase-fake` run `the_link_edge_sends_one_recovered_erase_ack_from_the_original_id` with guards (a)–(e), which reported `ok` in the controller-erase-fake log. ELF sha256 b7bd6c4a…df679 matches fix 11. `registry-matches-artifact` passed, so the image digest is unchanged (c86392bc). No registry edit, no frostsnap commit, no pin bump.
+- Fix 12: `app-rig` runs `tools/app-rig-test.sh` with `--app-restart --stub-restart`. Its log has "stub restart verified: pids [66607, 66608, 66609, 66610] -> [67333, 67334, 67335, 67336]; every device reloaded its flash file and came back with the same id, name and share" and "All tests passed!" for both app runs.
+
+Mutations: none. This fix adds and changes no check, so there was nothing new to show biting. Failure-path behaviour (failed, timed-out, skipped-required, stale and hung stages, SIGTERM) is covered by the 90 self-test cases above.
+
+Files changed: only this evidence section. No source changes, no commit (implementer step).
+
+Closes: the fix 8 42/42 result is now reproduced after fixes 9–12, from a report made by this run. Earlier open findings still open: fix 11's W1–W3 (guard (e) `//`-cut bypass, see § Fix 11 — close-out). The full profile does not reach W1–W3, because it runs the real code and no mutant.
+
+## Fix 13 — close-out
+
+- **Status: FIXED (software/pre-bench checks passed, scoped to the hardware-free full profile).** After fixes 9–12 the verbatim full profile exited 0 with 42/42 stages passed (none failed/blocked/skipped/unavailable), label "software/pre-bench checks passed", `orphans_after_run: []`, `source_drift: []`, on cold-snap b9aaf74 and frostsnap c2bcd65 (= `hostcheck/frostsnap.rev`). No stage was added, removed, reclassified or relaxed; every change of fixes 9–12 is reached by an existing stage (see above). No source changed, image digest unchanged (c86392bc, `registry-matches-artifact` passed), so no registry edit, frostsnap commit or pin bump.
+- **Implementer's commands:** § Fix 13 above (cwd /Users/garykrause/repos/cold-snap; logs `target/software-only/logs/13-fix13/tsr.log`, `full.log`, `full.rc` = `rc=0 elapsed=390s end=2026-09-29 12:59:25`).
+- **Verifier:** none ran for this fix; no verifier findings, no repair.
+- **Close-out's own checks** (cwd /Users/garykrause/repos/cold-snap):
+  - `python3 tools/test-software-readiness.py` (log `target/software-only/logs/13-fix13/closeout-tsr.log`): exit 0, 90 `ok`, "PASS: 0 failed case(s)".
+  - Read `target/software-readiness/results.json` (mtime 12:59, written by this run): `exit` 0, 42 stages all `passed`, `started` 2026-09-29T12:52:55-04:00, `finished` 12:59:25, identity heads b9aaf74 / c2bcd65, ELF sha256 b7bd6c4a…df679.
+  - Stage logs: `host-coldsnap-firmware.out:236` and `controller-erase-fake.out:236` show `the_link_edge_sends_one_recovered_erase_ack_from_the_original_id ... ok` (fix 11); `app-rig.err` has "stub restart verified", `app-rig.out` has "All tests passed!" twice, and the stage runs `tools/app-rig-test.sh`, which passes `--app-restart --stub-restart` (fix 12).
+  - `pgrep -fl 'examples/stub|app-rig\.py|bitcoin-node.*-regtest|flutter_tools|Frostsnap\.app'`: exit 1 (no orphans). User's PID 13555 untouched.
+  - Mutations: none; this fix adds or changes no check.
+- **CONFIRMED findings:** none.
+- **Closed by this fix:** fix 11 close-out "The full readiness profile was not run for this fix"; fix 12 PLAUSIBLE "the readiness profile's `app-rig` stage now includes `--stub-restart` but the full profile was not re-run".
+- **Still open:** fix 11 W1–W3 (guard (e) `//`-cut bypass) and W4's single gate; fix 9 PLAUSIBLE `_cmd` ignores returncode; fix 12's PLAUSIBLE items other than the one closed above. The full profile runs real code, not mutants, so it cannot reach W1–W3.
+- **Commits:** one cold-snap commit (this file, `09-automate-software-readiness-checks.md`, run.json). frostsnap: none.

@@ -510,3 +510,9 @@ Detail: `10-followup.md` § Fix 1.
 - **Closed:** the fix 7 PLAUSIBLE R12-prefix item. The readiness runner's `checkfw-negative-signature` stage now passes only on `[FAIL] R12 … expected valid under approved_pubkeys[0], actual signature failed verification; `. The other R12 failures (pubkey_num != 0 "cannot verify", "sig parse:", "range unusable") are classified failed. Two new self-test cases are built from real checkfw output on scratch fixtures under `target/software-only/fix10/`. They fail under the old pattern (M1) and pass on the fixed code. checkfw and the R12 codes are unchanged.
 - **Still open:** fix 6 mutant X1, and the fix 9 PLAUSIBLE `_cmd` returncode note.
 - Detail: `10-followup.md` § Fix 10. Scope: software/pre-bench checks passed, for this stage rule only.
+
+## Follow-up 2026-09-29 — fix 13
+
+- **Closed:** the full profile was not re-run after fixes 11 and 12. A verbatim `python3 tools/check-software-readiness.py --profile full --output-dir target/software-readiness` now exits 0 with 42/42 passed, "software/pre-bench checks passed", `orphans_after_run: []`, `source_drift: []`, on cold-snap b9aaf74 and frostsnap c2bcd65 (= pin). Its `app-rig` stage ran with `--app-restart --stub-restart` and the fix 11 link-edge test passed in it. Self-tests exit 0 (90 ok). No stage was added or changed.
+- **Still open:** fix 9 PLAUSIBLE `_cmd` returncode note; fix 11 W1–W3.
+- Detail: `10-followup.md` § Fix 13. Scope: software/pre-bench checks passed, for the hardware-free full profile only.

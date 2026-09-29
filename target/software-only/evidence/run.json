@@ -512,6 +512,19 @@
           "fix 9 PLAUSIBLE: _cmd ignores returncode, so git rc!=0 with empty stdout records dirty == []",
           "fix 6 mutant X1 (task 08)"
         ]
+      },
+      {
+        "fix": "13",
+        "commit": [
+          "cold-snap: the fix 13 close-out commit (see git log; it cannot name its own SHA)"
+        ],
+        "closed": [
+          "fix 11/12: full profile not re-run after fixes 11 and 12; verbatim full profile now 42/42 exit 0 on cold-snap b9aaf74 + frostsnap c2bcd65 (= pin), app-rig with --app-restart --stub-restart, self-tests 90 ok exit 0"
+        ],
+        "still_open": [
+          "fix 9 PLAUSIBLE: _cmd ignores returncode, so git rc!=0 with empty stdout records dirty == []",
+          "fix 11 W1-W3: guard (e) cuts at first // so a disguised ARM-only cfg bypasses it"
+        ]
       }
     ]
   }
