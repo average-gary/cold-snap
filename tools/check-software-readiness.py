@@ -613,7 +613,8 @@ def _cmd(argv, cwd=None, lines=False):
         out = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=60, env=_env()).stdout
         return out.splitlines() if lines else out.strip()
     except (OSError, subprocess.SubprocessError) as e:
-        return f'unavailable: {e}'
+        msg = f'unavailable: {e}'
+        return [msg] if lines else msg
 
 
 def identity():

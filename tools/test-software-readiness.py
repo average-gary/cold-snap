@@ -284,6 +284,17 @@ def main():
     R.FS = real_fs
     check("identity: unstaged first line keeps porcelain ' M', not staged 'M '",
           dirty == [' M frostsnap_coordinator/lib.rs'], dirty)
+    nogit = os.path.join(OUT, 'nogit-path')   # empty PATH dir: git cannot be run at all
+    os.makedirs(nogit)
+    real_path, real_fb = os.environ['PATH'], R.FLUTTER_BIN
+    os.environ['PATH'], R.FLUTTER_BIN = nogit, nogit
+    try:
+        ids = R.identity()['repos']
+    finally:
+        os.environ['PATH'], R.FLUTTER_BIN = real_path, real_fb
+    check("identity: git unavailable -> dirty is a one-item list, not the string's characters",
+          all(isinstance(r['dirty'], list) and len(r['dirty']) == 1 and r['dirty'][0].startswith('unavailable: ')
+              for r in ids.values()), {n: r['dirty'] for n, r in ids.items()})
     g('checkout', '-q', '--', '.')
     open(pinf, 'w').write('0' * 40 + '\n')
     r, o = pin()

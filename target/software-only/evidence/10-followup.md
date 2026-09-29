@@ -1084,3 +1084,45 @@ Files changed: `tools/check-software-readiness.py` and `tools/test-software-read
 - **Still open:** finding 2 above. Fix 6 mutant X1. The fix 7 PLAUSIBLE item: the R12 prefix is shared with the pubkey_num and sig-parse failures.
 - **Commits:** one cold-snap commit containing `tools/check-software-readiness.py`, `tools/test-software-readiness.py`, this file, the 09 evidence file and run.json. frostsnap: none.
 - Real USB enumeration, timing, SE calls, entropy, flash power loss and actual installation remain bench-only and untested. The install and bootloader effects in the profile are mocked.
+
+## Fix 9 — _cmd(lines=True) always returns a list
+
+**Status: FIXED (software/pre-bench checks passed, scoped to the runner self-tests and one verbatim full profile).** Every lines=True return path of `_cmd` now returns a list. A new self-test fails on the old code and passes on the fixed code. Neither verifier raised a CONFIRMED finding, so no repair was needed.
+
+
+Date 2026-09-29. Inputs: cold-snap HEAD a631297, frostsnap HEAD c2bcd65 (= `hostcheck/frostsnap.rev`). At start, both trees had only the user's pre-existing dirty files (`git status --porcelain`, `git diff --stat`). Nothing was left over from an earlier attempt.
+
+### Files changed (working tree only, not committed)
+- `tools/check-software-readiness.py:616-617`: the `except (OSError, subprocess.SubprocessError)` path of `_cmd` now returns `[msg] if lines else msg`. Before this change it always returned the string. Every return path with lines=True now returns a list.
+- `tools/test-software-readiness.py:287-297`: new case "identity: git unavailable -> dirty is a one-item list, not the string's characters". It points `os.environ['PATH']` and `R.FLUTTER_BIN` at an empty scratch directory `target/software-readiness-selftest/nogit-path`, so git cannot be run. It then calls the runner's real `identity()`, restores both values in `finally`, and requires every repo's `dirty` to be a list of exactly one item that starts with `unavailable: `.
+
+### Callers checked
+Only `identity()` (`:625`, `dirty`) passes `lines=True`. Its consumer, `summary.md` at `:708-709`, uses `len(rp['dirty'])` and `', '.join(rp['dirty'])`. With a list this now reports "1 dirty path(s): unavailable: ..." rather than counting characters. The callers without lines (`:623-627`, head, branch, rustc, cargo and flutter `.splitlines()[:1]`) still get strings, so they are unchanged. Stage classification and stage rules are unchanged.
+
+### Commands (cwd `/Users/garykrause/repos/cold-snap`; exit = the python process's own status, output redirected to the log)
+| # | Command | Exit | Elapsed | Log |
+|---|---|---|---|---|
+| 1 | `python3 tools/test-software-readiness.py` (new case, OLD `_cmd`) | 1: exactly one FAIL, the new case. Every repo's `dirty` was the string `"unavailable: [Errno 2] No such file or directory: 'git'"` | 113 s | `target/software-only/logs/13-fix9/selftest-oldcode.log` |
+| 2 | `python3 tools/test-software-readiness.py` (fixed `_cmd`) | 0, "PASS: 0 failed case(s)", 88 ok | 66 s | `target/software-only/logs/13-fix9/selftest-fixed.log` |
+| 3 | `python3 tools/check-software-readiness.py --list` | 0 | <1 s | (stdout discarded) |
+
+### Mutation
+The mutant is the pre-fix code itself: the test was added before the one-line fix, so run 1 is the mutant run. It failed for the named reason (the string was returned instead of a list). Run 2 on the real code passed. No in-tree revert was needed.
+
+### Closes
+Fix 8 close-out CONFIRMED finding 2 (§ Fix 8 — close-out: "`_cmd(lines=True)` returns the string `'unavailable: ...'` instead of a list", `tools/check-software-readiness.py:610-616`; also carried in the 09 evidence).
+
+### Not done
+The full readiness profile was not re-run. The change touches only the git-unavailable error path of `identity()`, which a normal run never takes, and no stage or classification changed. frostsnap was unchanged, so there was no registration and no pin bump. Claim: software/pre-bench checks passed, scoped to the runner self-tests. Real USB enumeration, timing, SE calls, entropy, flash power loss and actual installation remain bench-only and untested.
+
+## Fix 9 — close-out
+
+- **Status: FIXED (software/pre-bench checks passed, scoped as above).** `tools/check-software-readiness.py:616-617` returns `[msg] if lines else msg`. The success path at `:614` already returned `splitlines()`. The only lines=True caller is `identity()` (`:625`), and its only consumer is the summary.md writer (`:709-710`). No stage rule or classification changed.
+- **Implementer's commands** (cwd cold-snap): the self-test with the new case on the OLD `_cmd` exited 1, with exactly one FAIL, the new case (`target/software-only/logs/13-fix9/selftest-oldcode.log`). On the fixed code it exited 0 with 88 ok (`.../13-fix9/selftest-fixed.log`). `--list` exited 0.
+- **Re-runners' commands:** verifier 1 used scratch copies under `target/software-only/verify-rerun-cmd-list/{fixed,old}`. The fixed copy exited 0 with 88 ok. The old-HEAD `_cmd` copy exited 1 with 87 ok and a single FAIL, the new case, where `dirty` was the string `"unavailable: [Errno 2] No such file or directory: 'git'"`. Its first two scratch attempts failed only from setup: missing run.json, then the missing pin script (rc 127). It then ran task 09's Checks block verbatim in the real tree: `python3 tools/check-software-readiness.py --profile full --output-dir target/software-readiness` exited 0, 42/42 passed, "software/pre-bench checks passed", 10:12:30-10:18:23 EDT 2026-09-29 (log `target/software-only/verify-rerun-cmd-list/logs/full.log`). Afterwards `git status` was unchanged in both repos, and frostsnap HEAD c2bcd65 matched `hostcheck/frostsnap.rev`. Verifier 2 was read-only: it read the diff, `_cmd`/`_env`/`identity`/the summary writer, the grep for lines=True callers and the ok counts in both logs.
+- **Close-out's own check:** `python3 tools/test-software-readiness.py` (cwd cold-snap) exited 0 with "PASS: 0 failed case(s)" and 88 ok (log `target/software-only/logs/13-fix9/closeout/tsr.log`).
+- **CONFIRMED findings:** none. There were two PLAUSIBLE notes. (1) The 09 evidence and run.json still listed this finding as open. This close-out closes it in both. (2) `_cmd` ignores returncode, so git that runs but fails (for example rc 128 with empty stdout) records `dirty == []`, the same as a clean tree. This predates fix 9 and is outside its scope ("when git cannot run"). It is left open and not repaired.
+- **Closed by this fix:** fix 8 close-out CONFIRMED finding 2 (`_cmd(lines=True)` returned a str when git cannot run). It was also carried as open in the 09 evidence (fix 8 follow-up) and in run.json.
+- **Still open:** the PLAUSIBLE returncode note above, fix 6 mutant X1, and the fix 7 PLAUSIBLE R12-prefix item.
+- **Commits:** one cold-snap commit containing `tools/check-software-readiness.py`, `tools/test-software-readiness.py`, this file, the 09 evidence file and run.json. frostsnap was unchanged, so there was no registration and no pin bump.
+- Real USB enumeration, timing, SE calls, entropy, flash power loss and actual installation remain bench-only and untested. The install and bootloader effects in the profile are mocked.

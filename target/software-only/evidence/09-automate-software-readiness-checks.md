@@ -498,3 +498,9 @@ Detail: `10-followup.md` § Fix 1.
 - **Closed:** the acceptance criterion "the full profile runs every required implemented check" is now met with exit 0. `python3 tools/check-software-readiness.py --profile full --output-dir target/software-readiness` passed 42/42 with "software/pre-bench checks passed", `orphans_after_run: []` and `source_drift: []`. It passed on cold-snap ad3d6b2 and frostsnap c2bcd65 (= pin), and three independent runs reproduced it. This closes the fix 5 follow-up's "full profile exits 1". Also closed: `identity()` recorded the first `git status --porcelain` line without its leading space, so unstaged ` M` read as staged `M `. `_cmd(..., lines=True)` now keeps it, and a self-test was added with its mutant killed.
 - **Still open:** CONFIRMED, low severity, introduced by the fix 8 repair. When git cannot run, `_cmd(lines=True)` returns a string, not a list, so `summary.md` would count characters as dirty paths (`tools/check-software-readiness.py:610-616`). Also still open: the fix 7 PLAUSIBLE R12-prefix item.
 - Detail: `10-followup.md` § Fix 8. Scope: software/pre-bench checks passed, for the hardware-free full profile only.
+
+## Follow-up 2026-09-29 — fix 9
+
+- **Closed:** the fix 8 follow-up's CONFIRMED low item. When git cannot run, `_cmd(lines=True)` now returns a one-item list, not a string (`tools/check-software-readiness.py:616-617`), so summary.md no longer counts characters as dirty paths. The self-test "identity: git unavailable -> dirty is a one-item list" fails on the old code and passes on the fixed code. A verbatim full profile exited 0 with 42/42 on 2026-09-29.
+- **Still open:** PLAUSIBLE: `_cmd` ignores returncode, so a git that runs but fails records `dirty == []`, which reads as clean. Also still open: the fix 7 PLAUSIBLE R12-prefix item.
+- Detail: `10-followup.md` § Fix 9. Scope: software/pre-bench checks passed, for fix 9 only.

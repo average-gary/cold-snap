@@ -440,6 +440,19 @@
           "CONFIRMED, low: _cmd(lines=True) returns a str, not a list, when git cannot run (tools/check-software-readiness.py:610-616); summary.md would count characters as dirty paths",
           "PLAUSIBLE: tightened R12 line also printed for pubkey_num != 0 and sig-parse failures"
         ]
+      },
+      {
+        "fix": "9",
+        "commit": [
+          "cold-snap: the fix 9 close-out commit (see git log; it cannot name its own SHA)"
+        ],
+        "closed": [
+          "CONFIRMED, low: _cmd(lines=True) returned a str, not a list, when git cannot run; now [msg], self-test kills the old code; full profile 42/42 exit 0 re-run 2026-09-29"
+        ],
+        "still_open": [
+          "PLAUSIBLE: _cmd ignores returncode, so git that runs but fails records dirty == [] (reads as clean)",
+          "PLAUSIBLE: tightened R12 line also printed for pubkey_num != 0 and sig-parse failures"
+        ]
       }
     ]
   }
